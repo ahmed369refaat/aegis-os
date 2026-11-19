@@ -1,10 +1,12 @@
 //! # AegisOS core
 //!
 //! A `no_std` sample of the AegisOS architecture: Unix-philosophy building
-//! blocks (processes/domains, scheduling-relevant fast paths, memory, VFS
-//! mediated by capabilities, drivers-as-domains, syscalls) under a policy of
-//! strict isolation and least privilege, plus an integrated behavioral
-//! security monitor with a graduated response.
+//! blocks under a policy of strict isolation and least privilege —
+//! attenuation-only syscall masks, capabilities, W^X memory, buddy frame
+//! allocation — plus a full Linux-like semantics layer (VFS with Unix
+//! permissions and chroot, fd tables, pipes, signals, CFS scheduling,
+//! brokered rate-limited sockets) and an integrated behavioral security
+//! monitor with a graduated response.
 //!
 //! ## Layering
 //!
