@@ -235,6 +235,15 @@ pub fn stress_create_destroy<const N: usize>(
     cycles: u32,
     out: Out<'_>,
 ) -> Result<StressReport, M1Error> {
+    // F1 ballast: hold frames under a non-domain tag so this run's
+    // allocations (and the final free_all_owned) reach indexes >= 256 —
+    // the exact bound the old `0..FRAME_COUNT` loop missed. The baseline
+    // is measured *with* the ballast held and re-derived after release.
+    const BALLAST_OWNER: u32 = u32::MAX;
+    let ballast = if N >= 300 { 300 } else { 0 };
+    for _ in 0..ballast {
+        pool.alloc_for(&mut k.frames, BALLAST_OWNER)?;
+    }
     let baseline = k.frames.frames_in_use();
     let baseline_owners = pool.owned_count();
     let mut cb = [0u8; 20];
@@ -289,7 +298,13 @@ pub fn stress_create_destroy<const N: usize>(
         }
     }
 
-    let leaked = k.frames.frames_in_use().saturating_sub(baseline);
+    // F1: the ballast must come back through the very path under test
+    // (every index, scrub included), and the leak accounting is against
+    // the post-release expectation.
+    let ballast_back = pool.free_all_owned(&mut k.frames, BALLAST_OWNER);
+    debug_assert_eq!(ballast_back, ballast);
+    let expected_after = baseline - ballast;
+    let leaked = k.frames.frames_in_use().saturating_sub(expected_after);
     let owners_left = pool.owned_count();
     let mut b1 = [0u8; 20];
     let mut b2 = [0u8; 20];
@@ -298,7 +313,7 @@ pub fn stress_create_destroy<const N: usize>(
     line(out, &["[STRS] done: leaked_frames=", strutil::dec(leaked as u64, &mut b1),
         " (baseline ", strutil::dec(baseline as u64, &mut b2),
         "), owners_left=", strutil::dec(owners_left as u64, &mut b3),
-        " (expected ", strutil::dec(baseline_owners as u64, &mut b4),
+        " (expected ", strutil::dec((baseline_owners - ballast) as u64, &mut b4),
         "), scrub_readback=", yes_no(scrub_verified)]);
     Ok(StressReport { cycles, leaked_frames: leaked, baseline_frames: baseline, owners_left, scrub_verified })
 }

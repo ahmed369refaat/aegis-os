@@ -263,13 +263,17 @@ impl Kernel {
                 Ok(SysValue::FdPair(read_fd, write_fd))
             }
             SysRequest::Dup { fd, new_fd } => {
-                let target = self
-                    .domain_mut(domain_id)
-                    .map_err(into_sys)?
-                    .fds
-                    .get(fd)
-                    .ok_or(SysError::BadFd(fd))?
-                    .target;
+                // dup2(fd, fd) is a no-op (F2): it must not touch any
+                // refcount — the old path acquired one and dropped the
+                // replaced entry on the floor, leaking it.
+                if fd == new_fd {
+                    return Ok(SysValue::Fd(new_fd));
+                }
+                let (target, pos) = {
+                    let d = self.domain_mut(domain_id).map_err(into_sys)?;
+                    let e = d.fds.get(fd).ok_or(SysError::BadFd(fd))?;
+                    (e.target, e.pos)
+                };
                 // A duplicated pipe end is a second reference to it.
                 let acquire = match target {
                     FdTarget::PipeRead(p) => self.pipes.acquire_read(p),
@@ -277,11 +281,49 @@ impl Kernel {
                     FdTarget::File(_) => Ok(()),
                 };
                 acquire.map_err(SysError::Pipe)?;
-                self.domain_mut(domain_id)
-                    .map_err(into_sys)?
-                    .fds
-                    .replace_at(new_fd, target)
-                    .map_err(SysError::Fd)?;
+                // Replace the target fd, releasing whatever it held
+                // (F2: the old entry was silently discarded, leaking a
+                // pipe reference). A failed replace rolls the new
+                // reference back so dup cannot leak in either direction.
+                let replaced = {
+                    let d = self.domain_mut(domain_id).map_err(into_sys)?;
+                    d.fds.replace_at(new_fd, target)
+                };
+                let replaced = match replaced {
+                    Ok(old) => old,
+                    Err(e) => {
+                        match target {
+                            FdTarget::PipeRead(p) => {
+                                let _ = self.pipes.release_read(p);
+                            }
+                            FdTarget::PipeWrite(p) => {
+                                let _ = self.pipes.release_write(p);
+                            }
+                            FdTarget::File(_) => {}
+                        }
+                        return Err(SysError::Fd(e));
+                    }
+                };
+                if let Some(old) = replaced {
+                    match old.target {
+                        FdTarget::PipeRead(p) => {
+                            let _ = self.pipes.release_read(p);
+                        }
+                        FdTarget::PipeWrite(p) => {
+                            let _ = self.pipes.release_write(p);
+                        }
+                        FdTarget::File(_) => {}
+                    }
+                }
+                // The duplicate carries the source's file offset. NOTE:
+                // this is a snapshot, not POSIX's shared live offset —
+                // the fd table owns one offset per descriptor, and
+                // Write-with-offset semantics arrive with F11.
+                if let Ok(d) = self.domain_mut(domain_id) {
+                    if let Some(e) = d.fds.get_mut(new_fd) {
+                        e.pos = pos;
+                    }
+                }
                 Ok(SysValue::Fd(new_fd))
             }
             SysRequest::Kill { target, sig } => {

@@ -51,6 +51,11 @@ static SELFTEST_DE: AtomicBool = AtomicBool::new(false);
 /// Set by `arm_guard_write`: the next #PF at exactly this address is the
 /// (terminal) stack-guard selftest; 0 = unarmed.
 static GUARD_VA: AtomicU64 = AtomicU64::new(0);
+/// F4: the address alone is not proof of intent — an unarmed
+/// `GUARD_VA == cr2` match (both 0) is a kernel NULL dereference, not
+/// the selftest. The armed flag makes the distinction; classification
+/// lives in `fault_class` (pure, host-tested).
+static ARMED_GUARD: AtomicBool = AtomicBool::new(false);
 /// Set by `arm_nx_call`: the next #PF at exactly this address with the
 /// instruction-fetch (I/D) error bit is the NX selftest.
 static ARMED_NX: AtomicBool = AtomicBool::new(false);
@@ -185,7 +190,13 @@ fn dispatch(f: &mut ExceptionFrame) {
         serial::write_str("[EXC] domain guard selftest: guard-gap #PF ok\n");
         return;
     }
-    if f.vector == 14 && GUARD_VA.load(Ordering::SeqCst) == cr2 {
+    if super::fault_class::guard_selftest_hit(
+        ARMED_GUARD.load(Ordering::SeqCst),
+        GUARD_VA.load(Ordering::SeqCst),
+        f.vector as u8,
+        cr2,
+    ) {
+        ARMED_GUARD.store(false, Ordering::SeqCst);
         serial::write_str("[EXC] guard selftest: stack guard #PF ok\n");
         // Terminal by design: the last act of the boot, so the proof ends
         // the run cleanly (mirrors the PR-1.1 pattern).
@@ -271,6 +282,7 @@ pub fn arm_and_trigger_de() {
 /// (no fault → the mapping is wrong; different CR2 → a different bug) is
 /// a missing marker or an unexpected-fault halt — loud either way.
 pub fn arm_guard_write(guard_va: u64) -> ! {
+    ARMED_GUARD.store(true, Ordering::SeqCst);
     GUARD_VA.store(guard_va, Ordering::SeqCst);
     // SAFETY: deliberately stores to an unmapped (guard) address → #PF;
     // never completes, never touches live memory.

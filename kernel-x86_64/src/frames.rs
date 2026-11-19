@@ -109,7 +109,10 @@ impl<const N: usize> FramePool<N> {
     /// path. Returns how many frames were released.
     pub fn free_all_owned(&mut self, buddy: &mut BuddyAllocator<N>, owner: u32) -> usize {
         let mut released = 0;
-        for f in 0..FRAME_COUNT {
+        // F1: the pool is generic over N (the kernel uses 4096) — the
+        // old `0..FRAME_COUNT` (256) bound silently leaked — and never
+        // scrubbed — every frame past index 256 on the destroy path.
+        for f in 0..N {
             if self.owner[f] == Some(owner) {
                 let pa = self.pa_of(f);
                 (self.scrub)(pa);
@@ -213,6 +216,37 @@ mod tests {
             pool.free(&mut buddy, phys.base + 123, 1),
             Err(FrameError::Unaligned(_))
         ));
+    }
+
+    /// F1 regression: `free_all_owned` used to loop `0..FRAME_COUNT`
+    /// (256) instead of `0..N`, so a FramePool<4096> silently leaked —
+    /// and never scrubbed — every frame past index 256 on destroy.
+    #[test]
+    fn free_all_owned_covers_indexes_beyond_256() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static SCRUBS: AtomicU64 = AtomicU64::new(0);
+        fn count_scrub(_pa: u64) {
+            SCRUBS.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut buddy = BuddyAllocator::<4096>::new_over_arena();
+        let mut pool = FramePool::<4096>::new(POOL_BASE, count_scrub);
+        // Allocate enough that the last frame's index is past 256.
+        let mut last_pa = 0;
+        for _ in 0..260 {
+            last_pa = pool.alloc_for(&mut buddy, 77).unwrap();
+        }
+        let idx = ((last_pa - POOL_BASE) / FRAME_SIZE) as usize;
+        assert!(idx >= 256, "test must reach past the old bound (last idx {idx})");
+        let before = SCRUBS.load(Ordering::SeqCst);
+        let released = pool.free_all_owned(&mut buddy, 77);
+        assert_eq!(released, 260, "every owned frame released, not just the first 256");
+        assert!(pool.is_clear(), "no owner tags survive");
+        assert_eq!(buddy.frames_free(), 4096, "every frame back to the buddy");
+        assert_eq!(
+            SCRUBS.load(Ordering::SeqCst) - before,
+            260,
+            "every freed frame scrubbed exactly once"
+        );
     }
 
     #[test]

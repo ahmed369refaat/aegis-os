@@ -79,6 +79,11 @@ pub enum KernelError {
     TooManyDomains,
     DuplicateDomain(u32),
     UnknownDomain(u32),
+    /// The domain id cannot produce safe credentials through the
+    /// derived-uid scheme (F3: wrapping to uid 0, or aliasing another
+    /// id's uid). Explicit credentials via `create_domain_with` are the
+    /// only way to such uids.
+    InvalidId(u32),
 }
 
 /// The sample kernel: owns domains, the behavior monitor, the telemetry
@@ -144,7 +149,17 @@ impl<const N: usize> Kernel<N> {
     /// uid = 1000 + id, gid = 100; nice = 0. Use `create_domain_with` for
     /// explicit control.
     pub fn create_domain(&mut self, id: u32, profile: DomainProfile) -> Result<(), KernelError> {
-        self.create_domain_with(id, profile, 1000u16.wrapping_add(id as u16), 100, 0)
+        // F3: derived credentials must be injective and never root.
+        // The old `wrapping_add` made id 64536 wrap to uid 0 and let
+        // every id > 65535 alias a low id's uid.
+        if id > u16::MAX as u32 {
+            return Err(KernelError::InvalidId(id));
+        }
+        let uid = match 1000u16.checked_add(id as u16) {
+            Some(u) if u != 0 => u,
+            _ => return Err(KernelError::InvalidId(id)),
+        };
+        self.create_domain_with(id, profile, uid, 100, 0)
     }
 
     /// Spawn a domain with explicit credentials and nice level.
@@ -412,6 +427,68 @@ mod tests {
 
     const SYS_READ_ID: u8 = crate::syscall::SYS_READ;
     const SYS_NET_SEND_ID: u8 = crate::syscall::SYS_NET_SEND;
+
+    /// F2 regression: dup2 onto an open fd used to discard the replaced
+    /// entry's pipe reference (leak), and dup2(fd, fd) leaked an extra
+    /// one. After closing everything and destroying the domain, no pipe
+    /// slot may survive.
+    #[test]
+    fn dup2_releases_replaced_end_and_self_dup_is_a_noop() {
+        use crate::sys::{SysRequest, SysValue};
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        let pair = |k: &mut Kernel, d: u32| {
+            match k.syscall(d, SysRequest::Pipe).unwrap() {
+                SysValue::FdPair(r, w) => (r, w),
+                other => panic!("{:?}", other),
+            }
+        };
+        let (r_a, w_a) = pair(&mut k, 1);
+        let (r_b, w_b) = pair(&mut k, 1);
+        // dup2(w_a, r_b): pipe B's read end loses its reference here.
+        match k.syscall(1, SysRequest::Dup { fd: w_a, new_fd: r_b }).unwrap() {
+            SysValue::Fd(f) => assert_eq!(f, r_b),
+            other => panic!("{:?}", other),
+        }
+        // dup2(fd, fd) must be a pure no-op (no refcount change).
+        match k.syscall(1, SysRequest::Dup { fd: w_a, new_fd: w_a }).unwrap() {
+            SysValue::Fd(f) => assert_eq!(f, w_a),
+            other => panic!("{:?}", other),
+        }
+        for fd in [r_a, w_a, r_b, w_b] {
+            k.syscall(1, SysRequest::Close { fd }).unwrap();
+        }
+        k.destroy_domain(1).unwrap();
+        assert_eq!(k.pipes.len(), 0, "replaced/self-dup pipe ends must not leak");
+    }
+
+    /// F3 regression: the derived uid must never wrap (id 64536 would be
+    /// born uid 0 = root), and ids that do not fit the derivation scheme
+    /// are refused instead of silently colliding.
+    #[test]
+    fn create_domain_rejects_uid_wrapping_and_colliding_ids() {
+        let mut k = Kernel::new();
+        // 1000 + 64536 wraps to 0 — that would be root.
+        assert!(matches!(
+            k.create_domain(64536, service_profile()),
+            Err(KernelError::InvalidId(_))
+        ));
+        // id > u16::MAX would alias the low ids' uids.
+        assert!(matches!(
+            k.create_domain(65536 + 7, service_profile()),
+            Err(KernelError::InvalidId(_))
+        ));
+        assert!(matches!(
+            k.create_domain(u32::MAX, service_profile()),
+            Err(KernelError::InvalidId(_))
+        ));
+        // The normal range keeps working with the same derivation.
+        k.create_domain(5, service_profile()).unwrap();
+        assert_eq!(k.domain_mut(5).unwrap().uid, 1005);
+        // uid 0 stays reachable only through the explicit-credential API.
+        k.create_domain_with(9, service_profile(), 0, 0, 0).unwrap();
+        assert_eq!(k.domain_mut(9).unwrap().uid, 0);
+    }
 
     #[test]
     fn destroy_domain_releases_pipes_socket_bucket_and_slot() {

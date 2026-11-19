@@ -35,6 +35,11 @@ pub enum MapError {
     KernelHalf(u64),
     /// VA or PA not page-aligned.
     NotAligned(u64),
+    /// Write+exec on one page: refused beneath the policy gate too
+    /// (F5, defense in depth — the gate is the first line, this is the
+    /// last: a caller that skips `map_region`'s gate still cannot get a
+    /// W+X PTE).
+    WriteExec(u64),
     /// A leaf PTE already exists at this VA (no remap: unmap first).
     AlreadyMapped(u64),
     /// No PTE at this VA on unmap.
@@ -196,6 +201,11 @@ impl PageTables {
         }
         if va % PAGE != 0 || pa % PAGE != 0 {
             return Err(MapError::NotAligned(va));
+        }
+        // F5: W^X is architecture here as well as policy — refuse
+        // before any table walk or PTE write.
+        if flags.w && flags.x {
+            return Err(MapError::WriteExec(va));
         }
         let pt = self.pt_for(va, flags.user, src)?;
         let (_, _, _, pti) = Self::indices(va);
@@ -419,6 +429,25 @@ mod tests {
 
     fn rw() -> MemFlags {
         MemFlags::READ | MemFlags::WRITE
+    }
+
+    /// F5 regression (defense in depth): `map_user_page` is the layer
+    /// *beneath* the policy gate — any caller that skips the gate must
+    /// still never get a writable+executable PTE.
+    #[test]
+    fn map_user_page_refuses_write_exec_beneath_the_gate() {
+        use crate::mm::pte::PteFlags;
+        let mut src = TestSource::new(8);
+        let mut pt = PageTables::new(&mut src).unwrap();
+        // Direct call, bypassing map_region's policy gate on purpose.
+        let wx = PteFlags::from_memflags(MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC);
+        let r = pt.map_user_page(BASE, 0x1000_000, wx, &mut src);
+        assert!(
+            matches!(r, Err(MapError::WriteExec(_))),
+            "W+X must be refused beneath the policy gate, got {r:?}"
+        );
+        // And nothing was mapped by the failed attempt.
+        assert!(pt.translate(BASE).is_none());
     }
 
     #[test]
