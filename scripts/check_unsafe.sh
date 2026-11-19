@@ -46,7 +46,24 @@ for f in kernel-x86_64/src/boot/mod.rs kernel-x86_64/src/hw.rs kernel-x86_64/src
   grep -q "allow(unsafe_code)" "$f" || { echo "FAIL: $f lost its allow(unsafe_code) declaration" >&2; fail=1; }
 done
 
+# 4. Ratchet: the unsafe usage count in the allowlist must not grow
+#    beyond scripts/unsafe-count.txt. Raising the baseline requires an
+#    ADR reference in the PR that changes it; shrinking is always fine
+#    (lower the file in the same PR).
+BASELINE_FILE="scripts/unsafe-count.txt"
+COUNT=$(grep -rn "unsafe" kernel-x86_64/src/boot/ kernel-x86_64/src/hw.rs kernel-x86_64/src/memops.rs --include="*.rs" \
+  | grep -v "allow(unsafe_code)" \
+  | grep -v "deny(unsafe_code)" \
+  | grep -vE ':[0-9]+:\s*(//|/\*|\*)' \
+  | grep -vc "^$" || true)
+BASELINE=$(grep -E '^[0-9]+$' "$BASELINE_FILE" | tail -1)
+if [ -z "$BASELINE" ]; then
+  echo "FAIL: $BASELINE_FILE missing or malformed" >&2; fail=1
+elif [ "$COUNT" -gt "$BASELINE" ]; then
+  echo "FAIL: unsafe count grew: $COUNT > baseline $BASELINE — raise the baseline only with an ADR reference" >&2; fail=1
+fi
+
 if [ "$fail" = 0 ]; then
-  echo "UNSAFE POLICY: PASS"
+  echo "UNSAFE POLICY: PASS (allowlist usage: ${COUNT:-?}/$BASELINE)"
 fi
 exit $fail

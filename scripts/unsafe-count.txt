@@ -1,0 +1,5 @@
+# Baseline count of unsafe usages in the kernel allowlist
+# (boot/, hw.rs, memops.rs). scripts/check_unsafe.sh recomputes this;
+# the CI gate fails if the number grows without an ADR reference in
+# the PR. Shrinking is always allowed: lower it.
+14
