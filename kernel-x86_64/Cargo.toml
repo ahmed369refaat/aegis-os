@@ -1,0 +1,16 @@
+[package]
+name = "aegis-kernel"
+version = "0.2.0"
+edition = "2021"
+description = "AegisOS bootable M1 kernel for x86_64: multiboot bring-up, long mode, identity paging, real frame pool with scrub-on-free, and the M1 exit-criteria sequence (hello domain, monitor demo, 1000-cycle create/destroy)."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "aegis-kernel"
+path = "src/main.rs"
+
+# Path dependency on the policy core (package `aegis-os`, crate name
+# `aegis_os`): still zero external crates.
+[dependencies]
+aegis-os = { path = ".." }
