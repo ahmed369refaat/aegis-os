@@ -1,35 +1,59 @@
-# AegisOS — Core
+# AegisOS
 
-**A `no_std`, zero-dependency policy kernel for a modern operating system: Unix-philosophy foundations (VFS with Unix permissions, pipes, signals, fd tables, CFS-style scheduling, buddy allocator, brokered sockets) under strict per-domain isolation, plus a graduated AI security behavior monitor.**
+**A secure OS core that actually boots: a `no_std`, zero-dependency policy kernel with Unix-philosophy semantics (VFS with Unix permissions and chroot, pipes, signals, fd tables, CFS scheduling, buddy allocator, brokered sockets) under strict per-domain isolation, a graduated behavior-driven security monitor — and a bootable x86_64 kernel that runs it all on real hardware memory.**
 
 [![CI](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml/badge.svg)](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests: 191](https://img.shields.io/badge/tests-191%20passing-brightgreen.svg)](tests/)
+[![Tests: 219](https://img.shields.io/badge/tests-219%20passing-brightgreen.svg)](tests/)
+[![Boot](https://img.shields.io/badge/boots%20in%20QEMU-M1%20green-brightgreen.svg)](#quick-start)
 
 > The name: **Aegis** (the shield). One rule shapes the whole design: everything runs inside an isolated `Domain`, and every privilege is granted once and can only ever shrink.
+
+## Current status — honestly stated
+
+**Done and proven (M0 + M1):**
+
+- The full policy kernel as a library: attenuation-only syscall masks, capability generations, W^X memory policy, VFS with Unix DAC + chroot, pipes/signals/fd tables, CFS scheduling, rate-limited brokered sockets, behavior monitor with graduated response. **196 tests.**
+- A bootable x86_64 kernel (`kernel-x86_64/`): multiboot bring-up, 32-bit → long-mode transition, identity paging over real RAM, a physical frame pool (256 × 4 KiB at 16 MiB) behind the policy core's buddy allocator with **scrub-on-free verified by read-back**, and the M1 exit-criteria sequence running on boot: a hello domain scheduled by CFS, the monitor escalating an attacker across five windows while the healthy neighbor keeps running, and 1000 create/destroy cycles with zero frame leaks. **23 host tests run the same sequence logic without an emulator; the CI boot job runs it in QEMU and fails unless the exit-criteria markers appear.**
+- Unsafe policy enforced by machine, not convention: the policy core is `forbid(unsafe_code)`; the kernel is `deny(unsafe_code)` with a three-module allowlist (`boot/`, `hw.rs`, `memops.rs`), every item carrying a `SAFETY` note, checked by `scripts/check_unsafe.sh` in CI.
+
+**Not yet (roadmap, see `docs/ROADMAP.md`):** ring-3 user domains, per-domain page tables (M1 domains are kernel-resident objects whose region mappings pass the full policy and whose pages are real tracked frames — the hardware isolation boundary lands in M2), preemption/timers, IPC, virtio devices, real filesystems, aarch64 target.
 
 ## The architecture in one line
 
 > Unix gave us clarity, separation of concerns and stable interfaces; AegisOS adds one unbreakable rule on top: **attenuation-only privileges** — there is no code path anywhere in the kernel that can widen a live domain's syscall mask.
+
+## Quick start
+
+```bash
+./boot.sh           # build the kernel and boot it in QEMU (needs qemu-system-x86)
+./boot.sh --verify  # same, plus assert the M1 exit-criteria markers
+
+cargo test                       # 196 policy-core tests
+cargo test -p aegis-kernel       # 23 M1 boot-logic tests (host)
+cargo build --target thumbv7em-none-eabihf   # the core still builds for bare-metal ARM
+```
+
+What the boot log shows (CI greps exactly these): multiboot memory validation, the frame pool claim, the guard-gap policy rejecting an adjacent mapping **live**, CFS slices, `Hello from AegisOS domain 1`, the five-window escalation `55 → 50 → 37 → 80 → 80` ending in quarantine with the neighbor healthy, `leaked-frames=0`, `scrub-verified=yes`, and a single `M1-EXIT-CRITERIA: PASS` verdict line.
 
 ## What's inside
 
 | Area | Module | Linux analog | Key invariants |
 |---|---|---|---|
 | Syscall gate | `syscall` | syscall table + seccomp | `u64` bitmask, O(1) AND+bit-test; masks only ever attenuate |
-| Capabilities | `capability` | capabilities(7) | Generation counters make use-after-revoke impossible; derivation requires `GRANT` + subset rights |
-| Memory policy | `memory` | mmap + W^X | NULL/wraparound/overlap rejection, guard gaps, page quotas, scrub-on-release |
-| Page frames | `buddy` | buddy allocator | Power-of-two blocks, split on alloc, coalesce on free, full accounting |
-| Filesystem | `vfs` | VFS + DAC + chroot(2) | owner/group/other `rwx` bits, execute-to-traverse, `..` clamped at chroot root |
+| Capabilities | `capability` | capabilities(7) | Generation counters make use-after-revoke impossible |
+| Memory policy | `memory` | mmap + W^X | NULL/wraparound/overlap rejection, guard gaps, quotas, scrub accounting |
+| Page frames | `buddy` | buddy allocator | Power-of-two blocks, split on alloc, coalesce on free |
+| Boot + frames | `kernel-x86_64` | boot/paging | Multiboot → long mode → identity map; real pool, owner tracking, scrub-on-free |
+| Filesystem | `vfs` | VFS + DAC + chroot(2) | owner/group/other `rwx`, execute-to-traverse, `..` clamped at chroot root |
 | Descriptors | `fd` | open file table | lowest-free allocation, dup2 semantics |
-| Pipes | `pipe` | pipe(2) | bounded ring, short reads/writes, EOF, EPIPE, dup-aware end refcounts |
-| Signals | `signal` | signal(7) | 1..=31 bitsets, pending/blocked masks, unblockable SIGKILL/SIGSTOP, lowest-number-first delivery |
-| Scheduling | `sched` | CFS | vruntime + the real Linux nice→weight table (nice 0 = 1024), starvation-free ticks |
-| Network | `net` | sockets + tc/tbf | brokered sockets, per-domain token-bucket rate limiting, deterministic refill math |
-| Profiles | `profile` | service types | service / parser / driver / plugin / netd(broker) — least privilege by default |
-| Domains | `domain` | processes | fast-path gate, quarantine = SYS_EXIT-only, frozen stats while quarantined |
-| Monitoring | `monitor` + `response` | auditd/ML security | integer risk score, sensitivity-scaled thresholds, hysteresis + decay, Log → Tighten → Quarantine |
-| Telemetry | `ringbuf` | relay/perf rings | SPSC, power-of-two masking, drop-and-count when full — never blocks |
+| Pipes | `pipe` | pipe(2) | bounded ring, short I/O, EOF, EPIPE, dup-aware end refcounts |
+| Signals | `signal` | signal(7) | pending/blocked masks, unblockable SIGKILL/SIGSTOP |
+| Scheduling | `sched` | CFS | vruntime + the real Linux nice→weight table |
+| Network | `net` | sockets + tc/tbf | brokered sockets, per-domain token buckets |
+| Profiles | `profile` | service types | service / parser / driver / plugin / netd — least privilege |
+| Monitoring | `monitor` + `response` | auditd/ML security | integer risk score, hysteresis, Log → Tighten → Quarantine |
+| Telemetry | `ringbuf` | relay/perf rings | SPSC, drop-and-count when full — never blocks |
 
 ## The syscall pipeline
 
@@ -52,59 +76,40 @@
                        → Log → Tighten → Quarantine (EXIT-only, terminal)
 ```
 
-## Quick start
+On the booted kernel, all of this sits on real memory: `_start` → long mode → frame pool → `Kernel::new()` → the M1 sequence (see `kernel-x86_64/src/kmain.rs`).
 
-```bash
-cargo test                                  # 191 tests: 175 unit + 16 integration
-cargo build --target thumbv7em-none-eabihf  # proves true no_std on bare-metal ARM
-```
+## Behavior monitor (the security layer)
 
-Zero external dependencies (the `[dependencies]` section is empty on purpose — the supply-chain surface is this repository alone), `#![forbid(unsafe_code)]` throughout.
+Five real signals from the fast path — denied ratio, faults, capability-escalation attempts, out-of-profile syscall bits, rate spikes — feed an integer-only risk score (u128 intermediates, deterministic, overflow-proof). Graduated response with anti-flap: a single bad window never escalates (hysteresis), reported scores decay, tightening keeps the app alive (it only drops spawn/net/ioctl/mmap/open), quarantine is terminal and passes only `SYS_EXIT`. If the monitor's state table fills, it degrades to logging — but instant quarantine at score ≥ 95 still fires. Fail-safe, not fail-open. On boot, the proven five-window escalation scenario runs live and its verdicts are printed.
 
-## Sample Linux-like flows (all covered by tests)
-
-```bash
-cargo test --test linux_like
-```
-
-- **Unix permissions end to end**: a root-owned `0o644` file is readable by everyone but writable only by its owner; creating inside a `0o755` directory is denied for non-owners; uid 0 bypasses DAC.
-- **chroot confinement**: a domain chrooted to `/pub` cannot reach `/home` — not via absolute paths, not via `..` climbing (clamped at the chroot root), not via unlink. Unlike Linux, the cwd moves with the new root, closing the classic chroot+cwd escape.
-- **Pipes with dup semantics**: `pipe()`, write, `dup2` a second write end, close the original — the pipe stays alive until the *last* referencing descriptor closes, then readers see EOF.
-- **Signals with Unix kill rules**: same-uid or uid-0 kill allowed, others denied; SIGTERM delivery applies the default action (quarantine); SIGUSR1 is ignored; invalid signal numbers rejected.
-- **CFS fairness**: two nice-0 domains share exactly equally (25/25 slices over a settled cycle) while a nice+5 domain gets proportionally fewer (8); sleeping domains are skipped and wake with priority.
-- **Rate-limited brokered sockets**: the netd broker domain bursts up to 64 bytes, then exact-deficit throttling kicks in; one 100-tick window later the bucket refills; non-broker profiles are masked out of `NET_SEND` entirely.
-- **Buddy allocator**: 256 frames as eight max-order blocks, address-ordered allocation, worst-order frees coalesce the arena back whole.
-
-## Behavior monitor (the AI security layer)
-
-Five real signals from the fast path — denied ratio, faults, capability-escalation attempts, out-of-profile syscall bits, rate spikes — feed an integer-only risk score (u128 intermediates, deterministic, overflow-proof). Graduated response with anti-flap: a single bad window never escalates (hysteresis), reported scores decay, tightening keeps the app alive (it only drops spawn/net/ioctl/mmap/open), quarantine is terminal and passes only `SYS_EXIT`. If the monitor's state table fills, it degrades to logging — but instant quarantine at score ≥ 95 still fires. Fail-safe, not fail-open.
-
-Full design rationale: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · Staged build-out plan: [`docs/ROADMAP.md`](docs/ROADMAP.md)
+Docs: [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) (one-pager) · [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (full design) · [`docs/M1-PLAN.md`](docs/M1-PLAN.md) (M1 assessment, plan, results) · [`docs/ROADMAP.md`](docs/ROADMAP.md) (M0→M6)
 
 ## Repository layout
 
 ```text
-src/
-├── syscall.rs    attenuation-only syscall masks (O(1) gate)
-├── capability.rs capability table with generations
-├── memory.rs     W^X / guard-gap / quota address spaces
-├── buddy.rs      buddy page-frame allocator
-├── vfs.rs        VFS with Unix DAC + chroot
-├── fd.rs         per-domain file descriptor tables
-├── pipe.rs       bounded pipes (refcounted ends)
-├── signal.rs     POSIX-style signal sets
-├── sched.rs      CFS-style fair scheduler
-├── net.rs        brokered sockets + token buckets
-├── profile.rs    service/parser/driver/plugin/netd profiles
-├── domain.rs     the isolation unit + fast path
-├── monitor.rs    risk scoring, hysteresis, graduated response
-├── response.rs   response application + security telemetry
-├── ringbuf.rs    non-blocking SPSC rings
-├── sys.rs        the executing syscall layer
-└── lib.rs        Kernel assembly
+kernel-x86_64/            the bootable M1 kernel (x86_64, multiboot)
+├── linker.ld               1 MiB load, boot stack, image-size ASSERT
+├── build.rs                -T linker script only for the bare-metal target
+└── src/
+    ├── boot/               UNSAFE ALLOWLIST: entry asm, GDT, page tables
+    ├── hw.rs               UNSAFE ALLOWLIST: port I/O, rdtsc, poweroff
+    ├── memops.rs           UNSAFE ALLOWLIST: volatile memory + scrub
+    ├── serial.rs           COM1 output (safe, over hw primitives)
+    ├── multiboot.rs        pure multiboot-info parsing (host-tested)
+    ├── frames.rs           FramePool: owners + scrub over the core buddy
+    ├── runtime.rs          the M1 sequence (host-tested, callback-driven)
+    └── kmain.rs            live boot: validate → claim → run → verdict
+src/                      the policy core (this is the aegis-os crate)
+├── syscall.rs    capability.rs    memory.rs    buddy.rs
+├── vfs.rs        fd.rs            pipe.rs     signal.rs
+├── sched.rs      net.rs           profile.rs  domain.rs
+├── monitor.rs    response.rs      ringbuf.rs  sys.rs
+└── lib.rs        Kernel assembly (domains, VFS, scheduler, monitor)
 tests/
 ├── integration.rs   security scenarios (escalation, isolation, telemetry)
 └── linux_like.rs    Linux-semantics scenarios (VFS/pipe/signal/sched/net)
+boot.sh                 one command: build + boot (+ --verify proof mode)
+scripts/check_unsafe.sh the unsafe-allowlist policy check (CI-enforced)
 ```
 
 ## License

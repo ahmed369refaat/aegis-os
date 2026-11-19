@@ -15,14 +15,35 @@
 - Executing syscall layer (`sys.rs`): gate first, execute second, telemetry always.
 - **Exit criteria (met):** `cargo test` 100% green (191 tests), clean build for bare-metal ARM (thumbv7em), the full security scenario (Log→Tighten→Quarantine + neighbor isolation) and all ten Linux-semantics scenarios pass.
 
-## M1 — Boot and physical memory (Months 1–2)
+## M1 — Boot and physical memory (DONE — x86_64; see `docs/M1-PLAN.md`)
 
-**Output:** a binary that boots on QEMU (x86_64 or aarch64) and runs one domain with a hello-world program.
+**Output:** a binary that boots on QEMU and runs the M1 exit-criteria
+sequence: hello domain, live memory-policy demo, monitor escalation,
+1000-cycle create/destroy stress. Delivered for **x86_64** (multiboot);
+aarch64 remains a follow-up target under this milestone's umbrella.
 
-- Deterministic bring-up: boot frame → early memory setup → 4 KiB pages → buddy allocator over real physical frames.
-- Wire the M0 policies to real memory: actual page zeroing on release, real guard pages between a domain's regions.
-- Boot-time entropy source (for later ASLR); measure boot time from first instruction to first domain.
-- **Exit criteria:** boot < 300 ms in QEMU on a reference machine; leak test (a domain launched and reclaimed 1000 times → zero leaked frames, released pages verifiably zeroed).
+- Deterministic bring-up: multiboot v1 → own GDT → identity page tables
+  (1 GiB, 2 MiB pages) → long mode → Rust `kmain`; boot TSC stamped at
+  the first instruction.
+- Real physical frames: 256 × 4 KiB pool at 16 MiB, claimed only after
+  multiboot `mem_upper` validation, managed by the **existing** policy-core
+  buddy allocator; per-frame ownership; scrub-on-free verified by
+  read-back; boot-time entropy deferred to M2 (no consumer yet — not
+  built speculatively).
+- Guard gaps: the policy check runs live at boot (adjacent mapping
+  rejected); hardware-enforced guard pages arrive with per-domain page
+  tables in M2.
+- Measurement: kernel prints TSC cycles entry→done; the CI boot job
+  measures and reports the full QEMU run wall-clock (startup included).
+- **Exit criteria (met):** boots reliably (CI `boot-test` job greps the
+  `M1-EXIT-CRITERIA: PASS` verdict on every push; ELF sanity checks in
+  the `kernel-build` job); hello domain runs (CFS slices, 3 real backed
+  frames); 1000 create/destroy cycles → `leaked-frames=0` and
+  `scrub-verified=yes` (asserted in-kernel, in host tests, and CI-grepped);
+  all 196 core tests + 23 kernel host tests green; boot < 300 ms target
+  measured by the runner. Full honesty note: domains are kernel-resident
+  in M1 (no ring 3 / per-domain tables yet) — that boundary is M2 and is
+  stated in the README.
 
 ## M2 — Scheduling and live domains (Months 2–4)
 
