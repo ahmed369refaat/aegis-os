@@ -1,6 +1,6 @@
 # AegisOS — Full Engineering Architecture
 
-> Reference design document. The reference implementation in `src/` embodies every policy described here and backs it with tests (191 tests: 175 unit + 16 integration).
+> Reference design document. The reference implementation embodies every policy described here and backs it with tests — 219 total: 180 unit + 16 integration in the policy core, plus 23 host tests in the bootable kernel that run the M1 sequence logic itself. The kernel boots on QEMU and CI asserts its exit criteria on every push.
 
 ## 1. The foundation: what we take from Unix, and why
 
@@ -10,7 +10,7 @@
 | Processes and threads, efficient scheduling | The base unit is the **Domain**: a process + a full isolation envelope; threads inside a domain share its mask | Isolation enforced at the domain boundary, not the thread — cheaper and more precise |
 | `syscall` as a stable interface | 64 fixed syscall slots + a `u64` bit mask per domain | Membership test = one AND + one bit test: a deterministic O(1) path |
 | Drivers and structured I/O | A driver is a **driver domain** holding `IOCTL` only, no direct kernel access | Driver bugs and exploits stay outside the kernel |
-| Clarity and separation of concerns | Every core module has one testable contract in isolation | 191 tests run with no boot environment = provability |
+| Clarity and separation of concerns | Every core module has one testable contract in isolation | 196 core tests + 23 kernel host tests, all without special setup = provability |
 | POSIX process machinery | Pipes, signals, fd tables, dup2, nice levels, chroot — reimplemented under the mask | Familiar semantics, unfamiliar safety: every one of them is mask-gated |
 
 What we deliberately **drop** from Unix: default trust in processes (root/suid), signals as a control-plane mechanism (kept as delivery semantics only), and UID-based resource ownership — replaced by capabilities and attenuation. One Linux-ism is kept on purpose: uid 0 bypasses DAC checks (documented, and still confined by chroot).
@@ -37,11 +37,47 @@ aegis-os/
 │   ├── response.rs                 graduated response + SecurityEvent telemetry
 │   ├── sys.rs                      the executing syscall layer (gate → execute)
 │   └── lib.rs                      Kernel assembly (domains, VFS, sched, pipes…)
+├── kernel-x86_64/                  # the bootable M1 kernel (workspace member)
+│   ├── linker.ld                     1 MiB multiboot load, 256 KiB boot stack, size ASSERTs
+│   ├── build.rs                      -T linker script (bare-metal target only)
+│   └── src/
+│       ├── boot/                     UNSAFE ALLOWLIST: entry asm, GDT, identity page tables
+│       ├── hw.rs                     UNSAFE ALLOWLIST: port I/O, rdtsc, halt, QEMU poweroff
+│       ├── memops.rs                 UNSAFE ALLOWLIST: volatile memory + frame scrub
+│       ├── serial.rs                 COM1 output (safe, over hw primitives)
+│       ├── multiboot.rs              pure boot-info parsing (host-tested)
+│       ├── frames.rs                 FramePool: ownership + scrub over the core buddy
+│       ├── runtime.rs                the M1 sequence (host-tested, callback-driven)
+│       └── kmain.rs                  live boot: validate → claim pool → run → verdict
 ├── tests/integration.rs           # security scenarios (escalation, isolation)
 └── tests/linux_like.rs            # Linux-semantics scenarios (VFS/pipe/sched/net)
 ```
 
-On top of this kernel, the target system adds: `boot/` (deterministic bring-up), `mm/` (real page tables, scrub-on-release), `sched/` (preemptive slices), `ipc/` (capability channels), and user-space system domains — `vfsd`, `netd` (the sole NIC owner), `devd`, and one parser domain per file format.
+### 2.1 The boot path (M1, x86_64 — implemented)
+
+```text
+QEMU -kernel (multiboot v1, -machine pc, 128 MiB)
+ └─ ELF @ 1 MiB, entry in 32-bit protected mode, EAX=0x2BADB002
+     └─ _start: stash multiboot regs + boot TSC, own GDT, .bss stack
+         └─ setup_page_tables: identity-map first 1 GiB (2 MiB pages)
+         └─ PAE → CR3 → EFER.LME → CR0.PG → far jump to 64-bit CS
+             └─ kmain: serial → multiboot validation (mem_upper gate)
+                 → claim + scrub the 256-frame pool @ 16 MiB
+                 → hello domain → monitor demo → 1000-cycle stress
+                 → M1-EXIT-CRITERIA verdict → clean poweroff
+```
+
+The pool is managed by the **policy core's own buddy allocator** (the
+`Kernel.frames` instance): the kernel adds only per-frame ownership and
+the physical scrub (volatile zeroing, read-back verified). Unsafe code is
+confined to the three allowlisted modules; everything else in the kernel
+crate is safe Rust, and CI enforces the boundary
+(`scripts/check_unsafe.sh`).
+
+Beyond this kernel, the target system adds: `mm/` (per-domain page
+tables, scrub-on-release), `sched/` (preemptive slices), `ipc/`
+(capability channels), and user-space system domains — `vfsd`, `netd`
+(the sole NIC owner), `devd`, and one parser domain per file format.
 
 ## 3. Strict isolation & least privilege
 
@@ -61,7 +97,7 @@ On top of this kernel, the target system adds: `boot/` (deterministic bring-up),
 
 ### 3.3 Memory policy
 
-`AddressSpace::map` runs ten fixed-order checks: non-zero length, non-NULL base, page alignment, `checked_add` wraparound rejection, W^X (X-only and W-only allowed), at least one access bit, no overlap, a **full guard page between any two regions**, page quota, and `unmap` accounting that counts released pages as scrubbed (zeroed before reuse in a real kernel). `buddy.rs` backs this with Linux-style physical frame management: power-of-two blocks, split on allocation, buddy coalescing on free, exact accounting.
+`AddressSpace::map` runs ten fixed-order checks: non-zero length, non-NULL base, page alignment, `checked_add` wraparound rejection, W^X (X-only and W-only allowed), at least one access bit, no overlap, a **full guard page between any two regions**, page quota, and `unmap` accounting that counts released pages as scrubbed — and since M1, on the booted kernel the scrub is physical: freed pool frames are zeroed by volatile writes and verified by read-back. `buddy.rs` backs this with Linux-style physical frame management: power-of-two blocks, split on allocation, buddy coalescing on free, exact accounting.
 
 ### 3.4 Linux-like semantics, mask-gated
 
@@ -152,3 +188,8 @@ Integer-only math (deterministic, reproducible), `u128` intermediates (no overfl
 - `tests/linux_like.rs::cfs_scheduler_fairness_through_kernel` — exact 25/25/8 fair share over a settled cycle.
 - `tests/linux_like.rs::net_broker_send_is_rate_limited` — burst, exact-deficit throttle, window refill, profile masking.
 - Edge cases at every boundary: `usize::MAX - PAGE + 1` (wraparound), `u64::MAX` counters (saturation), stale handles after revoke, score exactly 45 vs 44, signal 0/32/31, nice clamping, empty/full rings and tables, OOM with largest-free reporting.
+
+- `kernel-x86_64` host tests — the M1 sequence (hello domain, guard-gap rejection, frame backing, CFS slices, five-window escalation, 1000-cycle create/destroy) runs identically on the host and asserts zero leaks, scrub read-back, and the exact escalation scores.
+- CI `boot-test` — QEMU boots the kernel; the run fails unless `M1-EXIT-CRITERIA: PASS`, the hello marker, `leaked-frames=0`, `scrub-verified=yes`, and `monitor-quarantined=yes` all appear in the serial log.
+- CI `kernel-build` — the ELF is structurally checked: entry at `_start`, the multiboot magic within the first 8 KiB.
+- `scripts/check_unsafe.sh` — unsafe exists only in the documented boot allowlist; the policy core has none.
