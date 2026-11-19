@@ -1,80 +1,84 @@
-# AegisOS — خارطة الطريق التنفيذية المتدرجة
+# AegisOS — Staged Execution Roadmap
 
-> مبدأ التخطيط: كل مرحلة تُنتج **نظاماً يقلع ويعمل ويثبت نفسه بالقياس** قبل التي تليها. النواة النموذجية في `src/` هي المرحلة M0 المكتملة — كل ما بعدها يضمّنها دون إعادة كتابة سياساتها.
+> Planning principle: every stage produces a **system that boots, runs, and proves itself by measurement** before the next one starts. The policy kernel in `src/` is the completed stage M0 — everything after it embeds the kernel without rewriting its policies.
 
-## M0 — نواة السياسات (منجزة، هذا المستودع)
+## M0 — Policy kernel + Linux semantics (DONE — this repository)
 
-**الناتج:** مكتبة `no_std` تجسّد كامل سياسات العزل والمراقبة والاستجابة المتدرجة، 93 اختباراً، صفر اعتماديات، `forbid(unsafe_code)`.
+**Output:** a `no_std`, zero-dependency library embodying the full isolation/monitoring/response policy set **and** the Linux-like semantics layer, 191 tests, `forbid(unsafe_code)`.
 
-- قناع syscalls باتجاه انحلال واحد + جدول قدرات بأجيال.
-- سياسة ذاكرة كاملة: W^X، Guard Gaps، محاذاة، Quota، Scrub accounting، منع wraparound/NULL.
-- حلقة قياس SPSC بلا حظر + `BehaviorMonitor` (درجة صحيحة حتمية + Hysteresis + تلاشي) + استجابة متدرجة.
-- **معيار الخروج:** `cargo test` أخضر 100%، بناء ناجح على هدف bare-metal (thumbv7em)، واختبار السيناريو الكامل (Log→Tighten→Quarantine + عزل الجار) يمر.
+- Attenuation-only syscall masks; capability table with generations; full memory policy (W^X, guard gaps, quotas, scrub accounting, wraparound/NULL rejection).
+- Buddy page-frame allocator with split/coalesce and exact accounting.
+- VFS with Unix DAC (owner/group/other), traversal rules, chroot with `..` clamping and cwd hardening.
+- Per-domain fd tables (lowest-free, dup2), refcounted bounded pipes (EOF/EPIPE/short I/O), POSIX signal sets with unblockable SIGKILL.
+- CFS-style scheduler using the real Linux nice→weight table; brokered sockets with per-domain token-bucket rate limits.
+- `BehaviorMonitor` (deterministic integer score + hysteresis + decay + sensitivity thresholds) and the graduated Log → Tighten → Quarantine response.
+- Executing syscall layer (`sys.rs`): gate first, execute second, telemetry always.
+- **Exit criteria (met):** `cargo test` 100% green (191 tests), clean build for bare-metal ARM (thumbv7em), the full security scenario (Log→Tighten→Quarantine + neighbor isolation) and all ten Linux-semantics scenarios pass.
 
-## M1 — الإقلاع والذاكرة الفعلية (Months 1–2)
+## M1 — Boot and physical memory (Months 1–2)
 
-**الناتج:** ثنائي يقلع على QEMU (x86_64 أو aarch64) ويشغّل نطاقاً واحداً ببرنامج hello.
+**Output:** a binary that boots on QEMU (x86_64 or aarch64) and runs one domain with a hello-world program.
 
-- bring-up حتمي: إطار إقلاع → تعيين ذاكرة مبكر → صفحات 4KB → مخصص صفحات buddy.
-- تفعيل سياسات M0 على ذاكرة فعلية حقيقية: تصفير الصفحات عند الإرجاع (Scrub فعلي)، Guard pages حقيقية بين مناطق كل نطاق.
-- عدّاد entropy عند الإقلاع (للـASLR لاحقاً) وقياس زمن الإقلاع من أول تعليمة إلى أول نطاق.
-- **معيار الخروج:** إقلاع < 300ms في QEMU على جهاز مرجعي؛ اختبار تسريب ذاكرة (نطاق يُطلق ويُستعاد 1000 مرة → صفر صفحات مسربة، محتوى الصفحات مصفّر).
+- Deterministic bring-up: boot frame → early memory setup → 4 KiB pages → buddy allocator over real physical frames.
+- Wire the M0 policies to real memory: actual page zeroing on release, real guard pages between a domain's regions.
+- Boot-time entropy source (for later ASLR); measure boot time from first instruction to first domain.
+- **Exit criteria:** boot < 300 ms in QEMU on a reference machine; leak test (a domain launched and reclaimed 1000 times → zero leaked frames, released pages verifiably zeroed).
 
-## M2 — الجدولة والنطاقات الحية (Months 2–4)
+## M2 — Scheduling and live domains (Months 2–4)
 
-**الناتج:** تعدد نطاقات مع جدولة استباقية وIPC.
+**Output:** multiple domains with preemptive scheduling and IPC.
 
-- جدولة نطاقات: Round-Robin بأولويات + خيوط خضراء داخل النطاق (تشترك في القناع والقدرات).
-- حافظة مقاطعات مؤمّنة (لا كود نطاق في سياق مقاطعة أبداً).
-- IPC بقدرات: قنوات point-to-point، الإرسال نسخة مُراقبة (no shared memory افتراضياً) — القنوات نفسها موارد `IpcChannel` تخضع لـGRANT/subset.
-- خادم إطلاق النطاقات (supervisor): إنشاء نطاق = قالب + مشتقات قدرات؛ إعادة إطلاق نطاق محجور.
-- **معيار الخروج:** ping-pong IPC بين نطاقين < 1µs في QEMU (قيمة مرجعية تُقاس وتُثبّت في `bench/`)؛ قتل نطاق أثناء IPC لا يعلّق النظام (اختبار حقن أعطال).
+- Preemptive slices driven by the CFS engine (vruntime, nice, wake/sleep); green threads inside a domain share its mask and capabilities.
+- Hardened interrupt frame (no domain code ever runs in interrupt context).
+- Capability IPC: point-to-point channels; sends are monitored copies (no default shared memory); channels are `IpcChannel` resources under GRANT/subset rules.
+- Domain supervisor: creation = profile + derived capabilities; supervised respawn of quarantined domains; fd passing between domains over IPC (the missing piece for cross-domain pipes).
+- **Exit criteria:** IPC ping-pong < 1 µs in QEMU (benchmarked in `bench/`); killing a domain mid-IPC never hangs the system (fault injection test).
 
-## M3 — VFS والملفات والدرايفرات (Months 4–7)
+## M3 — VFS and drivers (Months 4–7)
 
-**الناتج:** `vfsd` و`devd` ودرايفرات نموذجية كنطاقات مستخدم.
+**Output:** `vfsd` and `devd` plus reference drivers as user domains.
 
-- vfsd: جدار ملفات بسيط (ramfs ثم ext2 read-only) — كل فتح يمر بقدرة FsNode مشتقة.
-- devd: يملك مساحة الأجهزة؛ يمنح الدرايفر قدرة Device حصرية (MMIO عبر خريطة مناطق محدودة + مقاطعات كرسائل IPC).
-- درايفرات مرجعية: serial (لاخراج الإقلاع) ثم virtio-blk وvirtio-net (netd وحده يستهلك الأخير).
-- **معيار الخروج:** قراءة ملف عبر نطاق parser من القرص؛ عزل درايفر معطوب (تشغيل درايفر يفسد ذاكرته عمداً) لا يُسقط سوى نطاقه، مع حجر تلقائي من المراقب.
+- vfsd: real backing (ramfs, then read-only ext2) behind the existing DAC/chroot core; every open goes through derived `FsNode` capabilities.
+- devd: owns device space; grants drivers exclusive `Device` capabilities (MMIO through bounded region maps; interrupts as IPC messages).
+- Reference drivers: serial (boot output), then virtio-blk and virtio-net (consumed by netd alone).
+- **Exit criteria:** a parser domain reads a file end to end from disk; a deliberately corrupt driver is auto-quarantined by the monitor and takes down nothing but its own domain.
 
-## M4 — المراقبة السلوكية الكاملة (Months 7–10)
+## M4 — Full behavioral monitoring (Months 7–10)
 
-**الناتج:** طبقة الأمان الموصوفة في `docs/ARCHITECTURE.md` §6 تعمل على نظام حقيقي.
+**Output:** the security layer of `docs/ARCHITECTURE.md` §6 running on the real system.
 
-- ربط كل إشارات النواة (أعطال، تصعيد، منع، أنماط IPC/ملفات/شبكة عبر الوسيط) بعدادات M0.
-- نوافذ زمنية موقّتة + إغلاق ذري للنافذة + استمرارية الحلقات عبر كلّي (per-CPU) ثم تجميع.
-- وحدة تحكم أمنية (نطاق admin): عرض Telemetry، `reset` (فك الحجر بإشراف بشري)، ضبط العتبات لكل قالب.
-- **معيار الخروج:** حمل هجومي مرجعي (استطلاع syscalls + أعطال + تصعيد) يُحجر آلياً خلال ≤ 3 نوافذ؛ حمل عمل سليم لمدة 24 ساعة بصفر تصعيد خاطئ (يُقاس على منصة `parsec`-style benchmarks أو حمل عمل مخصص).
+- Wire every kernel signal (faults, escalations, denials, IPC/file/net mixes through the broker) into the window counters.
+- Timed windows with atomic close; per-CPU rings then aggregation.
+- Security console (admin domain): telemetry view, supervised `reset` (un-quarantine with human approval), per-profile threshold tuning.
+- **Exit criteria:** a reference attack workload (syscall recon + faults + escalation) is auto-quarantined within ≤ 3 windows; a 24-hour clean workload with zero false escalations.
 
-## M5 — نماذج التحليل الأثقل (AI/ML) (Months 10–14)
+## M5 — Heavier analysis models (AI/ML) (Months 10–14)
 
-**الناتج:** نماذج ML تعمل **كعميل** للنظام، لا كجزء منه.
+**Output:** ML models as *clients* of the system, never parts of it.
 
-- نطاق مراقبة خارجي يستهلك حلقات Telemetry: نموذج تسلسل خفيف (مثلاً n-gram على تسلسلات syscalls) ينتج إشارة ثقة لكل نطاق.
-- الإشارة تُصبّ في نفس واجهة الاستجابة المتدرجة — النموذج لا يملك أي قدرة تنفيذية؛ توصياته تمر بالعتبات وHysteresis نفسها.
-- تدريب خارج الخط (offline) على آثار مُصدَّرة من الحلقات؛ لا تحديث أوزان داخل النواة أبداً.
-- **معيار الخروج:** تحسن مكتشف الهجوم المرجعي (ROC-AUC أعلى من القاعدة الصحيحة وحدها على مجموعة الاختبار) مع صفر انحدار في زمن المسار السريع (قياس M6).
+- A monitoring domain consumes telemetry rings: a light sequence model (e.g. n-grams over syscall sequences) producing a per-domain confidence signal.
+- The signal feeds the same graduated-response interface — the model holds no execution capability; its recommendations pass through the same thresholds and hysteresis.
+- Offline training on exported ring traces; weights are never updated inside the kernel.
+- **Exit criteria:** improved detection on the reference attack suite (ROC-AUC above the integer-score baseline) with zero fast-path latency regression (measured by M6).
 
-## M6 — القياس والتحسين المستمر (مستمر من M2)
+## M6 — Continuous measurement (ongoing from M2)
 
-**البنية:** `bench/` كمنطقة قياس ثابتة تُدار مع CI.
+**Structure:** `bench/` as a permanent measurement area run by CI.
 
-| القياس | الأداة | الهدف المرجعي |
+| Measurement | Tool | Reference target |
 |---|---|---|
-| زمن الإقلاع | عدّاد دورات مبكر | < 300ms (QEMU) ثم < 150ms على حديد |
-| syscall مسموح (fast path) | حلقة قياس rdtsc/pmu | < 100ns ثابت التوزيع (p99 ≈ p50) |
-| syscall مرفوض | نفس | نفس الفئة — المنع ليس أبطأ من السماح |
-| IPC ping-pong | bench/ipc | < 1µs |
-| كلفة نافذة المراقبة | قياس حول `audit` | < 50µs لكل نطاق (خارج المسار الحرج) |
-| تخصيص/تحرير صفحة + Scrub | bench/mm | عتبة انحدار تُثبّت بعد M1 |
+| Boot time | early cycle counter | < 300 ms (QEMU), then < 150 ms on hardware |
+| Allowed syscall (fast path) | rdtsc/pmu loop | < 100 ns with p99 ≈ p50 |
+| Denied syscall | same | same class — denial is never slower than permission |
+| IPC ping-pong | bench/ipc | < 1 µs |
+| Monitoring window cost | measurement around `audit` | < 50 µs per domain (off the hot path) |
+| Page alloc/free + scrub | bench/mm | regression gate fixed after M1 |
 
-- كل قياس يُطبع كـJSON خطي في حلقة القياس نفسها (RingBuffer) — نفس بنية الإنتاج.
-- CI يشغّل الاختبارات + بناء no_std على هدفين (host + thumbv7em) + regression على bench الأساسية.
+- Every measurement prints as line-oriented JSON into the same ring infrastructure used in production.
+- CI runs tests + the no_std build for two targets (host + thumbv7em) + regression checks on core benches.
 
-## قرارات مؤجلة عمداً (ولا تُقر إلا ببيانات M6)
+## Deliberately deferred (decide only with M6 data)
 
-- استبدال RR بأولوية ديناميكية: فقط لو أظهرت القياسات جوعاً أو تأخيراً ذيلياً.
-- مشاركة صفحات read-only بين نطاقات: تحتاج عدّاد مرجعية عبر قدرات — لا قبل حاجة مقاسة.
-- SMP فعلي: النموذج مصمم له (حلقات SPSC لكل CPU) لكن الإدراج يؤجل لما بعد M4.
+- Replacing CFS slices with dynamic priority: only if measurements show starvation or tail latency.
+- Read-only page sharing between domains: needs reference counting through capabilities; not before a measured need.
+- Real SMP: the design is ready for it (per-CPU SPSC rings), but insertion waits until after M4 — complexity is only paid when workload exists.

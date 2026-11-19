@@ -8,10 +8,13 @@
 //! path (the behavior monitor) reads asynchronously.
 
 use crate::capability::CapabilityTable;
+use crate::fd::FdTable;
 use crate::memory::AddressSpace;
 use crate::monitor::DomainStats;
 use crate::profile::DomainProfile;
+use crate::signal::SignalState;
 use crate::syscall::{SyscallMask, SYSCALL_COUNT, SYS_EXIT};
+use crate::vfs::Credentials;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainState {
@@ -44,6 +47,18 @@ pub struct Domain {
     pub space: AddressSpace,
     pub stats: DomainStats,
     violations: u32,
+    // ── Linux-like extensions ──
+    /// Unix credentials of this domain (all its processes).
+    pub uid: u16,
+    pub gid: u16,
+    /// Current working directory (VFS inode id).
+    pub cwd: u32,
+    /// Chroot root (VFS inode id): path resolution cannot escape above it.
+    pub chroot_root: u32,
+    /// Open file descriptors (files, pipe ends).
+    pub fds: FdTable,
+    /// Pending/blocked POSIX-style signals.
+    pub signals: SignalState,
 }
 
 impl Domain {
@@ -58,7 +73,18 @@ impl Domain {
             caps: CapabilityTable::new(),
             stats: DomainStats::default(),
             violations: 0,
+            uid: 1000,
+            gid: 1000,
+            cwd: 0,
+            chroot_root: 0,
+            fds: FdTable::new(),
+            signals: SignalState::new(),
         }
+    }
+
+    #[must_use]
+    pub fn creds(&self) -> Credentials {
+        Credentials { uid: self.uid, gid: self.gid }
     }
 
     #[must_use]

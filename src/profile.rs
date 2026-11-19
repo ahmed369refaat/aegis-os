@@ -10,8 +10,9 @@
 
 use crate::capability::Rights;
 use crate::syscall::{
-    SyscallMask, SYS_CLOSE, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_MMAP, SYS_MUNMAP,
-    SYS_OPEN, SYS_READ, SYS_WRITE,
+    SyscallMask, SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND,
+    SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE,
+    SYS_READ, SYS_UNLINK, SYS_WRITE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +29,8 @@ pub struct DomainProfile {
     pub sensitivity: u8,
 }
 
-/// Long-running local service: file I/O + IPC, no direct network.
+/// Long-running local service (vfsd-style): full file I/O + IPC + the
+/// Linux-like process-management syscalls, still no direct network.
 pub const fn service_profile() -> DomainProfile {
     DomainProfile {
         name: "service",
@@ -39,6 +41,12 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_CLOSE)
                 | (1u64 << SYS_IPC_SEND)
                 | (1u64 << SYS_IPC_RECV)
+                | (1u64 << SYS_PIPE)
+                | (1u64 << SYS_DUP)
+                | (1u64 << SYS_KILL)
+                | (1u64 << SYS_CHROOT)
+                | (1u64 << SYS_MKDIR)
+                | (1u64 << SYS_UNLINK)
                 | (1u64 << SYS_EXIT),
         ),
         quota_pages: 256,
@@ -95,6 +103,28 @@ pub const fn plugin_profile() -> DomainProfile {
         quota_pages: 32,
         base_rights: Rights::READ,
         sensitivity: 80,
+    }
+}
+
+/// The network broker (netd): the ONLY profile that touches the NIC.
+/// Every other domain sends through it over IPC; its own sends are
+/// rate-limited per-client by the kernel (see `net`).
+pub const fn netd_profile() -> DomainProfile {
+    DomainProfile {
+        name: "netd",
+        syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ)
+                | (1u64 << SYS_WRITE)
+                | (1u64 << SYS_CLOSE)
+                | (1u64 << SYS_IPC_SEND)
+                | (1u64 << SYS_IPC_RECV)
+                | (1u64 << SYS_NET_SEND)
+                | (1u64 << SYS_NET_RECV)
+                | (1u64 << SYS_EXIT),
+        ),
+        quota_pages: 128,
+        base_rights: Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
+        sensitivity: 30,
     }
 }
 
@@ -168,11 +198,35 @@ mod tests {
     }
 
     #[test]
-    fn no_profile_has_direct_network_egress() {
-        // Network access is brokered; profiles must not hold NET_* rights.
-        for p in ALL_PROFILES {
+    fn only_the_broker_profile_has_network_egress() {
+        // Every non-broker profile must be NET-free...
+        for p in [service_profile(), parser_profile(), driver_profile(), plugin_profile()] {
             assert!(!p.syscalls.is_allowed(SYS_NET_SEND).unwrap(), "{}", p.name);
             assert!(!p.syscalls.is_allowed(SYS_NET_RECV).unwrap(), "{}", p.name);
+        }
+        // ...and netd (the broker) is the only one that holds NET_*.
+        let netd = netd_profile();
+        assert!(netd.syscalls.is_allowed(SYS_NET_SEND).unwrap());
+        assert!(netd.syscalls.is_allowed(SYS_NET_RECV).unwrap());
+        assert!(!netd.syscalls.is_allowed(SYS_SPAWN).unwrap());
+        assert!(!netd.syscalls.is_allowed(SYS_KILL).unwrap(), "the broker may not kill");
+    }
+
+    #[test]
+    fn service_holds_the_linux_like_syscalls_exclusively() {
+        let s = service_profile();
+        for allowed in [SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT, SYS_MKDIR, SYS_UNLINK] {
+            assert!(s.syscalls.is_allowed(allowed).unwrap(), "service may use {}", allowed);
+        }
+        for p in [parser_profile(), driver_profile(), plugin_profile(), netd_profile()] {
+            for denied in [SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT, SYS_MKDIR, SYS_UNLINK] {
+                assert!(
+                    !p.syscalls.is_allowed(denied).unwrap(),
+                    "{} may not use {}",
+                    p.name,
+                    denied
+                );
+            }
         }
     }
 

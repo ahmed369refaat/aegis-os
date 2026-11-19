@@ -1,184 +1,154 @@
-# AegisOS — المعمارية الهندسية الكاملة
+# AegisOS — Full Engineering Architecture
 
-> مستند تصميم مرجعي. النموذج المرجعي للكود في `src/` يجسّد كل سياسة مذكورة هنا ويغطيها باختبارات (93 اختباراً).
+> Reference design document. The reference implementation in `src/` embodies every policy described here and backs it with tests (191 tests: 175 unit + 16 integration).
 
-## 1. الأساس: ما نأخذه من Unix ولماذا
+## 1. The foundation: what we take from Unix, and why
 
-| أساس Unix | الأخذ في AegisOS | السبب الهندسي |
+| Unix foundation | AegisOS take | Engineering rationale |
 |---|---|---|
-| كل شيء ملف (VFS موحد) | كل مورد يُفتح عبر `Capability` تشير إلى `Resource` (FsNode/IpcChannel/Device/MemRegion) | واجهة واحدة تعني نقطة فرض واحدة للصلاحيات |
-| عمليات وخيوط بجدولة فعالة | الوحدة الأساسية **Domain**: عملية + نطاق عزل كامل؛ الخيوط داخل النطاق تشترك في قناعه | العزل يُفرض عند حدود النطاق لا الخيط — أرخص وأدق |
-| `syscall` كمستقر ثابت للواجهة | 64 خانة syscall ثابتة + قناع بت `u64` لكل نطاق | فحص العضوية = AND واحد + bit test: مسار حتمي O(1) |
-| درايفرات وI/O منظم | الدرايفر **نطاق درايفر** يملك `IOCTL` فقط بلا وصول مباشر للحلقة | عزل فشل الدرايفر وثغراته عن النواة |
-| الوضوح وتقسيم المهام | كل وحدة core لها عقد واحد قابل للاختبار بمعزل عن غيرها | 93 اختباراً تشتغل بلا بيئة تشغيل = قابلية إثبات |
+| Everything is a file (unified VFS) | Every resource opens through a `Capability` to a `Resource` (FsNode/IpcChannel/Device/MemRegion) | One interface means one enforcement point for permissions |
+| Processes and threads, efficient scheduling | The base unit is the **Domain**: a process + a full isolation envelope; threads inside a domain share its mask | Isolation enforced at the domain boundary, not the thread — cheaper and more precise |
+| `syscall` as a stable interface | 64 fixed syscall slots + a `u64` bit mask per domain | Membership test = one AND + one bit test: a deterministic O(1) path |
+| Drivers and structured I/O | A driver is a **driver domain** holding `IOCTL` only, no direct kernel access | Driver bugs and exploits stay outside the kernel |
+| Clarity and separation of concerns | Every core module has one testable contract in isolation | 191 tests run with no boot environment = provability |
+| POSIX process machinery | Pipes, signals, fd tables, dup2, nice levels, chroot — reimplemented under the mask | Familiar semantics, unfamiliar safety: every one of them is mask-gated |
 
-ما **لا** نأخذه من Unix: الثقة الافتراضية بالعملية (root/suid)، الـsignal كآلية تحكم، وملكية الموارد بالـUID — تُستبدل كلها بالقدرات (Capabilities) والانحلال (Attenuation).
+What we deliberately **drop** from Unix: default trust in processes (root/suid), signals as a control-plane mechanism (kept as delivery semantics only), and UID-based resource ownership — replaced by capabilities and attenuation. One Linux-ism is kept on purpose: uid 0 bypasses DAC checks (documented, and still confined by chroot).
 
-## 2. الشجرة الكاملة للنظام الهدف
+## 2. Full tree of the reference kernel
 
 ```text
 aegis-os/
-├── src/                          # النواة النموذجية (هذا المستودع)
-│   ├── syscall.rs                  قناع syscalls: attenuation-only، O(1)
-│   ├── capability.rs               جدول قدرات: مقابض بأجيال + GRANT + subset
-│   ├── memory.rs                   مساحة عناوين: W^X، Guard Gaps، Quota، Scrub
-│   ├── ringbuf.rs                  حلقة SPSC للقياسات: قوى-2، بلا حظر
-│   ├── profile.rs                  قوالب: service/parser/driver/plugin
-│   ├── domain.rs                   كيان العزل + المسار السريع الحتمي
-│   ├── monitor.rs                  درجة الخطورة + Hysteresis + عتبات حساسية
-│   ├── response.rs                 الاستجابة المتدرجة + SecurityEvent
-│   └── lib.rs                      Kernel: التجميع + البثق (dispatch/audit)
-├── tests/integration.rs           # سيناريوهات كاملة عبر الـAPI العامة
-└── docs/                          # هذا المستند + ROADMAP
+├── src/                          # the policy kernel (this repository)
+│   ├── syscall.rs                  attenuation-only syscall masks, O(1) gate
+│   ├── capability.rs               capability table: generations + GRANT + subset
+│   ├── memory.rs                   address spaces: W^X, guard gaps, quotas, scrub
+│   ├── buddy.rs                    buddy page-frame allocator (split/coalesce)
+│   ├── vfs.rs                      VFS: Unix rwx bits, traversal, chroot clamp
+│   ├── fd.rs                       per-domain fd tables: lowest-free, dup2
+│   ├── pipe.rs                     bounded pipes: short I/O, EOF, EPIPE, refcounts
+│   ├── signal.rs                   signal sets: pending/blocked, unblockable KILL
+│   ├── sched.rs                    CFS: vruntime + Linux nice→weight table
+│   ├── net.rs                      brokered sockets + token-bucket rate limits
+│   ├── ringbuf.rs                  SPSC telemetry rings: power-of-two, non-blocking
+│   ├── profile.rs                  profiles: service/parser/driver/plugin/netd
+│   ├── domain.rs                   the isolation unit + deterministic fast path
+│   ├── monitor.rs                  risk score, hysteresis, sensitivity thresholds
+│   ├── response.rs                 graduated response + SecurityEvent telemetry
+│   ├── sys.rs                      the executing syscall layer (gate → execute)
+│   └── lib.rs                      Kernel assembly (domains, VFS, sched, pipes…)
+├── tests/integration.rs           # security scenarios (escalation, isolation)
+└── tests/linux_like.rs            # Linux-semantics scenarios (VFS/pipe/sched/net)
 ```
 
-وفي النظام الهدف النهائي تُبنى فوق النواة:
+On top of this kernel, the target system adds: `boot/` (deterministic bring-up), `mm/` (real page tables, scrub-on-release), `sched/` (preemptive slices), `ipc/` (capability channels), and user-space system domains — `vfsd`, `netd` (the sole NIC owner), `devd`, and one parser domain per file format.
 
-```text
-kernel/            الإقلاع، Page Tables، الجدولة، IPC
-  ├── boot/          bring-up حتمي + Lazy init للخدمات غير الفورية
-  ├── mm/            مخصص صفحات + Scrub-on-release فعلي + Guard pages
-  ├── sched/         جدولة نطاقات (RR/EDF هجين) بخيوط داخلية
-  └── ipc/           قنوات بقدرات (لا أسماء عالمية)
-domains/
-  ├── vfsd/          خدمة ملفات: VFS فوق قدرات FsNode
-  ├── netd/          وسيط شبكة وحيد يملك NET_* (النطاقات لا ترى الشبكة)
-  ├── devd/          مدير أجهزة: يسلّم قدرات Device للدرايفرات
-  └── parsers/       كل صيغة ملف في نطاق parser مستقل
-monitor/
-  ├── fast/          العدادات + Ring Buffers (في النواة)
-  └── slow/          BehaviorMonitor ثم نماذج ML خارج النواة (نطاق خاص)
-```
+## 3. Strict isolation & least privilege
 
-## 3. العزل الصارم الافتراضي (Strict Isolation & Least Privilege)
+### 3.1 The syscall mask: one-way attenuation
 
-### 3.1 قناع Syscalls: الانحلال الأحادي الاتجاه
+- A domain's mask starts at its profile's surface — the lifetime maximum.
+- The only mutation anywhere is `attenuate(&tighter) = mask & tighter`. Mathematically, no bit can appear.
+- Cross-domain grants go through `try_narrow_to`, which rejects any derivation that adds a bit (`WidenForbidden`).
+- There is no widening code path in the kernel — provable by inspection: every write to a live mask goes through `attenuate`.
+- `SYS_EXIT` is present in every profile: a domain can always exit on its own (no hostage-taking), and quarantined domains can do nothing else.
 
-- قناع النطاق يبدأ من `profile.syscalls` (السقف الأقصى مدى الحياة).
-- التعديل الوحيد المتاح: `attenuate(&tighter) = mask & tighter` — تقاطع. رياضياً لا يمكن أن يزيد أي بت.
-- عند منح صلاحية بين نطاقات: `try_narrow_to` يرفض (`WidenForbidden`) أي اشتقاق يضيف بتاً.
-- **لا يوجد كود في النظام يستدعي توسيعاً** — الخاصية قابلة للإثبات بفحص أن كل مسار كتابة للقناع يمر بـ`attenuate`.
-- `SYS_EXIT` محفوظة في كل قالب: النطاق يستطيع دائماً الخروج بنظامه (لا حصار)، ولا يستطيع فعل أي شيء آخر أثناء الحجر.
+### 3.2 The capability table
 
-### 3.2 جدول القدرات (Capability Table)
+- Handles are `{index, generation}` pairs, kernel-internal; forging is meaningless because the table validates both parts.
+- `revoke` keeps the generation counter alive: any stale handle (use-after-revoke, or ABA after slot reuse) is rejected with `InvalidHandle`.
+- Derivation requires `GRANT` on the parent and subset rights on the child. Escalation attempts return an error and feed the monitor as `escalation_attempts`.
 
-- المقبض `CapHandle{index, generation}` غير قابل للتزوير: الخانة والجيل يتحقق منهما الجدول، والقدرة نفسها لا تغادر النواة.
-- `revoke` يبقي عدّاد الجيل: أي مقبض قديم (use-after-revoke أو ABA بعد إعادة استخدام الخانة) يُرفض بـ`InvalidHandle`.
-- الاشتقاق: يتطلب `GRANT` على الأب + الحقوق المطلوبة subset من حقوقه. محاولة التصعيد تُعاد كخطأ وتُحسب إشارة `escalation_attempts` للمراقب.
-- الحقوق: `READ | WRITE | EXEC | GRANT | STATS` — مجموعات جزئية فقط (`Rights::from_bits` يقتطع البتات غير المعرفة).
+### 3.3 Memory policy
 
-### 3.3 سياسة الذاكرة الصارمة
+`AddressSpace::map` runs ten fixed-order checks: non-zero length, non-NULL base, page alignment, `checked_add` wraparound rejection, W^X (X-only and W-only allowed), at least one access bit, no overlap, a **full guard page between any two regions**, page quota, and `unmap` accounting that counts released pages as scrubbed (zeroed before reuse in a real kernel). `buddy.rs` backs this with Linux-style physical frame management: power-of-two blocks, split on allocation, buddy coalescing on free, exact accounting.
 
-التحقق بترتيب ثابت حتمي في `AddressSpace::map`:
+### 3.4 Linux-like semantics, mask-gated
 
-1. `len == 0` → رفض (لا مناطق صفرية قابلة للسوء استخدام)
-2. `base == 0` → رفض (صفحة NULL محرّمة — لا يُسمح أبداً بتعيين أي شيء عند العنوان صفر)
-3. المحاذاة على `PAGE_SIZE` للقاعدة والطول
-4. `base.checked_add(len)` → رفض `Overflow` (منع الالتفاف على العنوان الأعلى)
-5. `W^X`: وجود `W` و`X` معاً → رفض؛ X-only وW-only مسموحان
-6. بت وصول واحد على الأقل (R/W/X) — وإلا `NoAccessBits`
-7. عدم التداخل مع أي منطقة قائمة (`Overlap`)
-8. **Guard Gap**: منطقة كاملة فارغة على الأقل بين أي منطقتين (ضد spray وأخطاء الحدود)
-9. حصة الصفحات `quota_pages` لكل نطاق (منع استنزاف الذاكرة عبر النطاقات)
-10. `unmap` يُرجع المنطقة ويَعُدّ صفحاتها **scrubbed** — في النواة الحقيقية تُصفَّر الصفحات قبل عودتها للمجمع (لا تسريب بيانات بين النطاقات)
+The `sys.rs` layer executes *after* the gate allows:
 
-### 3.4 العزل الافتراضي لكل صنف
+- **VFS + DAC**: owner/group/other `rwx` bits; execute bit required to traverse directories; uid 0 bypass (the one deliberate Linux-ism); `chmod` for owner or root only.
+- **chroot(2) with hardening**: `..` clamps at the chroot root; absolute paths resolve from it. Unlike Linux, `chroot` also moves the cwd — closing the historical chroot+cwd escape (a process holding a pre-chroot cwd cannot walk out).
+- **fd tables**: lowest-free descriptor allocation, `dup2` replacing targets silently, per-file read cursors.
+- **pipes**: bounded 64-byte rings; short writes and reads; `WouldBlock` when full/empty; `Ok(0)` at EOF; `BrokenPipe` (EPIPE) when the read end is gone. Pipe ends are **reference-counted**: a dup'ed descriptor keeps the end open until the last referencing fd closes.
+- **signals**: 1..=31 bitsets; blocked signals stay pending; SIGKILL/SIGSTOP cannot be blocked; delivery takes the lowest pending unblocked number; the fatal default action quarantines the domain; `kill` follows Unix permission rules (uid 0, same uid, or self).
+- **CFS scheduling**: `vruntime` charged by `ticks × 1024 / weight` with the real Linux `sched_prio_to_weight` table (nice −20 = 88761 … nice +19 = 15); the charge floors at 1 per tick so heavy domains cannot starve anyone; sleeping domains are skipped and wake with earned priority.
+- **brokered sockets with rate limits**: only the `netd` profile holds `NET_SEND`; every send passes a per-domain token bucket (burst 64, refill 64 per 100 ticks, capped accumulation) — throttling is exact-deficit and deterministic, a pure function of (bucket state, clock).
 
-| القالب | السطح الممنوح | الحصة | الحساسية |
+### 3.5 Profiles (initial, maximal surfaces)
+
+| Profile | Syscall surface | Pages | Sensitivity |
 |---|---|---|---|
-| `service` | READ, WRITE, OPEN, CLOSE, IPC_SEND/RECV, EXIT | 256 صفحة | 40 |
-| `parser` | READ, CLOSE, MMAP, MUNMAP, EXIT | 64 | 70 |
-| `driver` | READ, WRITE, IOCTL, IPC_SEND/RECV, EXIT | 128 | 50 |
-| `plugin` | READ, IPC_SEND/RECV, EXIT | 32 | 80 |
+| `service` | READ, WRITE, OPEN, CLOSE, IPC, **PIPE, DUP, KILL, CHROOT, MKDIR, UNLINK** | 256 | 40 |
+| `parser` | READ, CLOSE, MMAP, MUNMAP | 64 | 70 |
+| `driver` | READ, WRITE, IOCTL, IPC | 128 | 50 |
+| `plugin` | READ, IPC | 32 | 80 |
+| `netd` (broker) | READ, WRITE, CLOSE, IPC, **NET_SEND, NET_RECV** | 128 | 30 |
 
-قواعد عرضية مفروضة بالاختبار: لا قالب يملك `SPAWN`؛ لا قالب يملك `NET_*` مباشرة (الشبكة عبر نطاق وسيط `netd` يملك القدرات ويوسّطها عبر IPC بقدرات مشتقة)؛ الأقل ثقة (plugin/parser) أعلى حساسية مراقبة.
+Cross-profile rules enforced by tests: nobody gets `SPAWN`; only `netd` gets `NET_*`; only `service` gets the process-management syscalls; every profile keeps `EXIT`.
 
-## 4. الإقلاع والسرعة: المساران
+## 4. The two paths
 
-### 4.1 المسار السريع الحتمي (Fast Path)
-
-كل حدث syscall يمر بأربع عمليات ذرية بسيطة لا أكثر:
+### 4.1 Fast path (per syscall)
 
 ```rust
-// domain.rs::request_syscall — التكلفة ثابتة بالكامل
-if id >= SYSCALL_COUNT            { return BadSyscall }      // 1 مقارنة
-if quarantined && id != SYS_EXIT  { return DeniedQuarantined } // 1 مقارنة + 1 فحص حالة
-stats.mark_used(id); stats.syscalls_total += 1 (saturating)   // 2 OR/ADD
-if !mask.is_allowed(id)           { return DeniedByMask }    // AND + bit test
+if id >= SYSCALL_COUNT            { return BadSyscall }        // 1 compare
+if quarantined && id != SYS_EXIT  { return DeniedQuarantined } // 1 compare + state
+stats.mark_used(id); stats.syscalls_total += 1 (saturating)   // 2 ops
+if !mask.is_allowed(id)           { return DeniedByMask }      // AND + bit test
 ```
 
-لا تخصيص ذاكرة، لا أقفال في هذا النموذج (SPSC)، لا تحليل في المسار الحرج، والرياضيات كلها saturating — لا مسار panic إطلاقاً. بيانات القياس تخرج عبر `RingBuffer::push`: فهرسة بقناع `& (N-1)`، ممتلئ → إسقاط + عدّاد (لا انتظار).
+No allocation, no locks (SPSC in this sample), no analysis in the hot path, no panic path (all arithmetic saturates). Telemetry leaves through `RingBuffer::push`: index masking `& (N-1)`, drop-and-count when full — the fast path is never blocked by logging.
 
-### 4.2 المسار البطيء المجمع (Slow Path)
+### 4.2 Slow path (per monitoring window)
 
-مرة لكل نافذة زمنية (مثلاً 100ms)، `Kernel::audit`:
-1. يقرأ لقطة عدادات النافذة (ثم يصفّرها — النافذة تُغلق ذرياً)
-2. `BehaviorMonitor::evaluate` يحسب الدرجة ويقرر الاستجابة (انظر §6)
-3. `apply_response` يطبّق القرار: كتابة الحدث في Telemetry + (تضييق/حجر)
-4. التحليل الأثقل (نماذج ML) يعمل **خارج النواة** في نطاق مراقبة خاص، يقرأ نفس الحلقات — لا يدخل أبداً في مسار الحدث
+`Kernel::audit` snapshots the window counters, closes the window atomically, scores, applies the graduated response, and records a `SecurityEvent`. The heavier ML analysis (roadmap M5) runs *outside* the kernel in its own domain, reading the same rings — it never sits in the event path.
 
-### 4.3 الإقلاع السريع
+## 5. Flexibility & extensibility
 
-- bring-up حتمي بترتيب ثابت: نواة → جدولة → mm → ipc → نطاقات أساسية (vfsd, netd, devd).
-- كل ما ليس مطلوباً لتشغيل أول نطاق مستخدم يُسجَّل كـ**Lazy/Deferred init**: تعريف الجهاز يحدث عند أول `OPEN` لقدرته (الدرايفر يُطلق نطاقاً عند الطلب).
-- القوالب ثابتة (`const fn`) — بناء هياكل النطاقات بلا كلفة وقت تشغيل.
+The only extension interface is the triple **Syscalls / IPC / Capabilities** — which is itself the isolation toolkit. A new driver is a driver domain receiving a derived `Device` capability. A new filesystem is a service domain over `FsNode` capabilities. A new parser format is an existing profile, zero kernel code. A new ML model is another ring consumer in its own masked domain — the model itself is monitored. No extension can widen a live domain's surface.
 
-## 5. المرونة والقابلية للتوسع
+## 6. The AI security behavior layer
 
-- **درايفر جديد** = نطاق `driver` + قدرة `Device` مشتقة من `devd`. لا يمس النواة.
-- **نظام ملفات جديد** = نطاق خدمة يستقبل قدرات `FsNode`؛ VFS يرى واجهة واحدة.
-- **parser/plugin جديد** = قالب موجود مسبقاً؛ صفر كود نواة.
-- **نموذج تحليل جديد** = مستهلك جديد لحلقات القياس، نطاقه الخاص وقناعه الخاص — النموذج نفسه تحت المراقبة.
-- واجهة التوسع الوحيدة: `Syscalls / IPC / Capabilities` — نفسها ثلاثية العزل، فلا يمكن لإضافة أن تكسر النواة أو توسّع صلاحيات جارٍ.
+### 6.1 Signals (all real, all from fast-path counters)
 
-## 6. طبقة AI Security Behavior
-
-### 6.1 الإشارات (كلها واقعية من عدادات المسار السريع)
-
-| الإشارة | المصدر | ماذا تكشف |
+| Signal | Source | Weight |
 |---|---|---|
-| `denied/total` | عدادات القناع | استطلاع سطح ممنوح (recon) |
-| `faults` | مسار أخطاء الذاكرة (guard/quota/W^X) | استغلال أو فوضى |
-| `escalation_attempts` | فشل اشتقاق القدرات | محاولة تصعيد مباشرة |
-| `out_of_profile_bits` | بتات الاستخدام خارج القناع المسموح | سلوك خارج الغرض |
-| `spike` | total مقابل خط الأساس | طوفان/تشغيل آلي |
-| (`net_ops`, `file_ops`, `ipc_ops`) | تلميحات إضافية مُجمّعة للنماذج الأثقل | توزيع السلوك |
+| `denied/total` | mask-gate counters (recon probing) | 20% |
+| `faults` | memory fault path (guard/quota/W^X) | 25% |
+| `escalation_attempts` | failed capability derivations | 30% |
+| `out_of_profile_bits` | syscalls attempted outside the allowed mask | 10% |
+| `spike` | total vs. per-window baseline (floods) | 15% |
 
-### 6.2 درجة الخطورة (Score)
+### 6.2 Score
 
-رياضيات صحيحة خالصة (لا فواصل عائمة — حتمية وقابلة لإعادة الإنتاج)، وسيطات `u128` فلا فيضان مع `u64::MAX`:
+Integer-only math (deterministic, reproducible), `u128` intermediates (no overflow even at `u64::MAX` counters), each sub-signal saturated at 100, the weighted sum saturated at 100.
 
-```text
-score = ( 20·s_denied + 25·s_faults + 30·s_escalation
-        + 10·s_out_of_profile + 15·s_spike ) / 100     ⊂ [0..100]
-كل إشارة جزئية s ⊂ [0..100] (تُشبَع منفردة)
-```
+### 6.3 Graduated response
 
-العيّنة المضروبة: نسبة منع 100% (20) + 5 أعطال (25) + 4 تصعيدات (30) + بتّا استخدام خارجي (5) + طوفان 10× الأساس (15) = **100**.
-
-### 6.3 الاستجابة المتدرجة
-
-| الدرجة (فعالة*) | الاستجابة | الأثر |
+| Effective score* | Response | Effect |
 |---|---|---|
-| < tighten (45) | **Log** | تسجيل SecurityEvent فقط؛ المستخدم لا يرى شيئاً |
-| ≥ tighten لنوافذ متتالية (hysteresis=2) | **Tighten** | القناع ∩ السطح المنقوص: يُسقط SPAWN/NET_*/IOCTL/MMAP/OPEN — التطبيق السليم يستمر بالعمل |
-| ≥ quarantine (75) لنوافذ متتالية | **Quarantine** | EXIT فقط + تجميد الإحصاءات؛ نهائي (الاستعادة = إعادة إطلاب بإشراف) |
-| ≥ 95 في نافذة واحدة | **Quarantine فوري** | أنماط هجوم شاملة متعددة الإشارات لا تنتظر تأكيداً |
+| < 45 | **Log** | SecurityEvent only; the user notices nothing |
+| ≥ 45 for consecutive windows (hysteresis = 2) | **Tighten** | Mask ∩ reduced surface (drops SPAWN/NET/IOCTL/MMAP/OPEN); healthy apps keep working |
+| ≥ 75 for consecutive windows | **Quarantine** | EXIT-only, stats frozen; terminal (recovery = supervised respawn) |
+| ≥ 95 in a single window | **Instant quarantine** | Multi-signal attack patterns do not wait for confirmation |
 
-\* العتبات تنخفض مع حساسية القالب: `threshold − sensitivity/4` (أرضية 5/15). parser (70) → tighten@28, quarantine@58 — الأقل ثقة يُراقَب أشد.
+\* Thresholds drop with profile sensitivity (`threshold − sensitivity/4`, floors 5/15): parsers quarantine at 58, services at 75.
 
-### 6.4 الموازنة: لماذا لا يزعج هذا المستخدم العادي؟
+### 6.4 Why this does not harass normal users
 
-- **نافذة شر واحدة لا تصعّد أبداً** (hysteresis) — التطبيق السليم الذي تجاوز حصة الحمل نافذة واحدة يُسجَّل فقط.
-- **نوافذ متناوبة شر/سكون تُصفّر العدادات** — لا تصعيد بسبب نافذة عابرة كل ساعة.
-- **Tighten لا يقتل التطبيق**: يبقي READ/WRITE/CLOSE/IPC/EXIT — 99% من عمل التطبيق الحقيقي يستمر.
-- **الدرجة المُعلنة تتلاشى تدريجياً** (15/نافذة) — لا قفزات ولا ذعر.
-- **فشل المراقبة فاشٍ نحو الأمان**: امتلأ جدول الحالات؟ التحليل يتدهور إلى Log، لكن الحجر الفوري (≥95) يبقى يعمل — لا انفتاح عند الفشل.
+- One bad window never escalates (hysteresis); alternating bad/quiet windows reset the streaks.
+- Tightening keeps READ/WRITE/CLOSE/IPC/EXIT — real work continues.
+- Reported scores decay 15 points per quiet window (no cliff-drops).
+- Monitor failure fails *safe*: a full state table degrades to Log, but instant quarantine at 95+ still fires.
 
-## 7. ما يجسّده النموذج المرجعي في هذا المستودع
+## 7. What the tests prove
 
-كل بند أعلاه له كود واختبار (راجع `cargo test`):
-
-- `tests/integration.rs::escalating_parser_is_tightened_then_quarantined` — السيناريو الكامل: Log(55) → Tighten(50) → Tighten(37) → Tighten(80) → Quarantine(80) مع تحقق الماسك بعد كل مرحلة، وجارٍ سليم لا يتأثر.
-- `tests/integration.rs::benign_parser_is_never_escalated` — 2000 قراءة نظيفة عبر 10 نوافذ: Running دائماً.
-- اختبارات الحدّ: العتبة بالضبط (45 تُحتسب، 44 لا)، `u64::MAX` في كل العدادات، `usize::MAX - PAGE + 1` (wraparound)، مقبض بعد revoke وإعادة استخدام، حلقة ممتلئة، جدول قدرات ممتلئ (17th)، 8 مناطق (9th)، جدول مراقبة ممتلئ (النطاق 9).
+- `tests/integration.rs::escalating_parser_is_tightened_then_quarantined` — the full pipeline: Log(55) → Tighten(50) → Tighten(37) → Tighten(80) → Quarantine(80), with the mask verified after each step and a healthy neighbor unaffected.
+- `tests/linux_like.rs::vfs_unix_permissions_end_to_end` — Unix DAC over the real syscall layer.
+- `tests/linux_like.rs::chroot_confinement_through_syscalls` — absolute, `..`-climb, and unlink escapes all fail; the supervisor still sees the whole tree.
+- `tests/linux_like.rs::pipe_lifecycle_with_dup_semantics` — dup-aware pipe ends, EOF, EPIPE.
+- `tests/linux_like.rs::kill_permissions_and_fatal_signal_delivery` — Unix kill rules; fatal signals quarantine.
+- `tests/linux_like.rs::cfs_scheduler_fairness_through_kernel` — exact 25/25/8 fair share over a settled cycle.
+- `tests/linux_like.rs::net_broker_send_is_rate_limited` — burst, exact-deficit throttle, window refill, profile masking.
+- Edge cases at every boundary: `usize::MAX - PAGE + 1` (wraparound), `u64::MAX` counters (saturation), stale handles after revoke, score exactly 45 vs 44, signal 0/32/31, nice clamping, empty/full rings and tables, OOM with largest-free reporting.
