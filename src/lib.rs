@@ -37,23 +37,36 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod buddy;
 pub mod capability;
 pub mod domain;
+pub mod fd;
 pub mod memory;
 pub mod monitor;
+pub mod net;
+pub mod pipe;
 pub mod profile;
 pub mod response;
 pub mod ringbuf;
+pub mod sched;
+pub mod signal;
+pub mod sys;
 pub mod syscall;
+pub mod vfs;
 
 use core::array;
 
+use crate::buddy::BuddyAllocator;
 use crate::domain::{Decision, Domain, DomainState};
 use crate::monitor::{BehaviorMonitor, DomainStats, MonitorConfig, Verdict};
+use crate::net::{SocketTable, TokenBucket};
+use crate::pipe::PipeTable;
 use crate::profile::DomainProfile;
 use crate::response::{apply_response, SecurityEvent, TELEMETRY_CAPACITY};
 use crate::ringbuf::RingBuffer;
+use crate::sched::Scheduler;
 use crate::syscall::SyscallMask;
+use crate::vfs::Vfs;
 
 /// Maximum simultaneously resident domains in this sample kernel.
 pub const MAX_DOMAINS: usize = 4;
@@ -65,13 +78,32 @@ pub enum KernelError {
     UnknownDomain(u32),
 }
 
-/// The sample kernel: owns domains, the behavior monitor and the telemetry
-/// ring. `dispatch` is the deterministic fast path; `audit` is the batched
-/// slow path that runs once per monitoring window.
+/// The sample kernel: owns domains, the behavior monitor, the telemetry
+/// ring and the Linux-like machinery (VFS, fd tables, pipes, signals,
+/// scheduler, buddy allocator, brokered sockets).
+///
+/// `dispatch` is the deterministic fast path; `syscall` (in `sys.rs`) is
+/// the executing layer that runs only after the gate allows; `audit` is
+/// the batched slow path that runs once per monitoring window.
 pub struct Kernel {
-    domains: [Option<Domain>; MAX_DOMAINS],
+    pub(crate) domains: [Option<Domain>; MAX_DOMAINS],
     monitor: BehaviorMonitor,
     telemetry: RingBuffer<SecurityEvent, TELEMETRY_CAPACITY>,
+    // ── Linux-like state ──
+    /// Global filesystem with Unix permissions.
+    pub(crate) vfs: Vfs,
+    /// Anonymous pipes shared between domains via fds.
+    pub(crate) pipes: PipeTable,
+    /// Brokered sockets (owned by domains, rate-limited per domain).
+    pub(crate) sockets: SocketTable,
+    /// Per-domain token buckets (indexed by free slot, keyed by domain id).
+    pub(crate) buckets: [Option<(u32, TokenBucket)>; MAX_DOMAINS],
+    /// CFS-style fair scheduler over runnable domains.
+    pub sched: Scheduler,
+    /// Physical page-frame buddy allocator.
+    pub frames: BuddyAllocator,
+    /// Kernel clock in ticks (drives rate-limit windows).
+    pub(crate) clock: u64,
 }
 
 impl Kernel {
@@ -81,25 +113,54 @@ impl Kernel {
             monitor: BehaviorMonitor::new(MonitorConfig::default()),
             telemetry: RingBuffer::new()
                 .expect("TELEMETRY_CAPACITY is a power of two by construction"),
+            vfs: Vfs::new(),
+            pipes: PipeTable::new(),
+            sockets: SocketTable::new(),
+            buckets: [None; MAX_DOMAINS],
+            sched: Scheduler::new(),
+            frames: BuddyAllocator::new(),
+            clock: 0,
         }
     }
 
     /// Spawn a domain from a profile. The profile's mask is the *maximal*
-    /// surface this domain will ever have.
+    /// surface this domain will ever have. Credentials are deterministic:
+    /// uid = 1000 + id, gid = 100; nice = 0. Use `create_domain_with` for
+    /// explicit control.
     pub fn create_domain(&mut self, id: u32, profile: DomainProfile) -> Result<(), KernelError> {
+        self.create_domain_with(id, profile, 1000u16.wrapping_add(id as u16), 100, 0)
+    }
+
+    /// Spawn a domain with explicit credentials and nice level.
+    pub fn create_domain_with(
+        &mut self,
+        id: u32,
+        profile: DomainProfile,
+        uid: u16,
+        gid: u16,
+        nice: i8,
+    ) -> Result<(), KernelError> {
         if self.domains.iter().flatten().any(|d| d.id == id) {
             return Err(KernelError::DuplicateDomain(id));
         }
-        for slot in self.domains.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(Domain::new(id, profile));
-                return Ok(());
-            }
-        }
-        Err(KernelError::TooManyDomains)
+        let slot = self
+            .domains
+            .iter_mut()
+            .find(|s| s.is_none())
+            .ok_or(KernelError::TooManyDomains)?;
+        let mut d = Domain::new(id, profile);
+        d.uid = uid;
+        d.gid = gid;
+        // Both the cwd and the chroot root start at the VFS root.
+        d.cwd = crate::vfs::ROOT_ID;
+        d.chroot_root = crate::vfs::ROOT_ID;
+        *slot = Some(d);
+        // Register with the fair scheduler (idempotent).
+        let _ = self.sched.register(id, nice);
+        Ok(())
     }
 
-    fn domain_mut(&mut self, id: u32) -> Result<&mut Domain, KernelError> {
+    pub(crate) fn domain_mut(&mut self, id: u32) -> Result<&mut Domain, KernelError> {
         self.domains
             .iter_mut()
             .flatten()
@@ -183,30 +244,47 @@ impl Default for Kernel {
 
 /// Convenience re-exports for downstream kernels and tests.
 pub mod prelude {
+    pub use crate::buddy::{BuddyAllocator, BuddyError, FRAME_COUNT, MAX_ORDER};
     pub use crate::capability::{
         CapError, CapHandle, Capability, CapabilityTable, Resource, Rights, MAX_CAPABILITIES,
     };
     pub use crate::domain::{Decision, Domain, DomainState};
+    pub use crate::fd::{FdEntry, FdError, FdTable, FdTarget, MAX_FDS};
+    pub use crate::net::{
+        NetError, Socket, SocketState, SocketTable, TokenBucket, RATE_WINDOW_TICKS,
+    };
+    pub use crate::pipe::{PipeError, PipeTable, MAX_PIPES, PIPE_CAPACITY};
+    pub use crate::sched::{SchedEntity, SchedError, Scheduler, NICE0_WEIGHT, NICE_TO_WEIGHT};
+    pub use crate::signal::{
+        default_action, is_unblockable, SignalError, SignalSet, SignalState, SIGHUP, SIGINT,
+        SIGKILL, SIGSTOP, SIGTERM, SIGUSR1, SIGUSR2,
+    };
+    pub use crate::sys::{SysError, SysRequest, SysValue};
+    pub use crate::syscall::{
+        MaskError, SyscallMask, SYSCALL_COUNT, SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_EXIT,
+        SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MMAP, SYS_MKDIR, SYS_MUNMAP,
+        SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SPAWN, SYS_UNLINK,
+        SYS_WRITE,
+    };
+    pub use crate::vfs::{
+        Credentials, InodeKind, Mode, Vfs, VfsError, FILE_DATA_MAX, MAX_INODES, NAME_MAX, ROOT_ID,
+    };
     pub use crate::{
         memory::{AddressSpace, MemError, MemFlags, Region, MAX_REGIONS, PAGE_SIZE},
         monitor::{
             BehaviorMonitor, DomainStats, MonitorConfig, MonitorWeights, Response, Verdict,
             MAX_MONITORED,
         },
-    };
-    pub use crate::profile::{
-        driver_profile, parser_profile, plugin_profile, service_profile, DomainProfile,
-    };
-    pub use crate::response::{
-        apply_response, tightened_surface, EventAction, Outcome, SecurityEvent,
-        TELEMETRY_CAPACITY,
+        profile::{
+            driver_profile, netd_profile, parser_profile, plugin_profile, service_profile,
+            DomainProfile,
+        },
+        response::{
+            apply_response, tightened_surface, EventAction, Outcome, SecurityEvent,
+            TELEMETRY_CAPACITY,
+        },
     };
     pub use crate::ringbuf::{RingBuffer, RingError};
-    pub use crate::syscall::{
-        MaskError, SyscallMask, SYSCALL_COUNT, SYS_CLOSE, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV,
-        SYS_IPC_SEND, SYS_MMAP, SYS_MUNMAP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_READ,
-        SYS_SPAWN, SYS_WRITE,
-    };
     pub use crate::{Kernel, KernelError, MAX_DOMAINS};
 }
 

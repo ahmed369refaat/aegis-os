@@ -32,6 +32,18 @@ pub const SYS_NET_SEND: u8 = 9;
 pub const SYS_NET_RECV: u8 = 10;
 /// Device control.
 pub const SYS_IOCTL: u8 = 11;
+/// Create an anonymous pipe (Linux-like extension).
+pub const SYS_PIPE: u8 = 12;
+/// Duplicate a file descriptor onto a target index (dup2 semantics).
+pub const SYS_DUP: u8 = 13;
+/// Send a signal to another domain (kill(2)-like).
+pub const SYS_KILL: u8 = 14;
+/// Change the root directory of this domain (chroot(2)-like).
+pub const SYS_CHROOT: u8 = 15;
+/// Create a directory (mkdir(2)).
+pub const SYS_MKDIR: u8 = 16;
+/// Remove a file / empty directory (unlink(2) + rmdir(2)).
+pub const SYS_UNLINK: u8 = 17;
 /// Reserved: domain exit. Always reachable; a mask without it is rejected
 /// by convention (see `profile` tests).
 pub const SYS_EXIT: u8 = 63;
