@@ -13,25 +13,10 @@
 use crate::domain::Domain;
 use crate::monitor::{Response, Verdict};
 use crate::ringbuf::RingBuffer;
-use crate::syscall::{
-    SyscallMask, SYS_IOCTL, SYS_MMAP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_SPAWN,
-};
+use crate::syscall::SyscallMask;
 
 /// Telemetry ring capacity (power of two, required by the ring buffer).
 pub const TELEMETRY_CAPACITY: usize = 16;
-
-/// The surface a tightened domain keeps: local I/O and IPC only.
-#[must_use]
-pub const fn tightened_surface() -> SyscallMask {
-    SyscallMask::from_bits(
-        !((1u64 << SYS_SPAWN)
-            | (1u64 << SYS_NET_SEND)
-            | (1u64 << SYS_NET_RECV)
-            | (1u64 << SYS_IOCTL)
-            | (1u64 << SYS_MMAP)
-            | (1u64 << SYS_OPEN)),
-    )
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventAction {
@@ -71,7 +56,12 @@ pub fn apply_response(
     let action = match verdict.response {
         Response::Log => EventAction::Log,
         Response::Tighten => {
-            domain.tighten(&tightened_surface());
+            // F8: the degraded surface is per-profile (strict subset of
+            // the domain's own surface, EXIT always kept, core function
+            // alive) — the old single global mask gutted driver and netd
+            // and did nothing to plugin.
+            let degraded = domain.profile.degraded_syscalls;
+            domain.tighten(&degraded);
             EventAction::Tighten
         }
         Response::Quarantine => {
@@ -99,7 +89,8 @@ mod tests {
     use crate::monitor::Verdict as V;
     use crate::profile::{parser_profile, service_profile};
     use crate::syscall::{
-        SYS_CLOSE, SYS_EXIT, SYS_IPC_RECV, SYS_IPC_SEND, SYS_MUNMAP, SYS_READ, SYS_WRITE,
+        SYS_CLOSE, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_MUNMAP, SYS_NET_SEND,
+        SYS_OPEN, SYS_READ, SYS_WRITE,
     };
 
     fn ring() -> RingBuffer<SecurityEvent, TELEMETRY_CAPACITY> {
@@ -107,21 +98,19 @@ mod tests {
     }
 
     #[test]
-    fn tightened_surface_keeps_local_io_drops_dangerous() {
-        let t = tightened_surface();
-        for kept in [
-            SYS_READ,
-            SYS_WRITE,
-            SYS_CLOSE,
-            SYS_MUNMAP,
-            SYS_IPC_SEND,
-            SYS_IPC_RECV,
-            SYS_EXIT,
-        ] {
-            assert!(t.is_allowed(kept).unwrap(), "keep {}", kept);
-        }
-        for dropped in [SYS_SPAWN, SYS_NET_SEND, SYS_NET_RECV, SYS_IOCTL, SYS_MMAP, SYS_OPEN] {
-            assert!(!t.is_allowed(dropped).unwrap(), "drop {}", dropped);
+    fn tighten_applies_the_profile_degraded_surface() {
+        // The per-profile table test lives in profile.rs; here we pin
+        // the apply path for one representative of each shape.
+        let mut d = Domain::new(5, crate::profile::driver_profile());
+        let mut r = ring();
+        let out =
+            apply_response(&mut d, &V { score: 60, response: Response::Tighten }, &mut r);
+        match out {
+            Outcome::Tightened(m) => {
+                assert!(m.is_allowed(SYS_IOCTL).unwrap(), "driver keeps its purpose");
+                assert!(!m.is_allowed(SYS_IPC_SEND).unwrap(), "IPC drops while degraded");
+            }
+            other => panic!("expected Tightened, got {:?}", other),
         }
     }
 

@@ -108,6 +108,19 @@ impl Default for MonitorConfig {
     }
 }
 
+/// F9: what the kernel does with a monitor verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MonitorMode {
+    /// Verdicts are computed and logged to telemetry, but no mask
+    /// change and no quarantine is applied — the calibration mode
+    /// (SECURITY-MODEL.md): tune thresholds on real traffic before
+    /// letting the monitor act.
+    AuditOnly,
+    /// Verdicts are applied (Log / Tighten / Quarantine). The default.
+    #[default]
+    Enforce,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Response {
     /// Record and continue.
@@ -124,7 +137,10 @@ pub struct Verdict {
     pub response: Response,
 }
 
-pub const MAX_MONITORED: usize = 8;
+/// F7: the state table is sized from the domain table, not a magic
+/// number — monitor slots are domain slots' shadow (and destroy_domain
+/// frees them).
+pub const MAX_MONITORED: usize = crate::MAX_DOMAINS;
 const MIN_TIGHTEN_THRESHOLD: u8 = 5;
 const MIN_QUARANTINE_THRESHOLD: u8 = 15;
 

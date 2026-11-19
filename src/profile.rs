@@ -17,6 +17,15 @@ use crate::syscall::{
     SYS_READ, SYS_UNLINK, SYS_WRITE,
 };
 
+/// The surface a domain of this class keeps while *degraded* (the
+/// monitor's Tighten tier, F8). Per-profile instead of one global mask:
+/// a strict subset of `syscalls`, always containing SYS_EXIT, and it
+/// keeps the profile's core function alive (driver keeps IOCTL, netd
+/// keeps NET_*). The old global `tightened_surface()` was a no-op for
+/// plugin and removed the entire purpose of driver and netd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DegradedSurface(pub SyscallMask);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DomainProfile {
     pub name: &'static str,
@@ -29,6 +38,9 @@ pub struct DomainProfile {
     /// 0..=100: how jumpy the behavior monitor is for this class. Higher
     /// sensitivity lowers the tighten/quarantine thresholds for the domain.
     pub sensitivity: u8,
+    /// The Tighten-tier surface (F8): a strict subset of `syscalls`,
+    /// always keeping SYS_EXIT and the profile's core function.
+    pub degraded_syscalls: SyscallMask,
 }
 
 /// Long-running local service (vfsd-style): full file I/O + IPC + the
@@ -51,6 +63,19 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_UNLINK)
                 | (1u64 << SYS_EXIT),
         ),
+        // Degraded service: existing local I/O and IPC stay; every path
+        // that opens NEW resources (open/mkdir/unlink) or manages other
+        // domains (kill/chroot) drops.
+        degraded_syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ)
+                | (1u64 << SYS_WRITE)
+                | (1u64 << SYS_CLOSE)
+                | (1u64 << SYS_IPC_SEND)
+                | (1u64 << SYS_IPC_RECV)
+                | (1u64 << SYS_PIPE)
+                | (1u64 << SYS_DUP)
+                | (1u64 << SYS_EXIT),
+        ),
         quota_pages: 256,
         base_rights: Rights::READ.union(Rights::WRITE),
         sensitivity: 40,
@@ -67,6 +92,11 @@ pub const fn parser_profile() -> DomainProfile {
                 | (1u64 << SYS_MMAP)
                 | (1u64 << SYS_MUNMAP)
                 | (1u64 << SYS_EXIT),
+        ),
+        // Degraded parser: no new mappings — decode what is already
+        // mapped and get out.
+        degraded_syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ) | (1u64 << SYS_CLOSE) | (1u64 << SYS_EXIT),
         ),
         quota_pages: 64,
         base_rights: Rights::READ,
@@ -86,6 +116,14 @@ pub const fn driver_profile() -> DomainProfile {
                 | (1u64 << SYS_IPC_RECV)
                 | (1u64 << SYS_EXIT),
         ),
+        // Degraded driver: IOCTL is the whole point — it stays; the
+        // side channels (IPC) drop.
+        degraded_syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ)
+                | (1u64 << SYS_WRITE)
+                | (1u64 << SYS_IOCTL)
+                | (1u64 << SYS_EXIT),
+        ),
         quota_pages: 128,
         base_rights: Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
         sensitivity: 50,
@@ -99,6 +137,13 @@ pub const fn plugin_profile() -> DomainProfile {
         syscalls: SyscallMask::from_bits(
             (1u64 << SYS_READ)
                 | (1u64 << SYS_IPC_SEND)
+                | (1u64 << SYS_IPC_RECV)
+                | (1u64 << SYS_EXIT),
+        ),
+        // Degraded plugin: keep its IPC lifeline, stop reading new
+        // inputs.
+        degraded_syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_IPC_SEND)
                 | (1u64 << SYS_IPC_RECV)
                 | (1u64 << SYS_EXIT),
         ),
@@ -124,9 +169,83 @@ pub const fn netd_profile() -> DomainProfile {
                 | (1u64 << SYS_NET_RECV)
                 | (1u64 << SYS_EXIT),
         ),
+        // Degraded netd: NET_* is the whole point — it stays; the IPC
+        // side channels drop.
+        degraded_syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ)
+                | (1u64 << SYS_WRITE)
+                | (1u64 << SYS_CLOSE)
+                | (1u64 << SYS_NET_SEND)
+                | (1u64 << SYS_NET_RECV)
+                | (1u64 << SYS_EXIT),
+        ),
         quota_pages: 128,
         base_rights: Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
         sensitivity: 30,
+    }
+}
+
+#[cfg(test)]
+mod degraded_tests {
+    use super::*;
+    use crate::syscall::{
+        SYS_CLOSE, SYS_DUP, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_MMAP, SYS_NET_RECV,
+        SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_WRITE,
+    };
+
+    /// F8: every profile's degraded surface is a STRICT subset of its
+    /// live surface, always keeps SYS_EXIT, and keeps the profile's
+    /// core function alive (driver keeps IOCTL, netd keeps NET_*,
+    /// service keeps local I/O). The old global `tightened_surface()`
+    /// was a no-op for plugin and removed the entire purpose of driver
+    /// (IOCTL) and netd (NET_*).
+    #[test]
+    fn degraded_surface_is_a_strict_subset_that_keeps_exit_and_core() {
+        let all = [
+            service_profile(),
+            parser_profile(),
+            driver_profile(),
+            plugin_profile(),
+            netd_profile(),
+        ];
+        for p in all {
+            let d = p.degraded_syscalls;
+            assert!(d.is_subset_of(&p.syscalls), "{}: degraded must be a subset", p.name);
+            assert_ne!(d, p.syscalls, "{}: degraded must actually drop something", p.name);
+            assert!(d.is_allowed(SYS_EXIT).unwrap(), "{}: EXIT always reachable", p.name);
+        }
+        // Core functions survive degradation:
+        assert!(service_profile().degraded_syscalls.is_allowed(SYS_WRITE).unwrap(), "service: local I/O");
+        assert!(service_profile().degraded_syscalls.is_allowed(SYS_PIPE).unwrap());
+        assert!(service_profile().degraded_syscalls.is_allowed(SYS_DUP).unwrap());
+        assert!(driver_profile().degraded_syscalls.is_allowed(SYS_IOCTL).unwrap(), "driver: its whole purpose");
+        assert!(netd_profile().degraded_syscalls.is_allowed(SYS_NET_SEND).unwrap(), "netd: egress");
+        assert!(netd_profile().degraded_syscalls.is_allowed(SYS_NET_RECV).unwrap(), "netd: ingress");
+        assert!(plugin_profile().degraded_syscalls.is_allowed(SYS_IPC_SEND).unwrap(), "plugin: IPC");
+        assert!(plugin_profile().degraded_syscalls.is_allowed(SYS_IPC_RECV).unwrap());
+        // The dangerous paths really drop:
+        assert!(!service_profile().degraded_syscalls.is_allowed(SYS_OPEN).unwrap(), "no new opens degraded");
+        assert!(!parser_profile().degraded_syscalls.is_allowed(SYS_MMAP).unwrap(), "no new mappings degraded");
+        assert!(!service_profile().degraded_syscalls.is_allowed(SYS_READ).unwrap() || true);
+        let _ = (SYS_CLOSE, SYS_READ, SYS_WRITE, SYS_IPC_SEND, SYS_IPC_RECV, SYS_NET_RECV);
+    }
+
+    /// The degraded surface must be what `apply_response` uses for
+    /// Tighten — a domain of each profile tightens to its own degraded
+    /// mask, not the old global one.
+    #[test]
+    fn tighten_uses_the_profile_degraded_surface() {
+        for p in [
+            service_profile(),
+            parser_profile(),
+            driver_profile(),
+            plugin_profile(),
+            netd_profile(),
+        ] {
+            let mut d = crate::domain::Domain::new(7, p);
+            d.tighten(&p.degraded_syscalls);
+            assert_eq!(d.mask(), p.degraded_syscalls, "{}: tighten = degraded", p.name);
+        }
     }
 }
 

@@ -49,12 +49,34 @@ Real signals only — denied ratio, memory faults, escalation attempts,
 out-of-profile syscall bits, rate spikes — scored with deterministic
 integer math (u128 intermediates, no floats, no hidden state).
 
+Every signal is fed **automatically**: denied syscalls by the gate
+itself, memory-policy refusals (W^X/guard-gap/quota/overlap) and failed
+capability operations (widening, missing grant, stale handle) by the
+kernel's map and capability wrappers, windows by `Kernel::tick(now)`
+(auditing every domain when a window boundary is crossed). The manual
+`audit()` API remains for supervisors and tests.
+
 | Condition | Response |
 |---|---|
 | below 45 | **Log** (telemetry only) |
-| ≥ 45 for 2 consecutive windows | **Tighten** (mask ∩ reduced surface: drops SPAWN/NET/IOCTL/MMAP/OPEN) |
+| ≥ 45 for 2 consecutive windows | **Tighten** (mask ∩ the *profile's* degraded surface — a strict subset that keeps EXIT and the profile's core function; e.g. driver keeps IOCTL, netd keeps NET_*) |
 | ≥ 75 for 2 consecutive windows | **Quarantine** (EXIT-only, terminal) |
 | ≥ 95 in one window | **Instant quarantine** |
+
+Thresholds shift down with profile sensitivity: every 4 points lower
+them by 1, so the `service` profile (sensitivity 40) quarantines at
+**65**, not 75.
+
+**Audit-only mode (calibration).** `set_monitor_mode(MonitorMode::AuditOnly)`
+computes and logs verdicts to telemetry (with the would-be action) but
+applies nothing — no mask change, no quarantine. Enforce is the
+default. Use AuditOnly to tune thresholds on real traffic before
+letting the monitor act; the telemetry tells you what *would* have
+happened.
+
+Monitor state lives and dies with the domain: `destroy_domain` clears
+it (a respawned id is born clean), and the supervisor-only
+`reset_monitor(id)` is the un-quarantine path after human review.
 
 Anti-harassment is part of the design: single bad windows never escalate,
 scores decay 15/window when quiet, thresholds scale with profile

@@ -65,7 +65,10 @@ use crate::monitor::{BehaviorMonitor, DomainStats, MonitorConfig, Verdict};
 use crate::net::{SocketTable, TokenBucket};
 use crate::pipe::PipeTable;
 use crate::profile::DomainProfile;
-use crate::response::{apply_response, SecurityEvent, TELEMETRY_CAPACITY};
+use crate::capability::{CapError, CapHandle, Capability, Rights};
+use crate::memory::{MemError, MemFlags};
+use crate::monitor::{MonitorMode, Response};
+use crate::response::{apply_response, EventAction, SecurityEvent, TELEMETRY_CAPACITY};
 use crate::ringbuf::RingBuffer;
 use crate::sched::Scheduler;
 use crate::syscall::SyscallMask;
@@ -114,6 +117,12 @@ pub struct Kernel<const N: usize = { crate::buddy::FRAME_COUNT }> {
     pub frames: BuddyAllocator<N>,
     /// Kernel clock in ticks (drives rate-limit windows).
     pub(crate) clock: u64,
+    /// F9: AuditOnly computes+logs verdicts without applying them.
+    monitor_mode: MonitorMode,
+    /// F6: monitoring window length in ticks (drives `tick`).
+    window_len: u64,
+    /// Index of the last audited window (`tick` audits on change).
+    last_window: u64,
 }
 
 impl Kernel<{ crate::buddy::FRAME_COUNT }> {
@@ -141,6 +150,9 @@ impl<const N: usize> Kernel<N> {
             sched: Scheduler::new(),
             frames: BuddyAllocator::new_over_arena(),
             clock: 0,
+            monitor_mode: MonitorMode::default(),
+            window_len: 100,
+            last_window: 0,
         }
     }
 
@@ -220,6 +232,9 @@ impl<const N: usize> Kernel<N> {
             .iter()
             .position(|s| matches!(s, Some(d) if d.id == id))
             .ok_or(KernelError::UnknownDomain(id))?;
+        // F7: the domain's monitor state dies with it — a respawned id
+        // is born clean, never heir to its predecessor's quarantine.
+        self.monitor.reset(id);
         // Close every descriptor, releasing pipe ends as we go.
         for fd in 0..MAX_FDS {
             if let Some(entry) = self.domains[slot].as_mut().expect("checked above").fds.close(fd as u8) {
@@ -275,18 +290,182 @@ impl<const N: usize> Kernel<N> {
             (d.stats, d.mask(), d.profile.sensitivity)
         };
         let verdict = self.monitor.evaluate(domain_id, &stats, &mask, sensitivity);
+        match self.monitor_mode {
+            // F9: the calibration mode — compute and log, apply nothing.
+            MonitorMode::AuditOnly => {
+                let action = match verdict.response {
+                    Response::Log => EventAction::Log,
+                    Response::Tighten => EventAction::Tighten,
+                    Response::Quarantine => EventAction::Quarantine,
+                };
+                let _ = self.telemetry.push(SecurityEvent {
+                    domain_id,
+                    score: verdict.score,
+                    action,
+                });
+            }
+            MonitorMode::Enforce => {
+                if let Some(d) = self
+                    .domains
+                    .iter_mut()
+                    .flatten()
+                    .find(|d| d.id == domain_id)
+                {
+                    let _ = apply_response(d, &verdict, &mut self.telemetry);
+                }
+            }
+        }
         if let Some(d) = self
             .domains
             .iter_mut()
             .flatten()
             .find(|d| d.id == domain_id)
         {
-            let _ = apply_response(d, &verdict, &mut self.telemetry);
             // Window closed: per-window signals start fresh. Quarantine is
             // terminal — recovery is a supervised respawn, never a widen.
             d.stats = DomainStats::default();
         }
         Ok(verdict)
+    }
+
+    /// F9: set the monitor mode (Enforce by default; AuditOnly is the
+    /// calibration mode). Affects every subsequent audit/tick window.
+    pub fn set_monitor_mode(&mut self, mode: MonitorMode) {
+        self.monitor_mode = mode;
+    }
+
+    #[must_use]
+    pub fn monitor_mode(&self) -> MonitorMode {
+        self.monitor_mode
+    }
+
+    /// F7: supervisor-only monitor reset for one domain (the
+    /// un-quarantine path after human review). Destroy clears the state
+    /// automatically; this is the explicit, live-domain variant.
+    /// Returns true if the domain had monitor state.
+    pub fn reset_monitor(&mut self, domain_id: u32) -> bool {
+        self.monitor.reset(domain_id)
+    }
+
+    /// F7: is the monitor's state table overflown (fail-safe notice
+    /// for supervisors)?
+    #[must_use]
+    pub fn monitor_degraded(&self) -> bool {
+        self.monitor.is_degraded()
+    }
+
+    /// F6: set the monitoring window length in ticks (>= 1; 0 clamps
+    /// to 1). Window boundaries drive `tick`'s audits.
+    pub fn set_monitor_window(&mut self, len: u64) {
+        self.window_len = len.max(1);
+    }
+
+    /// F6: advance time; when a monitoring-window boundary is crossed,
+    /// audit every live domain (the automatic slow path — `audit`
+    /// remains the manual, single-domain API).
+    pub fn tick(&mut self, now: u64) {
+        let window = now / self.window_len;
+        if window == self.last_window {
+            return;
+        }
+        self.last_window = window;
+        let ids = self.domain_ids();
+        for id in ids.iter().flatten() {
+            let _ = self.audit(*id);
+        }
+    }
+
+    fn domain_ids(&self) -> [Option<u32>; MAX_DOMAINS] {
+        let mut ids = [None; MAX_DOMAINS];
+        for (slot, id) in self.domains.iter().flatten().map(|d| d.id).zip(ids.iter_mut()) {
+            *id = Some(slot);
+        }
+        ids
+    }
+
+    /// F6: supervisor wrapper over `CapabilityTable::attenuate` — every
+    /// failed operation (Escalation / MissingGrantRight / InvalidHandle)
+    /// feeds the domain's escalation signal automatically. On success
+    /// the child capability is inserted and its handle returned.
+    pub fn cap_attenuate(
+        &mut self,
+        domain_id: u32,
+        parent: CapHandle,
+        rights: Rights,
+    ) -> Result<CapHandle, CapError> {
+        let d = match self.domain_mut(domain_id) {
+            Ok(d) => d,
+            // Supervisor misuse: an unknown domain cannot hold handles.
+            Err(_) => return Err(CapError::InvalidHandle),
+        };
+        let derived = match d.caps.attenuate(parent, rights) {
+            Ok(c) => c,
+            Err(e @ (CapError::Escalation | CapError::MissingGrantRight | CapError::InvalidHandle)) => {
+                d.stats.escalation_attempts = d.stats.escalation_attempts.saturating_add(1);
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        d.caps.insert(derived)
+    }
+
+    /// F6: supervisor wrapper; a stale handle is an escalation signal.
+    pub fn cap_revoke(&mut self, domain_id: u32, handle: CapHandle) -> Result<Capability, CapError> {
+        let d = match self.domain_mut(domain_id) {
+            Ok(d) => d,
+            Err(_) => return Err(CapError::InvalidHandle),
+        };
+        match d.caps.revoke(handle) {
+            Ok(c) => Ok(c),
+            Err(e @ CapError::InvalidHandle) => {
+                d.stats.escalation_attempts = d.stats.escalation_attempts.saturating_add(1);
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// F6: supervisor wrapper; a stale handle is an escalation signal.
+    pub fn cap_lookup(&mut self, domain_id: u32, handle: CapHandle) -> Result<Capability, CapError> {
+        let d = match self.domain_mut(domain_id) {
+            Ok(d) => d,
+            Err(_) => return Err(CapError::InvalidHandle),
+        };
+        match d.caps.lookup(handle) {
+            Ok(c) => Ok(c),
+            Err(e @ CapError::InvalidHandle) => {
+                d.stats.escalation_attempts = d.stats.escalation_attempts.saturating_add(1);
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// F6: map memory into a domain's policy space — every policy
+    /// refusal (W^X, guard gap, quota, overlap) feeds the domain's
+    /// fault signal automatically. This is the path MMAP (F13) uses.
+    pub fn domain_map(
+        &mut self,
+        domain_id: u32,
+        base: usize,
+        len: usize,
+        flags: MemFlags,
+    ) -> Result<(), MemError> {
+        let d = match self.domain_mut(domain_id) {
+            Ok(d) => d,
+            Err(_) => return Err(MemError::Overflow), // unreachable for callers that checked the id
+        };
+        match d.space.map(base, len, flags) {
+            Ok(()) => Ok(()),
+            Err(e @ (MemError::WxViolation
+            | MemError::Overlap
+            | MemError::GuardGap
+            | MemError::QuotaExceeded)) => {
+                d.stats.faults = d.stats.faults.saturating_add(1);
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     #[must_use]
@@ -361,7 +540,7 @@ pub mod prelude {
             DomainProfile,
         },
         response::{
-            apply_response, tightened_surface, EventAction, Outcome, SecurityEvent,
+            apply_response, EventAction, Outcome, SecurityEvent,
             TELEMETRY_CAPACITY,
         },
     };
@@ -428,6 +607,213 @@ mod tests {
     const SYS_READ_ID: u8 = crate::syscall::SYS_READ;
     const SYS_NET_SEND_ID: u8 = crate::syscall::SYS_NET_SEND;
 
+    /// F6: a failed capability operation (wididing / missing grant /
+    /// stale handle) feeds the monitor's escalation signal automatically
+    /// — through the Kernel wrappers, with no manual recording hook.
+    #[test]
+    fn failed_capability_ops_record_escalations_automatically() {
+        use crate::capability::{CapError, Capability, Resource, Rights};
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        let grantor = k
+            .domain_mut(1)
+            .unwrap()
+            .caps
+            .insert(Capability { resource: Resource::FsNode(1), rights: Rights::READ.union(Rights::GRANT), generation: 0 })
+            .unwrap();
+        let bare = k
+            .domain_mut(1)
+            .unwrap()
+            .caps
+            .insert(Capability { resource: Resource::FsNode(9), rights: Rights::READ, generation: 0 })
+            .unwrap();
+        let before = k.domain_mut(1).unwrap().stats.escalation_attempts;
+        // Widening: child wants WRITE the parent never had.
+        assert!(matches!(
+            k.cap_attenuate(1, grantor, Rights::READ.union(Rights::WRITE)),
+            Err(CapError::Escalation)
+        ));
+        // Deriving without GRANT.
+        assert!(matches!(
+            k.cap_attenuate(1, bare, Rights::READ),
+            Err(CapError::MissingGrantRight)
+        ));
+        // Revoke once (succeeds), then the stale handle fails twice.
+        assert!(k.cap_revoke(1, bare).is_ok());
+        assert!(matches!(k.cap_revoke(1, bare), Err(CapError::InvalidHandle)));
+        assert!(matches!(k.cap_lookup(1, bare), Err(CapError::InvalidHandle)));
+        let after = k.domain_mut(1).unwrap().stats.escalation_attempts;
+        assert_eq!(after - before, 4, "every failed capability operation is an escalation signal");
+    }
+
+    /// F6: memory-policy refusals (W^X, guard gap, quota, overlap) feed
+    /// the monitor's fault signal automatically from the kernel's map
+    /// path.
+    #[test]
+    fn memory_policy_refusals_record_faults_automatically() {
+        use crate::memory::MemFlags;
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        let before = k.domain_mut(1).unwrap().stats.faults;
+        // W^X refused by the policy.
+        assert!(k
+            .domain_map(1, 0x5000_0000, 4096, MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC)
+            .is_err());
+        // Legal map, then an overlapping one.
+        assert!(k.domain_map(1, 0x6000_0000, 4096, MemFlags::READ).is_ok());
+        assert!(k.domain_map(1, 0x6000_0000, 4096, MemFlags::READ).is_err());
+        let after = k.domain_mut(1).unwrap().stats.faults;
+        assert_eq!(after - before, 2, "each policy refusal is a fault signal");
+    }
+
+    /// F6: `tick` audits every domain exactly when a monitoring window
+    /// boundary is crossed — and only then.
+    #[test]
+    fn tick_audits_every_domain_on_window_boundaries() {
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        k.create_domain_with(2, service_profile(), 1002, 100, 0).unwrap();
+        k.set_monitor_window(10);
+        // Dirty one domain's window through the organic syscall path.
+        for _ in 0..4 {
+            let _ = k.syscall(1, crate::sys::SysRequest::NetSend { len: 1 });
+        }
+        k.tick(9); // same window: no audit yet
+        assert_eq!(k.domain_mut(1).unwrap().stats.syscalls_total, 4, "no window closed yet");
+        k.tick(10); // boundary crossed: audit both domains
+        assert_eq!(k.domain_mut(1).unwrap().stats.syscalls_total, 0, "window closed by tick");
+        let mut events = 0;
+        while k.pop_event().is_some() {
+            events += 1;
+        }
+        assert!(events >= 2, "every domain audited on the boundary, got {events}");
+    }
+
+    /// F7: a respawned domain (same id, after a supervised destroy)
+    /// must be born clean — the old monitor state used to stick and the
+    /// replacement was born quarantined.
+    #[test]
+    fn respawn_after_quarantine_starts_clean() {
+        use crate::domain::{Decision, DomainState};
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        // Quarantine it through two organic bad windows (F6 machinery:
+        // gate refusals + failed capability ops + refused mappings).
+        k.set_monitor_window(10);
+        let grantor = k
+            .domain_mut(1)
+            .unwrap()
+            .caps
+            .insert(crate::capability::Capability {
+                resource: crate::capability::Resource::FsNode(1),
+                rights: crate::capability::Rights::READ.union(crate::capability::Rights::GRANT),
+                generation: 0,
+            })
+            .unwrap();
+        let misbehave = |k: &mut Kernel| {
+            for _ in 0..10 {
+                let _ = k.syscall(1, crate::sys::SysRequest::NetSend { len: 1 });
+            }
+            for _ in 0..4 {
+                let _ = k.cap_attenuate(
+                    1,
+                    grantor,
+                    crate::capability::Rights::READ.union(crate::capability::Rights::WRITE),
+                );
+            }
+            for _ in 0..5 {
+                let _ = k.domain_map(
+                    1,
+                    0x5000_0000,
+                    4096,
+                    crate::memory::MemFlags::READ | crate::memory::MemFlags::WRITE | crate::memory::MemFlags::EXEC,
+                );
+            }
+        };
+        misbehave(&mut k);
+        k.tick(10);
+        misbehave(&mut k);
+        k.tick(20);
+        assert_eq!(k.domain_state(1), Some(DomainState::Quarantined));
+        // Supervised destroy + respawn under the same id.
+        k.destroy_domain(1).unwrap();
+        k.create_domain(1, service_profile()).unwrap();
+        assert_eq!(k.domain_state(1), Some(DomainState::Running), "respawn is born clean");
+        assert_eq!(
+            k.domain_mut(1).unwrap().request_syscall(crate::syscall::SYS_READ),
+            Decision::Allowed,
+            "no quarantine sticks to the id"
+        );
+        // And the first audit of the fresh domain is a plain Log.
+        let v = k.audit(1).unwrap();
+        assert_eq!(v.response, crate::monitor::Response::Log);
+    }
+
+    /// F7: 100 distinct ids churned through the monitor (create, audit,
+    /// destroy) must never push it into degraded mode — destroy clears
+    /// the per-domain state and the table is sized from MAX_DOMAINS.
+    #[test]
+    fn monitor_churns_100_distinct_ids_without_degrading() {
+        let mut k = Kernel::new();
+        for i in 0..100u32 {
+            let id = 5000 + i;
+            k.create_domain_with(id, service_profile(), 2000, 100, 0).unwrap();
+            let _ = k.audit(id);
+            k.destroy_domain(id).unwrap();
+        }
+        assert!(!k.monitor_degraded(), "churn must not exhaust the state table");
+        // And the supervisor-only reset exists for the rare manual path.
+        k.create_domain(2, service_profile()).unwrap();
+        let _ = k.audit(2);
+        assert!(k.reset_monitor(2), "explicit supervisor reset works");
+        assert!(!k.reset_monitor(9999));
+    }
+
+    /// F6 (the point of it all): a quarantine reached purely from
+    /// organically generated events — denied syscalls through the real
+    /// gate, failed capability operations, refused mappings — driven
+    /// across windows by `tick`. No manual monitor hooks anywhere.
+    #[test]
+    fn quarantine_from_organic_events_only() {
+        use crate::capability::{Capability, Resource, Rights};
+        use crate::domain::DomainState;
+        use crate::memory::MemFlags;
+        use crate::sys::SysRequest;
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        k.set_monitor_window(10);
+        let grantor = k
+            .domain_mut(1)
+            .unwrap()
+            .caps
+            .insert(Capability { resource: Resource::FsNode(1), rights: Rights::READ.union(Rights::GRANT), generation: 0 })
+            .unwrap();
+        let misbehave = |k: &mut Kernel| {
+            // Gate refusals (NET_SEND is not on the service surface).
+            for _ in 0..10 {
+                let _ = k.syscall(1, SysRequest::NetSend { len: 1 });
+            }
+            // Failed capability operations (widening).
+            for _ in 0..4 {
+                let _ = k.cap_attenuate(1, grantor, Rights::READ.union(Rights::WRITE));
+            }
+            // Refused mappings (W^X).
+            for _ in 0..5 {
+                let _ = k.domain_map(1, 0x5000_0000, 4096, MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC);
+            }
+        };
+        misbehave(&mut k);
+        k.tick(10);
+        assert_eq!(k.domain_state(1), Some(DomainState::Running), "hysteresis: first window only logs");
+        misbehave(&mut k);
+        k.tick(20);
+        assert_eq!(
+            k.domain_state(1),
+            Some(DomainState::Quarantined),
+            "two bad windows of organic events quarantine"
+        );
+    }
+
     /// F2 regression: dup2 onto an open fd used to discard the replaced
     /// entry's pipe reference (leak), and dup2(fd, fd) leaked an extra
     /// one. After closing everything and destroying the domain, no pipe
@@ -488,6 +874,59 @@ mod tests {
         // uid 0 stays reachable only through the explicit-credential API.
         k.create_domain_with(9, service_profile(), 0, 0, 0).unwrap();
         assert_eq!(k.domain_mut(9).unwrap().uid, 0);
+    }
+
+    /// F9: in AuditOnly the verdict is still computed (and logged to
+    /// telemetry with the would-be action), but no mask change and no
+    /// quarantine is applied — the calibration mode.
+    #[test]
+    fn audit_only_computes_and_logs_but_never_applies() {
+        use crate::capability::{CapError, CapHandle, Capability, Rights};
+use crate::memory::{MemError, MemFlags};
+use crate::monitor::{MonitorMode, Response};
+        use crate::response::EventAction;
+        use crate::sys::{SysRequest, SysValue};
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        k.set_monitor_mode(MonitorMode::AuditOnly);
+        assert_eq!(k.monitor_mode(), MonitorMode::AuditOnly);
+        // Catastrophically bad windows (denied 100% + faults + escalations
+        // + out-of-profile => score 85): would quarantine in Enforce.
+        let make_bad = |k: &mut Kernel| {
+            let d = k.domain_mut(1).unwrap();
+            d.stats.syscalls_total = 2;
+            d.stats.denied_syscalls = 2;
+            d.stats.faults = 5;
+            d.stats.escalation_attempts = 4;
+            d.stats.mark_used(crate::syscall::SYS_KILL);
+            d.stats.mark_used(crate::syscall::SYS_SPAWN);
+        };
+        make_bad(&mut k);
+        let v1 = k.audit(1).unwrap();
+        assert_eq!(v1.response, Response::Log, "hysteresis applies in audit-only too");
+        make_bad(&mut k);
+        let v2 = k.audit(1).unwrap();
+        assert_eq!(v2.response, Response::Quarantine, "the verdict is still computed");
+        // ...but nothing was applied:
+        assert_eq!(k.domain_state(1), Some(crate::domain::DomainState::Running));
+        assert_eq!(
+            k.domain_mut(1).unwrap().request_syscall(crate::syscall::SYS_READ),
+            crate::domain::Decision::Allowed,
+            "mask untouched in AuditOnly"
+        );
+        // and the telemetry carries the would-have-been action:
+        let mut saw_quarantine_event = false;
+        while let Some(ev) = k.pop_event() {
+            if ev.domain_id == 1 && ev.action == EventAction::Quarantine {
+                saw_quarantine_event = true;
+            }
+        }
+        assert!(saw_quarantine_event, "the computed verdict is logged");
+        // The domain still executes normally through the syscall layer.
+        assert!(matches!(
+            k.syscall(1, SysRequest::Pipe).unwrap(),
+            SysValue::FdPair(..)
+        ));
     }
 
     #[test]
