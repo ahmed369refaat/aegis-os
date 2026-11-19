@@ -2,7 +2,7 @@
 name = "aegis-os"
 version = "0.1.0"
 edition = "2021"
-description = "AegisOS core: Unix-philosophy OS building blocks with strict per-domain isolation, attenuation-only syscall masks, capability tables, W^X memory policy and a graduated AI behavior monitor (no_std, zero dependencies)."
+description = "AegisOS core: a no_std, zero-dependency policy kernel combining Linux-like semantics (VFS with Unix permissions and chroot, pipes, signals, fd tables, CFS scheduling, buddy allocator, rate-limited brokered sockets) with strict per-domain isolation, attenuation-only syscall masks, capabilities, W^X memory and a graduated AI behavior monitor."
 license = "MIT"
 
 [lib]
