@@ -8,6 +8,8 @@
 //!   `try_narrow_to` rejects any derivation that would add a bit). There is
 //!   no code path in the kernel that widens a live domain's mask.
 
+use crate::domain::Decision;
+
 /// Read from a file/object.
 pub const SYS_READ: u8 = 0;
 /// Write to a file/object.
@@ -142,6 +144,32 @@ impl SyscallMask {
     }
 }
 
+/// The pure syscall gate (PR-1.4): the decision every caller gets, with
+/// no accounting. Extracted verbatim from `Domain::request_syscall` so
+/// kernel-resident domains and Ring-3 domains (whose hardware context
+/// lives outside the lib) run **the same gate code** — one policy, two
+/// execution sites.
+///
+/// Order matters and is load-bearing: unknown ids are bad before any
+/// state check; a quarantined domain may only ever EXIT; the mask is
+/// consulted last. `Domain::request_syscall` layers its behavioral
+/// accounting on top of exactly this decision.
+pub fn gate(mask: &SyscallMask, quarantined: bool, id: u8) -> Decision {
+    if id >= SYSCALL_COUNT {
+        return Decision::BadSyscall(id);
+    }
+    if quarantined {
+        if id == SYS_EXIT {
+            return Decision::Allowed;
+        }
+        return Decision::DeniedQuarantined(id);
+    }
+    if !mask.is_allowed(id).unwrap_or(false) {
+        return Decision::DeniedByMask(id);
+    }
+    Decision::Allowed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +273,22 @@ mod tests {
         let m = SyscallMask::from_ids(&[SYS_EXIT]).unwrap();
         assert_eq!(m.bits(), 1u64 << SYS_EXIT);
         assert_eq!(SyscallMask::from_bits(m.bits()), m);
+    }
+
+    #[test]
+    fn gate_matches_the_domain_semantics() {
+        use super::*;
+        let m = SyscallMask::from_ids(&[SYS_READ, SYS_WRITE, SYS_EXIT]).unwrap();
+        // Unknown id: bad before any state check.
+        assert_eq!(gate(&m, false, 200), Decision::BadSyscall(200));
+        assert_eq!(gate(&m, true, 200), Decision::BadSyscall(200));
+        // Quarantine: only EXIT passes.
+        assert_eq!(gate(&m, true, SYS_READ), Decision::DeniedQuarantined(SYS_READ));
+        assert_eq!(gate(&m, true, SYS_EXIT), Decision::Allowed);
+        // Mask decides the rest.
+        assert_eq!(gate(&m, false, SYS_WRITE), Decision::Allowed);
+        assert_eq!(gate(&m, false, SYS_KILL), Decision::DeniedByMask(SYS_KILL));
+        // Empty mask denies everything except (unquarantined) nothing.
+        assert_eq!(gate(&SyscallMask::NONE, false, SYS_EXIT), Decision::DeniedByMask(SYS_EXIT));
     }
 }

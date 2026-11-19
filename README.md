@@ -4,21 +4,22 @@
 
 [![CI](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml/badge.svg)](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests: 261](https://img.shields.io/badge/tests-261%20passing-brightgreen.svg)](tests/)
-[![Boot](https://img.shields.io/badge/boots%20in%20QEMU-per--domain%20page%20tables%20green-brightgreen.svg)](#quick-start)
+[![Tests: 265](https://img.shields.io/badge/tests-265%20passing-brightgreen.svg)](tests/)
+[![Boot](https://img.shields.io/badge/boots%20in%20QEMU-ring--3%20entry%20armed%20(env--blocked)%20green-brightgreen.svg)](#quick-start)
 
 > The name: **Aegis** (the shield). One rule shapes the whole design: everything runs inside an isolated `Domain`, and every privilege is granted once and can only ever shrink.
 
 ## Current status — honestly stated
 
-**Done and proven (M0 + M1 + PR-1.1 + PR-1.2 + PR-1.3):**
+**Done and proven (M0 + M1 + PR-1.1 + PR-1.2 + PR-1.3; PR-1.4 built, status note inside):**
 
 - The full policy kernel as a library: attenuation-only syscall masks, capability generations, W^X memory policy, VFS with Unix DAC + chroot, pipes/signals/fd tables, CFS scheduling, rate-limited brokered sockets, behavior monitor with graduated response. **196 tests.**
 - A bootable x86_64 system, two-stage (QEMU's `-kernel` loader rejects ELF64 — discovered on the first CI boot run): a pure-asm ELF32 multiboot stub (`boot-x86_64/`) sets up identity paging and long mode, then runs the 64-bit kernel (`kernel-x86_64/`, embedded at its 2 MiB link base) over real RAM: a physical frame pool (256 × 4 KiB at 16 MiB) behind the policy core's buddy allocator with **scrub-on-free verified by read-back**, and the M1 exit-criteria sequence running on boot: a hello domain scheduled by CFS, the monitor escalating an attacker across five windows while the healthy neighbor keeps running, and 1000 create/destroy cycles with zero frame leaks.
+- **SYSCALL/SYSRET entry + ring-3 machinery (Stage 1 / PR-1.4)**: the GDT carries the STAR slot arithmetic (host-test-pinned), the naked SYSCALL entry (swapgs, dedicated stack, 12-quadword SysV-aligned frame, TSC round-trip, sysretq), the shared policy gate extracted into `syscall::gate` (one door for kernel-resident and ring-3 domains, full-width nr bounds check), SYS_WRITE with per-page user-pointer validation, the CPL3-fault record/resume scaffolding, example user blobs (`examples/ring3-*`), and `make test-qemu-pr14`. **Status, honestly**: in this sandbox's QEMU (TCG, no KVM) the first user-context fault cannot be relayed by the inter-privilege delivery path — everything else verified bit-for-bit, and one build did reach ring-3 executing real gated syscalls; the boot ends the chapter with an explicit `launch blocked` verdict + clean poweroff, and the full marker set is required the moment the environment allows it (`docs/arch/syscall-entry.md`).
 - **Per-domain page tables (Stage 1 / PR-1.3)**: the lib's ten-check memory policy is the gate, and its decisions become hardware — `map_region` policy-checks first, then backs every accepted page with a scrubbed pool frame and a live PTE (U set, NX unless executable, guard gaps as **absent** pages). Two domains, disjoint tables, the same VA resolving to different frames — proven live in QEMU, including an NX exec fault that resumes cleanly and a guard-gap read that faults with CR2 naming the page. Pool grows to 4096 frames (16..32 MiB); `mm` stays unsafe-free. **11 new host tests** pin the walk, the policy gating, and unmap/rollback.
 - **Higher-half kernel + direct map (Stage 1 / PR-1.2, ADR-0002)**: the kernel links at `0xFFFFFFFF80000000` (loaded at PA 2 MiB via a linker `AT()` + objcopy-by-LMA split), the stub maps three windows before entry — kernel image, direct map (`0xFFFF888000000000`+PA, RW, never X), and a bring-up identity window the kernel **tears down and proves dead** right after entry. Guarded kernel stacks (absent-PTE guard pages, pool-backed, scrub-on-free) fault for real when run over; per-CPU state is anchored at the GS base. The `mm` layer itself is unsafe-free by design. **7 new host tests** pin the translation and slot arithmetic.
 - **Exception machinery (Stage 1 / PR-1.1)**: a kernel-owned GDT/TSS/IDT with a uniform exception frame, IST stacks for `#DF/#NMI/#MC/#SS`, and a live negative test — the boot forces a hardware `#DE` and the dispatch prints the diagnosis and the selftest marker before powering off. Every fault from here on is diagnosed, not a silent hang. **11 new host tests pin the descriptor/frame encodings, including the boot-stub GDT literals as an ABI contract.**
-- Unsafe policy enforced by machine, not convention: the policy core is `forbid(unsafe_code)`; the kernel is `deny(unsafe_code)` with a four-module allowlist (`arch/`, `boot/`, `hw.rs`, `memops.rs`), every item carrying a `SAFETY` note, and a **ratchet** (`scripts/unsafe-count.txt`, baseline 39) that fails CI if the count grows without an ADR.
+- Unsafe policy enforced by machine, not convention: the policy core is `forbid(unsafe_code)`; the kernel is `deny(unsafe_code)` with a four-module allowlist (`arch/`, `boot/`, `hw.rs`, `memops.rs`), every item carrying a `SAFETY` note, and a **ratchet** (`scripts/unsafe-count.txt`, baseline 61) that fails CI if the count grows without an ADR.
 
 **Not yet (roadmap v2, see [`docs/ROADMAP.md`](docs/ROADMAP.md)):** the hardware isolation boundary itself — Ring-3 user domains and SYSCALL/SYSRET entry (PR-1.4/1.5 of [`docs/STAGE1-PR-PLAN.md`](docs/STAGE1-PR-PLAN.md)), then IPC, block storage + ext2, preemption/SMP, the Linux-compatible syscall ABI, drivers, and hardening. Domains still run in Ring-0 with kernel-resident tables; since PR-1.3 every mapping is policy-gated *and* hardware-real (live PTEs, W^X, guard gaps).
 
@@ -33,7 +34,7 @@
 ./boot.sh --verify  # same, plus assert the M1 + exception-selftest markers
 
 cargo test                       # 196 policy-core tests
-cargo test -p aegis-kernel       # 52 host tests: boot logic + arch/mm/table encodings
+cargo test -p aegis-kernel       # 57 host tests: boot + arch/mm/gate/ring-3 encodings
 cargo build --target thumbv7em-none-eabihf   # the core still builds for bare-metal ARM
 ```
 
@@ -91,7 +92,7 @@ Docs: [`docs/ROADMAP.md`](docs/ROADMAP.md) (roadmap v2: the eight stages to a us
 
 ## Roadmap position
 
-Roadmap v2 turns this into a usable Unix-like core in eight stages (Ring-3 → IPC → storage → preemption/SMP → POSIX ABI → drivers → hardening → compliance; ≈ 65–80 PRs). **Current position: Stage 1, PR-1.1 + PR-1.2 + PR-1.3 merged** — exception machinery, the higher-half/direct-map layout, and per-domain page tables are live and selftested on every boot. Next: PR-1.4 (SYSCALL/SYSRET entry + the first Ring-3 domain), then the Stage-1 exit: a shell-less but real user space. Every stage gate is CI-verified: a stage does not start before the previous one's acceptance markers pass in QEMU.
+Roadmap v2 turns this into a usable Unix-like core in eight stages (Ring-3 → IPC → storage → preemption/SMP → POSIX ABI → drivers → hardening → compliance; ≈ 65–80 PRs). **Current position: Stage 1, PR-1.1..1.3 merged and fully green; PR-1.4 built and armed with an honest environment-blocked verdict in this sandbox's QEMU** (machinery host-tested; retry on a KVM host via `make test-qemu-pr14`). Next: PR-1.5 (faults to SIGSEGV + audit trail) — its CPL3-fault scaffolding is already in place from PR-1.4.
 
 ## Repository layout
 

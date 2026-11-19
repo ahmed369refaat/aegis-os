@@ -17,6 +17,7 @@ path = "src/lib.rs"
 # at the root scoped to the policy library.
 [workspace]
 members = ["kernel-x86_64"]
+exclude = ["examples/ring3-hello", "examples/ring3-rogue"]
 default-members = ["."]
 
 [profile.release]

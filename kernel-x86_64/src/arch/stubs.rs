@@ -13,14 +13,17 @@
 
 use core::arch::naked_asm;
 
-/// Which vectors take an IST stack (index into TSS.ist) — see
-/// `docs/arch/exceptions.md` for why #PF is *not* on this list.
+/// Which vectors take an IST stack (index into TSS.ist). PR-1.4: #PF
+/// moves to IST5 — the inter-privilege RSP0 delivery path proved
+/// unreliable in this environment while IST delivery from CPL3 is
+/// proven working (see `docs/arch/syscall-entry.md`).
 const fn ist_for(vector: u8) -> u8 {
     match vector {
         8 => 1,  // #DF: the current stack may be the thing that is broken
         2 => 2,  // #NMI: can interrupt any context, including other ISTs
         18 => 3, // #MC: most severe, its own stack
         12 => 4, // #SS: a stack fault cannot trust that stack
+        14 => 5, // #PF: own stack since PR-1.4 (was: none)
         _ => 0,
     }
 }

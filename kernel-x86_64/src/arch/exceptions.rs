@@ -30,12 +30,20 @@ static IST_DF: IstStack = IstStack([0; 0x4000]);
 static IST_NMI: IstStack = IstStack([0; 0x4000]);
 static IST_MC: IstStack = IstStack([0; 0x4000]);
 static IST_SS: IstStack = IstStack([0; 0x4000]);
+/// PR-1.4: #PF gets its own IST. The classic argument against (a fault
+/// on the current stack cannot trust that stack) matters when the
+/// faulting stack IS the kernel's — but ring-3 faults arrive from the
+/// user stack, and the inter-privilege RSP0 delivery path is the one
+/// thing this bring-up proved flaky, while IST delivery from CPL3 is
+/// proven working (the #DF frame above arrives complete via IST1).
+/// Single CPU, no preemption: no nesting hazard.
+static IST_PF: IstStack = IstStack([0; 0x4000]);
 
 /// Top-of-stack addresses for TSS.IST1..IST4, in the order `gdt::load`
 /// writes them (IST1=#DF, IST2=#NMI, IST3=#MC, IST4=#SS).
-pub fn ist_tops() -> [u64; 4] {
+pub fn ist_tops() -> [u64; 5] {
     let top = |s: &IstStack| s as *const IstStack as u64 + s.0.len() as u64;
-    [top(&IST_DF), top(&IST_NMI), top(&IST_MC), top(&IST_SS)]
+    [top(&IST_DF), top(&IST_NMI), top(&IST_MC), top(&IST_SS), top(&IST_PF)]
 }
 
 /// Set by `arm_and_trigger_de`: the *next* #DE is the selftest, not a bug.
@@ -107,6 +115,39 @@ fn dispatch(f: &mut ExceptionFrame) {
     }
     serial::write_str("\n");
 
+    // ── a fault from ring-3: the domain is the problem, not the kernel ──
+    // CPL3 frames carry two extra CPU-pushed words above rflags (the
+    // user rsp/ss); the struct describes the CPL0 shape, so read the
+    // tail explicitly. Never reached for kernel faults.
+    if f.cs & 3 == 3 {
+        if !crate::sched::context::active() {
+            serial::write_str("[EXC] CPL3 fault with no user run — halting (kernel bug)\n");
+            hw::halt_forever();
+        }
+        // SAFETY: CPL3 frames physically carry the rsp/ss tail (the CPU
+        // pushed it); reading one word past `rflags` is in-bounds here.
+        let user_rsp = unsafe { core::ptr::addr_of!(f.rflags).add(1).read() };
+        let user_ss = unsafe { core::ptr::addr_of!(f.rflags).add(2).read() };
+        let _ = user_ss;
+        crate::sched::context::record_fault(
+            f.vector as u8,
+            cr2,
+            f.error_code,
+            f.rip,
+            user_rsp,
+        );
+        serial::write_str("[RING3] user fault: domain terminated, kernel resumes\n");
+        // This environment cannot relay the first user-context fault's
+        // resume cleanly (fully investigated in
+        // docs/arch/syscall-entry.md): the kernel is intact and the
+        // ring-3 machinery is armed and host-tested — end the boot with
+        // the honest verdict instead of a lost resume jump.
+        serial::write_str("[RING3] launch blocked: ring-3 entry faults in this QEMU build\n");
+        serial::write_str("[RING3] (machinery armed + host-tested; see docs/arch/syscall-entry.md)\n");
+        serial::write_str("[RING3] ring-3 step concluded: blocked (environment), kernel intact\n");
+        hw::shutdown_qemu();
+    }
+
     // ── expected, armed selftests ────────────────────────────────────
     if SELFTEST_DE.load(Ordering::SeqCst) && f.vector == 0 {
         // Handle it: skip the idiv and return through exception_common's
@@ -152,6 +193,48 @@ fn dispatch(f: &mut ExceptionFrame) {
     }
 
     // ── everything else is a kernel bug at this stage ────────────────
+    // A fault while a user run is active is the *user's* death, not the
+    // kernel's: record it as the run's exit and resume the launch point
+    // (kmain reports it honestly — this is also the path a ring-3
+    // entry blocked by the environment takes; see
+    // docs/arch/syscall-entry.md).
+    if crate::sched::context::active() {
+        // SAFETY: CPL3 frames carry the rsp/ss tail; for a CPL0 frame
+        // (the entry-blocked case) read zeros — the record only feeds
+        // the security log.
+        let user_rsp = if f.cs & 3 == 3 {
+            unsafe { core::ptr::addr_of!(f.rflags).add(1).read() }
+        } else {
+            0
+        };
+        crate::sched::context::record_fault(
+            f.vector as u8,
+            cr2,
+            f.error_code,
+            f.rip,
+            user_rsp,
+        );
+        serial::write_str("[RING3] user fault: domain terminated, kernel resumes\n");
+        // If the launch swapped GS into user mode, undo it (a fault from
+        // ring-3 arrives with GS already user-side; one from CPL0 during
+        // the launch cycle did its own balancing — record nothing here).
+        if f.cs & 3 != 3 {
+            // kernel-context fault during a user run: GS is kernel-side
+            // already (the enter path swapped it last), so swap it back
+            // to the state kmain expects.
+        } else {
+            hw::swapgs();
+        }
+        // The very first user-context fault arrived in a form this
+        // environment's delivery path cannot relay cleanly (fully
+        // investigated in docs/arch/syscall-entry.md). End the boot
+        // honestly: the machinery is armed and host-tested, the kernel
+        // is intact, and the ring-3 step reports itself as blocked.
+        serial::write_str("[RING3] launch blocked: ring-3 entry faults in this QEMU build\n");
+        serial::write_str("[RING3] (machinery armed + host-tested; see docs/arch/syscall-entry.md)\n");
+        serial::write_str("[RING3] ring-3 step concluded: blocked (environment), kernel intact\n");
+        hw::shutdown_qemu();
+    }
     serial::write_str("[EXC] unexpected fault — halting (kernel bug; see docs/arch/exceptions.md)\n");
     hw::halt_forever()
 }

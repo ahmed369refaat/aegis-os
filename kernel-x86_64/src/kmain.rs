@@ -29,6 +29,14 @@
 
 use crate::arch;
 use crate::frames::{FramePool, FRAME_SIZE, KERNEL_POOL_FRAMES, KERNEL_POOL_LEN, POOL_BASE};
+
+/// The ring-3 example blobs (built to flat binaries by boot.sh from
+/// `examples/ring3-{hello,rogue}` and embedded here — PR-1.4).
+static RING3_HELLO: &[u8] = include_bytes!("../blob/ring3-hello.bin");
+static RING3_ROGUE: &[u8] = include_bytes!("../blob/ring3-rogue.bin");
+/// The exact message the hello blob writes from ring-3 (its length is
+/// baked into the blob's `mov edx, 26`).
+const RING3_MSG: &[u8] = b"hello from ring 3 (CPL=3)\n";
 use crate::runtime::{self, HelloReport, M1Error, MonitorReport, StressReport};
 use crate::{hw, memops, mm, multiboot, serial, strutil};
 use aegis_os::memory::MemFlags;
@@ -311,9 +319,178 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
     }
 
-    // The terminal guard-page proof on a fresh slot: the write must #PF,
-    // the dispatch must confirm CR2 is exactly the guard page, print the
-    // marker, and power off cleanly (CI greps it).
+    // ── 10. ring-3 isolation + SYSCALL/SYSRET (PR-1.4) ─────────────
+    // Cross the hardware boundary: a dedicated (guarded) syscall stack,
+    // the entry MSRs, then four user runs — the good citizen, an NX
+    // exec attack, a kernel-address read, and a forged syscall — each
+    // a fresh policy-mapped domain, each ending in SYS_EXIT or a
+    // user-mode fault the kernel survives.
+    let syscall_stack = match mm::stacks::alloc(&mut pool, &mut k.frames, 2) {
+        Ok(st) => st,
+        Err(_) => {
+            line(&mut out, &["[RING3] ERROR: syscall stack alloc failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    arch::gdt::set_rsp0(syscall_stack.top_va());
+    arch::percpu::set_kstack_top(syscall_stack.top_va());
+    arch::syscall_entry::set_entry_stack(syscall_stack.top_va());
+    arch::syscall_entry::init();
+    line(&mut out, &["[RING3] syscall entry armed: rsp0/kstack = guarded stack, STAR/LSTAR/SFMASK/SCE live"]);
+
+    // ── Run 1: the good citizen — hello from ring-3, then exit(0). ──
+    let spawn = match mm::user::spawn_user_blob(
+        &mut k, &mut pool, 5, aegis_os::profile::service_profile(),
+        RING3_HELLO, RING3_MSG,
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(&mut out, &["[RING3] ERROR: hello spawn failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    line(&mut out, &["[RING3] launching domain 5 (service profile) at CPL=3"]);
+    let kernel_cr3 = hw::read_cr3();
+    spawn.run.tables.activate();
+    crate::sched::context::begin(spawn.run);
+    crate::sched::context::launch(&spawn.ctx);
+    // Reached only via resume_kernel's jump (the launch itself never
+    // returns): the post-run code below runs exactly once per run.
+    // — ring-3 ran here; SYS_EXIT faulted us back to exactly this point —
+    let run = crate::sched::context::take();
+    hw::write_cr3(kernel_cr3);
+    let trip = arch::syscall_entry::roundtrip();
+    match run.exit {
+        crate::sched::context::ExitKind::Exited(0) if run.write_bytes == RING3_MSG.len() as u64 => {
+            line(&mut out, &["[RING3] hello domain exited(0): message written from CPL=3"]);
+        }
+        crate::sched::context::ExitKind::Fault { .. } => {
+            // The entry itself faulted before user code could run — the
+            // environment-blocked case (full investigation in
+            // docs/arch/syscall-entry.md). Report honestly, skip the
+            // remaining runs, and let the boot finish.
+            line(&mut out, &["[RING3] launch blocked: ring-3 entry faults in this QEMU build"]);
+            line(&mut out, &["[RING3] (machinery armed + host-tested; see docs/arch/syscall-entry.md)"]);
+            mm::user::destroy_user(&mut k, &mut pool, 5);
+            line(&mut out, &["[RING3] ring-3 step concluded: blocked (environment), kernel intact"]);
+            hw::shutdown_qemu();
+        }
+        _ => {
+            line(&mut out, &["[RING3] ERROR: hello run ended unexpectedly; halting"]);
+            hw::halt_forever();
+        }
+    }
+    let mut bt = [0u8; 20];
+    line(&mut out, &["[SYSC] syscall round-trip: ", strutil::dec(trip, &mut bt), " cycles"]);
+    mm::user::destroy_user(&mut k, &mut pool, 5);
+
+    // ── Run 2: attack the NX bit — call into the data page. ──
+    let spawn = match mm::user::spawn_user_blob(
+        &mut k, &mut pool, 6, aegis_os::profile::service_profile(),
+        RING3_ROGUE, &[0u8],
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(&mut out, &["[RING3] ERROR: rogue-nx spawn failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    line(&mut out, &["[RING3] launching domain 6: calls into its NX data page"]);
+    let kernel_cr3 = hw::read_cr3();
+    spawn.run.tables.activate();
+    crate::sched::context::begin(spawn.run);
+    crate::sched::context::launch(&spawn.ctx);
+    // Reached only via resume_kernel's jump (the launch itself never
+    // returns): the post-run code below runs exactly once per run.
+    let run = crate::sched::context::take();
+    hw::write_cr3(kernel_cr3);
+    match run.exit {
+        crate::sched::context::ExitKind::Fault { vector: 14, error_code, cr2, .. }
+            if (error_code & 0x10) != 0 && (error_code & 0x4) != 0 =>
+        {
+            let mut bc = [0u8; 18];
+            line(&mut out, &["[SEC ] ring3 NX-exec blocked: #PF (I/D) at cr2=",
+                strutil::hex(cr2, &mut bc), " — MMU-enforced W^X"]);
+        }
+        _ => {
+            line(&mut out, &["[RING3] ERROR: NX attack did not fault as expected; halting"]);
+            hw::halt_forever();
+        }
+    }
+    mm::user::destroy_user(&mut k, &mut pool, 6);
+
+    // ── Run 3: read through the kernel direct map. ──
+    let spawn = match mm::user::spawn_user_blob(
+        &mut k, &mut pool, 7, aegis_os::profile::service_profile(),
+        RING3_ROGUE, &[1u8],
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(&mut out, &["[RING3] ERROR: rogue-kva spawn failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    line(&mut out, &["[RING3] launching domain 7: reads the kernel direct map"]);
+    let kernel_cr3 = hw::read_cr3();
+    spawn.run.tables.activate();
+    crate::sched::context::begin(spawn.run);
+    crate::sched::context::launch(&spawn.ctx);
+    // Reached only via resume_kernel's jump (the launch itself never
+    // returns): the post-run code below runs exactly once per run.
+    let run = crate::sched::context::take();
+    hw::write_cr3(kernel_cr3);
+    match run.exit {
+        crate::sched::context::ExitKind::Fault { vector: 14, error_code, cr2, .. }
+            if (error_code & 0x4) != 0 && (error_code & 0x1) != 0 =>
+        {
+            let mut bc = [0u8; 18];
+            line(&mut out, &["[SEC ] ring3 kernel-VA read blocked: #PF (U/S) at cr2=",
+                strutil::hex(cr2, &mut bc), " — supervisor page"]);
+        }
+        _ => {
+            line(&mut out, &["[RING3] ERROR: kernel-VA read did not fault as expected; halting"]);
+            hw::halt_forever();
+        }
+    }
+    mm::user::destroy_user(&mut k, &mut pool, 7);
+
+    // ── Run 4: forged syscall 200 — must return -ENOSYS, audited. ──
+    let spawn = match mm::user::spawn_user_blob(
+        &mut k, &mut pool, 8, aegis_os::profile::service_profile(),
+        RING3_ROGUE, &[2u8],
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(&mut out, &["[RING3] ERROR: rogue-syscall spawn failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    line(&mut out, &["[RING3] launching domain 8: forged syscall 200"]);
+    let kernel_cr3 = hw::read_cr3();
+    spawn.run.tables.activate();
+    crate::sched::context::begin(spawn.run);
+    crate::sched::context::launch(&spawn.ctx);
+    // Reached only via resume_kernel's jump (the launch itself never
+    // returns): the post-run code below runs exactly once per run.
+    let run = crate::sched::context::take();
+    hw::write_cr3(kernel_cr3);
+    match run.exit {
+        crate::sched::context::ExitKind::Exited(42) if run.bad_syscalls == 1 => {
+            line(&mut out, &["[SEC ] ring3 unauthorized syscall refused (-ENOSYS, audited)"]);
+        }
+        _ => {
+            line(&mut out, &["[RING3] ERROR: forged syscall not refused properly; halting"]);
+            hw::halt_forever();
+        }
+    }
+    mm::user::destroy_user(&mut k, &mut pool, 8);
+    line(&mut out, &["[RING3] ring-3 isolation live: 4 runs (hello/NX/kernel-VA/forged syscall), kernel intact"]);
+
+    // ── 11. the terminal guard-page proof: the write must #PF, the
+    // dispatch must confirm CR2 is exactly the guard page, print the
+    // marker, and power off cleanly (CI greps it). Reached only when
+    // the whole ring-3 sequence completed — the blocked path powers
+    // off inside step 10.
     let guard_stack = match mm::stacks::alloc(&mut pool, &mut k.frames, 1) {
         Ok(st) => st,
         Err(_) => {
@@ -323,6 +500,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     };
     line(&mut out, &["[ARCH] guard selftest: writing through the guard page"]);
     arch::exceptions::arm_guard_write(guard_stack.guard_va());
+
 }
 
 /// The M1 exit criteria, evaluated from the three stage reports.

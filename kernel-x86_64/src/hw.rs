@@ -122,6 +122,20 @@ pub fn wrmsr(msr: u32, value: u64) {
     }
 }
 
+/// Exchange GS_BASE with KERNEL_GS_BASE (`swapgs`). The ring-3 state
+/// machine (PR-1.4) in one instruction: while user code runs GS holds
+/// the user value and the kernel percpu sits in the shadow MSR; the
+/// SYSCALL entry swaps them, SYSRET (and every exit-to-kernel path)
+/// swaps them back. Privileged (#GP in ring-3).
+///
+/// SAFETY: changes the GS base — the caller owns the pairing (every
+/// swap in must have exactly one swap out on the same path).
+pub fn swapgs() {
+    // SAFETY: no memory access of its own; see the fn doc for the
+    // pairing contract the caller must uphold.
+    unsafe { asm!("swapgs", options(nostack, preserves_flags)) }
+}
+
 /// Read control register CR4 (feature flags: PAE, PGE, ...).
 ///
 /// SAFETY: a pure register read.

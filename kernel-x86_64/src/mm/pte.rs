@@ -7,6 +7,9 @@
 
 use aegis_os::memory::MemFlags;
 
+/// Page size as u64 (the lib's `PAGE_SIZE` is usize).
+pub const PAGE_SIZE_U64: u64 = 4096;
+
 /// User VAs live strictly below this (the non-canonical boundary); the
 /// kernel half starts at `0xFFFF_8000_...` — nothing in between is ever
 /// mapped (ADR-0002).

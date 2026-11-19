@@ -1,5 +1,5 @@
-//! x86_64 architecture layer: CPU tables, exception entry (PR-1.1), and
-//! per-CPU state (PR-1.2).
+//! x86_64 architecture layer: CPU tables, exception entry (PR-1.1),
+//! per-CPU state (PR-1.2), and the SYSCALL/SYSRET entry (PR-1.4).
 //!
 //! SAFETY POLICY: `gdt`, `idt`, `percpu`, `stubs` and `exceptions` are
 //! part of the documented unsafe allowlist (`docs/adr/0005-exception-machinery.md`):
@@ -21,6 +21,8 @@ pub mod exceptions;
 pub mod percpu;
 #[cfg(not(test))]
 pub mod stubs;
+#[cfg(not(test))]
+pub mod syscall_entry;
 
 /// Load the kernel-owned GDT (+TSS) and IDT, arming the exception entry
 /// path. Called once from `kmain`, before anything is allowed to fault.

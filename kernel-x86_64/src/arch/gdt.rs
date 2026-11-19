@@ -8,17 +8,32 @@
 
 #![allow(unsafe_code)]
 
-/// Selector values (byte offsets into the GDT). **These mirror the boot
-/// stub's layout** (`boot-x86_64/stub.S`): the stub enters the kernel
-/// with CS=0x18 / DS=SS=0x10, so the kernel GDT must keep those slots
-/// meaning the same thing or the segment registers would describe the
-/// wrong descriptors after `lgdt`. The user segments are ours to place.
+/// Selector values (byte offsets into the GDT). **The kernel slots
+/// mirror the boot stub's layout** (`boot-x86_64/stub.S`): the stub
+/// enters the kernel with CS=0x18 / DS=SS=0x10, so the kernel GDT must
+/// keep those slots meaning the same thing or the segment registers
+/// would describe the wrong descriptors after `lgdt`.
+///
+/// Everything above 0x20 is ours to place, and PR-1.4 places it by the
+/// SYSCALL/SYSRET slot arithmetic (pinned by a host test below):
+/// - SYSCALL loads CS ← STAR[47:32] and SS ← STAR[47:32]+8, so the
+///   kernel needs a code→data pair at [0x30, 0x38] (the stub's own
+///   kernel pair is data-before-code and cannot serve).
+/// - SYSRET loads CS ← STAR[63:48]+16 and SS ← STAR[63:48]+8 (RPL 3),
+///   so user data must sit at 0x20 and user code at 0x28 (data before
+///   code).
 pub const CODE32: u16 = 0x08; // stub's 32-bit code, kept for the contract
 pub const KERNEL_DATA: u16 = 0x10;
 pub const KERNEL_CODE: u16 = 0x18; // 64-bit kernel code (stub's entry CS)
-pub const USER_CODE: u16 = 0x20;
-pub const USER_DATA: u16 = 0x28;
-pub const TSS_SEL: u16 = 0x30;
+/// User data (DPL 3) — placed for SYSRET's SS = base+8 arithmetic.
+pub const USER_DATA: u16 = 0x20;
+/// User code (DPL 3, L=1) — placed for SYSRET's CS = base+16 arithmetic.
+pub const USER_CODE: u16 = 0x28;
+/// Kernel code duplicate the SYSCALL instruction enters on (STAR[47:32]).
+pub const SYSCALL_CODE: u16 = 0x30;
+/// Kernel data duplicate SYSCALL enters with (SS = STAR[47:32]+8).
+pub const SYSCALL_DATA: u16 = 0x38;
+pub const TSS_SEL: u16 = 0x40;
 
 /// Encode a segment descriptor (64-bit layout: limit 0..15, base 0..23,
 /// access, limit 16..19, flags G/D/L/AVL, base 24..31).
@@ -123,7 +138,45 @@ mod tests {
         // Selector layout contract: CS at entry = 0x18, data = 0x10.
         assert_eq!(KERNEL_CODE, 0x18);
         assert_eq!(KERNEL_DATA, 0x10);
-        assert_eq!(TSS_SEL, 0x30);
+        assert_eq!(TSS_SEL, 0x40);
+    }
+
+    #[test]
+    fn syscall_sysret_slot_arithmetic_is_exact() {
+        // The PR-1.4 contract, in one place: given STAR's halves, the CPU
+        // computes SYSCALL CS/SS and SYSRET CS/SS by pure addition. Every
+        // slot these sums name must exist and mean the right thing.
+        let star_cs = SYSCALL_CODE; // STAR[47:32]
+        let star_user_base: u16 = 0x18; // STAR[63:48] (== KERNEL_CODE's slot)
+
+        // SYSCALL entry: CS = STAR[47:32], SS = +8 — both must be DPL0.
+        assert_eq!(star_cs, 0x30);
+        assert_eq!(star_cs + 8, SYSCALL_DATA);
+        let c = segment(0, 0xFFFFF, 0x9A, 0xA); // encoding used at 0x30
+        let d = segment(0, 0xFFFFF, 0x92, 0xC); // encoding used at 0x38
+        assert_eq!((c >> 45) & 0b11, 0, "syscall CS slot is DPL0");
+        assert_eq!((c >> 53) & 1, 1, "syscall CS slot is 64-bit (L=1)");
+        assert_eq!((d >> 45) & 0b11, 0, "syscall SS slot is DPL0");
+
+        // SYSRET exit: CS = base+16, SS = base+8 — both must be DPL3 and
+        // the code slot must be the 64-bit one.
+        assert_eq!(star_user_base + 16, USER_CODE);
+        assert_eq!(star_user_base + 8, USER_DATA);
+        let uc = segment(0, 0xFFFFF, 0xFA, 0xA); // encoding used at 0x28
+        let ud = segment(0, 0xFFFFF, 0xF2, 0xC); // encoding used at 0x20
+        assert_eq!((uc >> 45) & 0b11, 0b11, "user code is DPL3");
+        assert_eq!((uc >> 53) & 1, 1, "user code is 64-bit (L=1)");
+        assert_eq!((uc >> 43) & 1, 1, "user code is executable");
+        assert_eq!((ud >> 45) & 0b11, 0b11, "user data is DPL3");
+        assert_eq!((ud >> 43) & 1, 0, "user data is not executable");
+
+        // No overlaps: all seven used slots are distinct.
+        let slots = [KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA, SYSCALL_CODE, SYSCALL_DATA, TSS_SEL];
+        for i in 0..slots.len() {
+            for j in i + 1..slots.len() {
+                assert_ne!(slots[i], slots[j], "selector overlap at {:#x}", slots[i]);
+            }
+        }
     }
 
     #[test]
@@ -158,10 +211,10 @@ mod load {
     }
 
     struct Gdt {
-        entries: [u64; 8],
+        entries: [u64; 10],
     }
 
-    static mut GDT: Gdt = Gdt { entries: [0; 8] };
+    static mut GDT: Gdt = Gdt { entries: [0; 10] };
     static mut TSS: Tss = Tss::zeroed();
     static mut GDTR: PseudoDescriptor = PseudoDescriptor { limit: 0, base: 0 };
 
@@ -180,23 +233,28 @@ mod load {
             (*g).entries[1] = segment(0, 0xFFFFF, 0x9A, 0xC); // 32-bit code (stub contract)
             (*g).entries[2] = segment(0, 0xFFFFF, 0x92, 0xC); // kernel data
             (*g).entries[3] = segment(0, 0xFFFFF, 0x9A, 0xA); // 64-bit kernel code
-            (*g).entries[4] = segment(0, 0xFFFFF, 0xFA, 0xA); // user code
-            (*g).entries[5] = segment(0, 0xFFFFF, 0xF2, 0xC); // user data
+            (*g).entries[4] = segment(0, 0xFFFFF, 0xF2, 0xC); // user data  @0x20 (SYSRET SS)
+            (*g).entries[5] = segment(0, 0xFFFFF, 0xFA, 0xA); // user code  @0x28 (SYSRET CS)
+            (*g).entries[6] = segment(0, 0xFFFFF, 0x9A, 0xA); // SYSCALL CS @0x30
+            (*g).entries[7] = segment(0, 0xFFFFF, 0x92, 0xC); // SYSCALL SS @0x38
             let tss_base = t as u64;
             let [lo, hi] = tss_descriptor(tss_base, core::mem::size_of::<Tss>() as u32 - 1);
-            (*g).entries[6] = lo;
-            (*g).entries[7] = hi;
+            (*g).entries[8] = lo;
+            (*g).entries[9] = hi;
 
-            // RSP0: where ring-3 syscalls/interrupts will land (PR-1.4);
-            // IST1..IST4: the exception stacks from `exceptions`.
+            // RSP0: initial value is the boot stack top; `set_rsp0` moves
+            // it to a dedicated guarded stack once the frame pool exists
+            // (PR-1.4: exceptions from ring-3 land here — the boot stack
+            // would clobber kmain's frame). IST1..IST4: exception stacks.
             (*t).rsp[0] = core::ptr::addr_of!(stack_top) as u64;
             let tops = crate::arch::exceptions::ist_tops();
             (*t).ist[0] = tops[0]; // #DF
             (*t).ist[1] = tops[1]; // #NMI
             (*t).ist[2] = tops[2]; // #MC
             (*t).ist[3] = tops[3]; // #SS
+            (*t).ist[4] = tops[4]; // #PF (PR-1.4)
 
-            (*gdtr).limit = (8 * 8 - 1) as u16;
+            (*gdtr).limit = (8 * 10 - 1) as u16;
             (*gdtr).base = g as u64;
             asm!("lgdt (%rax)", in("rax") gdtr, options(att_syntax, nostack, preserves_flags));
             // Reload the data segments; CS stays valid untouched: the
@@ -209,7 +267,27 @@ mod load {
             asm!("ltr %ax", in("ax") TSS_SEL, options(att_syntax, nostack, preserves_flags));
         }
     }
+
+    /// Read back TSS.RSP0 (diagnostics: the ring-3 launch path proves
+    /// the exception entry stack is the guarded one before launching).
+    pub fn rsp0() -> u64 {
+        // SAFETY: single CPU; a plain read of a value only the CPU and
+        // `set_rsp0` touch.
+        unsafe { (*core::ptr::addr_of!(TSS)).rsp[0] }
+    }
+
+    /// Point RSP0 (the CPL3→CPL0 exception stack) at a dedicated guarded
+    /// stack. Called from `kmain` after the frame pool exists; the boot
+    /// stack value from `load()` was only a bring-up placeholder.
+    pub fn set_rsp0(top: u64) {
+        // SAFETY: single CPU; the TSS is written before any ring-3
+        // context exists (kmain sets this up before the first launch),
+        // and the CPU only ever reads RSP0 on a privilege change.
+        unsafe {
+            (*core::ptr::addr_of_mut!(TSS)).rsp[0] = top;
+        }
+    }
 }
 
 #[cfg(not(test))]
-pub use load::load;
+pub use load::{load, rsp0, set_rsp0};

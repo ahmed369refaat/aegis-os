@@ -47,6 +47,18 @@ pub fn init() {
     }
 }
 
+/// Point `kstack_top` at the dedicated (guarded) syscall stack. Called
+/// from `kmain` once the frame pool exists; the SYSCALL entry stub loads
+/// RSP from here via `%gs:` (SYSCALL itself does not switch stacks), and
+/// TSS.RSP0 is set to the same value for the exception path.
+pub fn set_kstack_top(top: u64) {
+    // SAFETY: single CPU, written exactly once from kmain before any
+    // ring-3 context exists; readers only ever see the final value.
+    unsafe {
+        (*core::ptr::addr_of_mut!(PERCPU)).kstack_top = top;
+    }
+}
+
 /// This CPU's state. The address comes from the GS base MSR — the same
 /// anchor `gs:`-relative addressing uses, so whatever points GS at a
 /// `PerCpu`, this reads it.

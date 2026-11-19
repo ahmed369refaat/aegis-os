@@ -7,9 +7,12 @@
 
 /// Layout (lowest address first; matches the push order in `stubs.rs`).
 ///
-/// CPL0 faults (no stack switch) push only `rip/cs/rflags` on top; the
-/// frame has no `rsp/ss` fields yet — Ring-3 entry (PR-1.4) always pushes
-/// those and the struct gains them there. See `docs/arch/exceptions.md`.
+/// The struct describes the CPL0 shape. For faults **from** ring-3 the
+/// CPU pushes two extra words above `rflags` (the user `rsp`/`ss`), so a
+/// CPL3 frame is this struct plus a 16-byte tail — physically present,
+/// consumed automatically by the unwind's `iretq` (RPL-driven), and read
+/// only by the user-fault branch via `exceptions::user_rsp/user_ss`.
+/// That is why the struct gains no fields: one shape, two tail modes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ExceptionFrame {

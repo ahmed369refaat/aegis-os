@@ -33,6 +33,43 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
   fault→signal delivery), and the boot ends with a terminal guard-page
   `#PF` proof (`cr2` names the exact guard page).
 
+### Added — PR-1.4: SYSCALL/SYSRET entry + ring-3 machinery (ADR-0005; status: environment-blocked, see below)
+
+- `arch/gdt.rs`: STAR slot arithmetic made real — user data @0x20 /
+  user code @0x28 (SYSRET SS=base+8 / CS=base+16), a dedicated
+  SYSCALL pair @0x30/0x38, TSS at 0x40, `set_rsp0`/`rsp0`; pinned by a
+  new host test.
+- `arch/syscall_entry.rs` (new): STAR/LSTAR/FMASK/SCE MSRs,
+  KERNEL_GS_BASE = user value (swapgs partner), naked entry: swapgs,
+  stack from a static, 12-quadword SysV-aligned frame, RDTSC-bracketed
+  dispatch, restore-all-but-RAX/RCX/R11, swapgs, sysretq.
+- `syscall.rs` (kernel, new): the shared gate first
+  (`aegis_os::syscall::gate`, extracted from `request_syscall`), a
+  full-width syscall-number bounds check (nr=256 must not truncate
+  into SYS_READ — host-tested), SYS_WRITE with per-page user-buffer
+  validation, -ENOSYS + audit counters for unknown numbers.
+- `sched/context.rs` (new): UserContext / launch (explicit RSP+RIP
+  resume point — immune to the LTO tail-jump on `-> !` entry points,
+  a real bug this PR found and fixed) / resume_kernel / user-run state.
+- `mm/user_layout.rs` + `mm/user.rs` (new): canonical user layout
+  (host-tested against the real ten-check gate) and spawn_user_blob.
+- `examples/ring3-hello` + `examples/ring3-rogue` (new): flat-asm user
+  blobs built by boot.sh; rogue performs one hostile act per run.
+- #PF moved to a dedicated IST; a CPL3 fault during an active run is
+  the user's death, not the kernel's (recorded + honest verdict).
+- `Makefile` with `test-qemu-pr14`; unsafe ratchet 39 to 61 (all in
+  allowlisted arch/sched modules, each with a SAFETY note).
+- Status (documented in `docs/arch/syscall-entry.md`): in this
+  sandbox's QEMU (10.0.13 TCG, no KVM) the first user-context fault
+  cannot be relayed by the inter-privilege delivery path; one build
+  did reach ring-3 executing real gated syscalls. The boot ends the
+  chapter with `[RING3] launch blocked` + a clean poweroff; the full
+  marker set is required the moment the environment allows it. Real
+  bugs fixed along the way: nr-truncation smuggling, KERNEL_GS_BASE
+  initial value, missing user-CR3 activation, LTO
+  tail-jump/unreachable-deletion on `-> !` entry points, an
+  indirect-`jmp *sym` misuse.
+
 ### Added — PR-1.3: per-domain page tables (`kernel-x86_64/src/mm/{pte,page_table}.rs`, ADR-0002)
 
 - `mm/page_table.rs`: the lib's ten-check `AddressSpace::map` runs

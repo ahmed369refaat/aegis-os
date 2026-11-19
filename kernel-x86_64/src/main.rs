@@ -60,6 +60,9 @@ pub mod hw;
 pub mod memops;
 pub mod multiboot;
 pub mod runtime;
+pub mod sched;
+#[cfg(not(test))]
+pub mod syscall;
 pub mod strutil;
 
 /// Boot-path panic handler: print what we can over serial and halt.

@@ -13,7 +13,7 @@ use crate::memory::AddressSpace;
 use crate::monitor::DomainStats;
 use crate::profile::DomainProfile;
 use crate::signal::SignalState;
-use crate::syscall::{SyscallMask, SYSCALL_COUNT, SYS_EXIT};
+use crate::syscall::{SyscallMask, SYS_EXIT};
 use crate::vfs::Credentials;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,36 +108,35 @@ impl Domain {
     /// feed the monitor) so a quarantined domain cannot keep pumping its own
     /// risk score.
     pub fn request_syscall(&mut self, id: u8) -> Decision {
-        if id >= SYSCALL_COUNT {
-            return Decision::BadSyscall(id);
-        }
-        if self.state == DomainState::Quarantined {
-            if id == SYS_EXIT {
-                return Decision::Allowed;
+        let quarantined = self.state == DomainState::Quarantined;
+        // The pure decision — shared verbatim with the Ring-3 entry path
+        // (PR-1.4): one policy, two execution sites.
+        let decision = crate::syscall::gate(&self.mask, quarantined, id);
+        // Behavioral accounting on top; frozen under quarantine (denials
+        // there do not feed the monitor) and skipped for unknown ids.
+        if !quarantined && !matches!(decision, Decision::BadSyscall(_)) {
+            // Attempts (even denied ones) are behavioral signal.
+            self.stats.mark_used(id);
+            self.stats.syscalls_total = self.stats.syscalls_total.saturating_add(1);
+            if matches!(decision, Decision::DeniedByMask(_)) {
+                self.violations = self.violations.saturating_add(1);
+                self.stats.denied_syscalls = self.stats.denied_syscalls.saturating_add(1);
+            } else {
+                match id {
+                    crate::syscall::SYS_NET_SEND | crate::syscall::SYS_NET_RECV => {
+                        self.stats.net_ops = self.stats.net_ops.saturating_add(1);
+                    }
+                    crate::syscall::SYS_OPEN | crate::syscall::SYS_CLOSE => {
+                        self.stats.file_ops = self.stats.file_ops.saturating_add(1);
+                    }
+                    crate::syscall::SYS_IPC_SEND | crate::syscall::SYS_IPC_RECV => {
+                        self.stats.ipc_ops = self.stats.ipc_ops.saturating_add(1);
+                    }
+                    _ => {}
+                }
             }
-            return Decision::DeniedQuarantined(id);
         }
-        // Attempts (even denied ones) are behavioral signal.
-        self.stats.mark_used(id);
-        self.stats.syscalls_total = self.stats.syscalls_total.saturating_add(1);
-        if !self.mask.is_allowed(id).unwrap_or(false) {
-            self.violations = self.violations.saturating_add(1);
-            self.stats.denied_syscalls = self.stats.denied_syscalls.saturating_add(1);
-            return Decision::DeniedByMask(id);
-        }
-        match id {
-            crate::syscall::SYS_NET_SEND | crate::syscall::SYS_NET_RECV => {
-                self.stats.net_ops = self.stats.net_ops.saturating_add(1);
-            }
-            crate::syscall::SYS_OPEN | crate::syscall::SYS_CLOSE => {
-                self.stats.file_ops = self.stats.file_ops.saturating_add(1);
-            }
-            crate::syscall::SYS_IPC_SEND | crate::syscall::SYS_IPC_RECV => {
-                self.stats.ipc_ops = self.stats.ipc_ops.saturating_add(1);
-            }
-            _ => {}
-        }
-        Decision::Allowed
+        decision
     }
 
     /// Narrow the syscall surface (monotonic: result is always a subset of

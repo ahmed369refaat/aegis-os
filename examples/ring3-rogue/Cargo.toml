@@ -1,0 +1,9 @@
+[package]
+name = "ring3-rogue"
+version = "0.2.0"
+edition = "2021"
+description = "AegisOS ring-3 security-example blob: deliberately attacks its own boundaries (NX exec / kernel-VA read / forged syscall), one mode at a time, chosen by a kernel-written byte in its data page. Built to a flat blob by boot.sh; NOT a workspace member."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
