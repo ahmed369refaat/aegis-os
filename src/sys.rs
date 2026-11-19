@@ -19,20 +19,32 @@ use crate::fd::{FdError, FdTarget};
 use crate::net::{NetError, TokenBucket, DEFAULT_BURST_BYTES, DEFAULT_RATE_BYTES_PER_WINDOW};
 use crate::pipe::PipeError;
 use crate::signal::{DefaultAction, SignalError};
-use crate::vfs::{InodeKind, Mode, VfsError};
+use crate::vfs::{Access, InodeKind, Mode, VfsError};
+use crate::memory::MemFlags;
 use crate::{
     Kernel, KernelError,
     syscall::{
-        SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_KILL, SYS_MKDIR, SYS_NET_SEND, SYS_OPEN, SYS_PIPE,
-        SYS_READ, SYS_UNLINK, SYS_WRITE,
+        SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL,
+        SYS_MMAP, SYS_MKDIR, SYS_MUNMAP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE,
+        SYS_READ, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
     },
 };
 
 /// A fully-marshaled syscall request (the ABI of this sample kernel).
 #[derive(Debug)]
 pub enum SysRequest<'a> {
-    /// open(path, O_CREAT?) — returns a file descriptor.
-    Open { path: &'a str, mode: Mode, create: bool },
+    /// open(path, mode, O_CREAT?, READ?, WRITE?, TRUNC?) — returns a
+    /// file descriptor. F11(b): the requested access is checked at open
+    /// time; F11(c): truncation is this explicit flag, never a side
+    /// effect of writing.
+    Open {
+        path: &'a str,
+        mode: Mode,
+        create: bool,
+        read: bool,
+        write: bool,
+        truncate: bool,
+    },
     /// read(fd, buf) — returns bytes read (short reads; 0 at EOF).
     Read { fd: u8, buf: &'a mut [u8] },
     /// write(fd, bytes) — returns bytes written (short writes on pipes).
@@ -54,6 +66,20 @@ pub enum SysRequest<'a> {
     Unlink { path: &'a str },
     /// send(len) — bytes through the domain's brokered socket, rate-limited.
     NetSend { len: u32 },
+    /// mmap(addr, len, flags) — map into the domain's policy space.
+    /// F13: executes through the ten-check gate; refusals feed the
+    /// monitor's fault signal automatically.
+    Mmap { addr: usize, len: usize, flags: MemFlags },
+    /// munmap(addr, len) — withdraw a mapping from the policy space.
+    Munmap { addr: usize, len: usize },
+    /// F13 stubs: mask bits without executors. They answer
+    /// `NotImplemented(nr)` — never a silent success — and the gate has
+    /// already counted the attempt for the monitor.
+    Spawn { cmd: u32 },
+    IpcSend { channel: u32, len: u32 },
+    IpcRecv { channel: u32 },
+    Ioctl { cmd: u32 },
+    NetRecv { len: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +88,8 @@ pub enum SysValue {
     FdPair(u8, u8),
     /// Byte count (read/write/net) or remaining tokens (net).
     Count(usize),
+    /// A mapped address (mmap).
+    Addr(u64),
     Unit,
 }
 
@@ -75,6 +103,18 @@ pub enum SysError {
     UnknownDomain(u32),
     /// Descriptor not open in this domain (EBADF).
     BadFd(u8),
+    /// The domain table is full (F14: surfaced, not collapsed).
+    TooManyDomains,
+    /// Domain id already in use.
+    DuplicateDomain(u32),
+    /// Domain id rejected by the credential-derivation rules.
+    InvalidId(u32),
+    /// F13: the syscall has a mask bit but no executor yet — never a
+    /// silent success. The monitor counts the attempt (the gate already
+    /// marks it used).
+    NotImplemented(u8),
+    /// F13: a memory-policy refusal from MMAP/MUNMAP (identity kept).
+    Mem(crate::memory::MemError),
     Fd(FdError),
     Vfs(VfsError),
     Pipe(PipeError),
@@ -83,6 +123,13 @@ pub enum SysError {
     Buddy(BuddyError),
     /// kill() denied: sender is not uid 0 and not the same uid.
     PermissionDenied,
+}
+
+/// F14: the two failure modes of `net_open`, kept distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetOpenError {
+    UnknownDomain(u32),
+    Net(crate::net::NetError),
 }
 
 impl Kernel {
@@ -107,8 +154,8 @@ impl Kernel {
             (d.creds(), d.chroot_root, d.cwd)
         };
         match req {
-            SysRequest::Open { path, mode, create } => {
-                let id = if create {
+            SysRequest::Open { path, mode, create, read, write, truncate } => {
+                let r = if create {
                     match self.vfs.resolve(root, cwd, path, creds) {
                         Ok(found) => {
                             if self.vfs.kind_of(found) != Some(InodeKind::File) {
@@ -132,11 +179,27 @@ impl Kernel {
                     }
                     found
                 };
+                // F11(b): permission for the requested access is checked
+                // AT OPEN, not deferred to each read/write.
+                if read {
+                    self.vfs
+                        .check_access_ref(r, creds, Access::Read)
+                        .map_err(SysError::Vfs)?;
+                }
+                if write {
+                    self.vfs
+                        .check_access_ref(r, creds, Access::Write)
+                        .map_err(SysError::Vfs)?;
+                    // F11(c): truncation is explicit and requires write.
+                    if truncate {
+                        self.vfs.truncate(r, creds).map_err(SysError::Vfs)?;
+                    }
+                }
                 let fd = self
                     .domain_mut(domain_id)
                     .map_err(into_sys)?
                     .fds
-                    .alloc(FdTarget::File(id))
+                    .alloc(FdTarget::File(r))
                     .map_err(SysError::Fd)?;
                 Ok(SysValue::Fd(fd))
             }
@@ -188,10 +251,28 @@ impl Kernel {
                     .target;
                 match target {
                     FdTarget::File(inode) => {
-                        self.vfs
-                            .write_by_id(inode, creds, bytes)
+                        // F11(c): writes land at the fd's offset and
+                        // advance it; existing bytes are not clobbered.
+                        let pos = self
+                            .domain_mut(domain_id)
+                            .map_err(into_sys)?
+                            .fds
+                            .get(fd)
+                            .ok_or(SysError::BadFd(fd))?
+                            .pos as usize;
+                        let n = self
+                            .vfs
+                            .write_at(inode, creds, pos, bytes)
                             .map_err(SysError::Vfs)?;
-                        Ok(SysValue::Count(bytes.len()))
+                        if let Some(e) = self
+                            .domain_mut(domain_id)
+                            .map_err(into_sys)?
+                            .fds
+                            .get_mut(fd)
+                        {
+                            e.pos = e.pos.saturating_add(n as u32);
+                        }
+                        Ok(SysValue::Count(n))
                     }
                     FdTarget::PipeWrite(pipe) => {
                         let n = self.pipes.write(pipe, bytes).map_err(SysError::Pipe)?;
@@ -327,17 +408,33 @@ impl Kernel {
                 Ok(SysValue::Fd(new_fd))
             }
             SysRequest::Kill { target, sig } => {
-                // Unix permission rules: uid 0, same uid, or self.
+                // Unix permission rules: uid 0, same uid, or self —
+                // checked BEFORE the target's existence is revealed, so
+                // domain ids cannot be enumerated through kill (F14): a
+                // foreign target answers PermissionDenied whether it
+                // exists or not; only root and self may learn
+                // UnknownDomain. SIGSTOP note: the signal is delivered
+                // (pending, unblockable) but this sample kernel has no
+                // Stopped scheduling state — stopping is documented as
+                // unsupported (see SECURITY-MODEL.md).
                 let sender_uid = self.domain_mut(domain_id).map_err(into_sys)?.uid;
+                if sender_uid != 0 && target != domain_id {
+                    let same_uid = self
+                        .domains
+                        .iter()
+                        .flatten()
+                        .find(|d| d.id == target)
+                        .is_some_and(|d| d.uid == sender_uid);
+                    if !same_uid {
+                        return Err(SysError::PermissionDenied);
+                    }
+                }
                 let victim = self
                     .domains
                     .iter_mut()
                     .flatten()
                     .find(|d| d.id == target)
                     .ok_or(SysError::UnknownDomain(target))?;
-                if sender_uid != 0 && sender_uid != victim.uid && domain_id != target {
-                    return Err(SysError::PermissionDenied);
-                }
                 victim.signals.send(sig).map_err(SysError::Signal)?;
                 Ok(SysValue::Unit)
             }
@@ -384,6 +481,22 @@ impl Kernel {
                 self.buckets[slot] = Some((owner, bucket));
                 result.map(|left| SysValue::Count(left as usize)).map_err(SysError::Net)
             }
+            SysRequest::Mmap { addr, len, flags } => {
+                // F13: through the policy space — a refusal is also an
+                // organic monitor fault (domain_map records it).
+                self.domain_map(domain_id, addr, len, flags)
+                    .map(|()| SysValue::Addr(addr as u64))
+                    .map_err(SysError::Mem)
+            }
+            SysRequest::Munmap { addr, len: _ } => {
+                let d = self.domain_mut(domain_id).map_err(into_sys)?;
+                d.space.unmap(addr).map(|_| SysValue::Unit).map_err(SysError::Mem)
+            }
+            SysRequest::Spawn { .. } => Err(SysError::NotImplemented(SYS_SPAWN)),
+            SysRequest::IpcSend { .. } => Err(SysError::NotImplemented(SYS_IPC_SEND)),
+            SysRequest::IpcRecv { .. } => Err(SysError::NotImplemented(SYS_IPC_RECV)),
+            SysRequest::Ioctl { .. } => Err(SysError::NotImplemented(SYS_IOCTL)),
+            SysRequest::NetRecv { .. } => Err(SysError::NotImplemented(SYS_NET_RECV)),
         }
     }
 
@@ -400,20 +513,20 @@ impl Kernel {
         Ok(sig)
     }
 
-    /// Supervisor API: open the domain's brokered socket + rate bucket.
-    pub fn net_open(&mut self, domain_id: u32) -> Result<u32, KernelError> {
+/// Supervisor API: open the domain's brokered socket + rate bucket.
+    /// F14: errors keep their identity — a full socket table is
+    /// `Net(..)`, a missing domain is `UnknownDomain`; the old version
+    /// folded both into UnknownDomain.
+    pub fn net_open(&mut self, domain_id: u32) -> Result<u32, NetOpenError> {
         let exists = self.domains.iter().flatten().any(|d| d.id == domain_id);
         if !exists {
-            return Err(KernelError::UnknownDomain(domain_id));
+            return Err(NetOpenError::UnknownDomain(domain_id));
         }
         // Idempotent: return the existing open socket.
         if let Some(id) = self.sockets.open_socket_of(domain_id) {
             return Ok(id);
         }
-        self.sockets.open(domain_id).map_err(|_| {
-            // Not a KernelError variant; fold into UnknownDomain for now.
-            KernelError::UnknownDomain(domain_id)
-        })
+        self.sockets.open(domain_id).map_err(NetOpenError::Net)
     }
 
     /// Advance the kernel clock (drives rate-limit windows).
@@ -456,12 +569,24 @@ fn syscall_nr(req: &SysRequest<'_>) -> u8 {
         SysRequest::Mkdir { .. } => SYS_MKDIR,
         SysRequest::Unlink { .. } => SYS_UNLINK,
         SysRequest::NetSend { .. } => SYS_NET_SEND,
+        SysRequest::Mmap { .. } => SYS_MMAP,
+        SysRequest::Munmap { .. } => SYS_MUNMAP,
+        SysRequest::Spawn { .. } => SYS_SPAWN,
+        SysRequest::IpcSend { .. } => SYS_IPC_SEND,
+        SysRequest::IpcRecv { .. } => SYS_IPC_RECV,
+        SysRequest::Ioctl { .. } => SYS_IOCTL,
+        SysRequest::NetRecv { .. } => SYS_NET_RECV,
     }
 }
 
+/// F14: every kernel error keeps its identity across the boundary —
+/// the old catch-all mapped everything to `UnknownDomain(0)`, hiding
+/// TooManyDomains/DuplicateDomain/InvalidId from callers.
 fn into_sys(e: KernelError) -> SysError {
     match e {
         KernelError::UnknownDomain(id) => SysError::UnknownDomain(id),
-        _ => SysError::UnknownDomain(0),
+        KernelError::TooManyDomains => SysError::TooManyDomains,
+        KernelError::DuplicateDomain(id) => SysError::DuplicateDomain(id),
+        KernelError::InvalidId(id) => SysError::InvalidId(id),
     }
 }

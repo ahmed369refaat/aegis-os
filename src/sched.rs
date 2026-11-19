@@ -41,12 +41,15 @@ pub struct SchedEntity {
 
 #[derive(Default)]
 pub struct Scheduler {
+    /// F12: the floor every new or woken entity is placed at — without
+    /// it, a late joiner starts at vruntime 0 and monopolizes the CPU.
+    min_vruntime: u64,
     entities: [Option<SchedEntity>; MAX_SCHED_ENTITIES],
 }
 
 impl Scheduler {
     pub const fn new() -> Self {
-        Scheduler { entities: [None; MAX_SCHED_ENTITIES] }
+        Scheduler { min_vruntime: 0, entities: [None; MAX_SCHED_ENTITIES] }
     }
 
     /// Register a domain with a nice level (clamped to -20..=19).
@@ -58,7 +61,7 @@ impl Scheduler {
             if slot.is_none() {
                 *slot = Some(SchedEntity {
                     domain_id,
-                    vruntime: 0,
+                    vruntime: self.min_vruntime,
                     nice: nice.clamp(NICE_MIN, NICE_MAX),
                     weight: weight_for(nice),
                     runnable: true,
@@ -107,6 +110,19 @@ impl Scheduler {
 
     /// Set the runnable flag (wake up / sleep).
     pub fn set_runnable(&mut self, domain_id: u32, runnable: bool) -> Result<(), SchedError> {
+        // F12: a domain waking up is placed at max(own, min_vruntime) so
+        // sleeping through everyone's work cannot buy it the CPU.
+        if runnable {
+            let floor = self.min_vruntime;
+            if let Some(e) = self
+                .entities
+                .iter_mut()
+                .flatten()
+                .find(|e| e.domain_id == domain_id)
+            {
+                e.vruntime = e.vruntime.max(floor);
+            }
+        }
         self.entity_mut(domain_id)?.runnable = runnable;
         Ok(())
     }
@@ -125,11 +141,17 @@ impl Scheduler {
 
     /// Charge `run_ticks` of execution to a domain: weighted virtual time.
     pub fn tick(&mut self, domain_id: u32, run_ticks: u64) -> Result<u64, SchedError> {
-        let e = self.entity_mut(domain_id)?;
-        let delta = (run_ticks.saturating_mul(NICE0_WEIGHT as u64) / e.weight as u64).max(1);
-        e.vruntime = e.vruntime.saturating_add(delta);
-        e.slices = e.slices.saturating_add(1);
-        Ok(e.vruntime)
+        let new_vruntime = {
+            let e = self.entity_mut(domain_id)?;
+            let delta = (run_ticks.saturating_mul(NICE0_WEIGHT as u64) / e.weight as u64).max(1);
+            e.vruntime = e.vruntime.saturating_add(delta);
+            e.slices = e.slices.saturating_add(1);
+            e.vruntime
+        };
+        // F12: the floor advances with the running entity so newcomers
+        // and woken domains land at "now", not at 0.
+        self.min_vruntime = self.min_vruntime.max(new_vruntime);
+        Ok(new_vruntime)
     }
 
     /// Convenience: pick then charge one standard slice.
@@ -154,6 +176,50 @@ impl Scheduler {
 pub fn weight_for(nice: i8) -> u32 {
     let idx = (nice.clamp(NICE_MIN, NICE_MAX) as i32 - NICE_MIN as i32) as usize;
     NICE_TO_WEIGHT[idx]
+}
+
+#[cfg(test)]
+mod f12_tests {
+    use super::*;
+
+    /// F12: a late joiner (or a woken domain) used to start at vruntime 0
+    /// and monopolize the CPU. New/woken entities must be placed at
+    /// max(own, min_vruntime).
+    #[test]
+    fn late_joiner_is_placed_at_min_vruntime_not_zero() {
+        let mut s = Scheduler::new();
+        s.register(1, 0).unwrap();
+        s.register(2, 0).unwrap();
+        for _ in 0..10 {
+            s.tick(1, 5).unwrap();
+            s.tick(2, 5).unwrap();
+        }
+        // Both runners are at vruntime 50; min_vruntime tracks the max
+        // of the two.
+        assert_eq!(s.entity(1).unwrap().vruntime, 50);
+        s.register(3, 0).unwrap();
+        let joined = s.entity(3).unwrap().vruntime;
+        assert!(
+            joined >= 50,
+            "late joiner placed at min_vruntime (got {joined}, want >= 50) — a 0 would starve the runners"
+        );
+        // Same for a domain that slept through the work and wakes now.
+        s.set_runnable(2, false).unwrap();
+        for _ in 0..4 {
+            s.tick(1, 5).unwrap();
+        }
+        s.set_runnable(2, true).unwrap();
+        let woken = s.entity(2).unwrap().vruntime;
+        assert!(woken >= 50, "woken domain placed at min_vruntime (got {woken})");
+        // Fair competition, no monopoly: 3 (behind at 50) is picked
+        // first, catches up to the floor, and then the tie breaks by id
+        // — a late birth buys at most a catch-up, never the CPU.
+        assert_eq!(s.pick_next(), Some(3));
+        while s.entity(3).unwrap().vruntime < 70 {
+            s.tick(3, 5).unwrap();
+        }
+        assert_eq!(s.pick_next(), Some(1));
+    }
 }
 
 #[cfg(test)]
@@ -276,9 +342,12 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(s.schedule_slice(2).unwrap(), 1);
         }
-        // Wake 2: its low vruntime wins immediately.
+        // Wake 2 (F12): placed at min_vruntime — it competes fairly
+        // instead of winning outright with a stale 0 (the old behavior
+        // let a sleeper monopolize the CPU on wake).
         s.set_runnable(2, true).unwrap();
-        assert_eq!(s.pick_next(), Some(2));
+        assert_eq!(s.entity(2).unwrap().vruntime, 10, "placed at the floor");
+        assert_eq!(s.pick_next(), Some(1), "tie at the floor breaks by id");
     }
 
     #[test]

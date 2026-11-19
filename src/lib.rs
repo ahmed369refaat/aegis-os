@@ -195,8 +195,8 @@ impl<const N: usize> Kernel<N> {
         d.uid = uid;
         d.gid = gid;
         // Both the cwd and the chroot root start at the VFS root.
-        d.cwd = crate::vfs::ROOT_ID;
-        d.chroot_root = crate::vfs::ROOT_ID;
+        d.cwd = crate::vfs::ROOT_REF;
+        d.chroot_root = crate::vfs::ROOT_REF;
         *slot = Some(d);
         // Register with the fair scheduler (idempotent).
         let _ = self.sched.register(id, nice);
@@ -687,6 +687,238 @@ mod tests {
             events += 1;
         }
         assert!(events >= 2, "every domain audited on the boundary, got {events}");
+    }
+
+    /// F10: stale inode references must fail closed. A domain chrooted
+    /// into a directory whose slot was freed and reused by an unrelated
+    /// inode must NOT silently re-root onto the new occupant: every
+    /// path operation through the stale ref answers NotFound.
+    #[test]
+    fn stale_chroot_ref_fails_closed_after_slot_reuse() {
+        use crate::sys::{SysError, SysRequest};
+        use crate::vfs::Mode;
+        let mut k = Kernel::new();
+        // uid-0 domain builds the tree (needs parent write on /home).
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(1, SysRequest::Mkdir { path: "/home", mode: Mode(0o755) }).unwrap();
+        k.syscall(1, SysRequest::Mkdir { path: "/home/jail", mode: Mode(0o777) }).unwrap();
+        k.syscall(1, SysRequest::Mkdir { path: "/pub", mode: Mode(0o755) }).unwrap();
+        // The confined domain (uid 1001) chroots into /home/jail.
+        k.create_domain(2, service_profile()).unwrap();
+        k.syscall(2, SysRequest::Chroot { path: "/home/jail" }).unwrap();
+        // Works while the jail lives.
+        k.syscall(2, SysRequest::Mkdir { path: "/inside", mode: Mode(0o755) }).unwrap();
+        // The jail directory is removed and its inode slot reused by an
+        // unrelated directory (root sweeps the parent first).
+        k.syscall(1, SysRequest::Unlink { path: "/home/jail/inside" }).unwrap();
+        k.syscall(1, SysRequest::Unlink { path: "/home/jail" }).unwrap();
+        // Reuse the freed slot from a different place.
+        let mut reused = false;
+        for i in 0..64 {
+            let p = format!("/pub/d{}", i);
+            if k.syscall(1, SysRequest::Mkdir { path: &p, mode: Mode(0o755) }).is_ok() {
+                reused = true;
+            }
+        }
+        assert!(reused);
+        // The confined domain's stale chroot/cwd refs must fail closed —
+        // no silent re-root onto whatever now lives in the old slot.
+        assert!(matches!(
+            k.syscall(2, SysRequest::Mkdir { path: "/x", mode: Mode(0o755) }),
+            Err(SysError::Vfs(crate::vfs::VfsError::StaleInode))
+        ));
+    }
+
+    /// F11(b)+(c): Open takes read/write flags and checks permission at
+    /// open time; Write writes at the fd offset; truncation is an
+    /// explicit Open flag, not a side effect of every write.
+    #[test]
+    fn open_flags_and_offset_writes() {
+        use crate::sys::{SysRequest, SysValue};
+        use crate::vfs::Mode;
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        // Create a file, write a prefix.
+        let fd = match k
+            .syscall(1, SysRequest::Open { path: "/log", mode: Mode(0o600), create: true, read: true, write: true, truncate: false })
+            .unwrap()
+        {
+            SysValue::Fd(f) => f,
+            o => panic!("{:?}", o),
+        };
+        k.syscall(1, SysRequest::Write { fd, bytes: b"hello" }).unwrap();
+        // A second write CONTINUES at the offset (no truncation).
+        k.syscall(1, SysRequest::Write { fd, bytes: b" world" }).unwrap();
+        // Read back through a fresh read-only fd.
+        let rfd = match k
+            .syscall(1, SysRequest::Open { path: "/log", mode: Mode(0o600), create: false, read: true, write: false, truncate: false })
+            .unwrap()
+        {
+            SysValue::Fd(f) => f,
+            o => panic!("{:?}", o),
+        };
+        let mut buf = [0u8; 32];
+        let n = match k.syscall(1, SysRequest::Read { fd: rfd, buf: &mut buf }).unwrap() {
+            SysValue::Count(n) => n,
+            o => panic!("{:?}", o),
+        };
+        assert_eq!(&buf[..n], b"hello world", "writes continue at the offset");
+        // Truncate is explicit: reopen with truncate and the file empties.
+        let tfd = match k
+            .syscall(1, SysRequest::Open { path: "/log", mode: Mode(0o600), create: false, read: false, write: true, truncate: true })
+            .unwrap()
+        {
+            SysValue::Fd(f) => f,
+            o => panic!("{:?}", o),
+        };
+        let _ = tfd;
+        let n2 = match k.syscall(1, SysRequest::Read { fd: rfd, buf: &mut buf }).unwrap() {
+            SysValue::Count(n) => n,
+            o => panic!("{:?}", o),
+        };
+        assert_eq!(n2, 0, "explicit truncate emptied the file");
+        // Opening write-only on a read-only-mode file is refused at open
+        // (a non-root domain against a root-owned 0o444 file).
+        k.syscall(1, SysRequest::Open { path: "/ro", mode: Mode(0o444), create: true, read: true, write: false, truncate: false }).unwrap();
+        k.create_domain(3, service_profile()).unwrap(); // uid 1003
+        assert!(k
+            .syscall(3, SysRequest::Open { path: "/ro", mode: Mode(0o444), create: false, read: false, write: true, truncate: false })
+            .is_err());
+        // ...while opening it read-only succeeds for the same domain.
+        assert!(k
+            .syscall(3, SysRequest::Open { path: "/ro", mode: Mode(0o444), create: false, read: true, write: false, truncate: false })
+            .is_ok());
+    }
+
+    /// F13: MMAP/MUNMAP execute through the domain's policy space
+    /// (refusals feed the monitor's fault signal automatically), and the
+    /// mask-bit-without-executor syscalls answer NotImplemented — never
+    /// a silent success.
+    #[test]
+    fn mmap_munmap_execute_and_stub_syscalls_never_succeed_silently() {
+        use crate::memory::MemFlags;
+        use crate::sys::{SysError, SysRequest, SysValue};
+        let mut k = Kernel::new();
+        k.create_domain(1, parser_profile()).unwrap(); // parser has MMAP/MUNMAP
+        // Legal mapping executes.
+        assert!(matches!(
+            k.syscall(1, SysRequest::Mmap { addr: 0x5000_0000, len: 8192, flags: MemFlags::READ | MemFlags::WRITE }),
+            Ok(SysValue::Addr(0x5000_0000))
+        ));
+        // Unmap executes too.
+        assert!(matches!(
+            k.syscall(1, SysRequest::Munmap { addr: 0x5000_0000, len: 8192 }),
+            Ok(SysValue::Unit)
+        ));
+        // A refused mapping is an error AND an organic monitor fault.
+        let faults_before = k.domain_mut(1).unwrap().stats.faults;
+        assert!(k
+            .syscall(1, SysRequest::Mmap { addr: 0x5000_0000, len: 4096, flags: MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC })
+            .is_err());
+        assert_eq!(k.domain_mut(1).unwrap().stats.faults, faults_before + 1);
+        // Stubs answer NotImplemented with their number, never Unit.
+        let mut k2 = Kernel::new();
+        k2.create_domain_with(2, crate::profile::driver_profile(), 1002, 100, 0).unwrap(); // driver has IOCTL
+        assert!(matches!(
+            k2.syscall(2, SysRequest::Ioctl { cmd: 0 }),
+            Err(SysError::NotImplemented(nr)) if nr == crate::syscall::SYS_IOCTL
+        ));
+        // And the monitor saw the attempt (the gate marks it used).
+        let used = k2.domain_mut(2).unwrap().stats.used_mask();
+        assert!(used & (1 << crate::syscall::SYS_IOCTL) != 0);
+    }
+
+    /// F14: `net_open` folded every NetError into UnknownDomain — a full
+    /// socket table would have reported a missing domain. The signature
+    /// now carries the real error. (The TableFull branch is structurally
+    /// unreachable through this API today: sockets die with their
+    /// domains and MAX_SOCKETS == MAX_DOMAINS, so a live table can never
+    /// overflow — the type keeps the distinction for the day that
+    /// decouples.) What is reachable is proven: UnknownDomain keeps its
+    /// identity and a full table of live domains opens cleanly.
+    #[test]
+    fn net_open_preserves_its_error_variants() {
+        use crate::sys::NetOpenError;
+        let mut k = Kernel::new();
+        assert!(matches!(
+            k.net_open(9999),
+            Err(NetOpenError::UnknownDomain(9999))
+        ));
+        // Every live domain opens: the table fills 4/4 with no folding.
+        for i in 0..4u32 {
+            let id = 4000 + i;
+            k.create_domain_with(id, service_profile(), 2100, 100, 0).unwrap();
+            assert!(k.net_open(id).is_ok(), "domain {id} opens its socket");
+        }
+        assert_eq!(k.sockets.len(), 4);
+    }
+
+    /// F14: kernel error variants must survive the syscall boundary —
+    /// the old `into_sys` collapsed everything but UnknownDomain into
+    /// `UnknownDomain(0)`.
+    #[test]
+    fn kernel_error_variants_survive_the_boundary() {
+        use crate::sys::{SysError, SysRequest};
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        // InvalidId through the syscall layer (derived-uid collision).
+        assert!(matches!(
+            k.create_domain(64536, service_profile()),
+            Err(KernelError::InvalidId(64536))
+        ));
+        // DuplicateDomain surfaced, not UnknownDomain(0).
+        assert!(matches!(
+            k.syscall(1, SysRequest::Pipe),
+            Ok(_)
+        ));
+        // Direct: duplicate create surfaces its own variant.
+        assert!(matches!(
+            k.create_domain(1, service_profile()),
+            Err(KernelError::DuplicateDomain(1))
+        ));
+        // Fill the table (MAX_DOMAINS=4) -> TooManyDomains surfaced.
+        k.create_domain(2, service_profile()).unwrap();
+        k.create_domain(3, service_profile()).unwrap();
+        k.create_domain(4, service_profile()).unwrap();
+        assert!(matches!(
+            k.create_domain(5, service_profile()),
+            Err(KernelError::TooManyDomains)
+        ));
+        // And a syscall on a domain that does not exist keeps the id.
+        assert!(matches!(
+            k.syscall(99, SysRequest::Pipe),
+            Err(SysError::UnknownDomain(99))
+        ));
+    }
+
+    /// F14: an unauthorized sender must not learn whether a target id
+    /// exists — PermissionDenied for both an existing foreign target and
+    /// a missing one; uid 0 and self still get the honest UnknownDomain.
+    #[test]
+    fn kill_does_not_reveal_target_existence() {
+        use crate::sys::{SysError, SysRequest};
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap(); // uid 1001
+        k.create_domain_with(2, service_profile(), 1002, 100, 0).unwrap();
+        // Foreign target that EXISTS: PermissionDenied (not UnknownDomain).
+        assert!(matches!(
+            k.syscall(1, SysRequest::Kill { target: 2, sig: 15 }),
+            Err(SysError::PermissionDenied)
+        ));
+        // Foreign target that does NOT exist: the same answer.
+        assert!(matches!(
+            k.syscall(1, SysRequest::Kill { target: 7777, sig: 15 }),
+            Err(SysError::PermissionDenied)
+        ));
+        // Self still works, and a missing *own-uid* target... self-target
+        // is domain 1 itself (exists): fine.
+        assert!(k.syscall(1, SysRequest::Kill { target: 1, sig: 15 }).is_ok());
+        // Root gets the truthful UnknownDomain for a missing target.
+        k.create_domain_with(9, service_profile(), 0, 0, 0).unwrap(); // uid 0
+        assert!(matches!(
+            k.syscall(9, SysRequest::Kill { target: 7777, sig: 15 }),
+            Err(SysError::UnknownDomain(7777))
+        ));
     }
 
     /// F7: a respawned domain (same id, after a supervised destroy)

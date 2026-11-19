@@ -24,10 +24,10 @@ fn kernel_with_tree() -> Kernel {
     k.syscall(SUPERVISOR, SysRequest::Mkdir { path: "/home", mode: Mode(0o755) }).unwrap();
     k.syscall(
         SUPERVISOR,
-        SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: true },
+        SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: true , read: true, write: false, truncate: false },
     )
     .unwrap();
-    let fd = match k.syscall(SUPERVISOR, SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: false }).unwrap() {
+    let fd = match k.syscall(SUPERVISOR, SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: false , read: true, write: false, truncate: false }).unwrap() {
         SysValue::Fd(fd) => fd,
         other => panic!("expected fd, got {:?}", other),
     };
@@ -41,7 +41,7 @@ fn vfs_unix_permissions_end_to_end() {
     let mut k = kernel_with_tree();
 
     // The unprivileged service can read a 0o644 root-owned file (other: r)…
-    let fd = match k.syscall(SERVICE, SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: false }).unwrap() {
+    let fd = match k.syscall(SERVICE, SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: false , read: true, write: false, truncate: false }).unwrap() {
         SysValue::Fd(fd) => fd,
         other => panic!("{:?}", other),
     };
@@ -57,20 +57,20 @@ fn vfs_unix_permissions_end_to_end() {
     );
     // …and cannot create inside root-owned /home (no w on parent).
     assert_eq!(
-        k.syscall(SERVICE, SysRequest::Open { path: "/home/evil", mode: Mode(0o644), create: true }),
+        k.syscall(SERVICE, SysRequest::Open { path: "/home/evil", mode: Mode(0o644), create: true , read: true, write: false, truncate: false }),
         Err(SysError::Vfs(VfsError::PermissionDenied))
     );
     // …while /pub (0o777) is writable for everyone. The file the service
     // creates is owned by the service itself (uid 1001), so it can write
     // it again later — ownership works end to end.
-    match k.syscall(SERVICE, SysRequest::Open { path: "/pub/mine.txt", mode: Mode(0o644), create: true }).unwrap() {
+    match k.syscall(SERVICE, SysRequest::Open { path: "/pub/mine.txt", mode: Mode(0o644), create: true , read: true, write: false, truncate: false }).unwrap() {
         SysValue::Fd(fd2) => {
             k.syscall(SERVICE, SysRequest::Write { fd: fd2, bytes: b"service data" }).unwrap();
             k.syscall(SERVICE, SysRequest::Close { fd: fd2 }).unwrap();
         }
         other => panic!("{:?}", other),
     }
-    let fd3 = match k.syscall(SERVICE, SysRequest::Open { path: "/pub/mine.txt", mode: Mode(0o644), create: false }).unwrap() {
+    let fd3 = match k.syscall(SERVICE, SysRequest::Open { path: "/pub/mine.txt", mode: Mode(0o644), create: false , read: true, write: false, truncate: false }).unwrap() {
         SysValue::Fd(fd) => fd,
         other => panic!("{:?}", other),
     };
@@ -82,11 +82,21 @@ fn vfs_unix_permissions_end_to_end() {
 #[test]
 fn file_cursor_reads_short_then_eof() {
     let mut k = kernel_with_tree();
-    let fd = match k.syscall(SERVICE, SysRequest::Open { path: "/pub/data.bin", mode: Mode(0o644), create: true }).unwrap() {
+    let fd = match k.syscall(SERVICE, SysRequest::Open { path: "/pub/data.bin", mode: Mode(0o644), create: true , read: true, write: false, truncate: false }).unwrap() {
         SysValue::Fd(fd) => fd,
         other => panic!("{:?}", other),
     };
     k.syscall(SERVICE, SysRequest::Write { fd, bytes: b"0123456789" }).unwrap();
+    // F11(c): the writer's offset moved with the write — read back
+    // through a fresh read-only descriptor.
+    k.syscall(SERVICE, SysRequest::Close { fd }).unwrap();
+    let fd = match k
+        .syscall(SERVICE, SysRequest::Open { path: "/pub/data.bin", mode: Mode(0o644), create: false, read: true, write: false, truncate: false })
+        .unwrap()
+    {
+        SysValue::Fd(fd) => fd,
+        other => panic!("{:?}", other),
+    };
 
     let mut buf = [0u8; 4];
     match k.syscall(SERVICE, SysRequest::Read { fd, buf: &mut buf }).unwrap() {
@@ -129,7 +139,7 @@ fn parser_is_masked_out_of_all_linux_syscalls() {
     let mut k = kernel_with_tree();
     // The fast-path gate denies every file/process syscall for the parser.
     assert_eq!(
-        k.syscall(PARSER, SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: false }),
+        k.syscall(PARSER, SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: false , read: true, write: false, truncate: false }),
         Err(SysError::Masked(SYS_OPEN))
     );
     assert_eq!(
@@ -214,7 +224,7 @@ fn chroot_confinement_through_syscalls() {
     // The service chroots itself into /pub (world-writable scratch).
     assert_eq!(k.syscall(SERVICE, SysRequest::Chroot { path: "/pub" }), Ok(SysValue::Unit));
     // Inside the chroot it can create and read its own files…
-    let fd = match k.syscall(SERVICE, SysRequest::Open { path: "box.txt", mode: Mode(0o644), create: true }).unwrap() {
+    let fd = match k.syscall(SERVICE, SysRequest::Open { path: "box.txt", mode: Mode(0o644), create: true , read: true, write: false, truncate: false }).unwrap() {
         SysValue::Fd(fd) => fd,
         other => panic!("{:?}", other),
     };
@@ -223,12 +233,12 @@ fn chroot_confinement_through_syscalls() {
     // …but every escape attempt misses:
     //   absolute paths resolve from the chroot root,
     assert_eq!(
-        k.syscall(SERVICE, SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: false }),
+        k.syscall(SERVICE, SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: false , read: true, write: false, truncate: false }),
         Err(SysError::Vfs(VfsError::NotFound))
     );
     //   as do ..-climbs…
     assert_eq!(
-        k.syscall(SERVICE, SysRequest::Open { path: "../../../home/notes.txt", mode: Mode(0o644), create: false }),
+        k.syscall(SERVICE, SysRequest::Open { path: "../../../home/notes.txt", mode: Mode(0o644), create: false , read: true, write: false, truncate: false }),
         Err(SysError::Vfs(VfsError::NotFound))
     );
     //   …and unlinking outside is equally impossible.
@@ -237,12 +247,12 @@ fn chroot_confinement_through_syscalls() {
         Err(SysError::Vfs(VfsError::NotFound))
     );
     // The supervisor (not chrooted) still sees the whole tree.
-    assert!(k.syscall(SUPERVISOR, SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: false }).is_ok());
+    assert!(k.syscall(SUPERVISOR, SysRequest::Open { path: "/home/notes.txt", mode: Mode(0o644), create: false , read: true, write: false, truncate: false }).is_ok());
     // The confined service can still chroot deeper (within its root).
     k.syscall(SUPERVISOR, SysRequest::Mkdir { path: "/pub/jail", mode: Mode(0o777) }).unwrap();
     assert_eq!(k.syscall(SERVICE, SysRequest::Chroot { path: "jail" }), Ok(SysValue::Unit));
     assert_eq!(
-        k.syscall(SERVICE, SysRequest::Open { path: "../box.txt", mode: Mode(0o644), create: false }),
+        k.syscall(SERVICE, SysRequest::Open { path: "../box.txt", mode: Mode(0o644), create: false , read: true, write: false, truncate: false }),
         Err(SysError::Vfs(VfsError::NotFound))
     );
 }
@@ -278,7 +288,7 @@ fn kill_permissions_and_fatal_signal_delivery() {
     assert_eq!(k.domain_state(PARSER), Some(DomainState::Quarantined));
     // A quarantined domain cannot even attempt syscalls anymore.
     assert_eq!(
-        k.syscall(PARSER, SysRequest::Open { path: "/pub/x", mode: Mode(0o644), create: false }),
+        k.syscall(PARSER, SysRequest::Open { path: "/pub/x", mode: Mode(0o644), create: false , read: true, write: false, truncate: false }),
         Err(SysError::Quarantined(SYS_OPEN))
     );
     // SIGUSR1 (default: Ignore) does NOT terminate the target.
@@ -321,8 +331,17 @@ fn cfs_scheduler_fairness_through_kernel() {
         assert!(id == 2 || id == 3);
     }
     k.sched.set_runnable(1, true).unwrap();
-    // Its untouched (low) vruntime wins the next pick.
-    assert_eq!(k.sched.pick_next(), Some(1));
+    // F12: the woken domain is placed at min_vruntime — it no longer
+    // wins outright with its stale low vruntime, but it must get the
+    // CPU again promptly (no starvation either).
+    let mut picked_one = false;
+    for _ in 0..8 {
+        if k.sched.schedule_slice(4).unwrap() == 1 {
+            picked_one = true;
+            break;
+        }
+    }
+    assert!(picked_one, "the woken domain must be scheduled again promptly");
     // Changing nice re-weights on the fly.
     k.set_nice_for(3, -10).unwrap();
     let e = k.sched.entity(3).unwrap();
@@ -389,7 +408,7 @@ fn mkdir_unlink_roundtrip_and_nonempty_dir() {
         Err(SysError::Vfs(VfsError::Exists))
     );
     // Non-empty dir cannot be unlinked…
-    let fd = match k.syscall(SERVICE, SysRequest::Open { path: "/pub/dir/f", mode: Mode(0o644), create: true }).unwrap() {
+    let fd = match k.syscall(SERVICE, SysRequest::Open { path: "/pub/dir/f", mode: Mode(0o644), create: true , read: true, write: false, truncate: false }).unwrap() {
         SysValue::Fd(fd) => fd,
         other => panic!("{:?}", other),
     };
@@ -403,7 +422,7 @@ fn mkdir_unlink_roundtrip_and_nonempty_dir() {
     assert_eq!(k.syscall(SERVICE, SysRequest::Unlink { path: "/pub/dir" }), Ok(SysValue::Unit));
     // Gone for real.
     assert_eq!(
-        k.syscall(SERVICE, SysRequest::Open { path: "/pub/dir", mode: Mode(0o644), create: false }),
+        k.syscall(SERVICE, SysRequest::Open { path: "/pub/dir", mode: Mode(0o644), create: false , read: true, write: false, truncate: false }),
         Err(SysError::Vfs(VfsError::NotFound))
     );
 }

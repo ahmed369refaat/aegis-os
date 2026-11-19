@@ -39,7 +39,7 @@ documents.
 | Capabilities | `{index, generation}` handles: revoked or reused handles are rejected; derivation needs `GRANT` + subset rights |
 | Memory | Ten ordered checks: W^X, alignment, wraparound, overlap, one-page guard gaps, quotas; unmap counts pages as scrubbed |
 | Physical frames (M1) | Pool frames are owned per-domain; freeing scrubs (zeroes) and is verified by read-back; freeing a frame you do not own is an error |
-| VFS | Unix DAC: owner/group/other `rwx`, execute-to-traverse, chmod owner-or-root; chroot clamps `..` and moves the cwd with the root |
+| VFS | Unix DAC: owner/group/other `rwx`, execute-to-traverse (including on `..` when *leaving* a directory), chmod owner-or-root; chroot clamps `..` and moves the cwd with the root; inode identity is (id, generation) — stale fds/cwd/chroot refs fail closed after slot reuse; open-time permission checks for the requested r/w access; truncation is an explicit flag, writes land at the fd offset |
 | Network | Only the `netd` profile holds `NET_*`; every send passes a per-domain token bucket |
 | Signals | Unix kill rules (uid 0, same uid, or self); SIGKILL/SIGSTOP unblockable |
 

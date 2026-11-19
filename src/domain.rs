@@ -14,7 +14,7 @@ use crate::monitor::DomainStats;
 use crate::profile::DomainProfile;
 use crate::signal::SignalState;
 use crate::syscall::{SyscallMask, SYS_EXIT};
-use crate::vfs::Credentials;
+use crate::vfs::{Credentials, InodeRef, ROOT_REF};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainState {
@@ -51,10 +51,12 @@ pub struct Domain {
     /// Unix credentials of this domain (all its processes).
     pub uid: u16,
     pub gid: u16,
-    /// Current working directory (VFS inode id).
-    pub cwd: u32,
-    /// Chroot root (VFS inode id): path resolution cannot escape above it.
-    pub chroot_root: u32,
+    /// Current working directory (VFS inode reference — F10: the
+    /// generation makes stale cwd refs fail closed).
+    pub cwd: InodeRef,
+    /// Chroot root (VFS inode reference): path resolution cannot escape
+    /// above it.
+    pub chroot_root: InodeRef,
     /// Open file descriptors (files, pipe ends).
     pub fds: FdTable,
     /// Pending/blocked POSIX-style signals.
@@ -75,8 +77,8 @@ impl Domain {
             violations: 0,
             uid: 1000,
             gid: 1000,
-            cwd: 0,
-            chroot_root: 0,
+            cwd: ROOT_REF,
+            chroot_root: ROOT_REF,
             fds: FdTable::new(),
             signals: SignalState::new(),
         }

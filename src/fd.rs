@@ -13,7 +13,7 @@ pub const MAX_FDS: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FdTarget {
     /// VFS inode, with `pos` as the file cursor.
-    File(u32),
+    File(crate::vfs::InodeRef),
     /// Reading end of pipe id.
     PipeRead(u32),
     /// Writing end of pipe id.
@@ -111,7 +111,7 @@ mod tests {
     use super::*;
 
     fn file(i: u32) -> FdTarget {
-        FdTarget::File(i)
+        FdTarget::File(crate::vfs::InodeRef { id: i, generation: 1 })
     }
 
     #[test]
@@ -203,10 +203,10 @@ mod tests {
         let mut t = FdTable::new();
         t.alloc(FdTarget::PipeRead(0)).unwrap();
         t.alloc(FdTarget::PipeWrite(0)).unwrap();
-        t.alloc(FdTarget::File(3)).unwrap();
+        t.alloc(FdTarget::File(crate::vfs::InodeRef { id: 3, generation: 1 })).unwrap();
         assert_eq!(t.get(0).unwrap().target, FdTarget::PipeRead(0));
         assert_eq!(t.get(1).unwrap().target, FdTarget::PipeWrite(0));
-        assert_eq!(t.get(2).unwrap().target, FdTarget::File(3));
+        assert_eq!(t.get(2).unwrap().target, FdTarget::File(crate::vfs::InodeRef { id: 3, generation: 1 }));
         assert_eq!(t.len(), 3);
     }
 }
