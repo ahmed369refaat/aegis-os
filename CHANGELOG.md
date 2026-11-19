@@ -10,10 +10,13 @@ proving it on every push.
 
 ### Added — bootable kernel (`kernel-x86_64/`, new workspace member)
 
-- Multiboot v1 bring-up: 32-bit entry, own GDT, identity page tables
-  (1 GiB, 2 MiB pages), PAE → EFER.LME → CR0.PG long-mode transition,
-  64-bit handoff to `kmain` with the boot TSC stamped at the first
-  instruction.
+- Two-stage multiboot v1 bring-up (QEMU's `-kernel` loader rejects
+  ELF64 — discovered on the first CI boot run and fixed with this
+  design): a pure-asm ELF32 stub (`boot-x86_64/stub.S`) — own GDT,
+  identity page tables (1 GiB, 2 MiB pages), PAE → EFER.LME → CR0.PG
+  long-mode transition, relocation-free 64-bit handoff — embeds the
+  flattened ELF64 kernel at its 2 MiB link base and jumps to its entry
+  with the boot TSC stamped at the stub's first instruction.
 - Real frame pool: 256 × 4 KiB at physical 16 MiB, claimed only after
   multiboot `mem_upper` validation, managed by the **existing** policy-core
   buddy allocator (the `Kernel.frames` instance), with per-frame ownership

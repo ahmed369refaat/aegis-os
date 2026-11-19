@@ -8,12 +8,9 @@
 
 use core::arch::asm;
 
-// State stashed by the 32-bit entry stub (see boot/asm.rs) before any Rust
-// code runs. Written exactly once by assembly; read-only afterwards.
-#[unsafe(no_mangle)]
-pub static mut MULTIBOOT_MAGIC: u32 = 0;
-#[unsafe(no_mangle)]
-pub static mut MULTIBOOT_INFO: u32 = 0;
+// Boot TSC stamp: the ELF32 boot stub captures the TSC at its first
+// instruction and passes it in RDX; `aegis_entry_64` stores it here
+// (after zeroing .bss). Written exactly once; read-only afterwards.
 #[unsafe(no_mangle)]
 pub static mut BOOT_TSC_LO: u32 = 0;
 #[unsafe(no_mangle)]
@@ -64,18 +61,6 @@ pub fn boot_tsc() -> u64 {
     // SAFETY: written once by the entry stub, before any Rust code runs;
     // there is no concurrent accesser.
     unsafe { ((BOOT_TSC_HI as u64) << 32) | BOOT_TSC_LO as u64 }
-}
-
-/// The multiboot magic value the loader passed us.
-pub fn multiboot_magic_saved() -> u32 {
-    // SAFETY: as `boot_tsc`.
-    unsafe { MULTIBOOT_MAGIC }
-}
-
-/// The multiboot info physical address the loader passed us.
-pub fn multiboot_info_saved() -> u32 {
-    // SAFETY: as `boot_tsc`.
-    unsafe { MULTIBOOT_INFO }
 }
 
 /// Halt forever (interrupts disabled). Never returns.
