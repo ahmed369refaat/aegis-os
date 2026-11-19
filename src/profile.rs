@@ -5,8 +5,10 @@
 //! Policy choices (deliberately narrow defaults — least privilege):
 //! - Parsers get no network, no spawn, no ioctl, no write.
 //! - Plugins get read + IPC only.
-//! - Network egress is brokered through a dedicated broker domain, so no
-//!   profile below carries NET_* rights.
+//! - Network egress is brokered: `netd_profile` is the ONLY profile that
+//!   carries NET_* rights, and its sends are kernel rate-limited per client.
+//! - The Linux-like process syscalls (PIPE/DUP/KILL/CHROOT/MKDIR/UNLINK)
+//!   belong to the service profile exclusively.
 
 use crate::capability::Rights;
 use crate::syscall::{
