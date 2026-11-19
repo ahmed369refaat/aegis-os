@@ -1,0 +1,17 @@
+[package]
+name = "aegis-os"
+version = "0.1.0"
+edition = "2021"
+description = "AegisOS core: Unix-philosophy OS building blocks with strict per-domain isolation, attenuation-only syscall masks, capability tables, W^X memory policy and a graduated AI behavior monitor (no_std, zero dependencies)."
+license = "MIT"
+
+[lib]
+name = "aegis_os"
+path = "src/lib.rs"
+
+# Intentionally empty: core-only, no_std, zero supply-chain surface.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true

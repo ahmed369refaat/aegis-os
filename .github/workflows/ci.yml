@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run unit + integration tests
+        run: cargo test --verbose
+
+  no-std:
+    name: no_std build (thumbv7em)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - name: Build for bare-metal ARM
+        run: cargo build --target thumbv7em-none-eabihf --verbose
+
+  no-deps:
+    name: Zero-dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Assert the dependency graph is empty
+        run: |
+          test -z "$(cargo tree --prefix none 2>/dev/null | grep -v '^aegis-os ' | grep -v '^$' || true)" || (cargo tree && exit 1)
+      - name: Forbid unsafe code
+        run: |
+          ! grep -rn "unsafe" src/ --include="*.rs" | grep -v "forbid(unsafe_code)"
