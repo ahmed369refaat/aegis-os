@@ -26,10 +26,15 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[repr(align(16))]
 struct IstStack([u8; 0x4000]);
 
-static IST_DF: IstStack = IstStack([0; 0x4000]);
-static IST_NMI: IstStack = IstStack([0; 0x4000]);
-static IST_MC: IstStack = IstStack([0; 0x4000]);
-static IST_SS: IstStack = IstStack([0; 0x4000]);
+// F16 (ADR-0006): `static mut` so these land in `.bss` (writable
+// NOBITS). As plain `static` they were immutable data that only worked
+// because the image mapping was writable — the exact accident the
+// image W^X work (F15) removes. CI asserts the sections
+// (scripts/check-ist-sections.sh, wired into boot.sh).
+static mut IST_DF: IstStack = IstStack([0; 0x4000]);
+static mut IST_NMI: IstStack = IstStack([0; 0x4000]);
+static mut IST_MC: IstStack = IstStack([0; 0x4000]);
+static mut IST_SS: IstStack = IstStack([0; 0x4000]);
 /// PR-1.4: #PF gets its own IST. The classic argument against (a fault
 /// on the current stack cannot trust that stack) matters when the
 /// faulting stack IS the kernel's — but ring-3 faults arrive from the
@@ -37,13 +42,21 @@ static IST_SS: IstStack = IstStack([0; 0x4000]);
 /// thing this bring-up proved flaky, while IST delivery from CPL3 is
 /// proven working (the #DF frame above arrives complete via IST1).
 /// Single CPU, no preemption: no nesting hazard.
-static IST_PF: IstStack = IstStack([0; 0x4000]);
+static mut IST_PF: IstStack = IstStack([0; 0x4000]);
 
 /// Top-of-stack addresses for TSS.IST1..IST4, in the order `gdt::load`
 /// writes them (IST1=#DF, IST2=#NMI, IST3=#MC, IST4=#SS).
 pub fn ist_tops() -> [u64; 5] {
-    let top = |s: &IstStack| s as *const IstStack as u64 + s.0.len() as u64;
-    [top(&IST_DF), top(&IST_NMI), top(&IST_MC), top(&IST_SS), top(&IST_PF)]
+    // F16: raw pointers into the `static mut` stacks — no references to
+    // mutable statics; the tops are pure address arithmetic.
+    let top = |s: *const IstStack| (s as usize + core::mem::size_of::<IstStack>()) as u64;
+    [
+        top(core::ptr::addr_of!(IST_DF)),
+        top(core::ptr::addr_of!(IST_NMI)),
+        top(core::ptr::addr_of!(IST_MC)),
+        top(core::ptr::addr_of!(IST_SS)),
+        top(core::ptr::addr_of!(IST_PF)),
+    ]
 }
 
 /// Set by `arm_and_trigger_de`: the *next* #DE is the selftest, not a bug.

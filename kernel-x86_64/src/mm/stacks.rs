@@ -34,6 +34,71 @@ const REGION_BYTES: u64 = 1 << 30;
 #[cfg(not(test))]
 const OWNER_KERNEL: u32 = 0;
 
+/// How many 2 MiB slots fit in the 1 GiB region (one PDPT entry).
+pub const MAX_SLOTS: usize = 512;
+
+/// F17: slot freelist as an atomic bitmap — slots are REUSED after free
+/// (the old monotonic cursor exhausted the region after 512 stacks per
+/// boot). Interior mutability is all atomic, so a `static StackSlots`
+/// is shareable (single-CPU today, ready for Stage 4).
+pub struct StackSlots {
+    bits: [core::sync::atomic::AtomicU64; MAX_SLOTS / 64],
+    hint: core::sync::atomic::AtomicUsize,
+}
+
+impl StackSlots {
+    pub const fn new() -> Self {
+        use core::sync::atomic::{AtomicU64, AtomicUsize};
+        StackSlots {
+            bits: [const { AtomicU64::new(0) }; MAX_SLOTS / 64],
+            hint: AtomicUsize::new(0),
+        }
+    }
+
+    /// Claim the lowest free slot (searching from the hint); None when
+    /// the region is exhausted.
+    pub fn alloc(&self) -> Option<u32> {
+        use core::sync::atomic::Ordering;
+        for word in 0..self.bits.len() {
+            let w = &self.bits[(self.hint.load(Ordering::Relaxed) + word) % self.bits.len()];
+            let mut cur = w.load(Ordering::Relaxed);
+            loop {
+                if cur == u64::MAX {
+                    break;
+                }
+                let bit = cur.trailing_ones() as usize;
+                match w.compare_exchange_weak(
+                    cur,
+                    cur | (1 << bit),
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        let slot = ((self.hint.load(Ordering::Relaxed) + word) % self.bits.len()) * 64 + bit;
+                        return Some(slot as u32);
+                    }
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+        None
+    }
+
+    /// Return a slot to the pool (idempotent-clear).
+    pub fn free(&self, slot: u32) {
+        use core::sync::atomic::Ordering;
+        let (word, bit) = ((slot as usize) / 64, (slot as usize) % 64);
+        self.bits[word].fetch_and(!(1 << bit), Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn in_use(&self, slot: u32) -> bool {
+        use core::sync::atomic::Ordering;
+        let (word, bit) = ((slot as usize) / 64, (slot as usize) % 64);
+        self.bits[word].load(Ordering::SeqCst) & (1 << bit) != 0
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Pure slot arithmetic (host-tested).
 // ─────────────────────────────────────────────────────────────────────────
@@ -74,7 +139,7 @@ pub enum StackError {
 /// A live guarded stack: its slot, its pool frames, and its page table.
 #[cfg(not(test))]
 pub struct KernelStack {
-    /// Slot index (slots are never reused; the cursor is monotonic).
+    /// Slot index (reused after free — see StackSlots, F17).
     pub slot: u32,
     /// How many mapped stack pages (guard excluded).
     pub pages: usize,
@@ -107,19 +172,20 @@ impl KernelStack {
 #[cfg(not(test))]
 mod target {
     use super::{
-        slot_base, KernelStack, StackError, OWNER_KERNEL, MAX_PAGES, PAGE, REGION_BYTES,
-        SLOT_BYTES,
+        slot_base, KernelStack, StackError, MAX_PAGES, MAX_SLOTS, OWNER_KERNEL, PAGE, SLOT_BYTES,
     };
     use crate::frames::FramePool;
     use crate::mm::{ADDR_MASK, PTE_P_RW};
     use crate::memops;
     use aegis_os::prelude::BuddyAllocator;
-    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     // Single-CPU bring-up state. Atomics (not `static mut`): this module
     // stays unsafe-free, and the ordering is explicit for the day a second
-    // CPU arrives (Stage 4).
-    static NEXT_SLOT: AtomicU32 = AtomicU32::new(0);
+    // CPU arrives (Stage 4). F17: the slot freelist replaced the old
+    // monotonic NEXT_SLOT cursor (512 stacks per boot, then forever
+    // exhausted).
+    static SLOTS: super::StackSlots = super::StackSlots::new();
     static REGION_PD_PA: AtomicU64 = AtomicU64::new(0);
 
     /// Physical address of the stub's kernel PDPT (PML4[511], flags
@@ -153,20 +219,44 @@ mod target {
             pd_pa = pd;
         }
 
-        let slot = NEXT_SLOT.fetch_add(1, Ordering::SeqCst);
-        if slot as u64 * SLOT_BYTES >= REGION_BYTES {
-            return Err(StackError::TooLarge(slot as usize)); // region exhausted
-        }
+        // F17: claim a REUSABLE slot (freed slots come back instead of a
+        // monotonic cursor that exhausts the region after 512 stacks).
+        let slot = match SLOTS.alloc() {
+            Some(s) => s,
+            None => return Err(StackError::TooLarge(MAX_SLOTS)), // region exhausted
+        };
 
         // The slot's page table: scrub to all-absent, link into the PD,
         // then map the stack pages. PT[0] stays absent — that IS the guard.
-        let pt = pool.alloc_for(buddy, OWNER_KERNEL).map_err(StackError::Pool)?;
+        // F17: on any failure from here on, everything allocated in this
+        // call is rolled back (the old code leaked the PT and the frames
+        // it had already grabbed).
+        let pt = match pool.alloc_for(buddy, OWNER_KERNEL) {
+            Ok(pa) => pa,
+            Err(e) => {
+                SLOTS.free(slot);
+                return Err(StackError::Pool(e));
+            }
+        };
         memops::scrub_frame(pt);
         memops::write_u64(pd_pa + slot as u64 * 8, pt | PTE_P_RW);
 
         let mut frames = [0u64; MAX_PAGES];
         for (i, frame_pa) in frames.iter_mut().enumerate().take(pages) {
-            let pa = pool.alloc_for(buddy, OWNER_KERNEL).map_err(StackError::Pool)?;
+            let pa = match pool.alloc_for(buddy, OWNER_KERNEL) {
+                Ok(pa) => pa,
+                Err(e) => {
+                    // Rollback: every frame taken so far, the PT, the PD
+                    // entry, and the slot itself.
+                    for j in 0..i {
+                        let _ = pool.free(buddy, frames[j], OWNER_KERNEL);
+                    }
+                    memops::write_u64(pd_pa + slot as u64 * 8, 0);
+                    let _ = pool.free(buddy, pt, OWNER_KERNEL);
+                    SLOTS.free(slot);
+                    return Err(StackError::Pool(e));
+                }
+            };
             // Kernel stack pages: RW, non-executable, global (PGE on).
             let bits = crate::mm::pte::PTE_P
                 | crate::mm::pte::PTE_W
@@ -197,6 +287,8 @@ mod target {
         }
         memops::write_u64(pd_pa + stack.slot as u64 * 8, 0);
         pool.free(buddy, stack.pt_pa, OWNER_KERNEL).map_err(StackError::Pool)?;
+        // F17: the slot is reusable by the next alloc.
+        SLOTS.free(stack.slot);
         Ok(())
     }
 }
@@ -207,6 +299,38 @@ pub use target::{alloc, free};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F17: slots must be REUSABLE (the old cursor was monotonic — 512
+    /// stacks per boot, then alloc fails forever) and bounded.
+    #[test]
+    fn slots_are_reusable_and_bounded() {
+        let s = StackSlots::new();
+        let a = s.alloc().unwrap();
+        let b = s.alloc().unwrap();
+        assert_ne!(a, b);
+        s.free(a);
+        // The freed slot comes back instead of being skipped forever.
+        let c = s.alloc().unwrap();
+        assert_eq!(c, a, "freed slots are reused");
+        assert!(s.in_use(a) && s.in_use(b));
+        // Bounded: after filling the rest, alloc answers None.
+        for _ in 0..(MAX_SLOTS - 2) {
+            s.alloc().expect("bounded by MAX_SLOTS");
+        }
+        assert_eq!(s.alloc(), None);
+        // Free everything: full reuse round two.
+        for i in 0..MAX_SLOTS as u32 {
+            s.free(i);
+        }
+        assert_eq!(s.alloc(), Some(0));
+    }
+
+    #[test]
+    fn slot_bitmap_matches_the_region_geometry() {
+        // One PDPT entry (1 GiB) of 2 MiB slots.
+        assert_eq!(MAX_SLOTS as u64 * SLOT_BYTES, 1 << 30);
+        assert!(MAX_SLOTS % 64 == 0, "bitmap words are full");
+    }
 
     #[test]
     fn slot_layout_guard_then_pages() {
