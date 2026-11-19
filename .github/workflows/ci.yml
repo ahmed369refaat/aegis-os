@@ -10,13 +10,22 @@ env:
 
 jobs:
   test:
-    name: Test (stable)
+    name: Policy-core tests (stable)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Run unit + integration tests
         run: cargo test --verbose
+
+  kernel-tests:
+    name: Kernel host tests (M1 boot logic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the M1 sequence logic on the host
+        run: cargo test -p aegis-kernel --verbose
 
   no-std:
     name: no_std build (thumbv7em)
@@ -26,18 +35,52 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv7em-none-eabihf
-      - name: Build for bare-metal ARM
+      - name: Build the policy core for bare-metal ARM
         run: cargo build --target thumbv7em-none-eabihf --verbose
 
-  no-deps:
-    name: Zero-dependency audit
+  kernel-build:
+    name: Kernel ELF build (x86_64-unknown-none)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Assert the dependency graph is empty
+        with:
+          targets: x86_64-unknown-none
+      - name: Build the bootable kernel
+        run: cargo build -p aegis-kernel --release --target x86_64-unknown-none --verbose
+      - name: Sanity-check the ELF (entry + multiboot header)
         run: |
-          test -z "$(cargo tree --prefix none 2>/dev/null | grep -v '^aegis-os ' | grep -v '^$' || true)" || (cargo tree && exit 1)
-      - name: Forbid unsafe code
+          ELF=target/x86_64-unknown-none/release/aegis-kernel
+          test -f "$ELF"
+          readelf -h "$ELF" | grep -q "Entry point address:.*0x100010"
+          # Multiboot magic (02 b0 ad 1b) must sit within the first 8 KiB.
+          od -A x -t x1 -j 4096 -N 4 "$ELF" | grep -q "02 b0 ad 1b"
+          echo "ELF checks: PASS"
+
+  boot-test:
+    name: Boot test (QEMU, M1 exit criteria)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      - name: Build, boot, and verify the M1 exit criteria
+        run: ./boot.sh --verify
+
+  no-deps:
+    name: Supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Assert the dependency graph contains only this repository
         run: |
-          ! grep -rn "unsafe" src/ --include="*.rs" | grep -v "forbid(unsafe_code)"
+          # Every line must be aegis-os or aegis-kernel (path dependency).
+          test -z "$(cargo tree --workspace --prefix none 2>/dev/null \
+            | grep -v '^aegis-os ' | grep -v '^aegis-kernel ' | grep -v '^$' || true)" \
+            || (cargo tree --workspace && exit 1)
+      - name: Unsafe-code policy (allowlist)
+        run: scripts/check_unsafe.sh
