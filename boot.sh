@@ -55,7 +55,7 @@ QEMU_ARGS=(-machine pc -cpu qemu64 -m 128M -kernel "$IMAGE" -display none -seria
 if [ "${1:-}" = "--verify" ]; then
   LOG=$(mktemp)
   trap 'rm -f "$LOG"' EXIT
-  echo "==> [4/4] booting in QEMU (TCG) — M1 exit-criteria run"
+  echo "==> [4/4] booting in QEMU (TCG) — M1 exit-criteria + PR-1.1 exception-selftest run"
   START=$(date +%s.%N)
   timeout 60 qemu-system-x86_64 "${QEMU_ARGS[@]}" | tee "$LOG"
   END=$(date +%s.%N)
@@ -67,6 +67,8 @@ if [ "${1:-}" = "--verify" ]; then
   grep -q "leaked-frames=0" "$LOG" || { echo "VERIFY FAIL: zero-leak assertion missing"; ok=0; }
   grep -q "scrub-verified=yes" "$LOG" || { echo "VERIFY FAIL: scrub verification missing"; ok=0; }
   grep -q "monitor-quarantined=yes" "$LOG" || { echo "VERIFY FAIL: monitor quarantine missing"; ok=0; }
+  grep -qF "[EXC] #DE vector=0 rip=" "$LOG" || { echo "VERIFY FAIL: #DE diagnosis marker missing"; ok=0; }
+  grep -qF "[EXC] selftest: exception machinery ok" "$LOG" || { echo "VERIFY FAIL: exception selftest marker missing"; ok=0; }
   if [ "$ok" = 1 ]; then
     echo "BOOT VERIFY: PASS"
   else

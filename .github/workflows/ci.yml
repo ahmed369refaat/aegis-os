@@ -19,12 +19,12 @@ jobs:
         run: cargo test --verbose
 
   kernel-tests:
-    name: Kernel host tests (M1 boot logic)
+    name: Kernel host tests (boot logic + arch encoding)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run the M1 sequence logic on the host
+      - name: Run the boot-logic and arch-layout tests on the host
         run: cargo test -p aegis-kernel --verbose
 
   no-std:
@@ -68,7 +68,7 @@ jobs:
           echo "image checks: PASS"
 
   boot-test:
-    name: Boot test (QEMU, M1 exit criteria)
+    name: Boot test (QEMU, M1 exit criteria + PR-1.1 selftest)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +77,7 @@ jobs:
           targets: x86_64-unknown-none
       - name: Install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
-      - name: Build, boot, and verify the M1 exit criteria
+      - name: Build, boot, and verify the M1 + exception-selftest markers
         run: ./boot.sh --verify
 
   no-deps:

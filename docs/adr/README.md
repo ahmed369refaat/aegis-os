@@ -23,3 +23,4 @@ it does not merge.
 | [0002](0002-higher-half-kernel-layout.md) | Higher-half kernel + direct map | Proposed (Stage 1) |
 | [0003](0003-linux-compatible-syscall-abi.md) | Linux-compatible syscall ABI | Proposed (Stage 5) |
 | [0004](0004-capability-endpoint-ipc.md) | Capability-endpoint IPC | Proposed (Stage 2) |
+| [0005](0005-exception-machinery.md) | Exception machinery + arch/ allowlist | Accepted (PR-1.1) |

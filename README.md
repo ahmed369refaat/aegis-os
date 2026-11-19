@@ -4,20 +4,21 @@
 
 [![CI](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml/badge.svg)](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests: 219](https://img.shields.io/badge/tests-219%20passing-brightgreen.svg)](tests/)
-[![Boot](https://img.shields.io/badge/boots%20in%20QEMU-M1%20green-brightgreen.svg)](#quick-start)
+[![Tests: 230](https://img.shields.io/badge/tests-230%20passing-brightgreen.svg)](tests/)
+[![Boot](https://img.shields.io/badge/boots%20in%20QEMU-M1%20%2B%20exceptions%20green-brightgreen.svg)](#quick-start)
 
 > The name: **Aegis** (the shield). One rule shapes the whole design: everything runs inside an isolated `Domain`, and every privilege is granted once and can only ever shrink.
 
 ## Current status — honestly stated
 
-**Done and proven (M0 + M1):**
+**Done and proven (M0 + M1 + PR-1.1):**
 
 - The full policy kernel as a library: attenuation-only syscall masks, capability generations, W^X memory policy, VFS with Unix DAC + chroot, pipes/signals/fd tables, CFS scheduling, rate-limited brokered sockets, behavior monitor with graduated response. **196 tests.**
-- A bootable x86_64 system, two-stage (QEMU's `-kernel` loader rejects ELF64 — discovered on the first CI boot run): a pure-asm ELF32 multiboot stub (`boot-x86_64/`) sets up identity paging and long mode, then runs the 64-bit kernel (`kernel-x86_64/`, embedded at its 2 MiB link base) over real RAM: a physical frame pool (256 × 4 KiB at 16 MiB) behind the policy core's buddy allocator with **scrub-on-free verified by read-back**, and the M1 exit-criteria sequence running on boot: a hello domain scheduled by CFS, the monitor escalating an attacker across five windows while the healthy neighbor keeps running, and 1000 create/destroy cycles with zero frame leaks. **23 host tests run the same sequence logic without an emulator; the CI boot job runs it in QEMU and fails unless the exit-criteria markers appear.**
-- Unsafe policy enforced by machine, not convention: the policy core is `forbid(unsafe_code)`; the kernel is `deny(unsafe_code)` with a three-module allowlist (`boot/`, `hw.rs`, `memops.rs`), every item carrying a `SAFETY` note, checked by `scripts/check_unsafe.sh` in CI.
+- A bootable x86_64 system, two-stage (QEMU's `-kernel` loader rejects ELF64 — discovered on the first CI boot run): a pure-asm ELF32 multiboot stub (`boot-x86_64/`) sets up identity paging and long mode, then runs the 64-bit kernel (`kernel-x86_64/`, embedded at its 2 MiB link base) over real RAM: a physical frame pool (256 × 4 KiB at 16 MiB) behind the policy core's buddy allocator with **scrub-on-free verified by read-back**, and the M1 exit-criteria sequence running on boot: a hello domain scheduled by CFS, the monitor escalating an attacker across five windows while the healthy neighbor keeps running, and 1000 create/destroy cycles with zero frame leaks.
+- **Exception machinery (Stage 1 / PR-1.1)**: a kernel-owned GDT/TSS/IDT with a uniform exception frame, IST stacks for `#DF/#NMI/#MC/#SS`, and a live negative test — the boot forces a hardware `#DE` and the dispatch prints the diagnosis and the selftest marker before powering off. Every fault from here on is diagnosed, not a silent hang. **11 new host tests pin the descriptor/frame encodings, including the boot-stub GDT literals as an ABI contract.**
+- Unsafe policy enforced by machine, not convention: the policy core is `forbid(unsafe_code)`; the kernel is `deny(unsafe_code)` with a four-module allowlist (`arch/`, `boot/`, `hw.rs`, `memops.rs`), every item carrying a `SAFETY` note, and a **ratchet** (`scripts/unsafe-count.txt`, baseline 23) that fails CI if the count grows without an ADR.
 
-**Not yet (roadmap, see `docs/ROADMAP.md`):** ring-3 user domains, per-domain page tables (M1 domains are kernel-resident objects whose region mappings pass the full policy and whose pages are real tracked frames — the hardware isolation boundary lands in M2), preemption/timers, IPC, virtio devices, real filesystems, aarch64 target.
+**Not yet (roadmap v2, see [`docs/ROADMAP.md`](docs/ROADMAP.md)):** the hardware isolation boundary itself — ring-3 user domains, per-domain page tables, SYSCALL/SYSRET entry (PR-1.2..1.4 of [`docs/STAGE1-PR-PLAN.md`](docs/STAGE1-PR-PLAN.md)), then IPC, block storage + ext2, preemption/SMP, the Linux-compatible syscall ABI, drivers, and hardening. M1 domains are still kernel-resident objects whose region mappings pass the full policy and whose pages are real tracked frames.
 
 ## The architecture in one line
 
@@ -27,14 +28,14 @@
 
 ```bash
 ./boot.sh           # build the kernel and boot it in QEMU (needs qemu-system-x86)
-./boot.sh --verify  # same, plus assert the M1 exit-criteria markers
+./boot.sh --verify  # same, plus assert the M1 + exception-selftest markers
 
 cargo test                       # 196 policy-core tests
-cargo test -p aegis-kernel       # 23 M1 boot-logic tests (host)
+cargo test -p aegis-kernel       # 34 host tests: boot logic + arch encodings
 cargo build --target thumbv7em-none-eabihf   # the core still builds for bare-metal ARM
 ```
 
-What the boot log shows (CI greps exactly these): multiboot memory validation, the frame pool claim, the guard-gap policy rejecting an adjacent mapping **live**, CFS slices, `Hello from AegisOS domain 1`, the five-window escalation `55 → 50 → 37 → 80 → 80` ending in quarantine with the neighbor healthy, `leaked-frames=0`, `scrub-verified=yes`, and a single `M1-EXIT-CRITERIA: PASS` verdict line.
+What the boot log shows (CI greps exactly these): multiboot memory validation, the GDT/TSS/IDT going live, the frame pool claim, the guard-gap policy rejecting an adjacent mapping **live**, CFS slices, `Hello from AegisOS domain 1`, the five-window escalation `55 → 50 → 37 → 80 → 80` ending in quarantine with the neighbor healthy, `leaked-frames=0`, `scrub-verified=yes`, a single `M1-EXIT-CRITERIA: PASS` verdict line — then the PR-1.1 selftest: a forced hardware `#DE` with the full diagnosis (`[EXC] #DE vector=0 rip=… cs=0x18 err=0`) and `[EXC] selftest: exception machinery ok`.
 
 ## What's inside
 
@@ -45,6 +46,7 @@ What the boot log shows (CI greps exactly these): multiboot memory validation, t
 | Memory policy | `memory` | mmap + W^X | NULL/wraparound/overlap rejection, guard gaps, quotas, scrub accounting |
 | Page frames | `buddy` | buddy allocator | Power-of-two blocks, split on alloc, coalesce on free |
 | Boot + frames | `kernel-x86_64` | boot/paging | Multiboot → long mode → identity map; real pool, owner tracking, scrub-on-free |
+| CPU tables + exceptions | `kernel-x86_64/src/arch` | GDT/TSS/IDT | Uniform frame, IST for #DF/#NMI/#MC/#SS (not #PF), DPL-0 gates, stub GDT = boot ABI |
 | Filesystem | `vfs` | VFS + DAC + chroot(2) | owner/group/other `rwx`, execute-to-traverse, `..` clamped at chroot root |
 | Descriptors | `fd` | open file table | lowest-free allocation, dup2 semantics |
 | Pipes | `pipe` | pipe(2) | bounded ring, short I/O, EOF, EPIPE, dup-aware end refcounts |
@@ -82,7 +84,11 @@ On the booted kernel, all of this sits on real memory: `_start` → long mode �
 
 Five real signals from the fast path — denied ratio, faults, capability-escalation attempts, out-of-profile syscall bits, rate spikes — feed an integer-only risk score (u128 intermediates, deterministic, overflow-proof). Graduated response with anti-flap: a single bad window never escalates (hysteresis), reported scores decay, tightening keeps the app alive (it only drops spawn/net/ioctl/mmap/open), quarantine is terminal and passes only `SYS_EXIT`. If the monitor's state table fills, it degrades to logging — but instant quarantine at score ≥ 95 still fires. Fail-safe, not fail-open. On boot, the proven five-window escalation scenario runs live and its verdicts are printed.
 
-Docs: [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) (one-pager) · [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (full design) · [`docs/M1-PLAN.md`](docs/M1-PLAN.md) (M1 assessment, plan, results) · [`docs/ROADMAP.md`](docs/ROADMAP.md) (M0→M6)
+Docs: [`docs/ROADMAP.md`](docs/ROADMAP.md) (roadmap v2: the eight stages to a usable Unix-like core) · [`docs/STAGE1-PR-PLAN.md`](docs/STAGE1-PR-PLAN.md) (the current stage, PR by PR) · [`docs/arch/exceptions.md`](docs/arch/exceptions.md) (PR-1.1 component doc) · [`docs/adr/`](docs/adr/) (architecture decision records) · [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) · [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/M1-PLAN.md`](docs/M1-PLAN.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) (the PR contract) · [`docs/ABI-VERSION.md`](docs/ABI-VERSION.md)
+
+## Roadmap position
+
+Roadmap v2 turns this into a usable Unix-like core in eight stages (Ring-3 → IPC → storage → preemption/SMP → POSIX ABI → drivers → hardening → compliance; ≈ 65–80 PRs). **Current position: Stage 1, PR-1.1 merged** — exception machinery live and selftested. Next: PR-1.2 (higher-half kernel + direct map, ADR-0002), then per-domain page tables, then the first Ring-3 domain. Every stage gate is CI-verified: a stage does not start before the previous one's acceptance markers pass in QEMU.
 
 ## Repository layout
 
@@ -94,8 +100,9 @@ kernel-x86_64/            stage 2: the bootable M1 kernel (x86_64)
 ├── linker.ld               2 MiB link base, pinned entry, 256 KiB stack
 ├── build.rs                -T linker script only for the bare-metal target
 └── src/
+    ├── arch/              UNSAFE ALLOWLIST (ADR-0005): GDT/TSS/IDT + exception entry
     ├── boot/               UNSAFE ALLOWLIST: naked 64-bit entry
-    ├── hw.rs               UNSAFE ALLOWLIST: port I/O, rdtsc, poweroff
+    ├── hw.rs               UNSAFE ALLOWLIST: port I/O, rdtsc, cr2, poweroff
     ├── memops.rs           UNSAFE ALLOWLIST: volatile memory + scrub
     ├── serial.rs           COM1 output (safe, over hw primitives)
     ├── multiboot.rs        pure multiboot-info parsing (host-tested)
@@ -112,7 +119,8 @@ tests/
 ├── integration.rs   security scenarios (escalation, isolation, telemetry)
 └── linux_like.rs    Linux-semantics scenarios (VFS/pipe/signal/sched/net)
 boot.sh                 one command: build + boot (+ --verify proof mode)
-scripts/check_unsafe.sh the unsafe-allowlist policy check (CI-enforced)
+scripts/check_unsafe.sh the unsafe-allowlist policy + ratchet (CI-enforced)
+docs/                   roadmap, stage plans, ADRs, component docs
 ```
 
 ## License

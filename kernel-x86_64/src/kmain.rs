@@ -1,15 +1,19 @@
-//! The live M1 boot sequence (called from the 64-bit entry stub).
+//! The live boot sequence (called from the 64-bit entry stub).
 //!
 //! Order:
-//! 1. serial banner, multiboot validation (magic + memory fields),
-//! 2. frame-pool claim: the region must fit reported low RAM, then it is
+//! 1. serial banner, kernel-owned GDT/TSS/IDT (exception entry live),
+//! 2. multiboot validation (magic + memory fields),
+//! 3. frame-pool claim: the region must fit reported low RAM, then it is
 //!    scrubbed once so every allocation starts provably zeroed,
-//! 3. hello domain → monitor demo → supervised cleanup of the attacker,
-//! 4. 1000-cycle create/destroy stress with zero-leak + scrub assertions,
-//! 5. one `M1-EXIT-CRITERIA` line that CI greps, TSC report, poweroff.
+//! 4. hello domain → monitor demo → supervised cleanup of the attacker →
+//!    1000-cycle create/destroy stress with zero-leak + scrub assertions,
+//! 5. one `M1-EXIT-CRITERIA` line that CI greps, TSC report,
+//! 6. the PR-1.1 exception selftest: force a #DE, the dispatch prints the
+//!    diagnosis + marker and powers off (CI greps both).
 //!
 //! No allocation: log lines are `&str` fragments plus stack-buffer numbers.
 
+use crate::arch;
 use crate::frames::{FramePool, FRAME_SIZE, POOL_BASE, POOL_LEN};
 use crate::runtime::{self, HelloReport, M1Error, MonitorReport, StressReport};
 use crate::{hw, memops, multiboot, serial, strutil};
@@ -41,7 +45,11 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     line(&mut out, &["AEGIS-M1 x86_64 kernel booting"]);
     line(&mut out, &["====================================="]);
 
-    // ── 1. multiboot validation ─────────────────────────────────────
+    // ── 1. kernel-owned CPU tables: exception entry goes live now, so
+    //      every later fault is diagnosed instead of triple-faulting.
+    arch::init();
+
+    // ── 2. multiboot validation ─────────────────────────────────────
     if magic != multiboot::BOOT_MAGIC {
         line(&mut out, &["[BOOT] ERROR: not started by a multiboot loader (magic mismatch); halting"]);
         hw::halt_forever();
@@ -63,7 +71,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         hw::halt_forever();
     }
 
-    // ── 2. frame pool: claim + scrub ────────────────────────────────
+    // ── 3. frame pool: claim + scrub ────────────────────────────────
     let mut pool = FramePool::new(POOL_BASE, memops::scrub_frame);
     for f in 0..(POOL_LEN / FRAME_SIZE) {
         memops::scrub_frame(POOL_BASE + f * FRAME_SIZE);
@@ -73,7 +81,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let mut k = Kernel::new();
     let t_boot = hw::boot_tsc();
 
-    // ── 3. the M1 sequence (identical code to the host tests) ──────
+    // ── 4. the M1 sequence (identical code to the host tests) ──────
     let hello = runtime::hello_domain(&mut k, &mut pool, &mut out);
     let mon = runtime::monitor_demo(&mut k, &mut out);
     // Supervised cleanup of the quarantined attacker — the respawn path.
@@ -82,7 +90,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         match cleanup { Ok(()) => "ok", Err(_) => "FAILED" }]);
     let stress = runtime::stress_create_destroy(&mut k, &mut pool, 1000, &mut out);
 
-    // ── 4. exit-criteria line (CI greps this) ───────────────────────
+    // ── 5. exit-criteria line (CI greps this) ───────────────────────
     let t_end = hw::rdtsc();
     let cycles = t_end.wrapping_sub(t_boot);
 
@@ -135,8 +143,14 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
     }
 
-    line(&mut out, &["[BOOT] powering off"]);
-    hw::shutdown_qemu();
+    // ── 6. exception-machinery selftest (PR-1.1) ────────────────────
+    // Everything above already passed its gates; now prove the entry
+    // path end-to-end: force a hardware #DE and let the dispatch print
+    // the diagnosis + selftest marker and power off cleanly (CI greps
+    // both). If the machinery were broken, the CPU would triple-fault
+    // instead and the markers would be missing — loud either way.
+    line(&mut out, &["[ARCH] exception selftest: forcing #DE"]);
+    arch::exceptions::arm_and_trigger_de();
 }
 
 /// The M1 exit criteria, evaluated from the three stage reports.

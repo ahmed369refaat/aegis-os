@@ -63,6 +63,16 @@ pub fn boot_tsc() -> u64 {
     unsafe { ((BOOT_TSC_HI as u64) << 32) | BOOT_TSC_LO as u64 }
 }
 
+/// Read the page-fault linear address (CR2).
+///
+/// SAFETY: a pure register read; only meaningful inside a #PF handler.
+pub fn read_cr2() -> u64 {
+    let v: u64;
+    // SAFETY: no memory access; the ISA guarantees no side effects.
+    unsafe { asm!("movq %cr2, %rax", out("rax") v, options(att_syntax, nostack, preserves_flags)) }
+    v
+}
+
 /// Halt forever (interrupts disabled). Never returns.
 pub fn halt_forever() -> ! {
     loop {

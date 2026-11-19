@@ -1,5 +1,14 @@
 # Baseline count of unsafe usages in the kernel allowlist
-# (boot/, hw.rs, memops.rs). scripts/check_unsafe.sh recomputes this;
-# the CI gate fails if the number grows without an ADR reference in
-# the PR. Shrinking is always allowed: lower it.
-14
+# (arch/, boot/, hw.rs, memops.rs). scripts/check_unsafe.sh recomputes
+# this; the CI gate fails if the number grows without an ADR reference
+# in the PR. Shrinking is always allowed: lower it.
+#
+# 14 -> M1 baseline (boot, hw, memops)
+# 23 -> PR-1.1 (ADR-0005): arch/ joins the allowlist. The +9 are:
+#      5 unsafe blocks (gdt::load lgdt/ltr, idt::load lidt, the frame
+#      pointer deref in the dispatch, the deliberate #DE trigger,
+#      hw::read_cr2) and 4 attribute lines (the naked stub macro
+#      definitions x2, exception_common, and the dispatch symbol —
+#      the 32 vector stubs expand from one macro, so they stay at 2
+#      source lines, not 32).
+23

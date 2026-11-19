@@ -27,7 +27,7 @@ done < <(grep -rn "unsafe" src/ --include="*.rs" \
 while IFS= read -r line; do
   file=${line%%:*}
   case "$file" in
-    kernel-x86_64/src/boot/*|kernel-x86_64/src/hw.rs|kernel-x86_64/src/memops.rs)
+    kernel-x86_64/src/arch/*|kernel-x86_64/src/boot/*|kernel-x86_64/src/hw.rs|kernel-x86_64/src/memops.rs)
       # allowlisted — and the module must actually carry the allow attribute
       ;;
     *)
@@ -42,7 +42,9 @@ done < <(grep -rn "unsafe" kernel-x86_64/src/ --include="*.rs" \
 
 # 3. The allowlisted modules must declare the allow (guards against
 #    someone adding a new allowlisted path without the attribute).
-for f in kernel-x86_64/src/boot/mod.rs kernel-x86_64/src/hw.rs kernel-x86_64/src/memops.rs; do
+for f in kernel-x86_64/src/arch/gdt.rs kernel-x86_64/src/arch/idt.rs kernel-x86_64/src/arch/stubs.rs \
+         kernel-x86_64/src/arch/exceptions.rs kernel-x86_64/src/boot/mod.rs \
+         kernel-x86_64/src/hw.rs kernel-x86_64/src/memops.rs; do
   grep -q "allow(unsafe_code)" "$f" || { echo "FAIL: $f lost its allow(unsafe_code) declaration" >&2; fail=1; }
 done
 
@@ -51,7 +53,7 @@ done
 #    ADR reference in the PR that changes it; shrinking is always fine
 #    (lower the file in the same PR).
 BASELINE_FILE="scripts/unsafe-count.txt"
-COUNT=$(grep -rn "unsafe" kernel-x86_64/src/boot/ kernel-x86_64/src/hw.rs kernel-x86_64/src/memops.rs --include="*.rs" \
+COUNT=$(grep -rn "unsafe" kernel-x86_64/src/arch/ kernel-x86_64/src/boot/ kernel-x86_64/src/hw.rs kernel-x86_64/src/memops.rs --include="*.rs" \
   | grep -v "allow(unsafe_code)" \
   | grep -v "deny(unsafe_code)" \
   | grep -vE ':[0-9]+:\s*(//|/\*|\*)' \

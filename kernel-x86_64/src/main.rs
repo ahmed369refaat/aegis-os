@@ -1,38 +1,47 @@
 //! # aegis-kernel (x86_64)
 //!
-//! The bootable AegisOS **M1** kernel: multiboot bring-up, the transition to
-//! 64-bit long mode with identity paging, a real physical frame pool behind
-//! the policy core's buddy allocator (scrubbed on every free), and the M1
-//! exit-criteria sequence: a hello domain scheduled by CFS, the behavior
-//! monitor escalating a misbehaving parser live, and a 1000-cycle
-//! create/destroy stress with zero-leak and scrub assertions.
+//! The bootable AegisOS kernel (M1 complete, Stage 1 in progress):
+//! multiboot bring-up, the transition to 64-bit long mode with identity
+//! paging, a real physical frame pool behind the policy core's buddy
+//! allocator (scrubbed on every free), the M1 exit-criteria sequence (a
+//! hello domain scheduled by CFS, the behavior monitor escalating a
+//! misbehaving parser live, a 1000-cycle create/destroy stress with
+//! zero-leak and scrub assertions) — and, since PR-1.1, a kernel-owned
+//! GDT/TSS/IDT with a uniform exception entry path proven live by a
+//! deliberate #DE selftest.
 //!
 //! ## Unsafe policy (enforced by CI)
 //!
 //! The policy core (`aegis_os`) is `#![forbid(unsafe_code)]`. This crate is
-//! `#![deny(unsafe_code)]` at the root, and exactly three modules carry an
+//! `#![deny(unsafe_code)]` at the root, and exactly four modules carry an
 //! inner `#![allow(unsafe_code)]` with per-item `SAFETY` documentation:
 //!
+//! - [`arch`] — CPU tables and exception entry: GDT/TSS/IDT encoding and
+//!   load, naked entry stubs, the fault dispatch (PR-1.1 onward; see
+//!   `docs/adr/0005-exception-machinery.md`).
 //! - [`boot`] — entry assembly, GDT, page tables: raw CPU control that only
 //!   exists at bring-up time.
-//! - [`hw`] — port I/O, `rdtsc`, halt/poweroff: single-instruction wrappers.
+//! - [`hw`] — port I/O, `rdtsc`, `cr2`, halt/poweroff: single-instruction
+//!   wrappers.
 //! - [`memops`] — volatile reads/writes over (identity-mapped) physical
 //!   addresses, i.e. scrubbing.
 //!
 //! Every other line of this crate is safe Rust. `scripts/check_unsafe.sh`
 //! fails the build if `unsafe` appears anywhere else in the repository.
 //!
-//! ## M1 scope (stated honestly)
+//! ## Stage-1 scope (stated honestly)
 //!
-//! Domains at this stage are kernel-resident objects: their region mappings
-//! pass the full ten-check memory policy and their pages are real, tracked,
+//! Domains are still kernel-resident objects: their region mappings pass
+//! the full ten-check memory policy and their pages are real, tracked,
 //! scrubbed pool frames — but there are no per-domain page tables and no
-//! ring-3 execution yet. Those are M2 work. See `docs/M1-PLAN.md`.
+//! ring-3 execution yet (PR-1.2..1.4, see `docs/ROADMAP.md` and
+//! `docs/STAGE1-PR-PLAN.md`).
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_code)]
 
+pub mod arch;
 #[cfg(not(test))]
 pub mod boot;
 #[cfg(not(test))]
