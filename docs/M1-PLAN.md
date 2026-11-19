@@ -215,7 +215,7 @@ milestone; M1 ends when §3.4 is proven.
 | Kernel host tests | 23 green across 3 consecutive runs (frame pool + scrub read-back, multiboot parsing, formatting, the full M1 sequence, monitor neighbor-isolation, leak observability) — the identical code path `kmain` runs |
 | Unsafe policy | `scripts/check_unsafe.sh` PASS: zero unsafe in the core; kernel unsafe only in `boot/`, `hw.rs`, `memops.rs` |
 | Exit criteria | In-kernel verdict line `M1-EXIT-CRITERIA: PASS … leaked-frames=0 … scrub-verified=yes … monitor-quarantined=yes`; CI `boot-test` boots QEMU and asserts it; `kernel-build` asserts the ELF structure |
-| Boot time | Kernel prints entry→complete TSC cycles; the CI runner measures and reports the full QEMU wall-clock (startup included) — the < 300 ms target is evaluated there, not hand-waved |
+| Boot time | **Measured: 0.21 s wall-clock for the full QEMU run (startup included) — under the 300 ms target**; kernel-internal 47,289,557 TSC cycles entry→M1-complete (first green boot run: f470ea9) |
 | Deviations from plan | aarch64 explicitly deferred (x86_64 first per the plan's own decision table); boot entropy deferred to M2 (no consumer yet); `Kernel::destroy_domain` added to the core (planned in §4 step 2) |
 | First CI boot run | **Failed** with `qemu: Cannot load x86-64 image, give a 32bit one` — QEMU's multiboot loader is ELF32-only. Fixed with the two-stage ELF32 stub design (§3.1); the failure and fix are kept here on purpose: it is exactly the kind of claim-vs-reality gap this plan exists to close |
 
