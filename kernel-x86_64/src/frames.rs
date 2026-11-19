@@ -2,10 +2,12 @@
 //! (the `Kernel.frames` field) plus per-frame ownership tracking and
 //! scrub-on-free.
 //!
-//! The pool covers `[base_pa, base_pa + 256*4 KiB)` — real, identity-mapped
+//! The pool covers `[base_pa, base_pa + N*4 KiB)` — real, direct-mapped
 //! RAM claimed at boot after multiboot validation. Every `free` scrubs
 //! (zeroes) the frame before returning it to the buddy allocator; the boot
-//! path verifies the scrubbing by read-back.
+//! path verifies the scrubbing by read-back. `N` defaults to the library
+//! arena size (host tests); the kernel boots with `N = 4096` (16 MiB,
+//! PR-1.3: per-domain page tables need the room).
 //!
 //! All of this is safe code: the volatile memory writes live in `memops`
 //! (allowlisted), the buddy allocator comes from the policy core.
@@ -15,10 +17,14 @@ use aegis_os::buddy::{BuddyAllocator, BuddyError, FRAME_COUNT};
 /// One frame = 4 KiB (matches `aegis_os::memory::PAGE_SIZE`).
 pub const FRAME_SIZE: u64 = 4096;
 /// Pool base: physical 16 MiB — safely above the kernel image and stack
-/// (linker ASSERTs keep the image below 8 MiB).
+/// (linker ASSERTs keep the image below 4 MiB).
 pub const POOL_BASE: u64 = 16 * 1024 * 1024;
-/// Total pool size: 256 frames = 1 MiB.
+/// Default pool size (host tests): 256 frames = 1 MiB.
 pub const POOL_LEN: u64 = FRAME_SIZE * FRAME_COUNT as u64;
+/// The boot pool (PR-1.3): 4096 frames = 16 MiB, i.e. physical
+/// 16..32 MiB of direct-mapped RAM.
+pub const KERNEL_POOL_FRAMES: usize = 4096;
+pub const KERNEL_POOL_LEN: u64 = FRAME_SIZE * KERNEL_POOL_FRAMES as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameError {
@@ -36,20 +42,20 @@ pub enum FrameError {
 /// is passed in explicitly (it is the `Kernel.frames` field, so the pool
 /// and the syscall layer share one instance — "managed by the existing
 /// buddy allocator" is literal).
-pub struct FramePool {
+pub struct FramePool<const N: usize = FRAME_COUNT> {
     base_pa: u64,
     scrub: fn(u64),
-    owner: [Option<u32>; FRAME_COUNT],
+    owner: [Option<u32>; N],
     scrub_calls: u64,
 }
 
-impl FramePool {
+impl<const N: usize> FramePool<N> {
     /// A pool over `[base_pa, base_pa + POOL_LEN)`. On the kernel,
     /// `scrub` is `memops::scrub_frame` over direct-mapped RAM; host
     /// tests pass the same function over a real host buffer.
     #[must_use]
     pub fn new(base_pa: u64, scrub: fn(u64)) -> Self {
-        FramePool { base_pa, scrub, owner: [None; FRAME_COUNT], scrub_calls: 0 }
+        FramePool { base_pa, scrub, owner: [None; N], scrub_calls: 0 }
     }
 
     /// Physical address of frame index `f`.
@@ -60,7 +66,7 @@ impl FramePool {
 
     /// Frame index for a physical address (must be in-pool and aligned).
     pub fn frame_of(&self, pa: u64) -> Result<usize, FrameError> {
-        if pa < self.base_pa || pa >= self.base_pa + POOL_LEN {
+        if pa < self.base_pa || pa >= self.base_pa + N as u64 * FRAME_SIZE {
             return Err(FrameError::NotInPool(pa));
         }
         if pa % FRAME_SIZE != 0 {
@@ -72,7 +78,7 @@ impl FramePool {
     /// Allocate one frame and tag it for `owner`.
     pub fn alloc_for(
         &mut self,
-        buddy: &mut BuddyAllocator,
+        buddy: &mut BuddyAllocator<N>,
         owner: u32,
     ) -> Result<u64, FrameError> {
         let f = buddy.alloc(0).map_err(FrameError::Buddy)?;
@@ -85,7 +91,7 @@ impl FramePool {
     /// cross-domain release.
     pub fn free(
         &mut self,
-        buddy: &mut BuddyAllocator,
+        buddy: &mut BuddyAllocator<N>,
         pa: u64,
         owner: u32,
     ) -> Result<(), FrameError> {
@@ -101,7 +107,7 @@ impl FramePool {
 
     /// Free (and scrub) every frame owned by `owner` — the domain destroy
     /// path. Returns how many frames were released.
-    pub fn free_all_owned(&mut self, buddy: &mut BuddyAllocator, owner: u32) -> usize {
+    pub fn free_all_owned(&mut self, buddy: &mut BuddyAllocator<N>, owner: u32) -> usize {
         let mut released = 0;
         for f in 0..FRAME_COUNT {
             if self.owner[f] == Some(owner) {

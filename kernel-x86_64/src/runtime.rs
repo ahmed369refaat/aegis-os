@@ -68,7 +68,11 @@ pub struct HelloReport {
 /// mapping is rejected by the guard-gap rule), back its regions with real
 /// pool frames, and give it scheduler slices. The domain stays alive —
 /// `monitor_demo` uses it as the healthy neighbor.
-pub fn hello_domain(k: &mut Kernel, pool: &mut FramePool, out: Out<'_>) -> Result<HelloReport, M1Error> {
+pub fn hello_domain<const N: usize>(
+    k: &mut Kernel<N>,
+    pool: &mut FramePool<N>,
+    out: Out<'_>,
+) -> Result<HelloReport, M1Error> {
     line(out, &["[DOM ] creating hello domain 1 (service profile, uid 1001, nice 0)"]);
     k.create_domain_with(1, service_profile(), 1001, 100, 0)?;
 
@@ -129,7 +133,7 @@ pub struct MonitorReport {
 /// Replay the integration-test escalation scenario on the live kernel:
 /// five audit windows, Log → Tighten → Tighten → Tighten → Quarantine,
 /// while the healthy hello domain keeps working.
-pub fn monitor_demo(k: &mut Kernel, out: Out<'_>) -> Result<MonitorReport, M1Error> {
+pub fn monitor_demo<const N: usize>(k: &mut Kernel<N>, out: Out<'_>) -> Result<MonitorReport, M1Error> {
     line(out, &["[MON ] escalating parser demo (domain 2, parser profile, sensitivity 70)"]);
     k.create_domain(2, parser_profile())?;
     let mut scores = [0u8; 5];
@@ -225,9 +229,9 @@ pub struct StressReport {
 /// frames → dirty them → destroy: scrub + free all + slot release).
 /// Accounting is checked every 250 cycles against the baseline, and once
 /// (immediately at cycle 0) a freed frame is read back to prove the scrub.
-pub fn stress_create_destroy(
-    k: &mut Kernel,
-    pool: &mut FramePool,
+pub fn stress_create_destroy<const N: usize>(
+    k: &mut Kernel<N>,
+    pool: &mut FramePool<N>,
     cycles: u32,
     out: Out<'_>,
 ) -> Result<StressReport, M1Error> {

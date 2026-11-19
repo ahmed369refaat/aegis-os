@@ -41,8 +41,22 @@ pub fn ist_tops() -> [u64; 4] {
 /// Set by `arm_and_trigger_de`: the *next* #DE is the selftest, not a bug.
 static SELFTEST_DE: AtomicBool = AtomicBool::new(false);
 /// Set by `arm_guard_write`: the next #PF at exactly this address is the
-/// guard selftest; 0 = unarmed.
+/// (terminal) stack-guard selftest; 0 = unarmed.
 static GUARD_VA: AtomicU64 = AtomicU64::new(0);
+/// Set by `arm_nx_call`: the next #PF at exactly this address with the
+/// instruction-fetch (I/D) error bit is the NX selftest.
+static ARMED_NX: AtomicBool = AtomicBool::new(false);
+static NX_VA: AtomicU64 = AtomicU64::new(0);
+/// Where execution resumes after the NX fetch fault. On an
+/// instruction-fetch #PF the saved RIP is the *target* address (the
+/// page we tried to execute), NOT the faulting instruction — so the
+/// resume cannot be a length; the trigger stores this label's address
+/// before its faulting `jmp`, and the dispatch jumps straight to it.
+static mut NX_RESUME: u64 = 0;
+/// Set by `arm_guard_read`: the next #PF at exactly this address is the
+/// (non-terminal) domain guard-gap selftest.
+static ARMED_DG: AtomicBool = AtomicBool::new(false);
+static DG_VA: AtomicU64 = AtomicU64::new(0);
 
 /// Called from `exception_common` (never from Rust).
 #[unsafe(no_mangle)]
@@ -59,6 +73,11 @@ extern "C" fn aegis_exception_dispatch(frame: *mut ExceptionFrame) {
 /// register operand = 3 bytes; it is the LAST instruction of the trigger
 /// asm block, so RIP+3 resumes at the block's end).
 const IDIV_LEN: u64 = 3;
+/// Length of `movq (%rax), %rax` (`48 8B 00`) = 3 bytes — the guard-gap
+/// read trigger; RIP+3 resumes after the skipped load.
+const MOV_LEN: u64 = 3;
+/// #PF error bit 4: the fault was an instruction FETCH (the NX proof).
+const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
 
 /// Print the diagnosis, then handle / halt / power off (see the module
 /// doc for the policy).
@@ -96,6 +115,33 @@ fn dispatch(f: &mut ExceptionFrame) {
         SELFTEST_DE.store(false, Ordering::SeqCst);
         serial::write_str("[EXC] selftest: exception machinery ok\n");
         serial::write_str("[EXC] #DE selftest ok: rip advanced, unwound to the caller\n");
+        return;
+    }
+    if ARMED_NX.load(Ordering::SeqCst)
+        && f.vector == 14
+        && cr2 == NX_VA.load(Ordering::SeqCst)
+        && (f.error_code & PF_INSTRUCTION_FETCH) != 0
+    {
+        // An instruction fetch into a non-executable page: W^X enforced
+        // by the MMU. The call never retired (nothing was pushed); the
+        // saved RIP is the target, so resume at the trigger's label.
+        // SAFETY: written by arm_nx_call's trigger before the fault;
+        // single CPU, read exactly once here.
+        // SAFETY: written by arm_nx_call's trigger before the fault;
+        // single CPU, read exactly once here.
+        f.rip = unsafe { core::ptr::addr_of!(NX_RESUME).read_volatile() };
+        ARMED_NX.store(false, Ordering::SeqCst);
+        serial::write_str("[EXC] NX selftest: exec of NX page faulted (I/D), rip advanced\n");
+        return;
+    }
+    if ARMED_DG.load(Ordering::SeqCst)
+        && f.vector == 14
+        && cr2 == DG_VA.load(Ordering::SeqCst)
+    {
+        // A read into a policy guard-gap page: absent PTE by design.
+        f.rip += MOV_LEN;
+        ARMED_DG.store(false, Ordering::SeqCst);
+        serial::write_str("[EXC] domain guard selftest: guard-gap #PF ok\n");
         return;
     }
     if f.vector == 14 && GUARD_VA.load(Ordering::SeqCst) == cr2 {
@@ -153,4 +199,70 @@ pub fn arm_guard_write(guard_va: u64) -> ! {
         );
     }
     hw::halt_forever()
+}
+
+/// PR-1.3: jump through `va`, which must be mapped **non-executable**
+/// (NX). The instruction-fetch #PF is diagnosed with the I/D error bit,
+/// and execution resumes at the trigger's label with RSP exactly as it
+/// was (the attempt is a faulting `jmp`: nothing was pushed, so the
+/// unwind restores the stack pointer bit-for-bit).
+pub fn arm_nx_call(va: u64) {
+    ARMED_NX.store(true, Ordering::SeqCst);
+    NX_VA.store(va, Ordering::SeqCst);
+    // SAFETY: deliberately fetches an instruction from an NX page → #PF.
+    // The first two instructions park the resume label's address in
+    // NX_RESUME so the dispatch can jump past the attempt (the saved
+    // RIP alone cannot: fetch faults report the target, not the faulting
+    // instruction). Crucially the attempt is a JMP, not a CALL: a call
+    // pushes its return address BEFORE the fetch fault, and resuming
+    // with that push still on the stack leaves RSP off by 8 — every
+    // RSP-relative local in the caller would silently slide. A faulting
+    // jmp leaves RSP untouched, so the unwind restores it exactly.
+    unsafe {
+        let slot = core::ptr::addr_of_mut!(NX_RESUME) as u64;
+        core::arch::asm!(
+            "lea 9f(%rip), %rcx",
+            "movq %rcx, (%rdx)",
+            "jmpq *%rax",
+            "9:",
+            in("rax") va,
+            in("rdx") slot,
+            out("rcx") _,
+            options(att_syntax),
+        );
+    }
+    ARMED_NX.store(false, Ordering::SeqCst);
+}
+
+/// PR-1.3: call through `va`, which must be mapped executable and hold
+/// valid code (the selftest writes a single `ret`). NOT armed: if this
+/// faults, the dispatch treats it as the kernel bug it would be.
+pub fn call_user(va: u64) {
+    // SAFETY: calls into a user RX page from CPL0 (allowed by the U/S
+    // rules: only lower privilege is restricted); the page holds `ret`.
+    unsafe {
+        core::arch::asm!(
+            "callq *%rax",
+            in("rax") va,
+            options(att_syntax),
+        );
+    }
+}
+
+/// PR-1.3: read through `va`, which must be a policy guard-gap page
+/// (absent PTE). The #PF is diagnosed, RIP advanced past the 3-byte
+/// `movq (%rax), %rax`, and execution resumes here.
+pub fn arm_guard_read(va: u64) {
+    ARMED_DG.store(true, Ordering::SeqCst);
+    DG_VA.store(va, Ordering::SeqCst);
+    // SAFETY: deliberately loads from an unmapped address → #PF;
+    // dispatch advances RIP by MOV_LEN.
+    unsafe {
+        core::arch::asm!(
+            "movq (%rax), %rax",
+            in("rax") va,
+            options(att_syntax, preserves_flags),
+        );
+    }
+    ARMED_DG.store(false, Ordering::SeqCst);
 }

@@ -88,7 +88,7 @@ pub enum KernelError {
 /// `dispatch` is the deterministic fast path; `syscall` (in `sys.rs`) is
 /// the executing layer that runs only after the gate allows; `audit` is
 /// the batched slow path that runs once per monitoring window.
-pub struct Kernel {
+pub struct Kernel<const N: usize = { crate::buddy::FRAME_COUNT }> {
     pub(crate) domains: [Option<Domain>; MAX_DOMAINS],
     monitor: BehaviorMonitor,
     telemetry: RingBuffer<SecurityEvent, TELEMETRY_CAPACITY>,
@@ -103,14 +103,27 @@ pub struct Kernel {
     pub(crate) buckets: [Option<(u32, TokenBucket)>; MAX_DOMAINS],
     /// CFS-style fair scheduler over runnable domains.
     pub sched: Scheduler,
-    /// Physical page-frame buddy allocator.
-    pub frames: BuddyAllocator,
+    /// Physical page-frame buddy allocator over `N` frames (the bootable
+    /// kernel uses 4096 = its 16 MiB pool; the default is the library
+    /// arena size — existing call sites and tests are unchanged).
+    pub frames: BuddyAllocator<N>,
     /// Kernel clock in ticks (drives rate-limit windows).
     pub(crate) clock: u64,
 }
 
-impl Kernel {
+impl Kernel<{ crate::buddy::FRAME_COUNT }> {
+    /// Fresh kernel over the default 256-frame arena. Every existing
+    /// call site and test constructs this; type-parameter defaults do
+    /// not guide inference, so this pins the arena explicitly.
     pub fn new() -> Self {
+        Kernel::new_over_arena()
+    }
+}
+
+impl<const N: usize> Kernel<N> {
+    /// Fresh kernel over an `N`-frame buddy arena. The bootable kernel
+    /// uses `Kernel::<4096>::new_over_arena()` (its 16 MiB pool, PR-1.3).
+    pub fn new_over_arena() -> Self {
         Kernel {
             domains: array::from_fn(|_| None),
             monitor: BehaviorMonitor::new(MonitorConfig::default()),
@@ -121,7 +134,7 @@ impl Kernel {
             sockets: SocketTable::new(),
             buckets: [None; MAX_DOMAINS],
             sched: Scheduler::new(),
-            frames: BuddyAllocator::new(),
+            frames: BuddyAllocator::new_over_arena(),
             clock: 0,
         }
     }

@@ -11,4 +11,9 @@
 #      virtual address), two percpu derefs (GS-base anchor, init + get),
 #      and the guard-write fault trigger in the exceptions selftest.
 #      mm/ itself stays unsafe-free by design.
-33
+# 39 -> PR-1.3 (ADR-0002): +6 — two hw wrappers (read_cr4, write_cr4)
+#      and four exceptions selftest items (the NX_RESUME volatile read
+#      in the dispatch, the faulting-jmp NX trigger, call_user, and the
+#      guard-gap read trigger). mm/page_table.rs + mm/pte.rs are
+#      unsafe-free by design.
+39

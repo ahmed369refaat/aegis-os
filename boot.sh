@@ -62,7 +62,7 @@ QEMU_ARGS=(-machine pc -cpu qemu64 -m 128M -kernel "$IMAGE" -display none -seria
 if [ "${1:-}" = "--verify" ]; then
   LOG=$(mktemp)
   trap 'rm -f "$LOG"' EXIT
-  echo "==> [4/4] booting in QEMU (TCG) — M1 exit-criteria + PR-1.1/1.2 selftests run"
+  echo "==> [4/4] booting in QEMU (TCG) — M1 exit-criteria + PR-1.1/1.2/1.3 selftests run"
   START=$(date +%s.%N)
   timeout 60 qemu-system-x86_64 "${QEMU_ARGS[@]}" | tee "$LOG"
   END=$(date +%s.%N)
@@ -78,6 +78,10 @@ if [ "${1:-}" = "--verify" ]; then
   grep -qF "[EXC] selftest: exception machinery ok" "$LOG" || { echo "VERIFY FAIL: exception selftest marker missing"; ok=0; }
   grep -qF "[EXC] #DE selftest ok: rip advanced, unwound to the caller" "$LOG" || { echo "VERIFY FAIL: #DE unwind-return marker missing"; ok=0; }
   grep -qF "[MM ] higher-half ok" "$LOG" || { echo "VERIFY FAIL: higher-half marker missing"; ok=0; }
+  grep -qF "[EXC] NX selftest: exec of NX page faulted (I/D), rip advanced" "$LOG" || { echo "VERIFY FAIL: NX selftest marker missing"; ok=0; }
+  grep -qF "[MM ] B: same VA resolves to a different frame (disjoint tables)" "$LOG" || { echo "VERIFY FAIL: disjoint-tables marker missing"; ok=0; }
+  grep -qF "[EXC] domain guard selftest: guard-gap #PF ok" "$LOG" || { echo "VERIFY FAIL: domain guard-gap marker missing"; ok=0; }
+  grep -qF "[MM ] per-domain tables: 2 domains, W^X + guards live" "$LOG" || { echo "VERIFY FAIL: per-domain acceptance marker missing"; ok=0; }
   grep -qF "[MM ] guarded stacks: alloc+map+cross-view ok, free+scrub ok" "$LOG" || { echo "VERIFY FAIL: guarded-stack marker missing"; ok=0; }
   grep -qF "[EXC] guard selftest: stack guard #PF ok" "$LOG" || { echo "VERIFY FAIL: guard-page #PF marker missing"; ok=0; }
   if [ "$ok" = 1 ]; then

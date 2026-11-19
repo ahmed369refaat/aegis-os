@@ -10,6 +10,8 @@
 
 use crate::memory::PAGE_SIZE;
 
+/// Default arena size (the library's own tests and every existing call
+/// site). The bootable kernel overrides with 4096 (16 MiB pool).
 pub const FRAME_COUNT: usize = 256;
 pub const MAX_ORDER: u32 = 5;
 /// Largest block = 32 frames = 128 KiB at 4 KiB pages.
@@ -21,21 +23,21 @@ pub enum BuddyError {
     OrderTooLarge(u32),
     /// No free block large enough.
     OutOfMemory { requested_order: u32, largest_free_order: u32 },
-    /// Frame index outside `0..FRAME_COUNT`.
+    /// Frame index outside the arena (`0..N`).
     InvalidFrame(usize),
     /// Frame was never allocated (or already freed and coalesced away).
     NotAllocated(usize),
 }
 
 #[derive(Clone, Copy)]
-struct FreeList {
-    frames: [u16; FRAME_COUNT],
+struct FreeList<const N: usize> {
+    frames: [u16; N],
     len: usize,
 }
 
-impl FreeList {
+impl<const N: usize> FreeList<N> {
     const fn new() -> Self {
-        FreeList { frames: [0; FRAME_COUNT], len: 0 }
+        FreeList { frames: [0; N], len: 0 }
     }
     fn push(&mut self, f: usize) {
         self.frames[self.len] = f as u16;
@@ -62,27 +64,48 @@ impl FreeList {
     }
 }
 
-pub struct BuddyAllocator {
-    free_lists: [FreeList; MAX_ORDER as usize + 1],
+/// Buddy allocator over `N` frames (`N` must be a multiple of
+/// `MAX_BLOCK_FRAMES`). Defaults to the library arena size; the kernel
+/// uses `BuddyAllocator<4096>` for its 16 MiB pool.
+pub struct BuddyAllocator<const N: usize = FRAME_COUNT> {
+    free_lists: [FreeList<N>; MAX_ORDER as usize + 1],
     /// True for the first frame of every allocated block.
-    allocated_start: [bool; FRAME_COUNT],
+    allocated_start: [bool; N],
     /// Order of the allocated block starting at each start frame.
-    order_of: [u8; FRAME_COUNT],
+    order_of: [u8; N],
     frames_in_use: usize,
 }
 
-impl BuddyAllocator {
-    /// A fresh allocator owning `FRAME_COUNT` frames as one max-order block.
+/// The default 256-frame arena (what `BuddyAllocator` without parameters
+/// means, and what the library's own tests exercise).
+pub type Buddy256 = BuddyAllocator<FRAME_COUNT>;
+
+impl Buddy256 {
+    /// Fresh allocator over the default 256-frame arena. Type-parameter
+    /// defaults do not guide inference, so this pins it for the many
+    /// existing `BuddyAllocator::new()` call sites and tests.
     pub fn new() -> Self {
+        BuddyAllocator::new_over_arena()
+    }
+}
+
+impl<const N: usize> BuddyAllocator<N> {
+    /// A fresh allocator owning `N` frames as consecutive max-order
+    /// blocks (e.g. 256 frames = 8 blocks of 32).
+    pub fn new_over_arena() -> Self {
+        assert!(
+            N % MAX_BLOCK_FRAMES == 0,
+            "arena must be a multiple of the max block size"
+        );
         let mut b = BuddyAllocator {
             free_lists: [FreeList::new(); MAX_ORDER as usize + 1],
-            allocated_start: [false; FRAME_COUNT],
-            order_of: [0; FRAME_COUNT],
+            allocated_start: [false; N],
+            order_of: [0; N],
             frames_in_use: 0,
         };
-        // The arena is FRAME_COUNT frames split into consecutive
+        // The arena is N frames split into consecutive
         // max-order blocks (e.g. 256 frames = 8 blocks of 32).
-        let blocks = FRAME_COUNT / MAX_BLOCK_FRAMES;
+        let blocks = N / MAX_BLOCK_FRAMES;
         for i in 0..blocks {
             b.free_lists[MAX_ORDER as usize].push(i * MAX_BLOCK_FRAMES);
         }
@@ -131,7 +154,7 @@ impl BuddyAllocator {
 
     /// Free a block previously returned by `alloc`. Coalesces buddies.
     pub fn free(&mut self, frame: usize) -> Result<(), BuddyError> {
-        if frame >= FRAME_COUNT {
+        if frame >= N {
             return Err(BuddyError::InvalidFrame(frame));
         }
         if !self.allocated_start[frame] {
@@ -164,7 +187,7 @@ impl BuddyAllocator {
 
     #[must_use]
     pub fn frames_free(&self) -> usize {
-        FRAME_COUNT - self.frames_in_use
+        N - self.frames_in_use
     }
 
     /// Order of the largest currently free block.
@@ -188,13 +211,13 @@ impl BuddyAllocator {
     /// Total managed bytes.
     #[must_use]
     pub fn capacity_bytes(&self) -> usize {
-        FRAME_COUNT * PAGE_SIZE
+        N * PAGE_SIZE
     }
 }
 
-impl Default for BuddyAllocator {
+impl<const N: usize> Default for BuddyAllocator<N> {
     fn default() -> Self {
-        Self::new()
+        Self::new_over_arena()
     }
 }
 
@@ -381,5 +404,23 @@ mod tests {
     fn capacity_bytes_matches_frames() {
         let b = BuddyAllocator::new();
         assert_eq!(b.capacity_bytes(), FRAME_COUNT * PAGE_SIZE);
+    }
+
+    #[test]
+    fn kernel_sized_arena_works_the_same() {
+        // The bootable kernel's pool: 4096 frames = 16 MiB (PR-1.3).
+        let mut b: BuddyAllocator<4096> = BuddyAllocator::new_over_arena();
+        assert_eq!(b.frames_free(), 4096);
+        assert_eq!(b.capacity_bytes(), 16 * 1024 * 1024);
+        assert_eq!(b.largest_free_order(), MAX_ORDER);
+        // Same FIFO max-block behavior, at the bigger scale.
+        let first = b.alloc(MAX_ORDER).unwrap();
+        assert_eq!(first, 0);
+        let second = b.alloc(MAX_ORDER).unwrap();
+        assert_eq!(second, MAX_BLOCK_FRAMES);
+        assert_eq!(b.frames_in_use(), 2 * MAX_BLOCK_FRAMES);
+        b.free(first).unwrap();
+        b.free(second).unwrap();
+        assert_eq!(b.frames_free(), 4096);
     }
 }

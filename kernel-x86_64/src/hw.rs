@@ -122,6 +122,25 @@ pub fn wrmsr(msr: u32, value: u64) {
     }
 }
 
+/// Read control register CR4 (feature flags: PAE, PGE, ...).
+///
+/// SAFETY: a pure register read.
+pub fn read_cr4() -> u64 {
+    let v: u64;
+    // SAFETY: no memory access; the ISA guarantees no side effects.
+    unsafe { asm!("movq %cr4, %rax", out("rax") v, options(att_syntax, nostack, preserves_flags)) }
+    v
+}
+
+/// Write control register CR4 (enable/disable CPU features).
+///
+/// SAFETY: `v` must be a valid CR4 image — callers own every bit they
+/// flip (a cleared PAE or a bogus reserved bit is instant #GP or worse).
+pub fn write_cr4(v: u64) {
+    // SAFETY: caller guarantees a valid value (see above).
+    unsafe { asm!("movq %rax, %cr4", in("rax") v, options(att_syntax, nostack, preserves_flags)) }
+}
+
 /// Read a model-specific register.
 ///
 /// SAFETY: `msr` must exist on this CPU; a pure register read otherwise.

@@ -33,9 +33,34 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
   fault→signal delivery), and the boot ends with a terminal guard-page
   `#PF` proof (`cr2` names the exact guard page).
 
+### Added — PR-1.3: per-domain page tables (`kernel-x86_64/src/mm/{pte,page_table}.rs`, ADR-0002)
+
+- `mm/page_table.rs`: the lib's ten-check `AddressSpace::map` runs
+  first and is the only gate; accepted regions become live PTEs (U set,
+  NX unless executable, fresh scrubbed pool frames, guard gaps as
+  absent PTEs). Walk/unmap/translate are allocation-free and
+  **unsafe-free**; host tests cover the walk, policy gating
+  (GuardGap/W^X/NULL/kernel-half), disjoint same-VA tables, unmap, and
+  pool-exhaustion rollback.
+- `mm/pte.rs`: `PteFlags` → PTE bits (XD for `!x`), `USER_LIMIT`
+  enforcement, per-page TLB flush. EFER.NXE + CR4.PGE enabled in
+  `mm::init`; kernel leaves marked global; the direct map's 1 GiB leaf
+  becomes RW+NX (never executable, now hardware-enforced).
+- QEMU selftest (CI-grepped): two domains, the same VA resolving to
+  different frames; an NX instruction-fetch fault (`err` P+I/D) that
+  **resumes execution**; an RX page executing `ret`; the policy
+  guard-gap page faulting on read with CR2 naming it.
+- Generic pool: `BuddyAllocator<const N>`, `Kernel<const N>`,
+  `FramePool<const N>` (defaults keep every existing call site green);
+  the kernel boots a 4096-frame pool (physical 16..32 MiB).
+- Fixed a real fault-resume bug found by the selftest: the NX trigger
+  must be a faulting `jmp`, not `call` — a faulting `call` pushes its
+  return address before the fetch fault and silently slides every
+  RSP-relative local in the caller.
+
 ### Changed
 
-- Unsafe ratchet 23 → 33 (five `hw` wrappers: cr3 r/w, invlpg, wrmsr,
+- Unsafe ratchet 23 → 33 (PR-1.2), then 33 → 39 (PR-1.3: two `hw` CR4 wrappers, four exceptions selftest items) (five `hw` wrappers: cr3 r/w, invlpg, wrmsr,
   rdmsr; two `memops` `_va` variants; two percpu derefs; one fault
   trigger) — referenced to ADR-0002.
 - CI: kernel-build greps the higher-half entry point

@@ -131,9 +131,9 @@ mod target {
 
     /// Allocate `pages` guarded stack pages in a fresh 2 MiB slot:
     /// PT[0] absent (the guard), PT[1..=pages] = pool frames RW.
-    pub fn alloc(
-        pool: &mut FramePool,
-        buddy: &mut BuddyAllocator,
+    pub fn alloc<const N: usize>(
+        pool: &mut FramePool<N>,
+        buddy: &mut BuddyAllocator<N>,
         pages: usize,
     ) -> Result<KernelStack, StackError> {
         if pages == 0 || pages > MAX_PAGES {
@@ -167,7 +167,12 @@ mod target {
         let mut frames = [0u64; MAX_PAGES];
         for (i, frame_pa) in frames.iter_mut().enumerate().take(pages) {
             let pa = pool.alloc_for(buddy, OWNER_KERNEL).map_err(StackError::Pool)?;
-            memops::write_u64(pt + (i as u64 + 1) * 8, pa | PTE_P_RW);
+            // Kernel stack pages: RW, non-executable, global (PGE on).
+            let bits = crate::mm::pte::PTE_P
+                | crate::mm::pte::PTE_W
+                | crate::mm::pte::PTE_NX
+                | crate::mm::pte::PTE_G;
+            memops::write_u64(pt + (i as u64 + 1) * 8, pa | bits);
             *frame_pa = pa;
         }
 
@@ -177,9 +182,9 @@ mod target {
     /// Release a stack: unmap its pages (invalidating each — they WERE
     /// mapped), scrub every frame on the way back to the pool, unhook and
     /// free the slot's page table.
-    pub fn free(
-        pool: &mut FramePool,
-        buddy: &mut BuddyAllocator,
+    pub fn free<const N: usize>(
+        pool: &mut FramePool<N>,
+        buddy: &mut BuddyAllocator<N>,
         stack: KernelStack,
     ) -> Result<(), StackError> {
         let pd_pa = REGION_PD_PA.load(Ordering::SeqCst);

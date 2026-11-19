@@ -4,22 +4,23 @@
 
 [![CI](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml/badge.svg)](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests: 237](https://img.shields.io/badge/tests-237%20passing-brightgreen.svg)](tests/)
-[![Boot](https://img.shields.io/badge/boots%20in%20QEMU-higher--half%20kernel%20green-brightgreen.svg)](#quick-start)
+[![Tests: 261](https://img.shields.io/badge/tests-261%20passing-brightgreen.svg)](tests/)
+[![Boot](https://img.shields.io/badge/boots%20in%20QEMU-per--domain%20page%20tables%20green-brightgreen.svg)](#quick-start)
 
 > The name: **Aegis** (the shield). One rule shapes the whole design: everything runs inside an isolated `Domain`, and every privilege is granted once and can only ever shrink.
 
 ## Current status — honestly stated
 
-**Done and proven (M0 + M1 + PR-1.1 + PR-1.2):**
+**Done and proven (M0 + M1 + PR-1.1 + PR-1.2 + PR-1.3):**
 
 - The full policy kernel as a library: attenuation-only syscall masks, capability generations, W^X memory policy, VFS with Unix DAC + chroot, pipes/signals/fd tables, CFS scheduling, rate-limited brokered sockets, behavior monitor with graduated response. **196 tests.**
 - A bootable x86_64 system, two-stage (QEMU's `-kernel` loader rejects ELF64 — discovered on the first CI boot run): a pure-asm ELF32 multiboot stub (`boot-x86_64/`) sets up identity paging and long mode, then runs the 64-bit kernel (`kernel-x86_64/`, embedded at its 2 MiB link base) over real RAM: a physical frame pool (256 × 4 KiB at 16 MiB) behind the policy core's buddy allocator with **scrub-on-free verified by read-back**, and the M1 exit-criteria sequence running on boot: a hello domain scheduled by CFS, the monitor escalating an attacker across five windows while the healthy neighbor keeps running, and 1000 create/destroy cycles with zero frame leaks.
+- **Per-domain page tables (Stage 1 / PR-1.3)**: the lib's ten-check memory policy is the gate, and its decisions become hardware — `map_region` policy-checks first, then backs every accepted page with a scrubbed pool frame and a live PTE (U set, NX unless executable, guard gaps as **absent** pages). Two domains, disjoint tables, the same VA resolving to different frames — proven live in QEMU, including an NX exec fault that resumes cleanly and a guard-gap read that faults with CR2 naming the page. Pool grows to 4096 frames (16..32 MiB); `mm` stays unsafe-free. **11 new host tests** pin the walk, the policy gating, and unmap/rollback.
 - **Higher-half kernel + direct map (Stage 1 / PR-1.2, ADR-0002)**: the kernel links at `0xFFFFFFFF80000000` (loaded at PA 2 MiB via a linker `AT()` + objcopy-by-LMA split), the stub maps three windows before entry — kernel image, direct map (`0xFFFF888000000000`+PA, RW, never X), and a bring-up identity window the kernel **tears down and proves dead** right after entry. Guarded kernel stacks (absent-PTE guard pages, pool-backed, scrub-on-free) fault for real when run over; per-CPU state is anchored at the GS base. The `mm` layer itself is unsafe-free by design. **7 new host tests** pin the translation and slot arithmetic.
 - **Exception machinery (Stage 1 / PR-1.1)**: a kernel-owned GDT/TSS/IDT with a uniform exception frame, IST stacks for `#DF/#NMI/#MC/#SS`, and a live negative test — the boot forces a hardware `#DE` and the dispatch prints the diagnosis and the selftest marker before powering off. Every fault from here on is diagnosed, not a silent hang. **11 new host tests pin the descriptor/frame encodings, including the boot-stub GDT literals as an ABI contract.**
-- Unsafe policy enforced by machine, not convention: the policy core is `forbid(unsafe_code)`; the kernel is `deny(unsafe_code)` with a four-module allowlist (`arch/`, `boot/`, `hw.rs`, `memops.rs`), every item carrying a `SAFETY` note, and a **ratchet** (`scripts/unsafe-count.txt`, baseline 33) that fails CI if the count grows without an ADR.
+- Unsafe policy enforced by machine, not convention: the policy core is `forbid(unsafe_code)`; the kernel is `deny(unsafe_code)` with a four-module allowlist (`arch/`, `boot/`, `hw.rs`, `memops.rs`), every item carrying a `SAFETY` note, and a **ratchet** (`scripts/unsafe-count.txt`, baseline 39) that fails CI if the count grows without an ADR.
 
-**Not yet (roadmap v2, see [`docs/ROADMAP.md`](docs/ROADMAP.md)):** the hardware isolation boundary itself — ring-3 user domains, per-domain page tables, SYSCALL/SYSRET entry (PR-1.3..1.5 of [`docs/STAGE1-PR-PLAN.md`](docs/STAGE1-PR-PLAN.md)), then IPC, block storage + ext2, preemption/SMP, the Linux-compatible syscall ABI, drivers, and hardening. M1 domains are still kernel-resident objects whose region mappings pass the full policy and whose pages are real tracked frames.
+**Not yet (roadmap v2, see [`docs/ROADMAP.md`](docs/ROADMAP.md)):** the hardware isolation boundary itself — Ring-3 user domains and SYSCALL/SYSRET entry (PR-1.4/1.5 of [`docs/STAGE1-PR-PLAN.md`](docs/STAGE1-PR-PLAN.md)), then IPC, block storage + ext2, preemption/SMP, the Linux-compatible syscall ABI, drivers, and hardening. Domains still run in Ring-0 with kernel-resident tables; since PR-1.3 every mapping is policy-gated *and* hardware-real (live PTEs, W^X, guard gaps).
 
 ## The architecture in one line
 
@@ -32,11 +33,11 @@
 ./boot.sh --verify  # same, plus assert the M1 + exception-selftest markers
 
 cargo test                       # 196 policy-core tests
-cargo test -p aegis-kernel       # 41 host tests: boot logic + arch/mm encodings
+cargo test -p aegis-kernel       # 52 host tests: boot logic + arch/mm/table encodings
 cargo build --target thumbv7em-none-eabihf   # the core still builds for bare-metal ARM
 ```
 
-What the boot log shows (CI greps exactly these): the GDT/TSS/IDT going live, the higher-half switch (`[MM ] higher-half ok`, identity window torn down), multiboot memory validation, the frame pool claim, the guard-gap policy rejecting an adjacent mapping **live**, CFS slices, `Hello from AegisOS domain 1`, the five-window escalation `55 → 50 → 37 → 80 → 80` ending in quarantine with the neighbor healthy, `leaked-frames=0`, `scrub-verified=yes`, a single `M1-EXIT-CRITERIA: PASS` verdict line — then the selftests: a forced hardware `#DE` diagnosed and **returned from** (`[EXC] #DE selftest ok: rip advanced, unwound to the caller` — the return path Ring-3 signals will use), a guarded stack allocated/mapped/cross-viewed against the direct map/freed-scrubbed (`[MM ] guarded stacks: … ok`), and a final write through a guard page → `#PF` with `cr2` naming exactly that page → clean poweroff.
+What the boot log shows (CI greps exactly these): the GDT/TSS/IDT going live, the higher-half switch (`[MM ] higher-half ok`, identity window torn down), multiboot memory validation, the frame pool claim, the guard-gap policy rejecting an adjacent mapping **live**, CFS slices, `Hello from AegisOS domain 1`, the five-window escalation `55 → 50 → 37 → 80 → 80` ending in quarantine with the neighbor healthy, `leaked-frames=0`, `scrub-verified=yes`, a single `M1-EXIT-CRITERIA: PASS` verdict line — then the selftests: a forced hardware `#DE` diagnosed and **returned from** (the unwind path Ring-3 signals will use); two domains with disjoint page tables — the same VA resolving to different frames, an **NX exec fault that resumes** (W^X enforced by the MMU), an RX page actually executing, and a policy guard-gap page faulting on read (`[MM ] per-domain tables: 2 domains, W^X + guards live`); a guarded kernel stack allocated/mapped/cross-viewed/freed-scrubbed; and a final write through a stack guard page → `#PF` → clean poweroff.
 
 ## What's inside
 
@@ -90,7 +91,7 @@ Docs: [`docs/ROADMAP.md`](docs/ROADMAP.md) (roadmap v2: the eight stages to a us
 
 ## Roadmap position
 
-Roadmap v2 turns this into a usable Unix-like core in eight stages (Ring-3 → IPC → storage → preemption/SMP → POSIX ABI → drivers → hardening → compliance; ≈ 65–80 PRs). **Current position: Stage 1, PR-1.1 + PR-1.2 merged** — exception machinery and the higher-half/direct-map layout are live and selftested on every boot. Next: PR-1.3 (per-domain page tables: policy → real PTEs), then ring-3 entry, then the first user domain. Every stage gate is CI-verified: a stage does not start before the previous one's acceptance markers pass in QEMU.
+Roadmap v2 turns this into a usable Unix-like core in eight stages (Ring-3 → IPC → storage → preemption/SMP → POSIX ABI → drivers → hardening → compliance; ≈ 65–80 PRs). **Current position: Stage 1, PR-1.1 + PR-1.2 + PR-1.3 merged** — exception machinery, the higher-half/direct-map layout, and per-domain page tables are live and selftested on every boot. Next: PR-1.4 (SYSCALL/SYSRET entry + the first Ring-3 domain), then the Stage-1 exit: a shell-less but real user space. Every stage gate is CI-verified: a stage does not start before the previous one's acceptance markers pass in QEMU.
 
 ## Repository layout
 
