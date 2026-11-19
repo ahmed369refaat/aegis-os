@@ -42,7 +42,7 @@ done < <(grep -rn "unsafe" kernel-x86_64/src/ --include="*.rs" \
 
 # 3. The allowlisted modules must declare the allow (guards against
 #    someone adding a new allowlisted path without the attribute).
-for f in kernel-x86_64/src/arch/gdt.rs kernel-x86_64/src/arch/idt.rs kernel-x86_64/src/arch/stubs.rs \
+for f in kernel-x86_64/src/arch/gdt.rs kernel-x86_64/src/arch/idt.rs kernel-x86_64/src/arch/stubs.rs kernel-x86_64/src/arch/percpu.rs \
          kernel-x86_64/src/arch/exceptions.rs kernel-x86_64/src/boot/mod.rs \
          kernel-x86_64/src/hw.rs kernel-x86_64/src/memops.rs; do
   grep -q "allow(unsafe_code)" "$f" || { echo "FAIL: $f lost its allow(unsafe_code) declaration" >&2; fail=1; }

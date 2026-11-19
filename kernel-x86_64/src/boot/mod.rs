@@ -61,11 +61,13 @@ pub extern "C" fn aegis_entry_64() {
         "shrq    $3, %rcx",
         "xorq    %rax, %rax",
         "rep     stosq",
-        // 3. Now that .bss is zero, store the boot TSC stamp.
-        "movl    %ebp, BOOT_TSC_LO",
+        // 3. Now that .bss is zero, store the boot TSC stamp. RIP-relative
+        //    addressing throughout: this code runs at the higher-half link
+        //    base (ADR-0002), where absolute disp32 would be wrong.
+        "movl    %ebp, BOOT_TSC_LO(%rip)",
         "movq    %rbp, %rax",
         "shrq    $32, %rax",
-        "movl    %eax, BOOT_TSC_HI",
+        "movl    %eax, BOOT_TSC_HI(%rip)",
         // 4. Switch to the kernel stack (defined in linker.ld).
         "lea     stack_top(%rip), %rsp",
         // 5. aegis_kmain_entry(magic, info) — SysV: rdi, rsi.

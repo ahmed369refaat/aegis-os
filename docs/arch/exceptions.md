@@ -11,11 +11,16 @@
   stacks, and an **IDT** covering all 32 CPU exception vectors.
 - A **uniform exception frame**: every stub leaves the stack in exactly
   the same shape, so one Rust dispatch can read any fault.
-- A **live selftest**: the boot deliberately raises a hardware `#DE`
-  (integer divide by zero via inline `idiv`), the dispatch prints the
-  diagnosis and the `[EXC] selftest: exception machinery ok` marker, and
+- A **live selftest**, extended in PR-1.2: the boot deliberately raises a
+  hardware `#DE` (integer divide by zero via inline `idiv`); the dispatch
+  prints the diagnosis and the markers, **advances RIP past the `idiv`,
+  and returns** through `exception_common`'s unwind — the return path is
+  live, proven, and is the seed of Ring-3 fault→signal delivery
+  (PR-1.5). The boot then ends with a terminal guard-page proof: a
+  deliberate write through a guarded kernel stack's absent page faults,
+  the dispatch confirms CR2 is exactly that page, prints the marker, and
   powers QEMU off cleanly. `boot.sh --verify` (and therefore CI) greps
-  both lines; a broken entry path triple-faults and the markers are
+  every line; a broken entry path triple-faults and the markers are
   missing instead — the failure is loud either way.
 
 ## Design
@@ -47,13 +52,16 @@
   context's stack (COW in Stage 5), and an IST `#PF` breaks nested-#PF
   debugging.
 - **IST stacks today**: four 16-KiB `.bss` statics, zeroed by the entry
-  stub. PR-1.2 replaces them with guarded, pool-backed stacks from the
-  stack allocator; the interim is recorded in ADR-0005.
-- **The unwind path in `exception_common` is dead code by design**: the
-  dispatch never returns in a CPL0-only kernel (every unexpected fault
-  halts). It is kept correct — `movq %rbx, %rsp` restore and full pop
-  sequence — because PR-1.4/1.5 turn it into the live path for Ring-3
-  fault → signal delivery.
+  stub. PR-1.2 keeps them: the vectors that need a switched stack exist
+  before any allocator does (guarded pool-backed stacks are the
+  `mm/stacks.rs` addition; ADR-0005 documents the interim).
+- **The unwind path in `exception_common` is live since PR-1.2**: an
+  armed-and-expected `#DE` is *handled* — the dispatch advances RIP past
+  the faulting `idiv` (its exact encoding length, `IDIV_LEN`) and
+  returns through the pop sequence + `iretq`, so the selftest itself
+  proves the return path every boot. Everything unhandled stays fatal:
+  in a CPL0 kernel an unexpected fault is a bug, and halting loudly
+  beats limping on.
 
 ## Invariants
 

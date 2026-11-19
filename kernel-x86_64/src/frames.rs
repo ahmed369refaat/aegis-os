@@ -45,7 +45,7 @@ pub struct FramePool {
 
 impl FramePool {
     /// A pool over `[base_pa, base_pa + POOL_LEN)`. On the kernel,
-    /// `scrub` is `memops::scrub_frame` over identity-mapped RAM; host
+    /// `scrub` is `memops::scrub_frame` over direct-mapped RAM; host
     /// tests pass the same function over a real host buffer.
     #[must_use]
     pub fn new(base_pa: u64, scrub: fn(u64)) -> Self {

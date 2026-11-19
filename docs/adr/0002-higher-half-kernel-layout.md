@@ -1,6 +1,6 @@
 # ADR-0002: Higher-half kernel + direct map
 
-- **Status:** Proposed
+- **Status:** Accepted (PR-1.2)
 - **Stage:** 1 (Ring-3 isolation), PR-1.2
 - **Date:** 2026-11-19
 

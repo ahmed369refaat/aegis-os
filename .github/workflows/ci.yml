@@ -60,15 +60,15 @@ jobs:
           readelf -h "$IMAGE" | grep -q "Entry point address:.*0x100010"
           # Multiboot magic (02 b0 ad 1b) within the first 8 KiB of the file.
           od -A x -t x1 -j 4096 -N 4 "$IMAGE" | grep -q "02 b0 ad 1b"
-          # The 64-bit kernel links at 2 MiB...
-          readelf -h "$KELF" | grep -q "Entry point address:.*0x200000"
+          # The 64-bit kernel links at the higher-half base (ADR-0002)...
+          readelf -h "$KELF" | grep -q "Entry point address:.*0xffffffff80000000"
           # ...and its flat blob is embedded at exactly 2 MiB in the image.
           SIZE=$(stat -c%s "$KBIN")
           cmp <(dd if="$IMAGE" bs=1 skip=8192 count="$SIZE" 2>/dev/null) "$KBIN"
           echo "image checks: PASS"
 
   boot-test:
-    name: Boot test (QEMU, M1 exit criteria + PR-1.1 selftest)
+    name: Boot test (QEMU, M1 + PR-1.1/1.2 selftests)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +77,7 @@ jobs:
           targets: x86_64-unknown-none
       - name: Install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
-      - name: Build, boot, and verify the M1 + exception-selftest markers
+      - name: Build, boot, and verify the M1 + exception/higher-half markers
         run: ./boot.sh --verify
 
   no-deps:

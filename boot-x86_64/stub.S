@@ -10,9 +10,14 @@
  *      protected mode with EAX = 0x2BADB002, EBX = multiboot info address,
  *   2. stashes the multiboot registers and an early TSC stamp,
  *   3. loads its own GDT (the loader's is unspecified),
- *   4. builds identity page tables for the first 1 GiB (2 MiB pages),
+ *   4. builds the bring-up page tables (ADR-0002): the low identity
+ *      window for the stub itself (first 1 GiB, torn down by the kernel
+ *      right after entry), the higher-half kernel window
+ *      (VA 0xFFFFFFFF80000000 → PA 2 MiB, one 2 MiB huge page), and the
+ *      direct map (VA 0xFFFF888000000000 + PA, first 1 GiB),
  *   5. enables PAE -> EFER.LME -> CR0.PG and far-jumps into 64-bit code,
- *   6. jumps to the 64-bit kernel entry, passing:
+ *   6. jumps to the 64-bit kernel entry (a higher-half VA, staged on the
+ *      stack as two 32-bit halves), passing:
  *        RDI = multiboot magic, RSI = info address, RDX = boot TSC.
  *
  * The 64-bit kernel blob is embedded by `.incbin` at its 2 MiB link base
@@ -85,6 +90,36 @@ _start:
     cmpl    $512, %ecx
     jb      2b
 
+    /* ── higher-half kernel window (ADR-0002) ──
+     * PML4[511] → PDPT_hh; PDPT_hh[510] → PD_hh; PD_hh[0] = 2 MiB huge
+     * page @ PA 2 MiB. This makes VA 0xFFFFFFFF80000000 (the kernel link
+     * base) the kernel image. The kernel later adds PDPT_hh[509] itself
+     * for the guarded-stack region. */
+    movl    $boot_pml4, %eax
+    movl    $boot_pdpt_hh, %ecx
+    orl     $3, %ecx
+    movl    %ecx, 4088(%eax)         /* 511 * 8 */
+    movl    $boot_pdpt_hh, %eax
+    movl    $boot_pd_hh, %ecx
+    orl     $3, %ecx
+    movl    %ecx, 4080(%eax)         /* 510 * 8 */
+    movl    $boot_pd_hh, %eax
+    movl    $(0x200000 | 0x83), %ecx /* PA 2 MiB | PRESENT|WRITE|HUGE */
+    movl    %ecx, (%eax)
+
+    /* ── direct map (ADR-0002) ──
+     * PML4[273] → PDPT_dm; PDPT_dm[0] = 1 GiB huge page @ PA 0. Every
+     * physical address below 1 GiB is reachable at VA 0xFFFF888000000000
+     * + PA; the kernel accesses the frame pool, the multiboot info, and
+     * these very tables through it. */
+    movl    $boot_pml4, %eax
+    movl    $boot_pdpt_dm, %ecx
+    orl     $3, %ecx
+    movl    %ecx, 2184(%eax)         /* 273 * 8 */
+    movl    $boot_pdpt_dm, %eax
+    movl    $0x83, %ecx
+    movl    %ecx, (%eax)
+
     /* ── long mode ── */
     /* CR4.PAE */
     movl    %cr4, %eax
@@ -106,20 +141,24 @@ _start:
     /* ── stage the 64-bit handoff ──
      * The i386 assembler cannot emit x86-64 relocations, so the 64-bit
      * section below must be relocation-free: everything it needs is
-     * staged here, on the stack (esp is already the stub stack) and in
-     * ECX. After the pushes the stack layout is:
-     *   [rsp]    tsc_hi
-     *   [rsp+4]  tsc_lo
-     *   [rsp+8]  multiboot info address
-     *   [rsp+12] multiboot magic
+     * staged here, on the stack (esp is already the stub stack). The
+     * kernel entry is a full 64-bit address now (higher-half kernel,
+     * ADR-0002), so it is staged as two 32-bit halves provided by
+     * boot.sh (--defsym=kernel_entry_lo/hi — the i386 stub cannot hold
+     * the 64-bit absolute itself). After the pushes the stack is:
+     *   [rsp]     kernel entry low 32
+     *   [rsp+4]   kernel entry high 32
+     *   [rsp+8]   tsc_hi
+     *   [rsp+12]  tsc_lo
+     *   [rsp+16]  multiboot info address
+     *   [rsp+20]  multiboot magic
      */
     pushl   (mb_magic_saved)
     pushl   (mb_info_saved)
     pushl   (stub_tsc_lo)
     pushl   (stub_tsc_hi)
-    /* Kernel entry address (absolute, --defsym at link time) staged in
-     * ECX; the far jump preserves it. */
-    movl    $kernel_entry, %ecx
+    pushl   $kernel_entry_hi
+    pushl   $kernel_entry_lo
     /* Far jump into the 64-bit code segment (selector 0x18). */
     ljmp    $0x18, $3f
 3:
@@ -134,13 +173,17 @@ _start:
      * staged handoff words on top. */
 
     /* ── hand off to the 64-bit kernel ── */
-    movl    12(%rsp), %edi        /* RDI = multiboot magic  */
-    movl    8(%rsp), %esi         /* RSI = info address     */
-    movl    (%rsp), %edx          /* RDX = TSC high half    */
+    movl    20(%rsp), %edi        /* RDI = multiboot magic  */
+    movl    16(%rsp), %esi        /* RSI = info address     */
+    movl    8(%rsp), %edx         /* RDX = TSC high half    */
     shlq    $32, %rdx
-    orl     4(%rsp), %edx         /* RDX = full boot TSC    */
-    addq    $16, %rsp             /* drop the staged words  */
-    /* Jump to the kernel entry (staged in RCX by the 32-bit code). */
+    orl     12(%rsp), %edx        /* RDX = full boot TSC    */
+    movl    (%rsp), %ecx          /* RCX = kernel entry lo  */
+    movl    4(%rsp), %eax
+    shlq    $32, %rax
+    orq     %rax, %rcx            /* RCX = full entry       */
+    addq    $24, %rsp             /* drop the staged words  */
+    /* Jump to the kernel entry (higher-half VA; mapped above). */
     jmp     *%rcx
     /* Never reached. */
 4:

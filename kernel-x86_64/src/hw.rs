@@ -73,6 +73,74 @@ pub fn read_cr2() -> u64 {
     v
 }
 
+/// Read the page-table base (CR3). Returns the physical address of the
+/// active PML4 (flag/PCID bits must be masked by the caller).
+///
+/// SAFETY: a pure register read.
+pub fn read_cr3() -> u64 {
+    let v: u64;
+    // SAFETY: no memory access; the ISA guarantees no side effects.
+    unsafe { asm!("movq %cr3, %rax", out("rax") v, options(att_syntax, nostack, preserves_flags)) }
+    v
+}
+
+/// Load CR3 (page-table base). Reloading the same value is the cheap
+/// full non-global TLB flush.
+///
+/// SAFETY: `pml4_pa` must be a present, page-aligned PML4 physical
+/// address (the active one, or a fully-built replacement); a wrong value
+/// instantly and unrecoverably breaks all further memory access.
+pub fn write_cr3(pml4_pa: u64) {
+    // SAFETY: caller guarantees a valid active PML4 (see above).
+    unsafe { asm!("movq %rax, %cr3", in("rax") pml4_pa, options(att_syntax, nostack, preserves_flags)) }
+}
+
+/// Invalidate the TLB entry for one virtual address (`invlpg`).
+/// Required after unmapping a page that may have been touched.
+///
+/// SAFETY: `va` is any canonical address; the instruction takes no
+/// memory operands and is CPL0-safe.
+pub fn invlpg(va: u64) {
+    // SAFETY: single-address TLB invalidation, no other effects.
+    unsafe { asm!("invlpg (%rax)", in("rax") va, options(att_syntax, nostack, preserves_flags)) }
+}
+
+/// Write a model-specific register (the `edx:eax` pair per the ISA).
+///
+/// SAFETY: `msr` must exist on this CPU; several MSRs change CPU state
+/// (GS base, EFER, ...) — callers own the semantics they program.
+pub fn wrmsr(msr: u32, value: u64) {
+    // SAFETY: no memory effects beyond the register pair.
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(att_syntax, nostack, preserves_flags),
+        )
+    }
+}
+
+/// Read a model-specific register.
+///
+/// SAFETY: `msr` must exist on this CPU; a pure register read otherwise.
+pub fn rdmsr(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: see above.
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") hi,
+            options(att_syntax, nostack, preserves_flags),
+        )
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
 /// Halt forever (interrupts disabled). Never returns.
 pub fn halt_forever() -> ! {
     loop {

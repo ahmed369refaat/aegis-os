@@ -44,9 +44,12 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
         . = ALIGN(4096);
-        boot_pml4 = .;  . += 4096;    /* level 4 table   */
-        boot_pdpt  = .;  . += 4096;    /* level 3 table   */
-        boot_pd    = .;  . += 4096;    /* level 2: 512 x 2 MiB = 1 GiB */
+        boot_pml4 = .;  . += 4096;    /* level 4 table                     */
+        boot_pdpt  = .;  . += 4096;    /* level 3: identity 1 GiB (PML4[0]) */
+        boot_pd    = .;  . += 4096;    /* level 2: 512 x 2 MiB = 1 GiB      */
+        boot_pdpt_hh = .; . += 4096;   /* level 3: kernel window (PML4[511])*/
+        boot_pd_hh  = .;  . += 4096;   /* level 2: kernel image @ PA 2 MiB  */
+        boot_pdpt_dm = .; . += 4096;   /* level 3: direct map (PML4[273])   */
         . = ALIGN(16);
         stub_stack_bottom = .;
         . += 16K;

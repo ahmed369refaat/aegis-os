@@ -1,41 +1,80 @@
-//! Volatile memory primitives over "physical" addresses.
+//! Volatile memory primitives.
 //!
-//! On the booted kernel every physical address is identity-mapped, so a
-//! physical address IS a dereferenceable virtual address. On the host test
-//! builds the same functions run against a real host buffer — the scrub
-//! and read-back code path is identical, which is exactly what the tests
-//! prove.
+//! Two address flavors share one raw layer:
 //!
-//! SAFETY POLICY: part of the documented unsafe allowlist (with `boot` and
-//! `hw`): volatile raw-pointer access is the one memory-unsafe primitive
-//! the kernel needs; every function below is a two-line wrapper.
+//! - **Kernel target**: the "physical" functions (`read_u32`, `write_u64`,
+//!   `scrub_frame`, `frame_is_zero`) take *physical* addresses and reach
+//!   RAM through the direct map (ADR-0002): `pa` is translated by
+//!   `mm::direct_map::pa_to_va` before the volatile access.
+//! - **Host tests**: the same functions run against a real host buffer
+//!   whose *virtual* address plays the role of the physical address
+//!   (`translate` is the identity there), so the scrub and read-back
+//!   paths execute the identical code.
+//!
+//! The `_va` variants are the raw layer itself: a volatile access at
+//! exactly the address given, no translation. The kernel uses them for
+//! already-virtual addresses (guarded-stack pages, `mm/stacks.rs`).
+//!
+//! SAFETY POLICY: part of the documented unsafe allowlist (with `arch`,
+//! `boot` and `hw`): volatile raw-pointer access is the one memory-unsafe
+//! primitive the kernel needs; every function below is a two-line
+//! wrapper.
 
 #![allow(unsafe_code)]
 
-/// Volatile 32-bit read at `pa`.
+/// Physical→virtual translation. Direct map on the kernel target;
+/// identity on the host, where test buffers are handed in as "physical".
+#[cfg(not(test))]
+fn translate(pa: u64) -> u64 {
+    crate::mm::direct_map::pa_to_va(pa)
+}
+
+#[cfg(test)]
+fn translate(pa: u64) -> u64 {
+    pa
+}
+
+/// Volatile 32-bit read at physical address `pa` (through the direct map
+/// on the kernel).
 ///
 /// SAFETY: `pa` must be 4-byte aligned and point to readable memory
-/// (guaranteed by callers: identity-mapped RAM on the kernel, an aligned
+/// (guaranteed by callers: direct-mapped RAM on the kernel, an aligned
 /// host buffer in tests).
 pub fn read_u32(pa: u64) -> u32 {
     // SAFETY: see function docs; volatile avoids any reordering.
-    unsafe { (pa as *const u32).read_volatile() }
+    unsafe { (translate(pa) as *const u32).read_volatile() }
 }
 
-/// Volatile 64-bit read at `pa`.
+/// Volatile 64-bit read at physical address `pa`.
 ///
 /// SAFETY: `pa` must be 8-byte aligned and readable.
 pub fn read_u64(pa: u64) -> u64 {
     // SAFETY: see function docs.
-    unsafe { (pa as *const u64).read_volatile() }
+    unsafe { (translate(pa) as *const u64).read_volatile() }
 }
 
-/// Volatile 64-bit write at `pa`.
+/// Volatile 64-bit write at physical address `pa`.
 ///
 /// SAFETY: `pa` must be 8-byte aligned and writable.
 pub fn write_u64(pa: u64, val: u64) {
     // SAFETY: see function docs.
-    unsafe { (pa as *mut u64).write_volatile(val) }
+    unsafe { (translate(pa) as *mut u64).write_volatile(val) }
+}
+
+/// Volatile 64-bit read at the *virtual* address `va` (no translation).
+///
+/// SAFETY: `va` must be 8-byte aligned, mapped and readable.
+pub fn read_u64_va(va: u64) -> u64 {
+    // SAFETY: see function docs.
+    unsafe { (va as *const u64).read_volatile() }
+}
+
+/// Volatile 64-bit write at the *virtual* address `va` (no translation).
+///
+/// SAFETY: `va` must be 8-byte aligned, mapped and writable.
+pub fn write_u64_va(va: u64, val: u64) {
+    // SAFETY: see function docs.
+    unsafe { (va as *mut u64).write_volatile(val) }
 }
 
 /// Zero one 4 KiB frame: 512 volatile u64 writes. This is the

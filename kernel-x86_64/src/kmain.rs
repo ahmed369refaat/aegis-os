@@ -2,6 +2,10 @@
 //!
 //! Order:
 //! 1. serial banner, kernel-owned GDT/TSS/IDT (exception entry live),
+//!    then mm::init: the stub's low identity window is torn down and
+//!    per-CPU state is armed — from here on the kernel lives purely in
+//!    the higher half and reaches physical memory only via the direct
+//!    map (ADR-0002),
 //! 2. multiboot validation (magic + memory fields),
 //! 3. frame-pool claim: the region must fit reported low RAM, then it is
 //!    scrubbed once so every allocation starts provably zeroed,
@@ -9,14 +13,19 @@
 //!    1000-cycle create/destroy stress with zero-leak + scrub assertions,
 //! 5. one `M1-EXIT-CRITERIA` line that CI greps, TSC report,
 //! 6. the PR-1.1 exception selftest: force a #DE, the dispatch prints the
-//!    diagnosis + marker and powers off (CI greps both).
+//!    diagnosis + markers, advances RIP, and RETURNS — the entry unwind
+//!    path is live and the boot continues,
+//! 7. the PR-1.2 guarded-stack selftest: alloc a guarded stack, prove
+//!    the mapping and the direct map agree on its contents, free it
+//!    (scrub on free), then write through a guard page — the #PF is
+//!    diagnosed, the marker printed, and QEMU powers off (CI greps it).
 //!
 //! No allocation: log lines are `&str` fragments plus stack-buffer numbers.
 
 use crate::arch;
 use crate::frames::{FramePool, FRAME_SIZE, POOL_BASE, POOL_LEN};
 use crate::runtime::{self, HelloReport, M1Error, MonitorReport, StressReport};
-use crate::{hw, memops, multiboot, serial, strutil};
+use crate::{hw, memops, mm, multiboot, serial, strutil};
 use aegis_os::Kernel;
 
 fn line(out: &mut dyn FnMut(&str), parts: &[&str]) {
@@ -47,15 +56,19 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
 
     // ── 1. kernel-owned CPU tables: exception entry goes live now, so
     //      every later fault is diagnosed instead of triple-faulting.
+    //      Then the memory layout settles into its final shape (ADR-0002):
+    //      the low identity window dies, per-CPU state is armed, and the
+    //      `[MM ] higher-half ok` line goes out.
     arch::init();
+    mm::init();
 
     // ── 2. multiboot validation ─────────────────────────────────────
     if magic != multiboot::BOOT_MAGIC {
         line(&mut out, &["[BOOT] ERROR: not started by a multiboot loader (magic mismatch); halting"]);
         hw::halt_forever();
     }
-    // The info-struct words: flags, mem_lower, mem_upper (identity-mapped,
-    // so the physical address is directly readable).
+    // The info-struct words: flags, mem_lower, mem_upper — physical
+    // addresses, read through the direct map.
     let flags = memops::read_u32(info as u64);
     let mem_lower = memops::read_u32(info as u64 + 4);
     let mem_upper = memops::read_u32(info as u64 + 8);
@@ -144,13 +157,62 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
 
     // ── 6. exception-machinery selftest (PR-1.1) ────────────────────
-    // Everything above already passed its gates; now prove the entry
-    // path end-to-end: force a hardware #DE and let the dispatch print
-    // the diagnosis + selftest marker and power off cleanly (CI greps
-    // both). If the machinery were broken, the CPU would triple-fault
-    // instead and the markers would be missing — loud either way.
+    // Prove the entry path end-to-end: force a hardware #DE; the
+    // dispatch prints the diagnosis + markers, advances RIP past the
+    // idiv, and RETURNS — the unwind path is live, execution continues
+    // below. If the machinery were broken, the CPU would triple-fault
+    // and the markers would be missing — loud either way.
     line(&mut out, &["[ARCH] exception selftest: forcing #DE"]);
     arch::exceptions::arm_and_trigger_de();
+    line(&mut out, &["[ARCH] back from the #DE handler: unwind path live"]);
+
+    // ── 7. guarded-stack selftest (PR-1.2) ──────────────────────────
+    // One stack through its whole life: alloc (guard + pages + PT from
+    // the pool), write and read the top word through the stack VA, read
+    // the SAME word through the direct map at the frame's physical
+    // address (both views must agree), free (scrub-on-free per frame),
+    // then the terminal proof: write through a fresh guard page → #PF.
+    line(&mut out, &["[MM ] guarded-stack selftest: alloc/map/cross-view/free"]);
+    let stack = match mm::stacks::alloc(&mut pool, &mut k.frames, 2) {
+        Ok(st) => st,
+        Err(_) => {
+            line(&mut out, &["[MM ] ERROR: guarded-stack alloc failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    const PATTERN: u64 = 0x6B67_6172_6469_616E; // "kgardian"
+    let top_word = stack.top_va() - 8;
+    memops::write_u64_va(top_word, PATTERN);
+    let via_stack_va = memops::read_u64_va(top_word);
+    let via_direct_map = stack
+        .frame_pa(stack.pages - 1)
+        .map(|pa| memops::read_u64(pa + 4088))
+        .unwrap_or(0);
+    if via_stack_va != PATTERN || via_direct_map != PATTERN {
+        line(&mut out, &["[MM ] ERROR: stack/direct-map views disagree; halting"]);
+        hw::halt_forever();
+    }
+    let freed = mm::stacks::free(&mut pool, &mut k.frames, stack);
+    match freed {
+        Ok(()) => line(&mut out, &["[MM ] guarded stacks: alloc+map+cross-view ok, free+scrub ok"]),
+        Err(_) => {
+            line(&mut out, &["[MM ] ERROR: guarded-stack free failed; halting"]);
+            hw::halt_forever();
+        }
+    }
+
+    // The terminal guard-page proof on a fresh slot: the write must #PF,
+    // the dispatch must confirm CR2 is exactly the guard page, print the
+    // marker, and power off cleanly (CI greps it).
+    let guard_stack = match mm::stacks::alloc(&mut pool, &mut k.frames, 1) {
+        Ok(st) => st,
+        Err(_) => {
+            line(&mut out, &["[MM ] ERROR: guard-selftest stack alloc failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    line(&mut out, &["[ARCH] guard selftest: writing through the guard page"]);
+    arch::exceptions::arm_guard_write(guard_stack.guard_va());
 }
 
 /// The M1 exit criteria, evaluated from the three stage reports.
