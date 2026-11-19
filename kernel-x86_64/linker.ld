@@ -1,31 +1,25 @@
 /*
- * AegisOS x86_64 kernel link script.
+ * AegisOS x86_64 kernel link script (stage 2 of the two-stage boot).
  *
- * The kernel is a multiboot v1 image loaded by QEMU (-kernel) at 1 MiB
- * physical. Link address == physical address everywhere: the boot page
- * tables identity-map the first 1 GiB, so symbols can be dereferenced
- * directly once paging is on.
+ * The kernel links at 2 MiB as a normal ELF64. The boot stub
+ * (boot-x86_64/stub.S) embeds the flat binary of this kernel at its 2 MiB
+ * link base, sets up long mode + identity paging, and jumps to the entry
+ * address (passed via --defsym at stub link time).
  *
- * Layout notes:
- * - .boot comes first so the multiboot header lands within the first
- *   8 KiB of the file (a multiboot requirement).
- * - A 256 KiB boot stack lives at the end of .bss; nothing else may grow
- *   into it (see the ASSERTs).
+ * `aegis_entry_64` is pinned to the very start of .text so the entry
+ * address is deterministic (0x200000) — though the stub reads the real
+ * value from the ELF header anyway.
  */
 OUTPUT_FORMAT(elf64-x86-64)
-ENTRY(_start)
+ENTRY(aegis_entry_64)
 
 SECTIONS
 {
-    . = 1M;
-
-    .boot : ALIGN(4)
-    {
-        KEEP(*(.boot))
-    }
+    . = 2M;
 
     .text : ALIGN(16)
     {
+        KEEP(*(.text.entry))
         *(.text .text.*)
     }
 
@@ -63,6 +57,5 @@ SECTIONS
     }
 }
 
-/* The kernel image + bss + stack must stay far below the frame pool at
- * 16 MiB (the pool is claimed at runtime after multiboot validation). */
+/* Image + bss + stack must stay far below the frame pool at 16 MiB. */
 ASSERT(_kernel_end < 8M, "kernel image overlaps the pre-pool safety region")

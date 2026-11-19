@@ -1,19 +1,47 @@
 #!/usr/bin/env bash
-# AegisOS M1 — build the kernel and boot it in QEMU.
+# AegisOS M1 — build the boot image and run it in QEMU.
 #
-#   ./boot.sh            build + boot (serial on stdio)
-#   ./boot.sh --verify   build + boot + assert the M1 exit-criteria
-#                        markers in the serial log; exits non-zero on
-#                        failure (used by CI and by humans who want proof)
+# Two-stage boot (see boot-x86_64/stub.S for the rationale): QEMU's
+# -kernel multiboot loader accepts ELF32 only, so we build
+#   stage 1: an ELF32 multiboot stub (stub.S + stub.ld) that embeds
+#            stage 2 and enters it in long mode, and
+#   stage 2: the 64-bit kernel (kernel-x86_64, ELF64 linked at 2 MiB,
+#            flattened with objcopy and .incbin'd into the stub at 2 MiB).
 #
-# Requirements: rustup target x86_64-unknown-none, qemu-system-x86.
+#   ./boot.sh              build + boot (serial on stdio)
+#   ./boot.sh --verify     build + boot + assert the M1 exit-criteria
+#                          markers in the serial log (CI proof mode)
+#   ./boot.sh --build-only build the image, print its path, don't boot
+#
+# Requirements: rustup target x86_64-unknown-none; binutils (objcopy, ld,
+# gcc/as); qemu-system-x86 (only for the boot modes).
 set -euo pipefail
 cd "$(dirname "$0")"
 
-KERNEL=target/x86_64-unknown-none/release/aegis-kernel
+KELF=target/x86_64-unknown-none/release/aegis-kernel
+KBIN=target/kernel.bin
+STUB_OBJ=target/stub.o
+IMAGE=target/aegis-boot.elf
 
-echo "==> building aegis-kernel (x86_64-unknown-none, release)"
+echo "==> [1/4] building the 64-bit kernel (x86_64-unknown-none, release)"
 cargo build -p aegis-kernel --release --target x86_64-unknown-none
+
+echo "==> [2/4] flattening the kernel to a binary ($KBIN)"
+objcopy -O binary "$KELF" "$KBIN"
+
+ENTRY=$(readelf -h "$KELF" | awk '/Entry point address/ { print $4 }')
+echo "==> [3/4] linking the ELF32 boot stub around it (kernel entry: $ENTRY)"
+# -m32: assemble the stub as an i386 object (the output container QEMU's
+# multiboot loader accepts); pure assembly, so no 32-bit libc is needed.
+gcc -c -m32 -o "$STUB_OBJ" boot-x86_64/stub.S
+ld -m elf_i386 -T boot-x86_64/stub.ld \
+   --defsym=kernel_entry="$ENTRY" \
+   -o "$IMAGE" "$STUB_OBJ"
+
+if [ "${1:-}" = "--build-only" ]; then
+  echo "image: $IMAGE"
+  exit 0
+fi
 
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
   echo "error: qemu-system-x86_64 not found (Debian/Ubuntu: apt-get install qemu-system-x86)" >&2
@@ -22,12 +50,12 @@ fi
 
 # -machine pc keeps the ACPI poweroff port (0x604) stable; -no-reboot
 # turns a triple fault into a clean QEMU exit instead of a loop.
-QEMU_ARGS=(-machine pc -cpu qemu64 -m 128M -kernel "$KERNEL" -display none -serial stdio -no-reboot)
+QEMU_ARGS=(-machine pc -cpu qemu64 -m 128M -kernel "$IMAGE" -display none -serial stdio -no-reboot)
 
 if [ "${1:-}" = "--verify" ]; then
   LOG=$(mktemp)
   trap 'rm -f "$LOG"' EXIT
-  echo "==> booting in QEMU (TCG) — M1 exit-criteria run"
+  echo "==> [4/4] booting in QEMU (TCG) — M1 exit-criteria run"
   START=$(date +%s.%N)
   timeout 60 qemu-system-x86_64 "${QEMU_ARGS[@]}" | tee "$LOG"
   END=$(date +%s.%N)
@@ -46,5 +74,6 @@ if [ "${1:-}" = "--verify" ]; then
     exit 1
   fi
 else
+  echo "==> [4/4] booting in QEMU"
   exec qemu-system-x86_64 "${QEMU_ARGS[@]}"
 fi

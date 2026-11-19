@@ -14,7 +14,7 @@
 **Done and proven (M0 + M1):**
 
 - The full policy kernel as a library: attenuation-only syscall masks, capability generations, W^X memory policy, VFS with Unix DAC + chroot, pipes/signals/fd tables, CFS scheduling, rate-limited brokered sockets, behavior monitor with graduated response. **196 tests.**
-- A bootable x86_64 kernel (`kernel-x86_64/`): multiboot bring-up, 32-bit → long-mode transition, identity paging over real RAM, a physical frame pool (256 × 4 KiB at 16 MiB) behind the policy core's buddy allocator with **scrub-on-free verified by read-back**, and the M1 exit-criteria sequence running on boot: a hello domain scheduled by CFS, the monitor escalating an attacker across five windows while the healthy neighbor keeps running, and 1000 create/destroy cycles with zero frame leaks. **23 host tests run the same sequence logic without an emulator; the CI boot job runs it in QEMU and fails unless the exit-criteria markers appear.**
+- A bootable x86_64 system, two-stage (QEMU's `-kernel` loader rejects ELF64 — discovered on the first CI boot run): a pure-asm ELF32 multiboot stub (`boot-x86_64/`) sets up identity paging and long mode, then runs the 64-bit kernel (`kernel-x86_64/`, embedded at its 2 MiB link base) over real RAM: a physical frame pool (256 × 4 KiB at 16 MiB) behind the policy core's buddy allocator with **scrub-on-free verified by read-back**, and the M1 exit-criteria sequence running on boot: a hello domain scheduled by CFS, the monitor escalating an attacker across five windows while the healthy neighbor keeps running, and 1000 create/destroy cycles with zero frame leaks. **23 host tests run the same sequence logic without an emulator; the CI boot job runs it in QEMU and fails unless the exit-criteria markers appear.**
 - Unsafe policy enforced by machine, not convention: the policy core is `forbid(unsafe_code)`; the kernel is `deny(unsafe_code)` with a three-module allowlist (`boot/`, `hw.rs`, `memops.rs`), every item carrying a `SAFETY` note, checked by `scripts/check_unsafe.sh` in CI.
 
 **Not yet (roadmap, see `docs/ROADMAP.md`):** ring-3 user domains, per-domain page tables (M1 domains are kernel-resident objects whose region mappings pass the full policy and whose pages are real tracked frames — the hardware isolation boundary lands in M2), preemption/timers, IPC, virtio devices, real filesystems, aarch64 target.
@@ -87,11 +87,14 @@ Docs: [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) (one-pager) · [`docs/A
 ## Repository layout
 
 ```text
-kernel-x86_64/            the bootable M1 kernel (x86_64, multiboot)
-├── linker.ld               1 MiB load, boot stack, image-size ASSERT
+boot-x86_64/              stage 1: the ELF32 multiboot boot stub (pure asm)
+├── stub.S                  GDT, identity paging, long mode, kernel handoff
+└── stub.ld                 1 MiB stub + kernel blob at its 2 MiB link base
+kernel-x86_64/            stage 2: the bootable M1 kernel (x86_64)
+├── linker.ld               2 MiB link base, pinned entry, 256 KiB stack
 ├── build.rs                -T linker script only for the bare-metal target
 └── src/
-    ├── boot/               UNSAFE ALLOWLIST: entry asm, GDT, page tables
+    ├── boot/               UNSAFE ALLOWLIST: naked 64-bit entry
     ├── hw.rs               UNSAFE ALLOWLIST: port I/O, rdtsc, poweroff
     ├── memops.rs           UNSAFE ALLOWLIST: volatile memory + scrub
     ├── serial.rs           COM1 output (safe, over hw primitives)

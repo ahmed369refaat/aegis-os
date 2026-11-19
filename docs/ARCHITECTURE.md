@@ -37,11 +37,14 @@ aegis-os/
 │   ├── response.rs                 graduated response + SecurityEvent telemetry
 │   ├── sys.rs                      the executing syscall layer (gate → execute)
 │   └── lib.rs                      Kernel assembly (domains, VFS, sched, pipes…)
-├── kernel-x86_64/                  # the bootable M1 kernel (workspace member)
-│   ├── linker.ld                     1 MiB multiboot load, 256 KiB boot stack, size ASSERTs
+├── boot-x86_64/                   # stage 1: the ELF32 multiboot boot stub
+│   ├── stub.S                        pure asm: GDT, identity paging, long mode
+│   └── stub.ld                       1 MiB stub + kernel blob at 2 MiB
+├── kernel-x86_64/                  # stage 2: the bootable M1 kernel (workspace member)
+│   ├── linker.ld                     2 MiB link base, pinned entry, 256 KiB stack
 │   ├── build.rs                      -T linker script (bare-metal target only)
 │   └── src/
-│       ├── boot/                     UNSAFE ALLOWLIST: entry asm, GDT, identity page tables
+│       ├── boot/                     UNSAFE ALLOWLIST: naked 64-bit entry (bss, TSC, stack)
 │       ├── hw.rs                     UNSAFE ALLOWLIST: port I/O, rdtsc, halt, QEMU poweroff
 │       ├── memops.rs                 UNSAFE ALLOWLIST: volatile memory + frame scrub
 │       ├── serial.rs                 COM1 output (safe, over hw primitives)
@@ -53,19 +56,34 @@ aegis-os/
 └── tests/linux_like.rs            # Linux-semantics scenarios (VFS/pipe/sched/net)
 ```
 
-### 2.1 The boot path (M1, x86_64 — implemented)
+### 2.1 The boot path (M1, x86_64 — implemented, two-stage)
+
+QEMU's `-kernel` multiboot loader only accepts ELF32, while the kernel is
+64-bit Rust linked as ELF64 — so booting is two stages:
 
 ```text
-QEMU -kernel (multiboot v1, -machine pc, 128 MiB)
- └─ ELF @ 1 MiB, entry in 32-bit protected mode, EAX=0x2BADB002
-     └─ _start: stash multiboot regs + boot TSC, own GDT, .bss stack
-         └─ setup_page_tables: identity-map first 1 GiB (2 MiB pages)
-         └─ PAE → CR3 → EFER.LME → CR0.PG → far jump to 64-bit CS
+QEMU -kernel aegis-boot.elf (ELF32 multiboot v1, -machine pc, 128 MiB)
+ └─ stage 1: boot-x86_64/stub.S — pure-asm ELF32 stub at 1 MiB
+     └─ stash multiboot regs + boot TSC, own GDT, stub stack
+     └─ identity-map the first 1 GiB (2 MiB pages)
+     └─ PAE → CR3 → EFER.LME → CR0.PG → far jump to 64-bit CS
+     └─ hand off RDI=magic, RSI=info, RDX=TSC, RCX=kernel entry
+         └─ stage 2: the 64-bit kernel, embedded in the stub image at
+            its 2 MiB link base, entered via aegis_entry_64 (naked asm)
+             └─ zero .bss, store the boot TSC, switch to the kernel stack
              └─ kmain: serial → multiboot validation (mem_upper gate)
                  → claim + scrub the 256-frame pool @ 16 MiB
                  → hello domain → monitor demo → 1000-cycle stress
                  → M1-EXIT-CRITERIA verdict → clean poweroff
 ```
+
+The stub has no logic (it is the machine-state trust base, ~150 commented
+assembly lines, also bootable by GRUB on real hardware); `boot.sh`
+orchestrates the build: kernel ELF64 → `objcopy` flat binary → the stub
+(`ld -m elf_i386`) with the blob `.incbin`'d at 2 MiB and the entry
+address injected via `--defsym`. The 64-bit handoff is staged on the
+stack by the 32-bit code because the i386 assembler cannot emit x86-64
+relocations.
 
 The pool is managed by the **policy core's own buddy allocator** (the
 `Kernel.frames` instance): the kernel adds only per-frame ownership and

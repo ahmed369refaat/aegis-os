@@ -88,21 +88,35 @@ Consequences for verification, in order of strength:
 
 ### 3.1 Boot path (x86_64)
 
+**Discovered constraint (first CI boot run):** QEMU's `-kernel` multiboot
+loader **rejects ELF64 outright** (`Cannot load x86-64 image, give a 32bit
+one`). The boot is therefore **two-stage**:
+
 ```text
-QEMU -kernel (multiboot v1, -m 128M, -machine pc)
-  └─ ELF loaded at 1 MiB, entry in 32-bit protected mode, EAX=0x2BADB002
-      └─ _start (asm, .code32): stash multiboot regs + TSC, load GDT,
-         set stack, call setup_page_tables (Rust)
-          └─ PML4/PDPT/PD identity map of the first 1 GiB (2 MiB pages)
-      └─ enable PAE → CR3 → EFER.LME → CR0.PG → far jump to 64-bit CS
-          └─ reload segments, new rsp, call kmain(magic, info)
-              └─ serial init → multiboot parse → pool claim+scrub
-                 → hello domain → monitor demo → 1000-cycle stress
-                 → leak/scrub assertions → exit-criteria line → poweroff
+QEMU -kernel aegis-boot.elf   (ELF32 multiboot v1 container, -machine pc)
+  └─ stage 1 — boot-x86_64/stub.S (pure asm, no logic, ~150 lines)
+      loaded at 1 MiB, entered in 32-bit protected mode (EAX=0x2BADB002)
+      └─ stash multiboot regs + TSC, own GDT, stub stack
+      └─ build identity page tables for the first 1 GiB (2 MiB pages)
+      └─ PAE → CR3 → EFER.LME → CR0.PG → far jump to 64-bit CS
+      └─ stage the handoff on the stack (the i386 assembler cannot emit
+         x86-64 relocations, so the 64-bit section is relocation-free):
+         RDI=magic, RSI=info, RDX=TSC, RCX=kernel entry
+  └─ stage 2 — the 64-bit kernel (ELF64, linked at 2 MiB)
+      embedded in the stub image at its link base (.incbin of the flat
+      binary — no copying), entered via aegis_entry_64 (naked asm):
+      └─ zero .bss, store the boot TSC, switch to the kernel stack
+      └─ kmain: serial → multiboot parse → pool claim+scrub
+         → hello domain → monitor demo → 1000-cycle stress
+         → leak/scrub assertions → exit-criteria line → poweroff
 ```
 
-- Identity map means link address == physical address everywhere; the pool
-  at 16 MiB is directly writable.
+The stub is also plain multiboot v1, so GRUB can boot the same image on
+real hardware. Identity map means link address == physical address
+everywhere; the pool at 16 MiB is directly writable. The kernel entry
+address is injected into the stub at link time
+(`ld --defsym=kernel_entry=<addr>` read from the kernel ELF header), so
+nothing depends on address conventions.
 - Poweroff via the QEMU ACPI port `0x604` (with `0xB004` fallback), so the
   CI job gets a clean exit and can time the run.
 - Panic handler prints and halts — a boot failure is visible in the log.
@@ -203,6 +217,7 @@ milestone; M1 ends when §3.4 is proven.
 | Exit criteria | In-kernel verdict line `M1-EXIT-CRITERIA: PASS … leaked-frames=0 … scrub-verified=yes … monitor-quarantined=yes`; CI `boot-test` boots QEMU and asserts it; `kernel-build` asserts the ELF structure |
 | Boot time | Kernel prints entry→complete TSC cycles; the CI runner measures and reports the full QEMU wall-clock (startup included) — the < 300 ms target is evaluated there, not hand-waved |
 | Deviations from plan | aarch64 explicitly deferred (x86_64 first per the plan's own decision table); boot entropy deferred to M2 (no consumer yet); `Kernel::destroy_domain` added to the core (planned in §4 step 2) |
+| First CI boot run | **Failed** with `qemu: Cannot load x86-64 image, give a 32bit one` — QEMU's multiboot loader is ELF32-only. Fixed with the two-stage ELF32 stub design (§3.1); the failure and fix are kept here on purpose: it is exactly the kind of claim-vs-reality gap this plan exists to close |
 
 **What is still NOT claimed (re-stated):** ring-3 execution, per-domain
 page tables, preemption, IPC, devices. M1's domains are kernel-resident

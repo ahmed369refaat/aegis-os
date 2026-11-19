@@ -39,23 +39,33 @@ jobs:
         run: cargo build --target thumbv7em-none-eabihf --verbose
 
   kernel-build:
-    name: Kernel ELF build (x86_64-unknown-none)
+    name: Boot image build (x86_64, two-stage)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none
-      - name: Build the bootable kernel
-        run: cargo build -p aegis-kernel --release --target x86_64-unknown-none --verbose
-      - name: Sanity-check the ELF (entry + multiboot header)
+      - name: Build the full boot image (ELF64 kernel + ELF32 multiboot stub)
+        run: ./boot.sh --build-only
+      - name: Sanity-check the image
         run: |
-          ELF=target/x86_64-unknown-none/release/aegis-kernel
-          test -f "$ELF"
-          readelf -h "$ELF" | grep -q "Entry point address:.*0x100010"
-          # Multiboot magic (02 b0 ad 1b) must sit within the first 8 KiB.
-          od -A x -t x1 -j 4096 -N 4 "$ELF" | grep -q "02 b0 ad 1b"
-          echo "ELF checks: PASS"
+          IMAGE=target/aegis-boot.elf
+          KELF=target/x86_64-unknown-none/release/aegis-kernel
+          KBIN=target/kernel.bin
+          test -f "$IMAGE" && test -f "$KELF" && test -f "$KBIN"
+          # Container: ELF32 i386 (QEMU's -kernel multiboot loader rejects ELF64).
+          readelf -h "$IMAGE" | grep -q "Class:.*ELF32"
+          readelf -h "$IMAGE" | grep -q "Machine:.*80386"
+          readelf -h "$IMAGE" | grep -q "Entry point address:.*0x100010"
+          # Multiboot magic (02 b0 ad 1b) within the first 8 KiB of the file.
+          od -A x -t x1 -j 4096 -N 4 "$IMAGE" | grep -q "02 b0 ad 1b"
+          # The 64-bit kernel links at 2 MiB...
+          readelf -h "$KELF" | grep -q "Entry point address:.*0x200000"
+          # ...and its flat blob is embedded at exactly 2 MiB in the image.
+          SIZE=$(stat -c%s "$KBIN")
+          cmp <(dd if="$IMAGE" bs=1 skip=8192 count="$SIZE" 2>/dev/null) "$KBIN"
+          echo "image checks: PASS"
 
   boot-test:
     name: Boot test (QEMU, M1 exit criteria)
