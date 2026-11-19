@@ -1,6 +1,6 @@
 [package]
 name = "aegis-os"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "AegisOS core: a no_std, zero-dependency policy kernel combining Linux-like semantics (VFS with Unix permissions and chroot, pipes, signals, fd tables, CFS scheduling, buddy allocator, rate-limited brokered sockets) with strict per-domain isolation, attenuation-only syscall masks, capabilities, W^X memory and a graduated AI behavior monitor."
 license = "MIT"
@@ -12,6 +12,15 @@ path = "src/lib.rs"
 # Intentionally empty: core-only, no_std, zero supply-chain surface.
 [dependencies]
 
+# The bootable kernel lives in kernel-x86_64/ (path dependency, still zero
+# external crates). default-members keeps plain `cargo build`/`cargo test`
+# at the root scoped to the policy library.
+[workspace]
+members = ["kernel-x86_64"]
+default-members = ["."]
+
 [profile.release]
 opt-level = 3
 lto = true
+# The kernel never unwinds; abort keeps the binary small and honest.
+panic = "abort"
