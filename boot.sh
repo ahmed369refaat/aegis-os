@@ -76,6 +76,8 @@ case "${1:-}" in
                   -device virtio-blk-pci,disable-legacy=on,iommu_platform=on,drive=vd0
                   -netdev user,id=n0
                   -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on
+                  -vga std
+                  -qmp unix:/tmp/qmp.sock,server,nowait
                   -drive id=vd0,if=none,format=raw,file=target/vdisk0.img)
     EXTRA_GREPS=(
       "[IOMMU] dmar: pa="
@@ -83,6 +85,9 @@ case "${1:-}" in
       "[VNET] alive: MAC="
       "[VNET] dbg q1 readback:"  # the device holds exactly the frames we mapped
       "[VNET] TX: DISCOVER published+kicked"
+      "[GFX] VBE 640x480x32 linear"  # the mode engaged
+      "[KBD] scancode 0x000000000000001e"  # QMP 'a' made it through the i8042
+      "[RTC] 2026-"  # the MC146818 read the host clock
       "[VNET] teardown: revoke_all(0) → 8 region(s)"
     )
     ;;
@@ -126,7 +131,17 @@ if [ "$MODE" = "verify" ]; then
   # carries the version context right next to it.
   echo "    $(qemu-system-x86_64 --version | head -1)"
   START=$(date +%s.%N)
-  timeout 60 qemu-system-x86_64 "${QEMU_ARGS[@]}" | tee "$LOG"
+  # The q35 lane's host-side driver: marker-driven QMP (send-key once
+  # the kernel is armed, screendump after it settles) + a longer
+  # timeout (the keyboard poll spins for the injected key).
+  QEMU_TIMEOUT=60
+  if [ "${1:-}" = "--verify-q35" ]; then
+    QEMU_TIMEOUT=130
+    rm -f /tmp/qmp.sock /tmp/screen.ppm
+    touch "$LOG"
+    (python3 "$(dirname "$0")/scripts/qmp_drive.py" "$LOG" >/tmp/qmp-drive.log 2>&1 &)
+  fi
+  timeout "$QEMU_TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" | tee "$LOG"
   END=$(date +%s.%N)
   echo
   echo "boot wall-clock: $(awk -v e="$END" -v s="$START" 'BEGIN { printf "%.2f", e - s }') s (QEMU startup included)"
@@ -211,6 +226,13 @@ grep -qF "(virtio-blk) → dom 0 ok (broker assigned)" "$LOG" || { echo "VERIFY 
       ;;
   esac
   if [ "$ok" = 1 ]; then
+    if [ "${1:-}" = "--verify-q35" ]; then
+      # Pixel-level proof of the GFX driver (must come AFTER ok=1 is
+      # final): what QMP captured has to match the pattern drawn.
+      if ! python3 "$(dirname "$0")/scripts/check_screen.py" /tmp/screen.ppm; then
+        ok=0
+      fi
+    fi
     echo "BOOT VERIFY: PASS"
   else
     echo "BOOT VERIFY: FAIL"

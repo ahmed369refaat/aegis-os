@@ -234,8 +234,11 @@ pub fn used_idx(used_pa: u64) -> u16 {
 /// The completion id from used-ring slot `i` (u32 at used+4+8i).
 #[must_use]
 pub fn used_entry_id(used_pa: u64, i: u16) -> u32 {
-    let pa = used_pa + 4 + 8 * u64::from(i);
-    memops::read_u32(pa)
+    // The used ring starts with flags+idx (4 bytes), so entry `i`
+    // sits at +4+8i — a u32 at a 4-aligned address on every ring
+    // frame. Two u32 reads (not one u64 at +4, which is only
+    // 4-aligned) keep the host UB-check clean and match the layout.
+    memops::read_u32(used_pa + 4 + 8 * u64::from(i))
 }
 
 // ── virtio-net additions (the second driver on this transport) ──
@@ -277,7 +280,8 @@ pub fn ip_checksum(pa: u64, len: u32) -> u16 {
 /// Length of completed transfer `i` in the used ring (the u32 at
 /// entry+4 — the RX driver reads the frame size from here).
 pub fn used_entry_len(used_pa: u64, i: u16) -> u32 {
-    (memops::read_u64(used_pa + 4 + 8 * u64::from(i)) >> 32) as u32
+    // The completed-length half of used entry `i` (u32 at +4+8i+4).
+    memops::read_u32(used_pa + 4 + 8 * u64::from(i) + 4)
 }
 
 /// The virtio-blk request header (16 bytes): type, reserved, sector.
@@ -462,7 +466,10 @@ mod tests {
     /// The net header is 10 zero bytes (no offloads, no GSO).
     #[test]
     fn net_header_is_ten_zero_bytes() {
-        let pa = 0x1234_5000;
+        // Test "physical" addresses are identity-translated host
+        // pointers — hand in a REAL leaked buffer, never a literal.
+        let buf: &'static mut [u64; 4] = Box::leak(Box::new([0u64; 4]));
+        let pa = buf.as_ptr() as u64;
         memops::write_u64(pa, 0xFFFF_FFFF_FFFF_FFFF);
         write_u16_pa(pa + 8, 0xFFFF);
         write_net_header(pa);
@@ -475,7 +482,8 @@ mod tests {
     /// (4500 0073 0000 4000 4011 0000 c0a8 0001 c0a8 00c7 → b861).
     #[test]
     fn ip_checksum_matches_the_reference_vector() {
-        let pa = 0x1234_5100;
+        let buf: &'static mut [u64; 4] = Box::leak(Box::new([0u64; 4]));
+        let pa = buf.as_ptr() as u64;
         let bytes: [u8; 20] = [
             0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
             0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
@@ -489,8 +497,10 @@ mod tests {
     /// The used ring's completed-length field (entry+4).
     #[test]
     fn used_entry_len_reads_the_second_word() {
-        let used = 0x1234_5200;
-        memops::write_u64(used + 4, (0x2A_u64) << 32 | 7);
+        let buf: &'static mut [u64; 4] = Box::leak(Box::new([0u64; 4]));
+        let used = buf.as_ptr() as u64;
+        memops::write_u32(used + 4, 7); // entry 0: id
+        memops::write_u32(used + 8, 0x2A); // entry 0: len
         assert_eq!(used_entry_id(used, 0), 7);
         assert_eq!(used_entry_len(used, 0), 0x2A);
     }
@@ -498,7 +508,8 @@ mod tests {
     /// Byte-granular writes land byte-exactly (the RMW lane).
     #[test]
     fn write_u8_pa_is_byte_exact() {
-        let pa = 0x1234_5300;
+        let buf: &'static mut [u64; 4] = Box::leak(Box::new([0u64; 4]));
+        let pa = buf.as_ptr() as u64;
         memops::write_u64(pa, 0x1111_1111_1111_1111);
         write_u8_pa(pa + 3, 0xAB);
         assert_eq!(read_u8_pa(pa + 3), 0xAB);
