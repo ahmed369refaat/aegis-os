@@ -60,6 +60,27 @@ macro_rules! vector_stub {
     };
 }
 
+// 32..=47: the legacy 8259 pair's range. No handler is armed yet (the
+// timer arrives with preemption) — these land in the dispatch's
+// unexpected-IRQ halt, a NAMED death instead of a #DF with a shifted
+// frame. No CPU error code on any of them.
+vector_stub!(irq32, 32, noerr);
+vector_stub!(irq33, 33, noerr);
+vector_stub!(irq34, 34, noerr);
+vector_stub!(irq35, 35, noerr);
+vector_stub!(irq36, 36, noerr);
+vector_stub!(irq37, 37, noerr);
+vector_stub!(irq38, 38, noerr);
+vector_stub!(irq39, 39, noerr);
+vector_stub!(irq40, 40, noerr);
+vector_stub!(irq41, 41, noerr);
+vector_stub!(irq42, 42, noerr);
+vector_stub!(irq43, 43, noerr);
+vector_stub!(irq44, 44, noerr);
+vector_stub!(irq45, 45, noerr);
+vector_stub!(irq46, 46, noerr);
+vector_stub!(irq47, 47, noerr);
+
 // 0..=31, with error-code vectors marked (8, 10-14, 17, 21).
 vector_stub!(v00, 0, noerr);
 vector_stub!(v01, 1, noerr);
@@ -178,7 +199,23 @@ pub fn vector_handler(vector: u8) -> (u64, u8) {
         29 => v29,
         30 => v30,
         31 => v31,
-        _ => panic!("vector_handler: not a CPU exception vector"),
+        32 => irq32,
+        33 => irq33,
+        34 => irq34,
+        35 => irq35,
+        36 => irq36,
+        37 => irq37,
+        38 => irq38,
+        39 => irq39,
+        40 => irq40,
+        41 => irq41,
+        42 => irq42,
+        43 => irq43,
+        44 => irq44,
+        45 => irq45,
+        46 => irq46,
+        47 => irq47,
+        _ => panic!("vector_handler: not a CPU exception or legacy IRQ vector"),
     };
     (stub as usize as u64, ist_for(vector))
 }

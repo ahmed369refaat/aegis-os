@@ -27,11 +27,15 @@ pub mod percpu;
 pub mod stubs;
 #[cfg(not(test))]
 pub mod syscall_entry;
+pub mod syscall_frame;
 
 /// Load the kernel-owned GDT (+TSS) and IDT, arming the exception entry
 /// path. Called once from `kmain`, before anything is allowed to fault.
 #[cfg(not(test))]
 pub fn init() {
+    // IRQ discipline first (see hw::pic_mask_all): nothing may deliver
+    // on vectors 32.. before the catch-all exists.
+    crate::hw::pic_mask_all();
     gdt::load();
     idt::load();
     crate::serial::write_str("[ARCH] gdt/tss/idt armed: exception entry live\n");

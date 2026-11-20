@@ -610,11 +610,55 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 &["[RING3] hello domain exited(0): message written from CPL=3"],
             );
         }
-        crate::sched::context::ExitKind::Fault { .. } => {
-            // The entry itself faulted before user code could run — the
+        crate::sched::context::ExitKind::Fault {
+            vector,
+            cr2,
+            error_code,
+            rip,
+            user_rsp,
+        } => {
+            // The run faulted before its first completed syscall — the
             // environment-blocked case (full investigation in
-            // docs/arch/syscall-entry.md). Report honestly, skip the
-            // remaining runs, and let the boot finish.
+            // docs/arch/syscall-entry.md). Print the FULL fault record:
+            // vector/cr2/err/rip/rsp + the resume point and the run's
+            // telemetry, so the next investigation does not have to
+            // guess (this exact record is what the monitor saw).
+            {
+                let mut b1 = [0u8; 20];
+                let mut b2 = [0u8; 18];
+                let mut b3 = [0u8; 18];
+                let mut b4 = [0u8; 18];
+                let mut b5 = [0u8; 18];
+                line(
+                    &mut out,
+                    &[
+                        "[RING3] fault record: vector=",
+                        strutil::dec(vector as u64, &mut b1),
+                        " cr2=",
+                        strutil::hex(cr2, &mut b2),
+                        " err=",
+                        strutil::hex(error_code, &mut b3),
+                        " rip=",
+                        strutil::hex(rip, &mut b4),
+                        " rsp=",
+                        strutil::hex(user_rsp, &mut b5),
+                    ],
+                );
+                let mut b6 = [0u8; 18];
+                let mut b7 = [0u8; 18];
+                let mut b8 = [0u8; 20];
+                line(
+                    &mut out,
+                    &[
+                        "[RING3] resume point: rip=",
+                        strutil::hex(crate::sched::context::saved_rip(), &mut b6),
+                        " rsp=",
+                        strutil::hex(crate::sched::context::saved_rsp(), &mut b7),
+                        " writes=",
+                        strutil::dec(run.write_bytes, &mut b8),
+                    ],
+                );
+            }
             line(
                 &mut out,
                 &["[RING3] launch blocked: ring-3 entry faults in this QEMU build"],
@@ -916,6 +960,15 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     mm::user::destroy_user(&mut k, &mut pool, 10);
     let _ = k.destroy_domain(11);
 
+    // M2-W2: the supervisor drains the telemetry ring between runs.
+    // The ring is a fixed 16-slot buffer that REFUSES on overflow (no
+    // silent overwrite, by design) — without a drain, run 5's spam
+    // events fill it and run 6's verdicts drop on the floor. Draining
+    // is the supervisor's job in the real system too (R5: the console
+    // domain reads the ring over an endpoint); kmain stands in for it
+    // here and prints the honest summary, drops included.
+    drain_telemetry(&mut k, &mut out);
+
     // ── Run 7 (N2): AuditOnly — the same rogue, the same windows:
     // verdicts computed and logged to telemetry, nothing applied. ──
     k.set_monitor_mode(aegis_os::monitor::MonitorMode::AuditOnly);
@@ -963,6 +1016,29 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             );
         }
         _ => {
+            // M2-W2 diagnostics: name the failing condition (the three
+            // the marker demands: exit(0), state Running, verdict logged).
+            let mut b1 = [0u8; 20];
+            serial::write_str("[RING3] audit-only mismatch: exit=");
+            match &run.exit {
+                crate::sched::context::ExitKind::Exited(c) => {
+                    serial::write_str(strutil::dec(*c, &mut b1))
+                }
+                crate::sched::context::ExitKind::Fault { vector, .. } => {
+                    serial::write_str("fault(v=");
+                    serial::write_str(strutil::dec(*vector as u64, &mut b1));
+                    serial::write_str(")");
+                }
+            }
+            serial::write_str(" state=");
+            serial::write_str(match k.domain_state(12) {
+                Some(aegis_os::domain::DomainState::Running) => "Running",
+                Some(aegis_os::domain::DomainState::Quarantined) => "Quarantined",
+                _ => "None",
+            });
+            serial::write_str(" verdict_logged=");
+            serial::write_str(if logged_a_verdict { "yes" } else { "no" });
+            serial::write_str("\n");
             line(
                 &mut out,
                 &["[RING3] ERROR: audit-only run did not behave as specified; halting"],
@@ -984,6 +1060,47 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         &["[ARCH] guard selftest: writing through the boot-stack guard page"],
     );
     arch::exceptions::arm_guard_write(arch::image_map::boot_stack_guard_va());
+}
+
+/// The supervisor's telemetry drain: pop every event, count by action,
+/// report the ring's own dropped-counter. One line per drain — the
+/// audit trail the console domain will read over IPC once endpoints
+/// carry it (M2-PLAN R5); the counts prove the monitor is producing
+/// verdicts even when the ring overflowed before a drain.
+fn drain_telemetry(
+    k: &mut aegis_os::Kernel<{ crate::frames::KERNEL_POOL_FRAMES }>,
+    out: &mut dyn FnMut(&str),
+) {
+    let (mut n, mut logs, mut tightens, mut quarantines) = (0u64, 0u64, 0u64, 0u64);
+    while let Some(ev) = k.pop_event() {
+        n += 1;
+        match ev.action {
+            aegis_os::response::EventAction::Log => logs += 1,
+            aegis_os::response::EventAction::Tighten => tightens += 1,
+            aegis_os::response::EventAction::Quarantine => quarantines += 1,
+        }
+    }
+    let dropped = k.telemetry_dropped();
+    let mut b1 = [0u8; 20];
+    let mut b2 = [0u8; 20];
+    let mut b3 = [0u8; 20];
+    let mut b4 = [0u8; 20];
+    let mut b5 = [0u8; 20];
+    line(
+        out,
+        &[
+            "[TELE] supervisor drain: ",
+            strutil::dec(n, &mut b1),
+            " events (log=",
+            strutil::dec(logs, &mut b2),
+            " tighten=",
+            strutil::dec(tightens, &mut b3),
+            " quarantine=",
+            strutil::dec(quarantines, &mut b4),
+            ") dropped=",
+            strutil::dec(dropped, &mut b5),
+        ],
+    );
 }
 
 /// The M1 exit criteria, evaluated from the three stage reports.

@@ -95,14 +95,14 @@ if [ "${1:-}" = "--verify" ]; then
   grep -qF "[EXC] domain guard selftest: guard-gap #PF ok" "$LOG" || { echo "VERIFY FAIL: domain guard-gap marker missing"; ok=0; }
   grep -qF "[MM ] per-domain tables: 2 domains, W^X + guards live" "$LOG" || { echo "VERIFY FAIL: per-domain acceptance marker missing"; ok=0; }
   # PR-1.4 gate: either the full ring-3 sequence ran (all seven markers),
-  # or the environment-blocked path reported itself honestly (one marker)
-  # and the kernel finished the boot. Both are CI-pass; the blocked path
-  # prints a loud warning so it can never pass silently.
+  # ADR-0010: the blocked outcome is RETIRED — its four root causes
+  # (stray IRQ at the IF boundary + absent IDT gates, mirror-inverted
+  # stub offsets, the launch/resume register hole, the iretq regression)
+  # were all ours, not the environment's. If this line ever returns it
+  # is a regression: fail loudly, never accept it again.
   if grep -qF "[RING3] launch blocked: ring-3 entry faults in this QEMU build" "$LOG"; then
-    echo "WARN: PR-1.4 ring-3 entry is environment-blocked in this QEMU build (see docs/arch/syscall-entry.md)"
-    grep -qF "[RING3] ring-3 step concluded: blocked (environment), kernel intact" "$LOG" || { echo "VERIFY FAIL: blocked path did not conclude cleanly"; ok=0; }
-    # The blocked path powers off at step 10; the terminal guard proof
-    # (step 11) only runs on the full-success path.
+    echo "VERIFY FAIL: the blocked ring-3 path is retired (ADR-0010) — a root cause regressed"
+    ok=0
   else
     grep -qF "hello from ring 3 (CPL=3)" "$LOG" || { echo "VERIFY FAIL: ring-3 hello marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 tail-of-page write ok" "$LOG" || { echo "VERIFY FAIL: N1 tail-of-page marker missing"; ok=0; }
@@ -122,7 +122,7 @@ if [ "${1:-}" = "--verify" ]; then
     grep -qF "[SEC ] ring3 NX-exec blocked: #PF (I/D)" "$LOG" || { echo "VERIFY FAIL: ring-3 NX security marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 kernel-VA read blocked: #PF (U/S)" "$LOG" || { echo "VERIFY FAIL: ring-3 U/S security marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 unauthorized syscall refused (-ENOSYS, audited)" "$LOG" || { echo "VERIFY FAIL: ring-3 syscall gate marker missing"; ok=0; }
-    grep -qF "[RING3] ring-3 isolation live: 4 runs" "$LOG" || { echo "VERIFY FAIL: ring-3 acceptance marker missing"; ok=0; }
+    grep -qF "[RING3] ring-3 isolation live: 7 runs" "$LOG" || { echo "VERIFY FAIL: ring-3 acceptance marker missing"; ok=0; }
   fi
   grep -qF "[MM ] guarded stacks: alloc+map+cross-view ok, free+scrub ok" "$LOG" || { echo "VERIFY FAIL: guarded-stack marker missing"; ok=0; }
   if ! grep -qF "[RING3] launch blocked: ring-3 entry faults in this QEMU build" "$LOG"; then

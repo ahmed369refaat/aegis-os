@@ -29,6 +29,9 @@
 
 #![allow(unsafe_code)]
 
+use super::syscall_frame::{
+    OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RAX, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
+};
 use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -52,25 +55,6 @@ static ROUNDTRIP: AtomicU64 = AtomicU64::new(0);
 /// The syscall-entry stack top (RIP-relative read; the GS path arrives
 /// with Stage 4's SMP work — see docs/arch/syscall-entry.md).
 static SYSCALL_RSP: AtomicU64 = AtomicU64::new(0);
-
-/// The register image the stub parks on the syscall stack (lowest
-/// address first — the stub's push order). Documentation of the asm
-/// below; the offsets must match exactly.
-#[repr(C)]
-pub struct SyscallFrame {
-    _pad0: u64,   // stack alignment (12 slots = 96 bytes)
-    pub rax: u64, // syscall number in; result out
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rdx: u64,
-    pub r10: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub rcx: u64, // user rip (SYSRET target)
-    pub r11: u64, // user rflags (SYSRET restores)
-    pub rbx: u64, // borrowed for the TSC measurement, restored
-    _pad1: u64,   // alignment
-}
 
 fn percpu_kstack_top() -> u64 {
     crate::arch::percpu::get().kstack_top
@@ -142,37 +126,50 @@ pub extern "C" fn syscall_entry() {
         "orq %rdx, %rax",
         "movq %rax, %rbx",             // t0 (dispatch preserves RBX)
         // ── dispatch(nr, a1..a5): SysV arg registers from the frame ──
-        "movq 8(%rsp), %rdi",          // nr   (user RAX)
-        "movq 16(%rsp), %rsi",         // a1   (user RDI)
-        "movq 24(%rsp), %rdx",         // a2   (user RSI)
-        "movq 32(%rsp), %rcx",         // a3   (user RDX)
-        "movq 40(%rsp), %r8",          // a4   (user R10)
-        "movq 48(%rsp), %r9",          // a5   (user R8)
+        // Every slot reference goes through the OFF_* consts — the same
+        // table the host test pins against SyscallFrame (see the OFF_*
+        // docs for the M2-W2 mirror-inversion this prevents).
+        "movq {off_rax}(%rsp), %rdi",  // nr   (user RAX)
+        "movq {off_rdi}(%rsp), %rsi",  // a1   (user RDI)
+        "movq {off_rsi}(%rsp), %rdx",  // a2   (user RSI)
+        "movq {off_rdx}(%rsp), %rcx",  // a3   (user RDX)
+        "movq {off_r10}(%rsp), %r8",   // a4   (user R10)
+        "movq {off_r8}(%rsp), %r9",    // a5   (user R8)
         "call {dispatch}",
         // ── result + t1 ──
-        "movq %rax, 8(%rsp)",          // result into the user-RAX slot
+        "movq %rax, {off_rax}(%rsp)",  // result into the user-RAX slot
         "rdtsc",
         "shlq $32, %rdx",
         "orq %rdx, %rax",
         "subq %rbx, %rax",             // delta = t1 - t0
         "movq %rax, {rt}(%rip)",       // ROUNDTRIP (single CPU)
         // ── restore: clobber exactly RAX, RCX, R11 ──
-        "movq 64(%rsp), %rcx",         // user rip   (SYSRET uses RCX)
-        "movq 72(%rsp), %r11",         // user rflags (SYSRET uses R11)
-        "movq 80(%rsp), %rbx",         // the borrowed callee-saved
-        "movq 8(%rsp),  %rax",         // result
-        "movq 16(%rsp), %rdi",
-        "movq 24(%rsp), %rsi",
-        "movq 32(%rsp), %rdx",
-        "movq 40(%rsp), %r10",
-        "movq 48(%rsp), %r8",
-        "movq 56(%rsp), %r9",
+        "movq {off_rcx}(%rsp), %rcx",  // user rip   (SYSRET uses RCX)
+        "movq {off_r11}(%rsp), %r11",  // user rflags (SYSRET uses R11)
+        "movq {off_rbx}(%rsp), %rbx",  // the borrowed callee-saved
+        "movq {off_rax}(%rsp), %rax",  // result
+        "movq {off_rdi}(%rsp), %rdi",
+        "movq {off_rsi}(%rsp), %rsi",
+        "movq {off_rdx}(%rsp), %rdx",
+        "movq {off_r10}(%rsp), %r10",
+        "movq {off_r8}(%rsp), %r8",
+        "movq {off_r9}(%rsp), %r9",
         "addq $96, %rsp",
         "swapgs",                      // GS ← user value
         "sysretq",                     // CPL=3, RFLAGS from R11
         srsp = sym SYSCALL_RSP,
         dispatch = sym crate::syscall::syscall_dispatch,
         rt = sym ROUNDTRIP,
+        off_rax = const OFF_RAX,
+        off_rdi = const OFF_RDI,
+        off_rsi = const OFF_RSI,
+        off_rdx = const OFF_RDX,
+        off_r10 = const OFF_R10,
+        off_r8 = const OFF_R8,
+        off_r9 = const OFF_R9,
+        off_rcx = const OFF_RCX,
+        off_r11 = const OFF_R11,
+        off_rbx = const OFF_RBX,
         options(att_syntax),
     );
 }

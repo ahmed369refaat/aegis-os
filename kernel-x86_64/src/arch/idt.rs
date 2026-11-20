@@ -128,18 +128,23 @@ mod load {
 
     static mut IDTR: PseudoDescriptor = PseudoDescriptor { limit: 0, base: 0 };
 
-    /// Fill vectors 0..=31 from the stub registry and `lidt`. Called
-    /// exactly once from `arch::init()`. Vectors 32.. stay absent on
-    /// purpose: no device IRQ exists yet (the timer arrives in Stage 4),
-    /// and the boot keeps IF=0 throughout — a stray IRQ double-faults
-    /// loudly instead of running an absent handler.
+    /// Fill vectors 0..=31 (exceptions) and 32..=47 (legacy IRQ range)
+    /// from the stub registry and `lidt`. Called exactly once from
+    /// `arch::init()`. No device IRQ is armed yet (the LAPIC timer
+    /// arrives with preemption, M2-W2) and `hw::pic_mask_all` keeps
+    /// every 8259 line masked — but the CPL3 boundary runs IF=1, so a
+    /// stray line would fire exactly there. The 32..=47 catch-all makes
+    /// that a NAMED halt instead of a #DF carrying a shifted frame (the
+    /// PR-1.4 "environment-blocked" failure, root-caused in M2-W2);
+    /// vectors 48.. stay absent — nothing on this machine delivers
+    /// above the legacy pair until MSI exists.
     pub fn load() {
         // SAFETY: single-CPU bring-up: the table is filled once, before
         // lidt publishes it to the CPU, and is never written again.
         unsafe {
             let i = &raw mut IDT;
             let idtr = &raw mut IDTR;
-            for vector in 0u8..32 {
+            for vector in 0u8..48 {
                 let (handler, ist) = crate::arch::stubs::vector_handler(vector);
                 (*i).entries[vector as usize] =
                     Entry::encode(handler, crate::arch::gdt::KERNEL_CODE, ist, 0);

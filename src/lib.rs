@@ -651,6 +651,14 @@ impl<const N: usize> Kernel<N> {
         &self.telemetry
     }
 
+    /// M2-W2: the ring's own drop counter (events refused because the
+    /// ring was full when pushed). A supervisor reading a nonzero value
+    /// must drain faster — the ring never overwrites, by design.
+    #[must_use]
+    pub fn telemetry_dropped(&self) -> u64 {
+        self.telemetry.dropped()
+    }
+
     pub fn pop_event(&mut self) -> Option<SecurityEvent> {
         self.telemetry.pop()
     }

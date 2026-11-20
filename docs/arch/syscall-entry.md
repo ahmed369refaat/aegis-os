@@ -59,45 +59,56 @@ read / forged syscall with a self-checking exit code) — pure
 `global_asm` blobs, built to flat `.bin` by boot.sh
 (rustc --emit=obj + objcopy) and embedded with `include_bytes!`.
 
-## The open issue (environment), documented with full evidence
+## The reopened case: closed (ADR-0010, M2-W2)
 
-In this sandbox's QEMU (10.0.13, TCG, no KVM), the ring-3 launch
-itself **works** — during the investigation one build reached ring-3
-and the user executed real syscalls (gate refusals with `-ENOSYS` and
-audit lines are in the investigation logs) — but the *first fault
-from the user context* cannot be relayed: it escalates to a #DF whose
-frame arrives shifted, and the resume jump does not land. Everything
-the fault path depends on was verified bit-for-bit from physical
-memory via the QEMU monitor:
+The investigation below was honest about its evidence but wrong in its
+verdict: nothing here was the environment's fault. M2-W2 added #DF
+forensics (raw frame words + CR2/CR3), the full fault record in the
+blocked path, and a QEMU-monitor probe of the post-resume hang, and the
+chain resolved into **four local bugs** (all in ADR-0010, each with its
+regression guard):
 
-- user PML4 walk: `[0]→0x27, [0]→0x27, [2]→0x27, [0]→0x25` — present,
-  U set at every level, code leaf P|U|A with NX clear;
-- kernel-half copies present (`[273]=pdpt_dm|P|W|A`, `[511]`);
-- the live GDT holds exactly the seven descriptors the host test
-  pins; TSS limit covers RSP0/ISTs;
-- RSP0 was pointed at a known-good IST top — same failure; the entry
-  stack was moved off `%gs:` to a static — same failure; PGE and G
-  bits were disabled — same failure; `-cpu max` / `Skylake-Client` —
-  same failure; both `iretq` and `sysretq` entries — same failure.
+1. **A stray legacy IRQ at the IF boundary.** The kernel runs IF=0 but
+   user code runs IF=1 (USER_RFLAGS) — the first instant an interrupt
+   can fire is the SYSRET boundary itself. The IDT covered 0..=31 only
+   and nothing masked the PIC, so a stray line (the PIT runs) hit an
+   absent gate, faulted mid-delivery, and escalated to #DF carrying the
+   *pending user frame* — the "shifted frame" of the original hunt
+   (QEMU's contribution-#DF also pushes no error code, which shifted
+   the stub's parse by one slot: the printed `err` was the real RIP).
+   Fixed: `pic_mask_all()` first thing in `arch::init()`, plus named
+   catch-all gates for 32..=47 that halt loudly with the vector.
+2. **Mirror-inverted stub offsets.** The last push lands at `[rsp+0]`,
+   but the stub read `nr` from offset 8 — the RBX slot. Every user
+   syscall was a garbage-nr `-ENOSYS`; the "gate refusals" recorded
+   during the original investigation were this bug. Fixed: named
+   `OFF_*` consts in the host-visible `arch::syscall_frame` module, read
+   by the asm via const operands, pinned by a host test.
+3. **The launch/resume register hole.** Both run-exit paths jump to the
+   resume label from mid-Rust, so kmain's callee-saved registers crossed
+   the user excursion unpreserved — `kernel_cr3` arrived as a live
+   `&mut Kernel` and `write_cr3` spun in a #GP loop (the monitor probe
+   caught RIP parked on `mov %rax,%cr3`). Fixed: `launch` parks
+   RBX/RBP/R12–R15; the resume label restores them.
+4. **An `iretq` regression.** The code contradicted its own doc
+   comment: the documented SYSRET entry performs no descriptor-
+   validation cycle and cannot fault mid-switch. Restored.
 
-What did get fixed on the way (all real bugs, all now regression-
-covered): the nr-truncation smuggling check, the KERNEL_GS_BASE
-initial value (must be the *user* value, not percpu), the missing
-user-CR3 activation before launch, the LTO tail-jump/unreachable-
-deletion on `-> !` entry points, and an indirect-`jmp *sym` misuse.
+Two more finds in the same pass: the telemetry ring (16 slots, refuses
+on overflow — never overwrites by design) was never drained, so run 6's
+AuditOnly verdicts dropped (2076 dropped events at the first drain);
+kmain now drains as the supervisor will (M2-PLAN R5). And `boot.sh`'s
+success marker still said "4 runs" against a kernel printing "7" — it
+had never fired because the full path had never run.
 
-**Status quo**: the boot ends the ring-3 chapter honestly —
-`[RING3] launch blocked: ...` + a clean poweroff, with the full marker
-set required only on a passing environment (`boot.sh --verify` accepts
-exactly one of the two outcomes, warning loudly on the blocked one).
+**Status quo:** the full seven-run sequence (hello / NX / kernel-VA /
+forged syscall / edge writes / live-monitor quarantine / audit-only)
+passes in this very QEMU build; `boot.sh --verify` accepts only that
+outcome — the blocked line is a CI failure if it ever returns.
 
-**Repro/retry on a different environment**: run `make test-qemu-pr14`
-(or `./boot.sh --verify`). On a KVM-capable host or a different QEMU,
-expect the four runs (hello/NX/kernel-VA/forged syscall) and the full
-marker set; if the entry still faults, the first place to look is the
-exception-delivery path from CPL3 (RSP0 vs IST) in that build, using
-the monitor recipes above (`xp` on the user PML4, the GDT at its GDTR
-address, and the IST frame below its top).
+The original investigation notes follow, kept verbatim for the record —
+the bit-for-bit verifications below were all correct and all beside the
+point:
 
 ## Why the gate runs before anything else
 

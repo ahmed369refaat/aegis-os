@@ -3,6 +3,15 @@
 - **Status:** Active plan (supersedes the M2 sketch in ROADMAP v2 §"Stage 2+")
 - **Basis:** commit `bf494f2` · 319 tests (243 lib+integration, 76 kernel) · CI green
 - **Date:** 2026-11-20
+- **Progress log:**
+  - M2-W1 (commit `d94d25a`): ADR-0004 async IPC landed (15 tests).
+  - M2-W2 (ADR-0010): **ring-3 reliability closed** — the PR-1.4
+    "environment-blocked" verdict was four local bugs (stray IRQ at the
+    IF boundary + absent IDT gates; mirror-inverted stub offsets; the
+    launch/resume register hole; an iretq regression). The full
+    seven-run ring-3 sequence now passes in QEMU TCG and
+    `boot.sh --verify` accepts only that outcome. Kernel tests 76 → 77;
+    the supervisor telemetry drain (R5, stand-in form) is live.
 - **Invariants (non-negotiable, restated):** attenuation-only privileges; a
   deterministic, allocation-free fast path; the BehaviorMonitor stays the
   single decision maker (heavier analysis joins later as a *monitored client
@@ -31,7 +40,12 @@ is measured against:
 
 ### P0 — M2 exit-critical (weeks 1–6): "the core is real and schedulable"
 
-1. **Ring-3 syscall surface is 2 of 20+ syscalls.** The demo path dispatches
+1. **Ring-3 reliability (closed, M2-W2/ADR-0010) + syscall surface.**
+   Reliability is done: the seven-run sequence (hello, NX, kernel-VA,
+   forged syscall, edge writes, live-monitor quarantine, audit-only)
+   passes end to end in QEMU TCG. What remains of this gap is the
+   *surface*: the demo path executes WRITE and EXIT only; the lib
+   executes ~20. The demo path dispatches
    WRITE and EXIT only; the lib executes ~20. Missing: a table-driven
    dispatch at the syscall entry so every profile-allowed syscall reaches the
    same executor the lib tests exercise. Rank #1 because every later feature

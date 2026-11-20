@@ -62,6 +62,14 @@ SYSCALL/SYSRET; unauthorized syscalls and memory faults become SIGSEGV
 with an audit record. Track B (aarch64: EL1/EL0, SVC, PAN) brings the
 second architecture to the same bar, and CI grows the aarch64 job.
 
+**Status (M2-W2/ADR-0010):** the ring-3 machinery is now fully live —
+   seven runs end to end in QEMU TCG (hello / NX / kernel-VA / forged
+   syscall / edge writes / live-monitor quarantine / audit-only), the
+   "environment-blocked" verdict retired (it was four local bugs), and
+   `boot.sh --verify` accepts only the full outcome. The Stage-1 items
+   that remain (full syscall surface from Ring-3, SMP) carry into M2
+   weeks 2–3 per `docs/M2-PLAN.md`.
+
 **Why this first:** everything else (IPC, FS, POSIX, drivers) is untrusted
 code talking through this wall. If the wall is soft, nothing after it
 matters.

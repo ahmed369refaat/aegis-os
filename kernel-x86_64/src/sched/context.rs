@@ -171,6 +171,22 @@ mod entry {
     /// stack and jumps to the label. Single CPU, single run at a time.
     static mut RESUME_RSP: u64 = 0;
     static mut RESUME_RIP: u64 = 0;
+    /// The kernel caller's callee-saved registers, parked at launch and
+    /// restored at the resume label. The user excursion crosses code
+    /// (the syscall stub, the IST fault handlers) that has no ABI
+    /// contract to preserve them, and BOTH run-exit paths jump to the
+    /// resume label from mid-Rust (SYS_EXIT in the dispatch, the
+    /// user-fault branch in the exception dispatch) — without this
+    /// park/restore, kmain's locals kept in callee-saved registers
+    /// arrive as the last handler's scratch (M2-W2: `kernel_cr3` landed
+    /// as a live `&mut Kernel` and `write_cr3` spun the CPU in a #GP
+    /// loop). Single CPU, single run: one slot per register.
+    static mut PARK_RBX: u64 = 0;
+    static mut PARK_RBP: u64 = 0;
+    static mut PARK_R12: u64 = 0;
+    static mut PARK_R13: u64 = 0;
+    static mut PARK_R14: u64 = 0;
+    static mut PARK_R15: u64 = 0;
 
     /// The active run, or `None` between runs.
     static mut USER_RUN: Option<UserRun> = None;
@@ -317,21 +333,44 @@ mod entry {
                 "lea 9f(%rip), %rax",
                 "movq %rax, {rip_slot}(%rip)",
                 "movq %rsp, {rsp_slot}(%rip)",
+                // Park the caller's callee-saved registers (see the
+                // PARK_* doc): the only registers the kernel caller has
+                // a right to find intact after this call returns.
+                "movq %rbx, {rbx_slot}(%rip)",
+                "movq %rbp, {rbp_slot}(%rip)",
+                "movq %r12, {r12_slot}(%rip)",
+                "movq %r13, {r13_slot}(%rip)",
+                "movq %r14, {r14_slot}(%rip)",
+                "movq %r15, {r15_slot}(%rip)",
                 "jmp {enter}",
+                // resume_kernel lands here (RSP restored to the value
+                // recorded above); restore the parked registers, then
+                // fall into launch's ordinary epilogue: the caller sees
+                // a plain function call that just... returned.
                 "9:",
+                "movq {rbx_slot}(%rip), %rbx",
+                "movq {rbp_slot}(%rip), %rbp",
+                "movq {r12_slot}(%rip), %r12",
+                "movq {r13_slot}(%rip), %r13",
+                "movq {r14_slot}(%rip), %r14",
+                "movq {r15_slot}(%rip), %r15",
                 enter = sym enter_ring3,
                 rip_slot = sym RESUME_RIP,
                 rsp_slot = sym RESUME_RSP,
+                rbx_slot = sym PARK_RBX,
+                rbp_slot = sym PARK_RBP,
+                r12_slot = sym PARK_R12,
+                r13_slot = sym PARK_R13,
+                r14_slot = sym PARK_R14,
+                r15_slot = sym PARK_R15,
                 options(att_syntax),
                 in("rdi") ctx,
             );
         }
     }
 
-    /// Enter ring-3 via `iretq`. Naked; the kernel resume point is NOT
-    /// taken from the stack here (see `set_resume_point` — the call site
-    /// may be a tail jump) — call `set_resume_point` immediately before
-    /// this.
+    /// Enter ring-3 via `sysretq`. Naked; the kernel resume point is
+    /// the (RSP, RIP) pair `launch` recorded just before the tail jump.
     ///
     /// Why SYSRET and not IRETQ for the initial entry: SYSRET loads
     /// CS/SS from the STAR slot arithmetic (no descriptor-validation
@@ -339,6 +378,14 @@ mod entry {
     /// privilege change), so the entry cannot fault mid-switch. The
     /// context's `cs`/`ss` fields stay documentation: what runs is the
     /// STAR contract (same selectors — pinned by gdt's host test).
+    ///
+    /// PR-1.4 reopen (M2-W2): the code had regressed to `iretq`, whose
+    /// privilege-switch cycle is exactly where the launch died in this
+    /// environment — the #DF frame carried the *pristine launch
+    /// context* (rip=CODE_BASE, rsp=STACK_TOP, rflags=0x202, cs=0x2b,
+    /// ss=0x23, CR2 stale from an earlier selftest), i.e. the user
+    /// context never started. SYSRET, as the design above specifies,
+    /// performs no such validation cycle.
     #[unsafe(no_mangle)]
     #[unsafe(naked)]
     /// NOTE: declared as returning `()` on purpose — it never returns
@@ -348,20 +395,16 @@ mod entry {
     /// it as unreachable*, which would erase the post-resume code.
     pub extern "C" fn enter_ring3(ctx: &UserContext) {
         naked_asm!(
-            // rdi = ctx (SysV first arg). The kernel resume point was
-            // recorded by `set_resume_point` just before this call.
-            "movq 0x00(%rdi), %rax", // rip
-            "movq 0x08(%rdi), %rcx", // cs
-            "movq 0x10(%rdi), %rdx", // rflags
-            "movq 0x18(%rdi), %rsi", // rsp
-            "movq 0x20(%rdi), %rdi", // ss (last: rdi was needed)
-            "pushq %rdi",            // ss
-            "pushq %rsi",            // rsp
-            "pushq %rdx",            // rflags
-            "pushq %rcx",            // cs
-            "pushq %rax",            // rip
+            // rdi = ctx (SysV first arg). SYSRET's contract: RIP comes
+            // from RCX, RFLAGS from R11, RSP from RSP; CS/SS come from
+            // the STAR user arithmetic (0x2b / 0x23 — the exact
+            // selectors UserContext carries, pinned by gdt's host test).
+            "movq 0x00(%rdi), %rcx", // rip → RCX
+            "movq 0x10(%rdi), %r11", // rflags → R11
+            "movq 0x18(%rdi), %rsp", // user rsp
             "swapgs",                // GS: user / KERNEL_GS_BASE: percpu
-            "iretq",                 // CPL=3, IF per rflags
+            "sysretq",               // CPL=3, IF from R11 — no mid-switch
+            // descriptor-validation cycle
             options(att_syntax),
         );
     }

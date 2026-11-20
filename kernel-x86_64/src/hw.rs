@@ -215,6 +215,20 @@ pub fn swapgs() {
 /// Read control register CR4 (feature flags: PAE, PGE, ...).
 ///
 /// SAFETY: a pure register read.
+/// Mask every line on both 8259 PICs. No IRQ source is armed yet (the
+/// LAPIC timer arrives with preemption, M2-W2) and the kernel runs IF=0
+/// in CPL0 — but ring-3 runs IF=1 (USER_RFLAGS), so an unmasked line
+/// fires at the very first SYSRET boundary. With no handler mapped that
+/// delivery faults mid-switch and escalates to #DF carrying the pending
+/// user frame — the exact failure PR-1.4 misdiagnosed as an environment
+/// block (see docs/arch/syscall-entry.md). Masking is the honest state
+/// until a handler exists; the IDT's 32..=47 catch-all backstops it.
+pub fn pic_mask_all() {
+    // `outb` is itself the safe port-I/O wrapper — no unsafe needed here.
+    outb(0xA1, 0xFF); // slave IMR: all 8 lines masked
+    outb(0x21, 0xFF); // master IMR: all 8 lines masked (incl. cascade)
+}
+
 /// F15 (ADR-0006): CR0 read — WP (bit 16) makes R-only pages stick
 /// for supervisor writes too.
 pub fn read_cr0() -> u64 {

@@ -153,6 +153,47 @@ fn dispatch(f: &mut ExceptionFrame) {
     serial::write_str(" err=");
     serial::write_str(strutil::hex(f.error_code, &mut berr));
 
+    // #DF forensics: a contribution-#DF in this environment arrives
+    // WITHOUT a CPU error code, which shifts the parse by exactly one
+    // slot (proven empirically: the err-slot holds the real RIP, the
+    // rip-slot the real CS, the cs-slot the real RFLAGS). Dump the raw
+    // tail plus CR2/CR3 so the original fault — the one that escalated
+    // — can be reconstructed instead of guessed at.
+    if f.vector == 8 {
+        // SAFETY: CR2/CR3 are register reads; the word reads start at
+        // the error_code slot and walk upward through words the stub
+        // or the CPU pushed (or the scrubbed IST stack below them) —
+        // every read lands on the mapped IST1 stack page.
+        let words: [u64; 8] = unsafe {
+            let base = core::ptr::addr_of!(f.error_code);
+            let mut w = [0u64; 8];
+            let mut i = 0;
+            while i < 8 {
+                w[i] = base.add(i).read();
+                i += 1;
+            }
+            w
+        };
+        let cr2f = hw::read_cr2();
+        let cr3f = hw::read_cr3();
+        for (i, w) in words.iter().enumerate() {
+            let mut bw = [0u8; 18];
+            let mut bi = [0u8; 20];
+            serial::write_str("[EXC] #DF raw w");
+            serial::write_str(strutil::dec(i as u64, &mut bi));
+            serial::write_str("=");
+            serial::write_str(strutil::hex(*w, &mut bw));
+            serial::write_str("\n");
+        }
+        let mut bc2 = [0u8; 18];
+        let mut bc3 = [0u8; 18];
+        serial::write_str("[EXC] #DF cr2=");
+        serial::write_str(strutil::hex(cr2f, &mut bc2));
+        serial::write_str(" cr3=");
+        serial::write_str(strutil::hex(cr3f, &mut bc3));
+        serial::write_str("\n");
+    }
+
     let mut cr2 = 0u64;
     if f.vector == 14 {
         cr2 = hw::read_cr2();
@@ -181,17 +222,16 @@ fn dispatch(f: &mut ExceptionFrame) {
         // on the LIVE domain, and drives the monitor clock.
         crate::sched::context::note_live_fault();
         serial::write_str("[RING3] user fault: domain terminated, kernel resumes\n");
-        // This environment cannot relay the first user-context fault's
-        // resume cleanly (fully investigated in
-        // docs/arch/syscall-entry.md): the kernel is intact and the
-        // ring-3 machinery is armed and host-tested — end the boot with
-        // the honest verdict instead of a lost resume jump.
-        serial::write_str("[RING3] launch blocked: ring-3 entry faults in this QEMU build\n");
-        serial::write_str(
-            "[RING3] (machinery armed + host-tested; see docs/arch/syscall-entry.md)\n",
-        );
-        serial::write_str("[RING3] ring-3 step concluded: blocked (environment), kernel intact\n");
-        hw::shutdown_qemu();
+        // The launch swapped GS to the user view; a CPL3 fault arrives
+        // with GS still user-side — swap it back before resuming (the
+        // exact pairing the SYS_EXIT path performs).
+        hw::swapgs();
+        // Resume the launch point: kmain takes the run, reports the
+        // fault as the run's exit kind, restores the kernel CR3, and
+        // proceeds to the next run. (The user CR3 stays active across
+        // the jump — the shared kernel half covers every static the
+        // resume path touches, and kmain writes CR3 back on take.)
+        crate::sched::context::resume_kernel();
     }
 
     // ── expected, armed selftests ────────────────────────────────────
@@ -285,6 +325,18 @@ fn dispatch(f: &mut ExceptionFrame) {
         // Terminal by design: the last act of the boot, so the proof ends
         // the run cleanly (mirrors the PR-1.1 pattern).
         hw::shutdown_qemu()
+    }
+
+    // ── a stray device IRQ: named, loud, terminal ────────────────────
+    // The PIC is masked and no device is armed; reaching this arm means
+    // either a mask regression or an unmodeled source. Halt with the
+    // vector number — never a silent #DF with a shifted frame.
+    if f.vector >= 32 && f.vector < 48 {
+        let mut bv2 = [0u8; 20];
+        serial::write_str("[IRQ ] unexpected IRQ vector=");
+        serial::write_str(strutil::dec(f.vector, &mut bv2));
+        serial::write_str(" — no source is armed (PIC masked); halting loudly\n");
+        hw::halt_forever();
     }
 
     // ── everything else is a kernel bug at this stage ────────────────
