@@ -33,7 +33,7 @@ pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
 /// active run — a CPL0 fault *before* this is the documented
 /// launch-relay limitation; after it, a CPL0 fault is a kernel bug.
 pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
-use aegis_os::syscall::{gate, SyscallMask, SYSCALL_COUNT, SYS_EXIT, SYS_WRITE};
+use aegis_os::syscall::{gate, SYSCALL_COUNT, SYS_EXIT, SYS_WRITE};
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
 pub const EPERM: i64 = 1;
@@ -118,7 +118,7 @@ mod exec {
     /// arg4 rides R10 per the syscall convention, not RCX). Returns the
     /// value RAX carries back to ring-3.
     pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 {
-    SYSCALLS_SERVED.store(true, Ordering::SeqCst);
+        SYSCALLS_SERVED.store(true, Ordering::SeqCst);
         let run = context::current();
 
         // Full-width bounds check first (see `normalize_nr`), then the
@@ -217,7 +217,7 @@ mod exec {
             buf,
             len,
             &memops::read_u8_va,
-            |b| serial::write_byte(b),
+            serial::write_byte,
         );
         if crate::hw::smap_active() {
             crate::hw::clac();
@@ -230,11 +230,7 @@ mod exec {
     /// Every page overlapping [buf, buf+len): present, U set, and the
     /// whole range inside the user half. The walk uses the domain's own
     /// tables — the same tables its CR3 points at.
-    fn validate_user_range(
-        run: &crate::sched::context::UserRun,
-        buf: u64,
-        len: u64,
-    ) -> bool {
+    fn validate_user_range(run: &crate::sched::context::UserRun, buf: u64, len: u64) -> bool {
         // N1 (ADR-0007 §1): the arithmetic lives in the pure, host-
         // tested mm::user_range; this adapter only walks the domain's
         // own tables (the same tables its CR3 points at).
@@ -262,7 +258,7 @@ mod exec {
         serial::write_str(" ");
         serial::write_str(why);
         serial::write_str(" -> ");
-        serial::write_str(strutil::dec(errno as i64 as u64, &mut be));
+        serial::write_str(strutil::dec(errno as u64, &mut be));
         serial::write_str(" (audited)\n");
     }
 }

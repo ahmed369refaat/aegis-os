@@ -187,7 +187,7 @@ Integer-only math (deterministic, reproducible), `u128` intermediates (no overfl
 | ≥ 75 for consecutive windows | **Quarantine** | EXIT-only, stats frozen; terminal (recovery = supervised respawn) |
 | ≥ 95 in a single window | **Instant quarantine** | Multi-signal attack patterns do not wait for confirmation |
 
-\* Thresholds drop with profile sensitivity (`threshold − sensitivity/4`, floors 5/15): parsers quarantine at 58, services at 75.
+* Thresholds drop with profile sensitivity (`threshold − sensitivity/4`, floors 5/15): parsers quarantine at 58, services at 65 (75 − 40/4).
 
 ### 6.4 Why this does not harass normal users
 

@@ -14,21 +14,21 @@
 //! no user-controlled sizes, no double-fetch hazards in this model.
 
 use crate::buddy::BuddyError;
+use crate::capability::Rights;
 use crate::domain::Decision;
 use crate::fd::{FdError, FdTarget};
+use crate::memory::MemFlags;
 use crate::net::{NetError, TokenBucket, DEFAULT_BURST_BYTES, DEFAULT_RATE_BYTES_PER_WINDOW};
 use crate::pipe::PipeError;
 use crate::signal::{DefaultAction, SignalError};
 use crate::vfs::{Access, InodeKind, Mode, VfsError};
-use crate::capability::Rights;
-use crate::memory::MemFlags;
 use crate::{
-    Kernel, KernelError,
     syscall::{
-        SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL,
-        SYS_MMAP, SYS_MKDIR, SYS_MUNMAP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE,
-        SYS_READ, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
+        SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR,
+        SYS_MMAP, SYS_MUNMAP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SPAWN,
+        SYS_UNLINK, SYS_WRITE,
     },
+    Kernel, KernelError,
 };
 
 /// A fully-marshaled syscall request (the ABI of this sample kernel).
@@ -47,40 +47,81 @@ pub enum SysRequest<'a> {
         truncate: bool,
     },
     /// read(fd, buf) — returns bytes read (short reads; 0 at EOF).
-    Read { fd: u8, buf: &'a mut [u8] },
+    Read {
+        fd: u8,
+        buf: &'a mut [u8],
+    },
     /// write(fd, bytes) — returns bytes written (short writes on pipes).
-    Write { fd: u8, bytes: &'a [u8] },
+    Write {
+        fd: u8,
+        bytes: &'a [u8],
+    },
     /// close(fd) — closes pipe ends held by the descriptor.
-    Close { fd: u8 },
+    Close {
+        fd: u8,
+    },
     /// pipe() — returns (read_fd, write_fd).
     Pipe,
     /// dup2(fd, new_fd) — installs a copy at `new_fd`, closing what is there.
-    Dup { fd: u8, new_fd: u8 },
+    Dup {
+        fd: u8,
+        new_fd: u8,
+    },
     /// kill(target, sig) — Unix permission rules apply (uid 0 / same uid).
-    Kill { target: u32, sig: u8 },
+    Kill {
+        target: u32,
+        sig: u8,
+    },
     /// chroot(path) — confinement change; unlike Linux, the cwd moves with
     /// the root (closes the historical chroot+cwd escape).
-    Chroot { path: &'a str },
+    Chroot {
+        path: &'a str,
+    },
     /// mkdir(path, mode).
-    Mkdir { path: &'a str, mode: Mode },
+    Mkdir {
+        path: &'a str,
+        mode: Mode,
+    },
     /// unlink(path) — files and *empty* directories.
-    Unlink { path: &'a str },
+    Unlink {
+        path: &'a str,
+    },
     /// send(len) — bytes through the domain's brokered socket, rate-limited.
-    NetSend { len: u32 },
+    NetSend {
+        len: u32,
+    },
     /// mmap(addr, len, flags) — map into the domain's policy space.
     /// F13: executes through the ten-check gate; refusals feed the
     /// monitor's fault signal automatically.
-    Mmap { addr: usize, len: usize, flags: MemFlags },
+    Mmap {
+        addr: usize,
+        len: usize,
+        flags: MemFlags,
+    },
     /// munmap(addr, len) — withdraw a mapping from the policy space.
-    Munmap { addr: usize, len: usize },
+    Munmap {
+        addr: usize,
+        len: usize,
+    },
     /// F13 stubs: mask bits without executors. They answer
     /// `NotImplemented(nr)` — never a silent success — and the gate has
     /// already counted the attempt for the monitor.
-    Spawn { cmd: u32 },
-    IpcSend { channel: u32, len: u32 },
-    IpcRecv { channel: u32 },
-    Ioctl { cmd: u32 },
-    NetRecv { len: u32 },
+    Spawn {
+        cmd: u32,
+    },
+    IpcSend {
+        channel: u32,
+        len: u32,
+    },
+    IpcRecv {
+        channel: u32,
+    },
+    Ioctl {
+        cmd: u32,
+    },
+    NetRecv {
+        len: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +196,14 @@ impl Kernel {
             (d.creds(), d.chroot_root, d.cwd)
         };
         match req {
-            SysRequest::Open { path, mode, create, read, write, truncate } => {
+            SysRequest::Open {
+                path,
+                mode,
+                create,
+                read,
+                write,
+                truncate,
+            } => {
                 // F18 (ADR-0009): the capability gate runs BEFORE any
                 // resolution work — an FsNode capability covering the
                 // path's parent directory, with the requested access.
@@ -465,7 +513,10 @@ impl Kernel {
             }
             SysRequest::Chroot { path } => {
                 // Resolve against the *current* root, then re-root.
-                let id = self.vfs.resolve(root, cwd, path, creds).map_err(SysError::Vfs)?;
+                let id = self
+                    .vfs
+                    .resolve(root, cwd, path, creds)
+                    .map_err(SysError::Vfs)?;
                 if self.vfs.kind_of(id) != Some(InodeKind::Dir) {
                     return Err(SysError::Vfs(VfsError::NotADirectory));
                 }
@@ -477,15 +528,25 @@ impl Kernel {
                 Ok(SysValue::Unit)
             }
             SysRequest::Mkdir { path, mode } => {
-                let parent = self.vfs.parent_ref(root, cwd, path, creds).map_err(SysError::Vfs)?;
+                let parent = self
+                    .vfs
+                    .parent_ref(root, cwd, path, creds)
+                    .map_err(SysError::Vfs)?;
                 self.require_fs_cap(domain_id, parent, Rights::WRITE)?;
-                self.vfs.mkdir(root, cwd, path, creds, mode).map_err(SysError::Vfs)?;
+                self.vfs
+                    .mkdir(root, cwd, path, creds, mode)
+                    .map_err(SysError::Vfs)?;
                 Ok(SysValue::Unit)
             }
             SysRequest::Unlink { path } => {
-                let parent = self.vfs.parent_ref(root, cwd, path, creds).map_err(SysError::Vfs)?;
+                let parent = self
+                    .vfs
+                    .parent_ref(root, cwd, path, creds)
+                    .map_err(SysError::Vfs)?;
                 self.require_fs_cap(domain_id, parent, Rights::WRITE)?;
-                self.vfs.unlink(root, cwd, path, creds).map_err(SysError::Vfs)?;
+                self.vfs
+                    .unlink(root, cwd, path, creds)
+                    .map_err(SysError::Vfs)?;
                 Ok(SysValue::Unit)
             }
             SysRequest::NetSend { len } => {
@@ -511,7 +572,9 @@ impl Kernel {
                 let (owner, mut bucket) = self.buckets[slot].take().expect("bucket ensured");
                 let result = self.sockets.send(sock, len, &mut bucket, self.clock);
                 self.buckets[slot] = Some((owner, bucket));
-                result.map(|left| SysValue::Count(left as usize)).map_err(SysError::Net)
+                result
+                    .map(|left| SysValue::Count(left as usize))
+                    .map_err(SysError::Net)
             }
             SysRequest::Mmap { addr, len, flags } => {
                 // F13: through the policy space — a refusal is also an
@@ -522,7 +585,10 @@ impl Kernel {
             }
             SysRequest::Munmap { addr, len: _ } => {
                 let d = self.domain_mut(domain_id).map_err(into_sys)?;
-                d.space.unmap(addr).map(|_| SysValue::Unit).map_err(SysError::Mem)
+                d.space
+                    .unmap(addr)
+                    .map(|_| SysValue::Unit)
+                    .map_err(SysError::Mem)
             }
             SysRequest::Spawn { .. } => Err(SysError::NotImplemented(SYS_SPAWN)),
             SysRequest::IpcSend { .. } => Err(SysError::NotImplemented(SYS_IPC_SEND)),
@@ -545,7 +611,7 @@ impl Kernel {
         Ok(sig)
     }
 
-/// Supervisor API: open the domain's brokered socket + rate bucket.
+    /// Supervisor API: open the domain's brokered socket + rate bucket.
     /// F14: errors keep their identity — a full socket table is
     /// `Net(..)`, a missing domain is `UnknownDomain`; the old version
     /// folded both into UnknownDomain.
@@ -593,8 +659,8 @@ impl Kernel {
     ) -> Result<(), SysError> {
         // no_std: a fixed-size snapshot (the table is bounded by
         // MAX_CAPABILITIES).
-        let mut caps =
-            [(crate::capability::Resource::Domain(0), Rights::NONE); crate::capability::MAX_CAPABILITIES];
+        let mut caps = [(crate::capability::Resource::Domain(0), Rights::NONE);
+            crate::capability::MAX_CAPABILITIES];
         let mut n = 0usize;
         {
             let d = self.domain_mut(domain_id).map_err(into_sys)?;
@@ -620,8 +686,8 @@ impl Kernel {
     /// F18 (ADR-0009): require the Device capability (the brokered NIC
     /// is device 0) with `access`.
     fn require_device_cap(&mut self, domain_id: u32, access: Rights) -> Result<(), SysError> {
-        let mut caps =
-            [(crate::capability::Resource::Domain(0), Rights::NONE); crate::capability::MAX_CAPABILITIES];
+        let mut caps = [(crate::capability::Resource::Domain(0), Rights::NONE);
+            crate::capability::MAX_CAPABILITIES];
         let mut n = 0usize;
         {
             let d = self.domain_mut(domain_id).map_err(into_sys)?;
@@ -648,8 +714,8 @@ impl Kernel {
     /// WRITE. Self-signaling is always allowed: creation minted
     /// Domain(id), so the normal check passes with no special case.
     fn require_domain_cap(&mut self, domain_id: u32, target: u32) -> Result<(), SysError> {
-        let mut caps =
-            [(crate::capability::Resource::Domain(0), Rights::NONE); crate::capability::MAX_CAPABILITIES];
+        let mut caps = [(crate::capability::Resource::Domain(0), Rights::NONE);
+            crate::capability::MAX_CAPABILITIES];
         let mut n = 0usize;
         {
             let d = self.domain_mut(domain_id).map_err(into_sys)?;

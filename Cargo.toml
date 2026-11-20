@@ -17,7 +17,7 @@ path = "src/lib.rs"
 # at the root scoped to the policy library.
 [workspace]
 members = ["kernel-x86_64"]
-exclude = ["examples/ring3-hello", "examples/ring3-rogue"]
+exclude = ["examples/ring3-hello", "examples/ring3-rogue", "examples/ring3-edge"]
 default-members = ["."]
 
 [profile.release]
@@ -25,3 +25,7 @@ opt-level = 3
 lto = true
 # The kernel never unwinds; abort keeps the binary small and honest.
 panic = "abort"
+# G (review round 2): release builds panic on arithmetic overflow the
+# same way debug builds do — a silent wrap on a counter or a size is a
+# security bug in a kernel, and the no_std panic handler halts loudly.
+overflow-checks = true

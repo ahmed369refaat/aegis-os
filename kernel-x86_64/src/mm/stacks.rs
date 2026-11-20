@@ -26,10 +26,6 @@ pub const SLOT_BYTES: u64 = 2 << 20;
 /// Upper bound on stack pages (a PT holds 512 entries; one is the guard).
 pub const MAX_PAGES: usize = 511;
 
-/// Region size (one PDPT entry = one PD = 1 GiB of slots).
-#[cfg(not(test))]
-const REGION_BYTES: u64 = 1 << 30;
-
 /// The kernel's pool owner tag (domain ids start at 1; 0 is the kernel).
 #[cfg(not(test))]
 const OWNER_KERNEL: u32 = 0;
@@ -74,7 +70,9 @@ impl StackSlots {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        let slot = ((self.hint.load(Ordering::Relaxed) + word) % self.bits.len()) * 64 + bit;
+                        let slot = ((self.hint.load(Ordering::Relaxed) + word) % self.bits.len())
+                            * 64
+                            + bit;
                         return Some(slot as u32);
                     }
                     Err(actual) => cur = actual,
@@ -96,6 +94,12 @@ impl StackSlots {
         use core::sync::atomic::Ordering;
         let (word, bit) = ((slot as usize) / 64, (slot as usize) % 64);
         self.bits[word].load(Ordering::SeqCst) & (1 << bit) != 0
+    }
+}
+
+impl Default for StackSlots {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -165,18 +169,20 @@ impl KernelStack {
     /// excluded) — for cross-view checks through the direct map.
     #[must_use]
     pub fn frame_pa(&self, i: usize) -> Option<u64> {
-        if i < self.pages { Some(self.frames[i]) } else { None }
+        if i < self.pages {
+            Some(self.frames[i])
+        } else {
+            None
+        }
     }
 }
 
 #[cfg(not(test))]
 mod target {
-    use super::{
-        slot_base, KernelStack, StackError, MAX_PAGES, MAX_SLOTS, OWNER_KERNEL, PAGE,
-    };
+    use super::{slot_base, KernelStack, StackError, MAX_PAGES, MAX_SLOTS, OWNER_KERNEL, PAGE};
     use crate::frames::FramePool;
-    use crate::mm::{ADDR_MASK, PTE_P_RW};
     use crate::memops;
+    use crate::mm::{ADDR_MASK, PTE_P_RW};
     use aegis_os::prelude::BuddyAllocator;
     use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -212,7 +218,9 @@ mod target {
         // stale entry can exist.
         let mut pd_pa = REGION_PD_PA.load(Ordering::SeqCst);
         if pd_pa == 0 {
-            let pd = pool.alloc_for(buddy, OWNER_KERNEL).map_err(StackError::Pool)?;
+            let pd = pool
+                .alloc_for(buddy, OWNER_KERNEL)
+                .map_err(StackError::Pool)?;
             memops::scrub_frame(pd);
             memops::write_u64(pdpt_hh_pa() + 509 * 8, pd | PTE_P_RW);
             REGION_PD_PA.store(pd, Ordering::SeqCst);
@@ -248,8 +256,8 @@ mod target {
                 Err(e) => {
                     // Rollback: every frame taken so far, the PT, the PD
                     // entry, and the slot itself.
-                    for j in 0..i {
-                        let _ = pool.free(buddy, frames[j], OWNER_KERNEL);
+                    for frame in frames[..i].iter() {
+                        let _ = pool.free(buddy, *frame, OWNER_KERNEL);
                     }
                     memops::write_u64(pd_pa + slot as u64 * 8, 0);
                     let _ = pool.free(buddy, pt, OWNER_KERNEL);
@@ -266,7 +274,12 @@ mod target {
             *frame_pa = pa;
         }
 
-        Ok(KernelStack { slot, pages, frames, pt_pa: pt })
+        Ok(KernelStack {
+            slot,
+            pages,
+            frames,
+            pt_pa: pt,
+        })
     }
 
     /// Release a stack: unmap its pages (invalidating each — they WERE
@@ -286,7 +299,8 @@ mod target {
                 .map_err(StackError::Pool)?;
         }
         memops::write_u64(pd_pa + stack.slot as u64 * 8, 0);
-        pool.free(buddy, stack.pt_pa, OWNER_KERNEL).map_err(StackError::Pool)?;
+        pool.free(buddy, stack.pt_pa, OWNER_KERNEL)
+            .map_err(StackError::Pool)?;
         // F17: the slot is reusable by the next alloc.
         SLOTS.free(stack.slot);
         Ok(())
@@ -329,7 +343,7 @@ mod tests {
     fn slot_bitmap_matches_the_region_geometry() {
         // One PDPT entry (1 GiB) of 2 MiB slots.
         assert_eq!(MAX_SLOTS as u64 * SLOT_BYTES, 1 << 30);
-        assert!(MAX_SLOTS % 64 == 0, "bitmap words are full");
+        assert!(MAX_SLOTS.is_multiple_of(64), "bitmap words are full");
     }
 
     #[test]
@@ -351,14 +365,14 @@ mod tests {
     fn the_region_sits_directly_below_the_kernel_image() {
         // PML4[511]·PDPT[509] (stacks) vs PDPT[510] (image): adjacent
         // PDPT entries, one GiB apart, image above stacks.
-        assert_eq!(crate::mm::KERNEL_BASE - STACK_REGION_BASE, 1 << 30);
-        // And the whole region is canonical high-half.
-        assert!(STACK_REGION_BASE >= 0xFFFF_8000_0000_0000);
+        // Compile-time invariants (clippy: assert_on_constants).
+        const _: () = assert!(crate::mm::KERNEL_BASE - STACK_REGION_BASE == 1 << 30);
+        const _: () = assert!(STACK_REGION_BASE >= 0xFFFF_8000_0000_0000);
     }
 
     #[test]
     fn max_pages_leaves_room_for_the_guard() {
-        assert!(MAX_PAGES < 512);
+        const _: () = assert!(MAX_PAGES < 512);
         assert_eq!(top_va(0, MAX_PAGES), slot_base(0) + 512 * PAGE);
     }
 }

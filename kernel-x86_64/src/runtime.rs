@@ -52,7 +52,11 @@ fn line(out: Out<'_>, parts: &[&str]) {
 }
 
 fn yes_no(v: bool) -> &'static str {
-    if v { "yes" } else { "NO" }
+    if v {
+        "yes"
+    } else {
+        "NO"
+    }
 }
 
 // ── 1. hello domain ──
@@ -73,12 +77,17 @@ pub fn hello_domain<const N: usize>(
     pool: &mut FramePool<N>,
     out: Out<'_>,
 ) -> Result<HelloReport, M1Error> {
-    line(out, &["[DOM ] creating hello domain 1 (service profile, uid 1001, nice 0)"]);
+    line(
+        out,
+        &["[DOM ] creating hello domain 1 (service profile, uid 1001, nice 0)"],
+    );
     k.create_domain_with(1, service_profile(), 1001, 100, 0)?;
 
     // Region 1: two RW pages at an arbitrary (policy-checked) base.
     let base = 0x4000_0000usize;
-    k.domain_mut(1)?.space.map(base, 8192, MemFlags::READ | MemFlags::WRITE)?;
+    k.domain_mut(1)?
+        .space
+        .map(base, 8192, MemFlags::READ | MemFlags::WRITE)?;
 
     // The guard-gap policy, live: a region placed directly adjacent must
     // be rejected; one page further (leaving the guard page) must pass.
@@ -88,11 +97,16 @@ pub fn hello_domain<const N: usize>(
         .map(base + 8192, 4096, MemFlags::READ | MemFlags::WRITE);
     let guard_gap_rejected = matches!(adjacent, Err(MemError::GuardGap));
     if guard_gap_rejected {
-        line(out, &["[MEM ] guard-gap policy live: adjacent mapping rejected (GuardGap)"]);
+        line(
+            out,
+            &["[MEM ] guard-gap policy live: adjacent mapping rejected (GuardGap)"],
+        );
     } else {
         line(out, &["[MEM ] WARNING: adjacent mapping was NOT rejected"]);
     }
-    k.domain_mut(1)?.space.map(base + 3 * 4096, 4096, MemFlags::READ | MemFlags::WRITE)?;
+    k.domain_mut(1)?
+        .space
+        .map(base + 3 * 4096, 4096, MemFlags::READ | MemFlags::WRITE)?;
 
     // Back both regions (3 pages) with real frames from the pool, and
     // write a recognizable pattern into each: physical memory, writable,
@@ -103,7 +117,10 @@ pub fn hello_domain<const N: usize>(
         memops::write_u64(pa, 0x6169_6765_3031_0001); // "aige01" in ASCII
         frames_backed += 1;
     }
-    line(out, &["[MEM ] backed 3 pages with real pool frames (16 MiB..17 MiB), pattern written"]);
+    line(
+        out,
+        &["[MEM ] backed 3 pages with real pool frames (16 MiB..17 MiB), pattern written"],
+    );
 
     // Scheduler slices: CFS hands the runnable domain its turns.
     let mut slices = 0u32;
@@ -115,11 +132,23 @@ pub fn hello_domain<const N: usize>(
         }
     }
     let mut b = [0u8; 20];
-    line(out, &["[SCHD] CFS granted the hello domain ", strutil::dec(slices as u64, &mut b), "/4 slices"]);
+    line(
+        out,
+        &[
+            "[SCHD] CFS granted the hello domain ",
+            strutil::dec(slices as u64, &mut b),
+            "/4 slices",
+        ],
+    );
     // The domain speaks (the kernel prints on its behalf in M1):
     line(out, &["[DOM ] Hello from AegisOS domain 1 (x86_64, M1)!"]);
 
-    Ok(HelloReport { domain: 1, frames_backed, guard_gap_rejected, slices })
+    Ok(HelloReport {
+        domain: 1,
+        frames_backed,
+        guard_gap_rejected,
+        slices,
+    })
 }
 
 // ── 2. behavior-monitor demo (the proven escalation scenario) ──
@@ -133,8 +162,14 @@ pub struct MonitorReport {
 /// Replay the integration-test escalation scenario on the live kernel:
 /// five audit windows, Log → Tighten → Tighten → Tighten → Quarantine,
 /// while the healthy hello domain keeps working.
-pub fn monitor_demo<const N: usize>(k: &mut Kernel<N>, out: Out<'_>) -> Result<MonitorReport, M1Error> {
-    line(out, &["[MON ] escalating parser demo (domain 2, parser profile, sensitivity 70)"]);
+pub fn monitor_demo<const N: usize>(
+    k: &mut Kernel<N>,
+    out: Out<'_>,
+) -> Result<MonitorReport, M1Error> {
+    line(
+        out,
+        &["[MON ] escalating parser demo (domain 2, parser profile, sensitivity 70)"],
+    );
     k.create_domain(2, parser_profile())?;
     let mut scores = [0u8; 5];
     let mut b = [0u8; 20];
@@ -150,7 +185,14 @@ pub fn monitor_demo<const N: usize>(k: &mut Kernel<N>, out: Out<'_>) -> Result<M
         k.report_escalation_attempt(2)?;
     }
     scores[0] = k.audit(2)?.score;
-    line(out, &["[MON ] W1 score=", strutil::dec(scores[0] as u64, &mut b), " -> Log"]);
+    line(
+        out,
+        &[
+            "[MON ] W1 score=",
+            strutil::dec(scores[0] as u64, &mut b),
+            " -> Log",
+        ],
+    );
 
     // W2: keeps misbehaving → 50, Tighten (streak 1).
     for _ in 0..4 {
@@ -163,7 +205,14 @@ pub fn monitor_demo<const N: usize>(k: &mut Kernel<N>, out: Out<'_>) -> Result<M
         k.report_escalation_attempt(2)?;
     }
     scores[1] = k.audit(2)?.score;
-    line(out, &["[MON ] W2 score=", strutil::dec(scores[1] as u64, &mut b), " -> Tighten"]);
+    line(
+        out,
+        &[
+            "[MON ] W2 score=",
+            strutil::dec(scores[1] as u64, &mut b),
+            " -> Tighten",
+        ],
+    );
 
     // W3: probes the surface it just lost (MMAP now denied by the mask).
     for _ in 0..6 {
@@ -173,7 +222,14 @@ pub fn monitor_demo<const N: usize>(k: &mut Kernel<N>, out: Out<'_>) -> Result<M
         k.report_fault(2)?;
     }
     scores[2] = k.audit(2)?.score;
-    line(out, &["[MON ] W3 score=", strutil::dec(scores[2] as u64, &mut b), " -> Tighten"]);
+    line(
+        out,
+        &[
+            "[MON ] W3 score=",
+            strutil::dec(scores[2] as u64, &mut b),
+            " -> Tighten",
+        ],
+    );
 
     // W4: full attack pattern → 80, Tighten (quarantine streak 1).
     for _ in 0..10 {
@@ -187,7 +243,14 @@ pub fn monitor_demo<const N: usize>(k: &mut Kernel<N>, out: Out<'_>) -> Result<M
         k.report_escalation_attempt(2)?;
     }
     scores[3] = k.audit(2)?.score;
-    line(out, &["[MON ] W4 score=", strutil::dec(scores[3] as u64, &mut b), " -> Tighten"]);
+    line(
+        out,
+        &[
+            "[MON ] W4 score=",
+            strutil::dec(scores[3] as u64, &mut b),
+            " -> Tighten",
+        ],
+    );
 
     // W5: same pattern again → 80, Quarantine (terminal).
     for _ in 0..10 {
@@ -201,16 +264,34 @@ pub fn monitor_demo<const N: usize>(k: &mut Kernel<N>, out: Out<'_>) -> Result<M
         k.report_escalation_attempt(2)?;
     }
     scores[4] = k.audit(2)?.score;
-    line(out, &["[MON ] W5 score=", strutil::dec(scores[4] as u64, &mut b), " -> Quarantine (terminal)"]);
+    line(
+        out,
+        &[
+            "[MON ] W5 score=",
+            strutil::dec(scores[4] as u64, &mut b),
+            " -> Quarantine (terminal)",
+        ],
+    );
 
     let quarantined = k.domain_state(2) == Some(DomainState::Quarantined);
     // The healthy neighbor is untouched: still running, still allowed READ.
-    let neighbor_healthy = k.domain_state(1) == Some(DomainState::Running)
-        && k.dispatch(1, SYS_READ).is_ok();
-    line(out, &["[MON ] attacker quarantined: ", yes_no(quarantined),
-        "; healthy domain 1 still running: ", yes_no(neighbor_healthy)]);
+    let neighbor_healthy =
+        k.domain_state(1) == Some(DomainState::Running) && k.dispatch(1, SYS_READ).is_ok();
+    line(
+        out,
+        &[
+            "[MON ] attacker quarantined: ",
+            yes_no(quarantined),
+            "; healthy domain 1 still running: ",
+            yes_no(neighbor_healthy),
+        ],
+    );
 
-    Ok(MonitorReport { scores, quarantined, neighbor_healthy })
+    Ok(MonitorReport {
+        scores,
+        quarantined,
+        neighbor_healthy,
+    })
 }
 
 // ── 3. create/destroy stress ──
@@ -247,15 +328,24 @@ pub fn stress_create_destroy<const N: usize>(
     let baseline = k.frames.frames_in_use();
     let baseline_owners = pool.owned_count();
     let mut cb = [0u8; 20];
-    line(out, &["[STRS] create/destroy stress: ", strutil::dec(cycles as u64, &mut cb), " cycles"]);
+    line(
+        out,
+        &[
+            "[STRS] create/destroy stress: ",
+            strutil::dec(cycles as u64, &mut cb),
+            " cycles",
+        ],
+    );
     let mut scrub_verified = false;
 
     for i in 0..cycles {
-        let id = 10 + (i % 3) as u32;
+        let id = 10 + (i % 3);
         k.create_domain_with(id, plugin_profile(), 1000 + id as u16, 100, 0)?;
 
         // One 2-page RW region — through the ten-check policy.
-        k.domain_mut(id)?.space.map(0x5000_0000, 8192, MemFlags::READ | MemFlags::WRITE)?;
+        k.domain_mut(id)?
+            .space
+            .map(0x5000_0000, 8192, MemFlags::READ | MemFlags::WRITE)?;
 
         // Back it with two real frames and dirty them.
         let mut probe_pa: Option<u64> = None;
@@ -283,10 +373,23 @@ pub fn stress_create_destroy<const N: usize>(
             let in_use = k.frames.frames_in_use();
             let mut b1 = [0u8; 20];
             let mut b2 = [0u8; 20];
-            line(out, &["[STRS]   ", strutil::dec(i as u64 + 1, &mut b1),
-                " cycles: frames_in_use=", strutil::dec(in_use as u64, &mut b2)]);
+            line(
+                out,
+                &[
+                    "[STRS]   ",
+                    strutil::dec(i as u64 + 1, &mut b1),
+                    " cycles: frames_in_use=",
+                    strutil::dec(in_use as u64, &mut b2),
+                ],
+            );
             if in_use != baseline {
-                line(out, &["[STRS] LEAK DETECTED at cycle ", strutil::dec(i as u64 + 1, &mut b1)]);
+                line(
+                    out,
+                    &[
+                        "[STRS] LEAK DETECTED at cycle ",
+                        strutil::dec(i as u64 + 1, &mut b1),
+                    ],
+                );
                 return Ok(StressReport {
                     cycles: i + 1,
                     leaked_frames: in_use.saturating_sub(baseline),
@@ -310,12 +413,28 @@ pub fn stress_create_destroy<const N: usize>(
     let mut b2 = [0u8; 20];
     let mut b3 = [0u8; 20];
     let mut b4 = [0u8; 20];
-    line(out, &["[STRS] done: leaked_frames=", strutil::dec(leaked as u64, &mut b1),
-        " (baseline ", strutil::dec(baseline as u64, &mut b2),
-        "), owners_left=", strutil::dec(owners_left as u64, &mut b3),
-        " (expected ", strutil::dec((baseline_owners - ballast) as u64, &mut b4),
-        "), scrub_readback=", yes_no(scrub_verified)]);
-    Ok(StressReport { cycles, leaked_frames: leaked, baseline_frames: baseline, owners_left, scrub_verified })
+    line(
+        out,
+        &[
+            "[STRS] done: leaked_frames=",
+            strutil::dec(leaked as u64, &mut b1),
+            " (baseline ",
+            strutil::dec(baseline as u64, &mut b2),
+            "), owners_left=",
+            strutil::dec(owners_left as u64, &mut b3),
+            " (expected ",
+            strutil::dec((baseline_owners - ballast) as u64, &mut b4),
+            "), scrub_readback=",
+            yes_no(scrub_verified),
+        ],
+    );
+    Ok(StressReport {
+        cycles,
+        leaked_frames: leaked,
+        baseline_frames: baseline,
+        owners_left,
+        scrub_verified,
+    })
 }
 
 #[cfg(test)]
@@ -355,14 +474,20 @@ mod tests {
             let hello = hello_domain(&mut k, &mut pool, &mut out).unwrap();
             assert_eq!(hello.domain, 1);
             assert_eq!(hello.frames_backed, 3);
-            assert!(hello.guard_gap_rejected, "adjacent mapping must be rejected");
+            assert!(
+                hello.guard_gap_rejected,
+                "adjacent mapping must be rejected"
+            );
             assert_eq!(hello.slices, 4, "sole runnable domain gets every slice");
 
             // 2) Monitor demo: exact escalation timeline.
             let mon = monitor_demo(&mut k, &mut out).unwrap();
             assert_eq!(mon.scores, [55, 50, 37, 80, 80]);
             assert!(mon.quarantined);
-            assert!(mon.neighbor_healthy, "the healthy neighbor must be unaffected");
+            assert!(
+                mon.neighbor_healthy,
+                "the healthy neighbor must be unaffected"
+            );
 
             // 3) Supervised cleanup of the quarantined domain.
             k.destroy_domain(2).unwrap();
@@ -375,8 +500,14 @@ mod tests {
         assert!(log.contains("Hello from AegisOS domain 1"));
         assert_eq!(stress.cycles, 1000);
         assert_eq!(stress.baseline_frames, 3, "hello domain's frames");
-        assert_eq!(stress.leaked_frames, 0, "zero frame leaks after 1000 cycles");
-        assert_eq!(stress.owners_left, 3, "only the hello domain's frames remain owned");
+        assert_eq!(
+            stress.leaked_frames, 0,
+            "zero frame leaks after 1000 cycles"
+        );
+        assert_eq!(
+            stress.owners_left, 3,
+            "only the hello domain's frames remain owned"
+        );
         assert!(stress.scrub_verified, "freed frame must read back as zero");
 
         // End-state frame accounting.
@@ -417,7 +548,8 @@ mod tests {
         hello_domain(&mut k, &mut pool, &mut out).unwrap();
         // Domain 9 allocates two frames and is destroyed without the
         // pool-free step (a buggy supervisor).
-        k.create_domain_with(9, plugin_profile(), 1009, 100, 0).unwrap();
+        k.create_domain_with(9, plugin_profile(), 1009, 100, 0)
+            .unwrap();
         for _ in 0..2 {
             let _ = pool.alloc_for(&mut k.frames, 9);
         }
@@ -426,13 +558,21 @@ mod tests {
         // they are still owned and still in use — exactly what the
         // accounting must reveal.
         assert_eq!(pool.owned_by(9), 2);
-        assert_eq!(k.frames.frames_in_use(), 5, "3 (hello) + 2 (leaked by domain 9)");
+        assert_eq!(
+            k.frames.frames_in_use(),
+            5,
+            "3 (hello) + 2 (leaked by domain 9)"
+        );
         let report = stress_create_destroy(&mut k, &mut pool, 250, &mut out).unwrap();
         // Baseline inside stress now includes the leak (5), so the cycles
         // themselves stay clean — but the leaked frames are still there,
         // visible in the end-state accounting:
         assert_eq!(report.baseline_frames, 5);
         assert_eq!(report.leaked_frames, 0);
-        assert_eq!(pool.owned_by(9), 2, "the bug is still observable, not hidden");
+        assert_eq!(
+            pool.owned_by(9),
+            2,
+            "the bug is still observable, not hidden"
+        );
     }
 }

@@ -143,7 +143,10 @@ mod tests {
         assert_eq!(c.cs, crate::arch::gdt::USER_CODE as u64 + 3);
         assert_eq!(c.ss, crate::arch::gdt::USER_DATA as u64 + 3);
         assert_eq!(c.rflags, 0x202);
-        assert!(c.rflags & (1 << 9) != 0, "IF=1: user code runs interruptible");
+        assert!(
+            c.rflags & (1 << 9) != 0,
+            "IF=1: user code runs interruptible"
+        );
         assert_eq!(c.rflags & (1 << 8), 0, "TF clear");
         assert_eq!(c.rflags & (1 << 10), 0, "DF clear");
     }
@@ -182,8 +185,7 @@ mod entry {
     /// concurrently (the dispatch runs on the kernel stack of the only
     /// CPU; nested entry is impossible — SYSCALL never re-enters the
     /// kernel — and the fault path runs after the dispatch returned).
-    static mut KERNEL: Option<*mut aegis_os::Kernel<{ crate::frames::KERNEL_POOL_FRAMES }>> =
-        None;
+    static mut KERNEL: Option<*mut aegis_os::Kernel<{ crate::frames::KERNEL_POOL_FRAMES }>> = None;
 
     /// Install the run state. Called from kmain just before
     /// `enter_ring3`.
@@ -198,19 +200,17 @@ mod entry {
     pub fn current() -> &'static mut UserRun {
         // SAFETY: single CPU; called only from the syscall/exception
         // dispatch paths, which run strictly inside a launched run.
-        unsafe {
-            match USER_RUN.as_mut() {
-                Some(r) => r,
-                None => panic!("user run state missing"),
-            }
-        }
+        // SAFETY: single CPU; USER_RUN is written only by begin/take
+        // around a launched run (no concurrent access exists).
+        unsafe { (*core::ptr::addr_of_mut!(USER_RUN)).as_mut() }
+            .unwrap_or_else(|| panic!("user run state missing"))
     }
 
     /// Is a user run launched right now? (Exception path: a CPL3 fault
     /// with no active run would be a kernel bug, reported loudly.)
     pub fn active() -> bool {
         // SAFETY: single CPU; a plain read of the Option's discriminant.
-        unsafe { USER_RUN.is_some() }
+        unsafe { (*core::ptr::addr_of!(USER_RUN)).is_some() }
     }
 
     /// Record a ring-3 fault as the run's exit reason (exception path).
@@ -225,7 +225,8 @@ mod entry {
 
     /// N2: the live kernel, when installed (host tests never install
     /// one — callers fall back to the snapshot).
-    pub fn kernel_mut() -> Option<&'static mut aegis_os::Kernel<{ crate::frames::KERNEL_POOL_FRAMES }>> {
+    pub fn kernel_mut(
+    ) -> Option<&'static mut aegis_os::Kernel<{ crate::frames::KERNEL_POOL_FRAMES }>> {
         // SAFETY: the pointer was set once from a live `&mut Kernel`
         // that outlives every ring-3 run (kmain owns it for the whole
         // boot); single CPU, no nesting (see the static's comment).
@@ -234,12 +235,11 @@ mod entry {
 
     /// N2: the active run's domain id (for the fault-path live feeds).
     pub fn active_domain() -> Option<u32> {
-        // SAFETY: single CPU; a read-only peek at the installed run.
-        unsafe {
-            USER_RUN
-                .as_ref()
-                .map(|r| r.domain)
-        }
+        // addr_of on a static mut is safe (no reference is formed).
+        let run = core::ptr::addr_of!(USER_RUN);
+        // SAFETY: single CPU; a read-only peek at the installed run —
+        // the raw pointer was just taken, no aliasing reference exists.
+        unsafe { (*run).as_ref().map(|r| r.domain) }
     }
 
     /// N2 (ADR-0007 §2): feed a user-context fault to the LIVE domain
@@ -262,9 +262,17 @@ mod entry {
         // SAFETY: single CPU; called only from the exception dispatch,
         // which runs strictly inside a launched run (checked by the
         // caller via `active()`).
+        let run = core::ptr::addr_of_mut!(USER_RUN);
+        // SAFETY: single CPU; the raw pointer was just taken.
         unsafe {
-            if let Some(r) = USER_RUN.as_mut() {
-                r.exit = ExitKind::Fault { vector, cr2, error_code, rip, user_rsp };
+            if let Some(r) = (*run).as_mut() {
+                r.exit = ExitKind::Fault {
+                    vector,
+                    cr2,
+                    error_code,
+                    rip,
+                    user_rsp,
+                };
             }
         }
     }
@@ -285,11 +293,9 @@ mod entry {
     pub fn take() -> UserRun {
         // SAFETY: single CPU; called exactly once after the resume,
         // before the next `begin`.
-        unsafe {
-            match unsafe { (*core::ptr::addr_of_mut!(USER_RUN)).take() } {
-                Some(r) => r,
-                None => panic!("user run state missing on take"),
-            }
+        match unsafe { (*core::ptr::addr_of_mut!(USER_RUN)).take() } {
+            Some(r) => r,
+            None => panic!("user run state missing on take"),
         }
     }
 
@@ -344,18 +350,18 @@ mod entry {
         naked_asm!(
             // rdi = ctx (SysV first arg). The kernel resume point was
             // recorded by `set_resume_point` just before this call.
-            "movq 0x00(%rdi), %rax",   // rip
-            "movq 0x08(%rdi), %rcx",   // cs
-            "movq 0x10(%rdi), %rdx",   // rflags
-            "movq 0x18(%rdi), %rsi",   // rsp
-            "movq 0x20(%rdi), %rdi",   // ss (last: rdi was needed)
-            "pushq %rdi",              // ss
-            "pushq %rsi",              // rsp
-            "pushq %rdx",              // rflags
-            "pushq %rcx",              // cs
-            "pushq %rax",              // rip
-            "swapgs",                  // GS: user / KERNEL_GS_BASE: percpu
-            "iretq",                   // CPL=3, IF per rflags
+            "movq 0x00(%rdi), %rax", // rip
+            "movq 0x08(%rdi), %rcx", // cs
+            "movq 0x10(%rdi), %rdx", // rflags
+            "movq 0x18(%rdi), %rsi", // rsp
+            "movq 0x20(%rdi), %rdi", // ss (last: rdi was needed)
+            "pushq %rdi",            // ss
+            "pushq %rsi",            // rsp
+            "pushq %rdx",            // rflags
+            "pushq %rcx",            // cs
+            "pushq %rax",            // rip
+            "swapgs",                // GS: user / KERNEL_GS_BASE: percpu
+            "iretq",                 // CPL=3, IF per rflags
             options(att_syntax),
         );
     }

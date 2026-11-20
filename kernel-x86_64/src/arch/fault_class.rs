@@ -24,9 +24,9 @@ mod tests {
         // match it and print the success marker. It must not.
         assert!(!guard_selftest_hit(false, 0, 14, 0));
         // Even armed, only a #PF at exactly the armed VA matches.
-        assert!(guard_selftest_hit(true, 0xdead_000, 14, 0xdead_000));
-        assert!(!guard_selftest_hit(true, 0xdead_000, 14, 0xdead_004));
-        assert!(!guard_selftest_hit(true, 0xdead_000, 13, 0xdead_000));
+        assert!(guard_selftest_hit(true, 0xdead_0000, 14, 0xdead_0000));
+        assert!(!guard_selftest_hit(true, 0xdead_0000, 14, 0xdead_0004));
+        assert!(!guard_selftest_hit(true, 0xdead_0000, 13, 0xdead_0000));
     }
 }
 
@@ -83,6 +83,9 @@ mod n1_tests {
         assert_eq!(fault_owner(0, true, false), FaultOwner::KernelBugUserCopy);
         // CPL0 before the first syscall: the documented launch-relay
         // limitation (environment), resumed honestly.
-        assert_eq!(fault_owner(0, false, false), FaultOwner::LaunchRelayLimitation);
+        assert_eq!(
+            fault_owner(0, false, false),
+            FaultOwner::LaunchRelayLimitation
+        );
     }
 }

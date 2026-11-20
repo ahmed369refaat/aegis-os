@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
       - name: Run unit + integration tests
         run: cargo test --verbose
 
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
       - name: Run the boot-logic and arch-layout tests on the host
         run: cargo test -p aegis-kernel --verbose
 
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
         with:
           targets: thumbv7em-none-eabihf
       - name: Build the policy core for bare-metal ARM
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
         with:
           targets: x86_64-unknown-none
       - name: Build the full boot image (ELF64 kernel + ELF32 multiboot stub)
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
         with:
           targets: x86_64-unknown-none
       - name: Install QEMU
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
       - name: Assert the dependency graph contains only this repository
         run: |
           # Every line must be aegis-os or aegis-kernel (path dependency).
@@ -94,3 +94,52 @@ jobs:
             || (cargo tree --workspace && exit 1)
       - name: Unsafe-code policy (allowlist)
         run: scripts/check_unsafe.sh
+      - name: IST/static-mut section check (ADR-0006)
+        run: |
+          cargo build -p aegis-kernel --release --target x86_64-unknown-none
+          scripts/check-ist-sections.sh
+
+  fmt:
+    name: Formatting (rustfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy (deny warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
+        with:
+          components: clippy
+          targets: x86_64-unknown-none
+      - name: Workspace clippy (host, all targets)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Kernel clippy (release target)
+        run: cargo clippy -p aegis-kernel --release --target x86_64-unknown-none -- -D warnings
+
+  coverage:
+    name: Coverage (cargo-llvm-cov, report-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # CONTRIBUTING.md: coverage is required on host-testable code;
+      # boot/arch paths that need QEMU/hardware are excluded from the
+      # bucket and must be called out in the PR. Report-only for now —
+      # no hard threshold gate (see CONTRIBUTING.md).
+      - run: cargo llvm-cov --workspace --summary-only || true
+      - name: Emit the lcov report as an artifact
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info

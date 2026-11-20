@@ -132,7 +132,7 @@ proving it on every push.
 - `boot.sh` (one command to build+boot; `--verify` asserts the exit
   criteria and is what CI runs).
 - Unsafe policy, machine-enforced: kernel is `deny(unsafe_code)` with a
-  documented three-module allowlist (`boot/`, `hw.rs`, `memops.rs`), each
+  documented allowlist (`arch/`, `boot/`, `hw.rs`, `memops.rs`, `sched/`), each
   item carrying a `SAFETY` note; `scripts/check_unsafe.sh` fails CI on
   violations.
 

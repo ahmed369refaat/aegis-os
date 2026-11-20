@@ -18,7 +18,12 @@ use crate::mm::ADDR_MASK;
 /// page alignment is LOAD-BEARING: a PD entry pointing at a non-4KiB-
 /// aligned table is invalid — the walk reads garbage and triple-faults.
 #[repr(align(4096))]
-struct PageTable([u64; 512]);
+struct PageTable(
+    /// Addressed only through `addr_of_mut!` (the alignment is the
+    /// point; the field itself is never read by name).
+    #[allow(dead_code)]
+    [u64; 512],
+);
 
 static mut IMAGE_PT: PageTable = PageTable([0; 512]);
 
@@ -29,15 +34,15 @@ pub const KERNEL_PHYS_BASE: u64 = 0x0020_0000;
 /// gaps and the boot-stack guard page ABSENT; then set CR0.WP. Called
 /// from mm::init before its CR3 reload (which flushes the old leaf).
 pub fn install() {
-    // SAFETY: single CPU, bring-up; the PT is written before the PD
-    // entry ever points at it, and nothing else touches it afterwards.
-    let pt_va = unsafe { core::ptr::addr_of_mut!(IMAGE_PT) } as u64;
-    debug_assert!(pt_va % 4096 == 0, "IMAGE_PT must be page-aligned");
+    // addr_of_mut! on a static mut is safe (no reference is formed);
+    // the PT is written before the PD entry ever points at it.
+    let pt_va = core::ptr::addr_of_mut!(IMAGE_PT) as u64;
+    debug_assert!(pt_va.is_multiple_of(4096), "IMAGE_PT must be page-aligned");
     let pt_pa = pt_va - KERNEL_BASE + KERNEL_PHYS_BASE;
     let bounds = image::section_bounds();
     for i in 0..512u64 {
         let va = KERNEL_BASE + i * 4096;
-        let entry = match image::image_pte_flags(va, bounds.0, bounds.1, bounds.2, bounds.3, bounds.4) {
+        let entry = match image::image_pte_flags(va, bounds) {
             Some(flags) => (KERNEL_PHYS_BASE + i * 4096) | flags,
             None => 0, // absent: gaps + the boot-stack guard
         };

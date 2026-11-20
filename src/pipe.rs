@@ -96,7 +96,9 @@ pub struct PipeTable {
 
 impl PipeTable {
     pub const fn new() -> Self {
-        PipeTable { pipes: [None; MAX_PIPES] }
+        PipeTable {
+            pipes: [None; MAX_PIPES],
+        }
     }
 
     /// Create a pipe; the returned id addresses both ends.
@@ -326,7 +328,18 @@ mod tests {
         let mut seq = 0u8;
         // Write 10, read 10, repeatedly: crosses the 64-byte ring many times.
         for _ in 0..30 {
-            let chunk = [seq, seq.wrapping_add(1), seq.wrapping_add(2), seq.wrapping_add(3), seq.wrapping_add(4), seq.wrapping_add(5), seq.wrapping_add(6), seq.wrapping_add(7), seq.wrapping_add(8), seq.wrapping_add(9)];
+            let chunk = [
+                seq,
+                seq.wrapping_add(1),
+                seq.wrapping_add(2),
+                seq.wrapping_add(3),
+                seq.wrapping_add(4),
+                seq.wrapping_add(5),
+                seq.wrapping_add(6),
+                seq.wrapping_add(7),
+                seq.wrapping_add(8),
+                seq.wrapping_add(9),
+            ];
             assert_eq!(t.write(id, &chunk).unwrap(), 10);
             let mut out = [0u8; 10];
             assert_eq!(t.read(id, &mut out).unwrap(), 10);
@@ -387,7 +400,10 @@ mod tests {
         let mut out = [0u8; 4];
         assert_eq!(t.read(0, &mut out), Err(PipeError::InvalidPipe(0)));
         assert_eq!(t.write(99, b"x"), Err(PipeError::InvalidPipe(99)));
-        assert_eq!(t.close_read(u32::MAX), Err(PipeError::InvalidPipe(u32::MAX)));
+        assert_eq!(
+            t.close_read(u32::MAX),
+            Err(PipeError::InvalidPipe(u32::MAX))
+        );
     }
 
     #[test]

@@ -82,7 +82,6 @@ pub enum DefaultAction {
     Continue,
 }
 
-#[must_use]
 pub fn default_action(sig: u8) -> Result<DefaultAction, SignalError> {
     check(sig)?;
     Ok(match sig {
@@ -107,7 +106,10 @@ pub struct SignalState {
 
 impl SignalState {
     pub const fn new() -> Self {
-        SignalState { pending: SignalSet::EMPTY, blocked: SignalSet::EMPTY }
+        SignalState {
+            pending: SignalSet::EMPTY,
+            blocked: SignalSet::EMPTY,
+        }
     }
 
     /// Mark a signal pending. Sending to an already-pending signal
@@ -140,9 +142,7 @@ impl SignalState {
     /// Clears it from pending and returns it.
     pub fn deliver(&mut self) -> Option<u8> {
         for sig in 1..=MAX_SIGNAL {
-            if self.pending.contains(sig)
-                && (is_unblockable(sig) || !self.blocked.contains(sig))
-            {
+            if self.pending.contains(sig) && (is_unblockable(sig) || !self.blocked.contains(sig)) {
                 let _ = self.pending.remove(sig);
                 return Some(sig);
             }
@@ -153,14 +153,9 @@ impl SignalState {
     /// Peek without consuming (for tests and status reporting).
     #[must_use]
     pub fn next_pending(&self) -> Option<u8> {
-        for sig in 1..=MAX_SIGNAL {
-            if self.pending.contains(sig)
-                && (is_unblockable(sig) || !self.blocked.contains(sig))
-            {
-                return Some(sig);
-            }
-        }
-        None
+        (1..=MAX_SIGNAL).find(|&sig| {
+            self.pending.contains(sig) && (is_unblockable(sig) || !self.blocked.contains(sig))
+        })
     }
 
     #[must_use]

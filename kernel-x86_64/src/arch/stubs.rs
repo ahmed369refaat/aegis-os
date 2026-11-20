@@ -97,7 +97,8 @@ vector_stub!(v31, 31, noerr);
 /// Common entry: push the GPRs (frame order r15..rax), align the stack,
 /// call the Rust dispatch, and keep a correct unwind for the day the
 /// dispatch starts returning (Ring-3 fault delivery).
-#[unsafe(no_mangle)] #[unsafe(naked)]
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
 pub extern "C" fn exception_common() {
     naked_asm!(
         "pushq %rax",
@@ -115,11 +116,11 @@ pub extern "C" fn exception_common() {
         "pushq %r13",
         "pushq %r14",
         "pushq %r15",
-        "movq %rsp, %rdi",          // frame pointer (SysV first arg)
-        "movq %rsp, %rbx",          // original rsp; rbx's live copy is in the frame
-        "andq $-16, %rsp",          // SysV: rsp must be 16-aligned at call
+        "movq %rsp, %rdi", // frame pointer (SysV first arg)
+        "movq %rsp, %rbx", // original rsp; rbx's live copy is in the frame
+        "andq $-16, %rsp", // SysV: rsp must be 16-aligned at call
         "call aegis_exception_dispatch",
-        "movq %rbx, %rsp",          // unwind: reached only if dispatch returns
+        "movq %rbx, %rsp", // unwind: reached only if dispatch returns
         "popq %r15",
         "popq %r14",
         "popq %r13",
@@ -135,7 +136,7 @@ pub extern "C" fn exception_common() {
         "popq %rcx",
         "popq %rbx",
         "popq %rax",
-        "addq $16, %rsp",           // drop vector + error code
+        "addq $16, %rsp", // drop vector + error code
         "iretq",
         options(att_syntax),
     );
@@ -145,13 +146,38 @@ pub extern "C" fn exception_common() {
 /// CPU exception vector. Valid for `vector < 32` only.
 pub fn vector_handler(vector: u8) -> (u64, u8) {
     let stub: extern "C" fn() = match vector {
-        0 => v00, 1 => v01, 2 => v02, 3 => v03, 4 => v04,
-        5 => v05, 6 => v06, 7 => v07, 8 => v08, 9 => v09,
-        10 => v10, 11 => v11, 12 => v12, 13 => v13, 14 => v14,
-        15 => v15, 16 => v16, 17 => v17, 18 => v18, 19 => v19,
-        20 => v20, 21 => v21, 22 => v22, 23 => v23, 24 => v24,
-        25 => v25, 26 => v26, 27 => v27, 28 => v28, 29 => v29,
-        30 => v30, 31 => v31,
+        0 => v00,
+        1 => v01,
+        2 => v02,
+        3 => v03,
+        4 => v04,
+        5 => v05,
+        6 => v06,
+        7 => v07,
+        8 => v08,
+        9 => v09,
+        10 => v10,
+        11 => v11,
+        12 => v12,
+        13 => v13,
+        14 => v14,
+        15 => v15,
+        16 => v16,
+        17 => v17,
+        18 => v18,
+        19 => v19,
+        20 => v20,
+        21 => v21,
+        22 => v22,
+        23 => v23,
+        24 => v24,
+        25 => v25,
+        26 => v26,
+        27 => v27,
+        28 => v28,
+        29 => v29,
+        30 => v30,
+        31 => v31,
         _ => panic!("vector_handler: not a CPU exception vector"),
     };
     (stub as usize as u64, ist_for(vector))

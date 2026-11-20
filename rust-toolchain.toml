@@ -1,0 +1,6 @@
+# G (review round 2): pin the exact stable toolchain so naked functions,
+# `#[unsafe(...)]` attribute syntax and const-generic defaults behave
+# identically locally and in CI. Bump deliberately, with a full suite
+# run (scripts/count-tests.sh --update afterwards if counts drift).
+[toolchain]
+channel = "1.100.0"

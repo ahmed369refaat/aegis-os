@@ -51,7 +51,7 @@ pub const fn segment(base: u64, limit: u32, access: u8, flags: u8) -> u64 {
 /// Encode the 16-byte (two-slot) TSS descriptor for long mode.
 /// Access `0x89` = present, DPL 0, system, available-TSS.
 pub const fn tss_descriptor(base: u64, limit: u32) -> [u64; 2] {
-    [segment(base, limit, 0x89, 0x0), (base >> 32) as u64]
+    [segment(base, limit, 0x89, 0x0), (base >> 32)]
 }
 
 /// The 64-bit task state segment (SDM vol. 3, §7.7).
@@ -124,7 +124,10 @@ mod tests {
         assert_eq!(lo & 0xFFFF, 103, "limit low");
         assert_eq!(hi, base >> 32, "base[63:32]");
         // base[23:0] and base[31:24] round-trip through the low word.
-        assert_eq!(((lo >> 16) & 0xFF_FFFF) | (((lo >> 56) & 0xFF) << 24), base & 0xFFFF_FFFF);
+        assert_eq!(
+            ((lo >> 16) & 0xFF_FFFF) | (((lo >> 56) & 0xFF) << 24),
+            base & 0xFFFF_FFFF
+        );
     }
 
     #[test]
@@ -132,10 +135,10 @@ mod tests {
         // Boot ABI contract (boot-x86_64/stub.S): the stub enters the
         // kernel through these exact descriptors, and the kernel GDT must
         // reproduce them so the live segment registers stay valid.
-        assert_eq!(segment(0, 0xFFFFF, 0x9A, 0xC), 0x00CF9A00_0000_FFFF); // 32-bit code
-        assert_eq!(segment(0, 0xFFFFF, 0x92, 0xC), 0x00CF9200_0000_FFFF); // data
-        assert_eq!(segment(0, 0xFFFFF, 0x9A, 0xA), 0x00AF9A00_0000_FFFF); // 64-bit code
-        // Selector layout contract: CS at entry = 0x18, data = 0x10.
+        assert_eq!(segment(0, 0xFFFFF, 0x9A, 0xC), 0x00CF_9A00_0000_FFFF); // 32-bit code
+        assert_eq!(segment(0, 0xFFFFF, 0x92, 0xC), 0x00CF_9200_0000_FFFF); // data
+        assert_eq!(segment(0, 0xFFFFF, 0x9A, 0xA), 0x00AF_9A00_0000_FFFF); // 64-bit code
+                                                                           // Selector layout contract: CS at entry = 0x18, data = 0x10.
         assert_eq!(KERNEL_CODE, 0x18);
         assert_eq!(KERNEL_DATA, 0x10);
         assert_eq!(TSS_SEL, 0x40);
@@ -171,7 +174,15 @@ mod tests {
         assert_eq!((ud >> 43) & 1, 0, "user data is not executable");
 
         // No overlaps: all seven used slots are distinct.
-        let slots = [KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA, SYSCALL_CODE, SYSCALL_DATA, TSS_SEL];
+        let slots = [
+            KERNEL_CODE,
+            KERNEL_DATA,
+            USER_CODE,
+            USER_DATA,
+            SYSCALL_CODE,
+            SYSCALL_DATA,
+            TSS_SEL,
+        ];
         for i in 0..slots.len() {
             for j in i + 1..slots.len() {
                 assert_ne!(slots[i], slots[j], "selector overlap at {:#x}", slots[i]);

@@ -166,7 +166,9 @@ pub fn read_cr3() -> u64 {
 /// instantly and unrecoverably breaks all further memory access.
 pub fn write_cr3(pml4_pa: u64) {
     // SAFETY: caller guarantees a valid active PML4 (see above).
-    unsafe { asm!("movq %rax, %cr3", in("rax") pml4_pa, options(att_syntax, nostack, preserves_flags)) }
+    unsafe {
+        asm!("movq %rax, %cr3", in("rax") pml4_pa, options(att_syntax, nostack, preserves_flags))
+    }
 }
 
 /// Invalidate the TLB entry for one virtual address (`invlpg`).
@@ -218,14 +220,18 @@ pub fn swapgs() {
 pub fn read_cr0() -> u64 {
     let v: u64;
     // SAFETY: reading CR0 is unprivileged-safe and touches no memory.
-    unsafe { core::arch::asm!("movq %cr0, %rax", out("rax") v, options(att_syntax, nostack, preserves_flags)) };
+    unsafe {
+        core::arch::asm!("movq %cr0, %rax", out("rax") v, options(att_syntax, nostack, preserves_flags))
+    };
     v
 }
 
 /// F15 (ADR-0006): CR0 write.
 pub fn write_cr0(v: u64) {
     // SAFETY: the caller owns the value written (mm::init sets WP).
-    unsafe { core::arch::asm!("movq %rax, %cr0", in("rax") v, options(att_syntax, nostack, preserves_flags)) };
+    unsafe {
+        core::arch::asm!("movq %rax, %cr0", in("rax") v, options(att_syntax, nostack, preserves_flags))
+    };
 }
 
 pub fn read_cr4() -> u64 {

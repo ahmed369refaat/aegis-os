@@ -39,14 +39,20 @@ impl MemInfo {
     pub fn contains(&self, base: u64, len: u64) -> bool {
         self.has_mem()
             && base >= 1024 * 1024
-            && base.checked_add(len).map_or(false, |end| end <= self.top_of_low_mem())
+            && base
+                .checked_add(len)
+                .is_some_and(|end| end <= self.top_of_low_mem())
     }
 }
 
 /// Parse the raw words into a `MemInfo`.
 #[must_use]
 pub fn parse(flags: u32, mem_lower: u32, mem_upper: u32) -> MemInfo {
-    MemInfo { flags, mem_lower_kb: mem_lower, mem_upper_kb: mem_upper }
+    MemInfo {
+        flags,
+        mem_lower_kb: mem_lower,
+        mem_upper_kb: mem_upper,
+    }
 }
 
 #[cfg(test)]
@@ -102,7 +108,10 @@ mod tests {
     #[test]
     fn contains_handles_wraparound_safely() {
         let mi = qemu_like();
-        assert!(!mi.contains(u64::MAX, 1), "base+len must not wrap into 'fits'");
+        assert!(
+            !mi.contains(u64::MAX, 1),
+            "base+len must not wrap into 'fits'"
+        );
         assert!(!mi.contains(u64::MAX - 100, 4096));
     }
 }

@@ -14,11 +14,11 @@
 //! physical tables, so the kernel half is identical in every address
 //! space and its global leaves survive CR3 switches.
 
-use aegis_os::memory::{AddressSpace, MemError, MemFlags, Region, PAGE_SIZE};
-use aegis_os::prelude::BuddyAllocator;
 use crate::frames::FramePool;
 use crate::memops;
 use crate::mm::pte::{self, PteFlags, USER_LIMIT};
+use aegis_os::memory::{AddressSpace, MemError, MemFlags, Region, PAGE_SIZE};
+use aegis_os::prelude::BuddyAllocator;
 
 use super::{ADDR_MASK, PAGE};
 
@@ -46,7 +46,11 @@ pub enum MapError {
     NotMapped(u64),
     /// Policy and hardware disagree about a region (should be impossible;
     /// loud rather than silent).
-    Desync { base: u64, policy_pages: usize, mapped_pages: usize },
+    Desync {
+        base: u64,
+        policy_pages: usize,
+        mapped_pages: usize,
+    },
 }
 
 /// Where frames for page tables and mapped pages come from. The kernel
@@ -82,10 +86,14 @@ impl<const N: usize> PoolSource<'_, N> {
 
 impl<const N: usize> FrameSource for PoolSource<'_, N> {
     fn alloc_frame(&mut self) -> Result<u64, MapError> {
-        self.pool.alloc_for(self.buddy, self.owner).map_err(MapError::Pool)
+        self.pool
+            .alloc_for(self.buddy, self.owner)
+            .map_err(MapError::Pool)
     }
     fn free_frame(&mut self, pa: u64) -> Result<(), MapError> {
-        self.pool.free(self.buddy, pa, self.owner).map_err(MapError::Pool)
+        self.pool
+            .free(self.buddy, pa, self.owner)
+            .map_err(MapError::Pool)
     }
 }
 
@@ -158,12 +166,7 @@ impl PageTables {
 
     /// Walk to the PT covering `va`, creating absent intermediate tables
     /// from `src` (each scrubbed). Returns the PT's physical address.
-    fn pt_for(
-        &mut self,
-        va: u64,
-        user: bool,
-        src: &mut dyn FrameSource,
-    ) -> Result<u64, MapError> {
+    fn pt_for(&mut self, va: u64, user: bool, src: &mut dyn FrameSource) -> Result<u64, MapError> {
         let (pml4i, pdpti, pdi, _) = Self::indices(va);
 
         let mut e = Self::entry(self.pml4_pa, pml4i);
@@ -206,7 +209,7 @@ impl PageTables {
         if va >= USER_LIMIT {
             return Err(MapError::KernelHalf(va));
         }
-        if va % PAGE != 0 || pa % PAGE != 0 {
+        if !va.is_multiple_of(PAGE) || !pa.is_multiple_of(PAGE) {
             return Err(MapError::NotAligned(va));
         }
         // F5: W^X is architecture here as well as policy — refuse
@@ -242,7 +245,9 @@ impl PageTables {
             return Err(MapError::KernelHalf(base));
         }
         // The policy gate: ten checks before any PTE write.
-        space.map(base as usize, len, flags).map_err(MapError::Policy)?;
+        space
+            .map(base as usize, len, flags)
+            .map_err(MapError::Policy)?;
 
         let pf = PteFlags::from_memflags(flags);
         let end = base + len as u64;
@@ -266,7 +271,11 @@ impl PageTables {
             }
             va += PAGE;
         }
-        Ok(Region { base: base as usize, len, flags })
+        Ok(Region {
+            base: base as usize,
+            len,
+            flags,
+        })
     }
 
     /// Undo a partial `map_region`: unmap every present page in
@@ -409,7 +418,11 @@ mod tests {
             let mut slab = vec![0u64; n * 512 + 512];
             let base = (slab.as_mut_ptr() as u64 + 4095) & !4095u64;
             let free = (0..n).map(|i| base + i as u64 * 4096).rev().collect();
-            TestSource { _slab: slab, free, live: 0 }
+            TestSource {
+                _slab: slab,
+                free,
+                live: 0,
+            }
         }
         fn available(&self) -> usize {
             self.free.len()
@@ -421,7 +434,10 @@ mod tests {
 
     impl FrameSource for TestSource {
         fn alloc_frame(&mut self) -> Result<u64, MapError> {
-            let pa = self.free.pop().ok_or(MapError::Pool(crate::frames::FrameError::NotInPool(0)))?;
+            let pa = self
+                .free
+                .pop()
+                .ok_or(MapError::Pool(crate::frames::FrameError::NotInPool(0)))?;
             self.live += 1;
             Ok(pa)
         }
@@ -448,7 +464,7 @@ mod tests {
         let mut pt = PageTables::new(&mut src).unwrap();
         // Direct call, bypassing map_region's policy gate on purpose.
         let wx = PteFlags::from_memflags(MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC);
-        let r = pt.map_user_page(BASE, 0x1000_000, wx, &mut src);
+        let r = pt.map_user_page(BASE, 0x0100_0000, wx, &mut src);
         assert!(
             matches!(r, Err(MapError::WriteExec(_))),
             "W+X must be refused beneath the policy gate, got {r:?}"
@@ -463,7 +479,9 @@ mod tests {
         let mut pt = PageTables::new(&mut src).unwrap();
         let mut space = AddressSpace::new(8);
 
-        let region = pt.map_region(&mut space, BASE, 2 * PAGE_SIZE, rw(), &mut src).unwrap();
+        let region = pt
+            .map_region(&mut space, BASE, 2 * PAGE_SIZE, rw(), &mut src)
+            .unwrap();
         assert_eq!(region.base, BASE as usize);
         assert_eq!(region.len, 2 * PAGE_SIZE);
 
@@ -490,7 +508,8 @@ mod tests {
         let mut pt = PageTables::new(&mut src).unwrap();
         let mut space = AddressSpace::new(8);
 
-        pt.map_region(&mut space, BASE, 2 * PAGE_SIZE, rw(), &mut src).unwrap();
+        pt.map_region(&mut space, BASE, 2 * PAGE_SIZE, rw(), &mut src)
+            .unwrap();
 
         // Adjacent mapping: the ten-check policy must refuse it with
         // GuardGap — and no PTE may exist for the refused page.
@@ -499,7 +518,10 @@ mod tests {
             .map_region(&mut space, BASE + 2 * PAGE, PAGE_SIZE, rw(), &mut src)
             .unwrap_err();
         assert_eq!(err, MapError::Policy(MemError::GuardGap));
-        assert!(pt.pte_of(BASE + 2 * PAGE).is_none(), "refused page has no PTE");
+        assert!(
+            pt.pte_of(BASE + 2 * PAGE).is_none(),
+            "refused page has no PTE"
+        );
         assert_eq!(src.live_frames(), before, "no frame consumed by a refusal");
 
         // One page further (the guard page left free): accepted.
@@ -518,20 +540,32 @@ mod tests {
 
         // W^X: refused by the policy, no PTE.
         let e = pt
-            .map_region(&mut space, BASE, PAGE_SIZE, MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC, &mut src)
+            .map_region(
+                &mut space,
+                BASE,
+                PAGE_SIZE,
+                MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC,
+                &mut src,
+            )
             .unwrap_err();
         assert_eq!(e, MapError::Policy(MemError::WxViolation));
         assert!(pt.pte_of(BASE).is_none());
 
         // NULL page: the policy's first check.
-        let e = pt.map_region(&mut space, 0, PAGE_SIZE, rw(), &mut src).unwrap_err();
+        let e = pt
+            .map_region(&mut space, 0, PAGE_SIZE, rw(), &mut src)
+            .unwrap_err();
         assert_eq!(e, MapError::Policy(MemError::NullBase));
 
         // The kernel half is refused before the policy even runs.
         let kva = crate::mm::KERNEL_BASE;
-        let e = pt.map_region(&mut space, kva, PAGE_SIZE, rw(), &mut src).unwrap_err();
+        let e = pt
+            .map_region(&mut space, kva, PAGE_SIZE, rw(), &mut src)
+            .unwrap_err();
         assert_eq!(e, MapError::KernelHalf(kva));
-        let e = pt.map_user_page(USER_LIMIT, 0x10_0000, PteFlags::USER_RW, &mut src).unwrap_err();
+        let e = pt
+            .map_user_page(USER_LIMIT, 0x10_0000, PteFlags::USER_RW, &mut src)
+            .unwrap_err();
         assert!(matches!(e, MapError::KernelHalf(_)));
     }
 
@@ -543,8 +577,10 @@ mod tests {
         let mut sa = AddressSpace::new(8);
         let mut sb = AddressSpace::new(8);
 
-        a.map_region(&mut sa, BASE, PAGE_SIZE, rw(), &mut src).unwrap();
-        b.map_region(&mut sb, BASE, PAGE_SIZE, rw(), &mut src).unwrap();
+        a.map_region(&mut sa, BASE, PAGE_SIZE, rw(), &mut src)
+            .unwrap();
+        b.map_region(&mut sb, BASE, PAGE_SIZE, rw(), &mut src)
+            .unwrap();
 
         let pa = a.translate(BASE).unwrap();
         let pb = b.translate(BASE).unwrap();
@@ -563,7 +599,8 @@ mod tests {
         let mut space = AddressSpace::new(8);
 
         let start = src.available();
-        pt.map_region(&mut space, BASE, 2 * PAGE_SIZE, rw(), &mut src).unwrap();
+        pt.map_region(&mut space, BASE, 2 * PAGE_SIZE, rw(), &mut src)
+            .unwrap();
         // Frames held by the region: PDPT + PD + PT (the PML4 itself
         // was allocated before `start`) + 2 data pages = 5.
         let tables = 3usize;

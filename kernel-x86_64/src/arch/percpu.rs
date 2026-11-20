@@ -33,7 +33,11 @@ extern "C" {
     static stack_top: u8;
 }
 
-static mut PERCPU: PerCpu = PerCpu { cpu_id: 0, current: 0, kstack_top: 0 };
+static mut PERCPU: PerCpu = PerCpu {
+    cpu_id: 0,
+    current: 0,
+    kstack_top: 0,
+};
 
 /// Point the GS base at this CPU's state. Called once from `mm::init`,
 /// single-CPU bring-up.

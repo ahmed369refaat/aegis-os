@@ -130,15 +130,20 @@ impl CapabilityTable {
                 if self.gens[i] == 0 {
                     self.gens[i] = 1; // generation 0 is reserved ("not inserted")
                 }
-                let stored = Capability { generation: self.gens[i], ..cap };
+                let stored = Capability {
+                    generation: self.gens[i],
+                    ..cap
+                };
                 self.slots[i] = Some(stored);
-                return Ok(CapHandle { index: i, generation: self.gens[i] });
+                return Ok(CapHandle {
+                    index: i,
+                    generation: self.gens[i],
+                });
             }
         }
         Err(CapError::TableFull)
     }
 
-    #[must_use]
     pub fn lookup(&self, handle: CapHandle) -> Result<Capability, CapError> {
         if handle.index >= MAX_CAPABILITIES {
             return Err(CapError::OutOfRange);
@@ -166,11 +171,7 @@ impl CapabilityTable {
 
     /// Derive a child capability: requires GRANT on the parent and a subset
     /// of the parent's rights. Never widens.
-    pub fn attenuate(
-        &self,
-        parent: CapHandle,
-        rights: Rights,
-    ) -> Result<Capability, CapError> {
+    pub fn attenuate(&self, parent: CapHandle, rights: Rights) -> Result<Capability, CapError> {
         let p = self.lookup(parent)?;
         if !p.rights.contains(Rights::GRANT) {
             return Err(CapError::MissingGrantRight);
@@ -178,7 +179,11 @@ impl CapabilityTable {
         if !rights.is_subset_of(p.rights) {
             return Err(CapError::Escalation);
         }
-        Ok(Capability { resource: p.resource, rights, generation: 0 })
+        Ok(Capability {
+            resource: p.resource,
+            rights,
+            generation: 0,
+        })
     }
 
     /// F18: iterate live capabilities (the syscall gates scan for a
@@ -191,10 +196,12 @@ impl CapabilityTable {
     /// supervisors enumerate to revoke; generation 0 is reserved, so
     /// guessing handles never works).
     pub fn handles(&self) -> impl Iterator<Item = CapHandle> + use<'_> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|c| CapHandle { index: i, generation: c.generation }))
+        self.slots.iter().enumerate().filter_map(|(i, s)| {
+            s.as_ref().map(|c| CapHandle {
+                index: i,
+                generation: c.generation,
+            })
+        })
     }
 
     #[must_use]
@@ -219,7 +226,14 @@ mod tests {
     use super::*;
 
     fn file_cap(rights: Rights) -> Capability {
-        Capability { resource: Resource::FsNode(crate::vfs::InodeRef { id: 7, generation: 1 }), rights, generation: 0 }
+        Capability {
+            resource: Resource::FsNode(crate::vfs::InodeRef {
+                id: 7,
+                generation: 1,
+            }),
+            rights,
+            generation: 0,
+        }
     }
 
     #[test]
@@ -228,7 +242,13 @@ mod tests {
         assert!(t.is_empty());
         let h = t.insert(file_cap(Rights::READ | Rights::GRANT)).unwrap();
         let c = t.lookup(h).unwrap();
-        assert_eq!(c.resource, Resource::FsNode(crate::vfs::InodeRef { id: 7, generation: 1 }));
+        assert_eq!(
+            c.resource,
+            Resource::FsNode(crate::vfs::InodeRef {
+                id: 7,
+                generation: 1
+            })
+        );
         assert!(c.rights.contains(Rights::READ));
         assert_eq!(t.len(), 1);
     }
@@ -238,7 +258,10 @@ mod tests {
         let mut t = CapabilityTable::new();
         for i in 0..MAX_CAPABILITIES {
             t.insert(Capability {
-                resource: Resource::FsNode(crate::vfs::InodeRef { id: i as u32, generation: 1 }),
+                resource: Resource::FsNode(crate::vfs::InodeRef {
+                    id: i as u32,
+                    generation: 1,
+                }),
                 rights: Rights::READ,
                 generation: 0,
             })
@@ -253,7 +276,13 @@ mod tests {
         let mut t = CapabilityTable::new();
         let h = t.insert(file_cap(Rights::READ)).unwrap();
         let revoked = t.revoke(h).unwrap();
-        assert_eq!(revoked.resource, Resource::FsNode(crate::vfs::InodeRef { id: 7, generation: 1 }));
+        assert_eq!(
+            revoked.resource,
+            Resource::FsNode(crate::vfs::InodeRef {
+                id: 7,
+                generation: 1
+            })
+        );
         assert_eq!(t.lookup(h), Err(CapError::InvalidHandle));
     }
 
@@ -301,7 +330,10 @@ mod tests {
             Err(CapError::Escalation)
         );
         // Superset rights are rejected too.
-        assert_eq!(t.attenuate(h, Rights::from_bits(0xFF)), Err(CapError::Escalation));
+        assert_eq!(
+            t.attenuate(h, Rights::from_bits(0xFF)),
+            Err(CapError::Escalation)
+        );
     }
 
     #[test]
@@ -311,7 +343,13 @@ mod tests {
         let h = t.insert(file_cap(Rights::READ | Rights::GRANT)).unwrap();
         let child = t.attenuate(h, Rights::NONE).unwrap();
         assert!(child.rights.is_empty());
-        assert_eq!(child.resource, Resource::FsNode(crate::vfs::InodeRef { id: 7, generation: 1 }));
+        assert_eq!(
+            child.resource,
+            Resource::FsNode(crate::vfs::InodeRef {
+                id: 7,
+                generation: 1
+            })
+        );
     }
 
     #[test]
@@ -325,7 +363,13 @@ mod tests {
             .attenuate(h, Rights::READ | Rights::WRITE | Rights::GRANT)
             .unwrap();
         assert!(child.rights.is_subset_of(h_lookup(&t, h).rights));
-        assert_eq!(child.resource, Resource::FsNode(crate::vfs::InodeRef { id: 7, generation: 1 }));
+        assert_eq!(
+            child.resource,
+            Resource::FsNode(crate::vfs::InodeRef {
+                id: 7,
+                generation: 1
+            })
+        );
         // Attenuation of an attenuation still cannot exceed the parent.
         let h2 = t.insert(child).unwrap();
         let grandchild = t.attenuate(h2, Rights::READ).unwrap();
@@ -340,11 +384,17 @@ mod tests {
     fn out_of_range_handles_rejected() {
         let t = CapabilityTable::new();
         assert_eq!(
-            t.lookup(CapHandle { index: MAX_CAPABILITIES, generation: 1 }),
+            t.lookup(CapHandle {
+                index: MAX_CAPABILITIES,
+                generation: 1
+            }),
             Err(CapError::OutOfRange)
         );
         assert_eq!(
-            t.lookup(CapHandle { index: 255, generation: 1 }),
+            t.lookup(CapHandle {
+                index: 255,
+                generation: 1
+            }),
             Err(CapError::OutOfRange)
         );
     }

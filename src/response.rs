@@ -34,7 +34,11 @@ pub struct SecurityEvent {
 
 impl Default for SecurityEvent {
     fn default() -> Self {
-        SecurityEvent { domain_id: 0, score: 0, action: EventAction::Log }
+        SecurityEvent {
+            domain_id: 0,
+            score: 0,
+            action: EventAction::Log,
+        }
     }
 }
 
@@ -88,10 +92,7 @@ mod tests {
     use crate::domain::DomainState;
     use crate::monitor::Verdict as V;
     use crate::profile::{parser_profile, service_profile};
-    use crate::syscall::{
-        SYS_CLOSE, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_MUNMAP, SYS_NET_SEND,
-        SYS_OPEN, SYS_READ, SYS_WRITE,
-    };
+    use crate::syscall::{SYS_IOCTL, SYS_IPC_SEND, SYS_NET_SEND, SYS_OPEN, SYS_READ};
 
     fn ring() -> RingBuffer<SecurityEvent, TELEMETRY_CAPACITY> {
         RingBuffer::new().unwrap()
@@ -103,12 +104,21 @@ mod tests {
         // the apply path for one representative of each shape.
         let mut d = Domain::new(5, crate::profile::driver_profile());
         let mut r = ring();
-        let out =
-            apply_response(&mut d, &V { score: 60, response: Response::Tighten }, &mut r);
+        let out = apply_response(
+            &mut d,
+            &V {
+                score: 60,
+                response: Response::Tighten,
+            },
+            &mut r,
+        );
         match out {
             Outcome::Tightened(m) => {
                 assert!(m.is_allowed(SYS_IOCTL).unwrap(), "driver keeps its purpose");
-                assert!(!m.is_allowed(SYS_IPC_SEND).unwrap(), "IPC drops while degraded");
+                assert!(
+                    !m.is_allowed(SYS_IPC_SEND).unwrap(),
+                    "IPC drops while degraded"
+                );
             }
             other => panic!("expected Tightened, got {:?}", other),
         }
@@ -119,12 +129,26 @@ mod tests {
         let mut d = Domain::new(1, service_profile());
         let before = d.mask();
         let mut r = ring();
-        let out = apply_response(&mut d, &V { score: 10, response: Response::Log }, &mut r);
+        let out = apply_response(
+            &mut d,
+            &V {
+                score: 10,
+                response: Response::Log,
+            },
+            &mut r,
+        );
         assert_eq!(out, Outcome::Logged);
         assert_eq!(d.state(), DomainState::Running);
         assert_eq!(d.mask(), before);
         let ev = r.pop().unwrap();
-        assert_eq!(ev, SecurityEvent { domain_id: 1, score: 10, action: EventAction::Log });
+        assert_eq!(
+            ev,
+            SecurityEvent {
+                domain_id: 1,
+                score: 10,
+                action: EventAction::Log
+            }
+        );
     }
 
     #[test]
@@ -133,7 +157,14 @@ mod tests {
         let mut r = ring();
         let before = d.mask();
 
-        let out1 = apply_response(&mut d, &V { score: 60, response: Response::Tighten }, &mut r);
+        let out1 = apply_response(
+            &mut d,
+            &V {
+                score: 60,
+                response: Response::Tighten,
+            },
+            &mut r,
+        );
         let m1 = match out1 {
             Outcome::Tightened(m) => m,
             other => panic!("expected Tightened, got {:?}", other),
@@ -145,7 +176,14 @@ mod tests {
         assert_eq!(d.state(), DomainState::Tightened);
 
         // Tighten again: idempotent, never widens back.
-        let out2 = apply_response(&mut d, &V { score: 65, response: Response::Tighten }, &mut r);
+        let out2 = apply_response(
+            &mut d,
+            &V {
+                score: 65,
+                response: Response::Tighten,
+            },
+            &mut r,
+        );
         let m2 = match out2 {
             Outcome::Tightened(m) => m,
             other => panic!("expected Tightened, got {:?}", other),
@@ -158,11 +196,21 @@ mod tests {
     fn quarantine_cuts_to_exit_only() {
         let mut d = Domain::new(3, parser_profile());
         let mut r = ring();
-        let out = apply_response(&mut d, &V { score: 90, response: Response::Quarantine }, &mut r);
+        let out = apply_response(
+            &mut d,
+            &V {
+                score: 90,
+                response: Response::Quarantine,
+            },
+            &mut r,
+        );
         assert_eq!(out, Outcome::Quarantined);
         assert_eq!(d.state(), DomainState::Quarantined);
         assert!(d.request_syscall(crate::syscall::SYS_READ).is_denied());
-        assert_eq!(d.request_syscall(crate::syscall::SYS_EXIT), crate::domain::Decision::Allowed);
+        assert_eq!(
+            d.request_syscall(crate::syscall::SYS_EXIT),
+            crate::domain::Decision::Allowed
+        );
         let ev = r.pop().unwrap();
         assert_eq!(ev.action, EventAction::Quarantine);
         assert_eq!(ev.score, 90);
@@ -174,7 +222,10 @@ mod tests {
         let mut r = ring();
         // Fill the 16-slot ring and keep applying: drops counted, no panic.
         for i in 0..20u8 {
-            let v = V { score: i, response: Response::Log };
+            let v = V {
+                score: i,
+                response: Response::Log,
+            };
             let out = apply_response(&mut d, &v, &mut r);
             assert_eq!(out, Outcome::Logged);
         }
@@ -193,8 +244,22 @@ mod tests {
         let mut d1 = Domain::new(11, service_profile());
         let mut d2 = Domain::new(22, parser_profile());
         let mut r = ring();
-        apply_response(&mut d1, &V { score: 30, response: Response::Tighten }, &mut r);
-        apply_response(&mut d2, &V { score: 95, response: Response::Quarantine }, &mut r);
+        apply_response(
+            &mut d1,
+            &V {
+                score: 30,
+                response: Response::Tighten,
+            },
+            &mut r,
+        );
+        apply_response(
+            &mut d2,
+            &V {
+                score: 95,
+                response: Response::Quarantine,
+            },
+            &mut r,
+        );
         // FIFO: d1's event was pushed first, so it pops first.
         let ev1 = r.pop().unwrap();
         let ev2 = r.pop().unwrap();

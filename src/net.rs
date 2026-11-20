@@ -42,7 +42,12 @@ pub struct TokenBucket {
 impl TokenBucket {
     pub const fn new(rate: u32, burst: u32) -> Self {
         // A fresh bucket starts full (traffic may burst immediately).
-        TokenBucket { rate, burst, tokens: burst, last_window: 0 }
+        TokenBucket {
+            rate,
+            burst,
+            tokens: burst,
+            last_window: 0,
+        }
     }
 
     /// Refill for elapsed whole windows and try to consume `n` tokens.
@@ -99,7 +104,9 @@ pub struct SocketTable {
 
 impl SocketTable {
     pub const fn new() -> Self {
-        SocketTable { sockets: [None; MAX_SOCKETS] }
+        SocketTable {
+            sockets: [None; MAX_SOCKETS],
+        }
     }
 
     /// Open a socket owned by `domain_id`; returns the socket id.
@@ -154,7 +161,10 @@ impl SocketTable {
                 s.bytes_sent = s.bytes_sent.saturating_add(len as u64);
                 Ok(remaining)
             }
-            Err((requested, available)) => Err(NetError::RateLimited { requested, available }),
+            Err((requested, available)) => Err(NetError::RateLimited {
+                requested,
+                available,
+            }),
         }
     }
 
@@ -217,7 +227,7 @@ mod tests {
     fn refill_happens_only_for_whole_elapsed_windows() {
         let mut b = bucket();
         b.try_consume(0, 64).unwrap(); // empty
-        // 99 ticks later: still inside window 0 — no refill.
+                                       // 99 ticks later: still inside window 0 — no refill.
         assert_eq!(b.try_consume(99, 1), Err((1, 0)));
         // Tick 100 = window 1: 32 tokens credited.
         assert_eq!(b.try_consume(100, 1).unwrap(), 31);
@@ -262,7 +272,10 @@ mod tests {
         // Bucket has 14 left: 15 bytes throttled.
         assert_eq!(
             t.send(id, 15, &mut b, 0),
-            Err(NetError::RateLimited { requested: 15, available: 14 })
+            Err(NetError::RateLimited {
+                requested: 15,
+                available: 14
+            })
         );
         // Throttled send did not count.
         assert_eq!(t.bytes_sent(id), Some(50));
@@ -299,7 +312,7 @@ mod tests {
         let mut b1 = TokenBucket::new(10, 10);
         let mut b2 = TokenBucket::new(10, 10);
         b1.try_consume(0, 10).unwrap(); // domain 1 empty
-        // Domain 2 unaffected.
+                                        // Domain 2 unaffected.
         assert_eq!(b2.try_consume(0, 10).unwrap(), 0);
         assert_eq!(b1.try_consume(0, 1), Err((1, 0)));
     }

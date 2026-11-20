@@ -59,15 +59,15 @@ pub mod vfs;
 use core::array;
 
 use crate::buddy::BuddyAllocator;
+use crate::capability::{CapError, CapHandle, Capability, Rights};
 use crate::domain::{Decision, Domain, DomainState};
 use crate::fd::{FdTarget, MAX_FDS};
+use crate::memory::{MemError, MemFlags};
 use crate::monitor::{BehaviorMonitor, DomainStats, MonitorConfig, Verdict};
+use crate::monitor::{MonitorMode, Response};
 use crate::net::{SocketTable, TokenBucket};
 use crate::pipe::PipeTable;
 use crate::profile::DomainProfile;
-use crate::capability::{CapError, CapHandle, Capability, Rights};
-use crate::memory::{MemError, MemFlags};
-use crate::monitor::{MonitorMode, Response};
 use crate::response::{apply_response, EventAction, SecurityEvent, TELEMETRY_CAPACITY};
 use crate::ringbuf::RingBuffer;
 use crate::sched::Scheduler;
@@ -237,7 +237,12 @@ impl<const N: usize> Kernel<N> {
         self.monitor.reset(id);
         // Close every descriptor, releasing pipe ends as we go.
         for fd in 0..MAX_FDS {
-            if let Some(entry) = self.domains[slot].as_mut().expect("checked above").fds.close(fd as u8) {
+            if let Some(entry) = self.domains[slot]
+                .as_mut()
+                .expect("checked above")
+                .fds
+                .close(fd as u8)
+            {
                 match entry.target {
                     FdTarget::PipeRead(p) => {
                         let _ = self.pipes.release_read(p);
@@ -388,7 +393,13 @@ impl<const N: usize> Kernel<N> {
 
     fn domain_ids(&self) -> [Option<u32>; MAX_DOMAINS] {
         let mut ids = [None; MAX_DOMAINS];
-        for (slot, id) in self.domains.iter().flatten().map(|d| d.id).zip(ids.iter_mut()) {
+        for (slot, id) in self
+            .domains
+            .iter()
+            .flatten()
+            .map(|d| d.id)
+            .zip(ids.iter_mut())
+        {
             *id = Some(slot);
         }
         ids
@@ -411,7 +422,9 @@ impl<const N: usize> Kernel<N> {
         };
         let derived = match d.caps.attenuate(parent, rights) {
             Ok(c) => c,
-            Err(e @ (CapError::Escalation | CapError::MissingGrantRight | CapError::InvalidHandle)) => {
+            Err(
+                e @ (CapError::Escalation | CapError::MissingGrantRight | CapError::InvalidHandle),
+            ) => {
                 d.stats.escalation_attempts = d.stats.escalation_attempts.saturating_add(1);
                 return Err(e);
             }
@@ -421,7 +434,11 @@ impl<const N: usize> Kernel<N> {
     }
 
     /// F6: supervisor wrapper; a stale handle is an escalation signal.
-    pub fn cap_revoke(&mut self, domain_id: u32, handle: CapHandle) -> Result<Capability, CapError> {
+    pub fn cap_revoke(
+        &mut self,
+        domain_id: u32,
+        handle: CapHandle,
+    ) -> Result<Capability, CapError> {
         let d = match self.domain_mut(domain_id) {
             Ok(d) => d,
             Err(_) => return Err(CapError::InvalidHandle),
@@ -437,7 +454,11 @@ impl<const N: usize> Kernel<N> {
     }
 
     /// F6: supervisor wrapper; a stale handle is an escalation signal.
-    pub fn cap_lookup(&mut self, domain_id: u32, handle: CapHandle) -> Result<Capability, CapError> {
+    pub fn cap_lookup(
+        &mut self,
+        domain_id: u32,
+        handle: CapHandle,
+    ) -> Result<Capability, CapError> {
         let d = match self.domain_mut(domain_id) {
             Ok(d) => d,
             Err(_) => return Err(CapError::InvalidHandle),
@@ -468,10 +489,12 @@ impl<const N: usize> Kernel<N> {
         };
         match d.space.map(base, len, flags) {
             Ok(()) => Ok(()),
-            Err(e @ (MemError::WxViolation
-            | MemError::Overlap
-            | MemError::GuardGap
-            | MemError::QuotaExceeded)) => {
+            Err(
+                e @ (MemError::WxViolation
+                | MemError::Overlap
+                | MemError::GuardGap
+                | MemError::QuotaExceeded),
+            ) => {
                 d.stats.faults = d.stats.faults.saturating_add(1);
                 Err(e)
             }
@@ -525,6 +548,7 @@ pub mod prelude {
         NetError, Socket, SocketState, SocketTable, TokenBucket, RATE_WINDOW_TICKS,
     };
     pub use crate::pipe::{PipeError, PipeTable, MAX_PIPES, PIPE_CAPACITY};
+    pub use crate::ringbuf::{RingBuffer, RingError};
     pub use crate::sched::{SchedEntity, SchedError, Scheduler, NICE0_WEIGHT, NICE_TO_WEIGHT};
     pub use crate::signal::{
         default_action, is_unblockable, SignalError, SignalSet, SignalState, SIGHUP, SIGINT,
@@ -532,10 +556,9 @@ pub mod prelude {
     };
     pub use crate::sys::{SysError, SysRequest, SysValue};
     pub use crate::syscall::{
-        MaskError, SyscallMask, SYSCALL_COUNT, SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_EXIT,
-        SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MMAP, SYS_MKDIR, SYS_MUNMAP,
-        SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SPAWN, SYS_UNLINK,
-        SYS_WRITE,
+        MaskError, SyscallMask, SYSCALL_COUNT, SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_EXIT, SYS_IOCTL,
+        SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NET_RECV,
+        SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
     };
     pub use crate::vfs::{
         Credentials, InodeKind, Mode, Vfs, VfsError, FILE_DATA_MAX, MAX_INODES, NAME_MAX, ROOT_ID,
@@ -550,12 +573,8 @@ pub mod prelude {
             driver_profile, netd_profile, parser_profile, plugin_profile, service_profile,
             DomainProfile,
         },
-        response::{
-            apply_response, EventAction, Outcome, SecurityEvent,
-            TELEMETRY_CAPACITY,
-        },
+        response::{apply_response, EventAction, Outcome, SecurityEvent, TELEMETRY_CAPACITY},
     };
-    pub use crate::ringbuf::{RingBuffer, RingError};
     pub use crate::{Kernel, KernelError, MAX_DOMAINS};
 }
 
@@ -572,7 +591,10 @@ mod tests {
             k.create_domain(1, service_profile()),
             Err(KernelError::DuplicateDomain(1))
         );
-        assert_eq!(k.dispatch(42, SYS_READ_ID), Err(KernelError::UnknownDomain(42)));
+        assert_eq!(
+            k.dispatch(42, SYS_READ_ID),
+            Err(KernelError::UnknownDomain(42))
+        );
         assert_eq!(k.report_fault(42), Err(KernelError::UnknownDomain(42)));
         assert_eq!(k.audit(42), Err(KernelError::UnknownDomain(42)));
         assert!(k.domain_state(42).is_none());
@@ -630,13 +652,27 @@ mod tests {
             .domain_mut(1)
             .unwrap()
             .caps
-            .insert(Capability { resource: Resource::FsNode(crate::vfs::InodeRef { id: 1, generation: 1 }), rights: Rights::READ.union(Rights::GRANT), generation: 0 })
+            .insert(Capability {
+                resource: Resource::FsNode(crate::vfs::InodeRef {
+                    id: 1,
+                    generation: 1,
+                }),
+                rights: Rights::READ.union(Rights::GRANT),
+                generation: 0,
+            })
             .unwrap();
         let bare = k
             .domain_mut(1)
             .unwrap()
             .caps
-            .insert(Capability { resource: Resource::FsNode(crate::vfs::InodeRef { id: 9, generation: 1 }), rights: Rights::READ, generation: 0 })
+            .insert(Capability {
+                resource: Resource::FsNode(crate::vfs::InodeRef {
+                    id: 9,
+                    generation: 1,
+                }),
+                rights: Rights::READ,
+                generation: 0,
+            })
             .unwrap();
         let before = k.domain_mut(1).unwrap().stats.escalation_attempts;
         // Widening: child wants WRITE the parent never had.
@@ -651,10 +687,20 @@ mod tests {
         ));
         // Revoke once (succeeds), then the stale handle fails twice.
         assert!(k.cap_revoke(1, bare).is_ok());
-        assert!(matches!(k.cap_revoke(1, bare), Err(CapError::InvalidHandle)));
-        assert!(matches!(k.cap_lookup(1, bare), Err(CapError::InvalidHandle)));
+        assert!(matches!(
+            k.cap_revoke(1, bare),
+            Err(CapError::InvalidHandle)
+        ));
+        assert!(matches!(
+            k.cap_lookup(1, bare),
+            Err(CapError::InvalidHandle)
+        ));
         let after = k.domain_mut(1).unwrap().stats.escalation_attempts;
-        assert_eq!(after - before, 4, "every failed capability operation is an escalation signal");
+        assert_eq!(
+            after - before,
+            4,
+            "every failed capability operation is an escalation signal"
+        );
     }
 
     /// F6: memory-policy refusals (W^X, guard gap, quota, overlap) feed
@@ -668,7 +714,12 @@ mod tests {
         let before = k.domain_mut(1).unwrap().stats.faults;
         // W^X refused by the policy.
         assert!(k
-            .domain_map(1, 0x5000_0000, 4096, MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC)
+            .domain_map(
+                1,
+                0x5000_0000,
+                4096,
+                MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC
+            )
             .is_err());
         // Legal map, then an overlapping one.
         assert!(k.domain_map(1, 0x6000_0000, 4096, MemFlags::READ).is_ok());
@@ -683,21 +734,33 @@ mod tests {
     fn tick_audits_every_domain_on_window_boundaries() {
         let mut k = Kernel::new();
         k.create_domain(1, service_profile()).unwrap();
-        k.create_domain_with(2, service_profile(), 1002, 100, 0).unwrap();
+        k.create_domain_with(2, service_profile(), 1002, 100, 0)
+            .unwrap();
         k.set_monitor_window(10);
         // Dirty one domain's window through the organic syscall path.
         for _ in 0..4 {
             let _ = k.syscall(1, crate::sys::SysRequest::NetSend { len: 1 });
         }
         k.tick(9); // same window: no audit yet
-        assert_eq!(k.domain_mut(1).unwrap().stats.syscalls_total, 4, "no window closed yet");
+        assert_eq!(
+            k.domain_mut(1).unwrap().stats.syscalls_total,
+            4,
+            "no window closed yet"
+        );
         k.tick(10); // boundary crossed: audit both domains
-        assert_eq!(k.domain_mut(1).unwrap().stats.syscalls_total, 0, "window closed by tick");
+        assert_eq!(
+            k.domain_mut(1).unwrap().stats.syscalls_total,
+            0,
+            "window closed by tick"
+        );
         let mut events = 0;
         while k.pop_event().is_some() {
             events += 1;
         }
-        assert!(events >= 2, "every domain audited on the boundary, got {events}");
+        assert!(
+            events >= 2,
+            "every domain audited on the boundary, got {events}"
+        );
     }
 
     /// F10: stale inode references must fail closed. A domain chrooted
@@ -711,23 +774,67 @@ mod tests {
         let mut k = Kernel::new();
         // uid-0 domain builds the tree (needs parent write on /home).
         k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
-        k.syscall(1, SysRequest::Mkdir { path: "/home", mode: Mode(0o755) }).unwrap();
-        k.syscall(1, SysRequest::Mkdir { path: "/home/jail", mode: Mode(0o777) }).unwrap();
-        k.syscall(1, SysRequest::Mkdir { path: "/pub", mode: Mode(0o755) }).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/home",
+                mode: Mode(0o755),
+            },
+        )
+        .unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/home/jail",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o755),
+            },
+        )
+        .unwrap();
         // The confined domain (uid 1001) chroots into /home/jail.
         k.create_domain(2, service_profile()).unwrap();
-        k.syscall(2, SysRequest::Chroot { path: "/home/jail" }).unwrap();
+        k.syscall(2, SysRequest::Chroot { path: "/home/jail" })
+            .unwrap();
         // Works while the jail lives.
-        k.syscall(2, SysRequest::Mkdir { path: "/inside", mode: Mode(0o755) }).unwrap();
+        k.syscall(
+            2,
+            SysRequest::Mkdir {
+                path: "/inside",
+                mode: Mode(0o755),
+            },
+        )
+        .unwrap();
         // The jail directory is removed and its inode slot reused by an
         // unrelated directory (root sweeps the parent first).
-        k.syscall(1, SysRequest::Unlink { path: "/home/jail/inside" }).unwrap();
-        k.syscall(1, SysRequest::Unlink { path: "/home/jail" }).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Unlink {
+                path: "/home/jail/inside",
+            },
+        )
+        .unwrap();
+        k.syscall(1, SysRequest::Unlink { path: "/home/jail" })
+            .unwrap();
         // Reuse the freed slot from a different place.
         let mut reused = false;
         for i in 0..64 {
             let p = format!("/pub/d{}", i);
-            if k.syscall(1, SysRequest::Mkdir { path: &p, mode: Mode(0o755) }).is_ok() {
+            if k.syscall(
+                1,
+                SysRequest::Mkdir {
+                    path: &p,
+                    mode: Mode(0o755),
+                },
+            )
+            .is_ok()
+            {
                 reused = true;
             }
         }
@@ -735,7 +842,13 @@ mod tests {
         // The confined domain's stale chroot/cwd refs must fail closed —
         // no silent re-root onto whatever now lives in the old slot.
         assert!(matches!(
-            k.syscall(2, SysRequest::Mkdir { path: "/x", mode: Mode(0o755) }),
+            k.syscall(
+                2,
+                SysRequest::Mkdir {
+                    path: "/x",
+                    mode: Mode(0o755)
+                }
+            ),
             Err(SysError::Vfs(crate::vfs::VfsError::StaleInode))
         ));
     }
@@ -751,53 +864,146 @@ mod tests {
         k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
         // Create a file, write a prefix.
         let fd = match k
-            .syscall(1, SysRequest::Open { path: "/log", mode: Mode(0o600), create: true, read: true, write: true, truncate: false })
+            .syscall(
+                1,
+                SysRequest::Open {
+                    path: "/log",
+                    mode: Mode(0o600),
+                    create: true,
+                    read: true,
+                    write: true,
+                    truncate: false,
+                },
+            )
             .unwrap()
         {
             SysValue::Fd(f) => f,
             o => panic!("{:?}", o),
         };
-        k.syscall(1, SysRequest::Write { fd, bytes: b"hello" }).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Write {
+                fd,
+                bytes: b"hello",
+            },
+        )
+        .unwrap();
         // A second write CONTINUES at the offset (no truncation).
-        k.syscall(1, SysRequest::Write { fd, bytes: b" world" }).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Write {
+                fd,
+                bytes: b" world",
+            },
+        )
+        .unwrap();
         // Read back through a fresh read-only fd.
         let rfd = match k
-            .syscall(1, SysRequest::Open { path: "/log", mode: Mode(0o600), create: false, read: true, write: false, truncate: false })
+            .syscall(
+                1,
+                SysRequest::Open {
+                    path: "/log",
+                    mode: Mode(0o600),
+                    create: false,
+                    read: true,
+                    write: false,
+                    truncate: false,
+                },
+            )
             .unwrap()
         {
             SysValue::Fd(f) => f,
             o => panic!("{:?}", o),
         };
         let mut buf = [0u8; 32];
-        let n = match k.syscall(1, SysRequest::Read { fd: rfd, buf: &mut buf }).unwrap() {
+        let n = match k
+            .syscall(
+                1,
+                SysRequest::Read {
+                    fd: rfd,
+                    buf: &mut buf,
+                },
+            )
+            .unwrap()
+        {
             SysValue::Count(n) => n,
             o => panic!("{:?}", o),
         };
         assert_eq!(&buf[..n], b"hello world", "writes continue at the offset");
         // Truncate is explicit: reopen with truncate and the file empties.
         let tfd = match k
-            .syscall(1, SysRequest::Open { path: "/log", mode: Mode(0o600), create: false, read: false, write: true, truncate: true })
+            .syscall(
+                1,
+                SysRequest::Open {
+                    path: "/log",
+                    mode: Mode(0o600),
+                    create: false,
+                    read: false,
+                    write: true,
+                    truncate: true,
+                },
+            )
             .unwrap()
         {
             SysValue::Fd(f) => f,
             o => panic!("{:?}", o),
         };
         let _ = tfd;
-        let n2 = match k.syscall(1, SysRequest::Read { fd: rfd, buf: &mut buf }).unwrap() {
+        let n2 = match k
+            .syscall(
+                1,
+                SysRequest::Read {
+                    fd: rfd,
+                    buf: &mut buf,
+                },
+            )
+            .unwrap()
+        {
             SysValue::Count(n) => n,
             o => panic!("{:?}", o),
         };
         assert_eq!(n2, 0, "explicit truncate emptied the file");
         // Opening write-only on a read-only-mode file is refused at open
         // (a non-root domain against a root-owned 0o444 file).
-        k.syscall(1, SysRequest::Open { path: "/ro", mode: Mode(0o444), create: true, read: true, write: false, truncate: false }).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/ro",
+                mode: Mode(0o444),
+                create: true,
+                read: true,
+                write: false,
+                truncate: false,
+            },
+        )
+        .unwrap();
         k.create_domain(3, service_profile()).unwrap(); // uid 1003
         assert!(k
-            .syscall(3, SysRequest::Open { path: "/ro", mode: Mode(0o444), create: false, read: false, write: true, truncate: false })
+            .syscall(
+                3,
+                SysRequest::Open {
+                    path: "/ro",
+                    mode: Mode(0o444),
+                    create: false,
+                    read: false,
+                    write: true,
+                    truncate: false
+                }
+            )
             .is_err());
         // ...while opening it read-only succeeds for the same domain.
         assert!(k
-            .syscall(3, SysRequest::Open { path: "/ro", mode: Mode(0o444), create: false, read: true, write: false, truncate: false })
+            .syscall(
+                3,
+                SysRequest::Open {
+                    path: "/ro",
+                    mode: Mode(0o444),
+                    create: false,
+                    read: true,
+                    write: false,
+                    truncate: false
+                }
+            )
             .is_ok());
     }
 
@@ -811,25 +1017,46 @@ mod tests {
         use crate::sys::{SysError, SysRequest, SysValue};
         let mut k = Kernel::new();
         k.create_domain(1, parser_profile()).unwrap(); // parser has MMAP/MUNMAP
-        // Legal mapping executes.
+                                                       // Legal mapping executes.
         assert!(matches!(
-            k.syscall(1, SysRequest::Mmap { addr: 0x5000_0000, len: 8192, flags: MemFlags::READ | MemFlags::WRITE }),
+            k.syscall(
+                1,
+                SysRequest::Mmap {
+                    addr: 0x5000_0000,
+                    len: 8192,
+                    flags: MemFlags::READ | MemFlags::WRITE
+                }
+            ),
             Ok(SysValue::Addr(0x5000_0000))
         ));
         // Unmap executes too.
         assert!(matches!(
-            k.syscall(1, SysRequest::Munmap { addr: 0x5000_0000, len: 8192 }),
+            k.syscall(
+                1,
+                SysRequest::Munmap {
+                    addr: 0x5000_0000,
+                    len: 8192
+                }
+            ),
             Ok(SysValue::Unit)
         ));
         // A refused mapping is an error AND an organic monitor fault.
         let faults_before = k.domain_mut(1).unwrap().stats.faults;
         assert!(k
-            .syscall(1, SysRequest::Mmap { addr: 0x5000_0000, len: 4096, flags: MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC })
+            .syscall(
+                1,
+                SysRequest::Mmap {
+                    addr: 0x5000_0000,
+                    len: 4096,
+                    flags: MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC
+                }
+            )
             .is_err());
         assert_eq!(k.domain_mut(1).unwrap().stats.faults, faults_before + 1);
         // Stubs answer NotImplemented with their number, never Unit.
         let mut k2 = Kernel::new();
-        k2.create_domain_with(2, crate::profile::driver_profile(), 1002, 100, 0).unwrap(); // driver has IOCTL
+        k2.create_domain_with(2, crate::profile::driver_profile(), 1002, 100, 0)
+            .unwrap(); // driver has IOCTL
         assert!(matches!(
             k2.syscall(2, SysRequest::Ioctl { cmd: 0 }),
             Err(SysError::NotImplemented(nr)) if nr == crate::syscall::SYS_IOCTL
@@ -858,7 +1085,8 @@ mod tests {
         // Every live domain opens: the table fills 4/4 with no folding.
         for i in 0..4u32 {
             let id = 4000 + i;
-            k.create_domain_with(id, service_profile(), 2100, 100, 0).unwrap();
+            k.create_domain_with(id, service_profile(), 2100, 100, 0)
+                .unwrap();
             assert!(k.net_open(id).is_ok(), "domain {id} opens its socket");
         }
         assert_eq!(k.sockets.len(), 4);
@@ -878,10 +1106,7 @@ mod tests {
             Err(KernelError::InvalidId(64536))
         ));
         // DuplicateDomain surfaced, not UnknownDomain(0).
-        assert!(matches!(
-            k.syscall(1, SysRequest::Pipe),
-            Ok(_)
-        ));
+        assert!(k.syscall(1, SysRequest::Pipe).is_ok());
         // Direct: duplicate create surfaces its own variant.
         assert!(matches!(
             k.create_domain(1, service_profile()),
@@ -910,7 +1135,8 @@ mod tests {
         use crate::sys::{SysError, SysRequest};
         let mut k = Kernel::new();
         k.create_domain(1, service_profile()).unwrap(); // uid 1001
-        k.create_domain_with(2, service_profile(), 1002, 100, 0).unwrap();
+        k.create_domain_with(2, service_profile(), 1002, 100, 0)
+            .unwrap();
         // Foreign target that EXISTS: PermissionDenied (not UnknownDomain).
         assert!(matches!(
             k.syscall(1, SysRequest::Kill { target: 2, sig: 15 }),
@@ -918,18 +1144,32 @@ mod tests {
         ));
         // Foreign target that does NOT exist: the same answer.
         assert!(matches!(
-            k.syscall(1, SysRequest::Kill { target: 7777, sig: 15 }),
+            k.syscall(
+                1,
+                SysRequest::Kill {
+                    target: 7777,
+                    sig: 15
+                }
+            ),
             Err(SysError::PermissionDenied)
         ));
         // Self still works, and a missing *own-uid* target... self-target
         // is domain 1 itself (exists): fine.
-        assert!(k.syscall(1, SysRequest::Kill { target: 1, sig: 15 }).is_ok());
+        assert!(k
+            .syscall(1, SysRequest::Kill { target: 1, sig: 15 })
+            .is_ok());
         // Root without a Domain capability is unauthorized too (F18,
         // ADR-0009 supersedes the old root-UnknownDomain expectation) —
         // and gets the SAME answer for a missing target: no enumeration.
         k.create_domain_with(9, service_profile(), 0, 0, 0).unwrap(); // uid 0
         assert!(matches!(
-            k.syscall(9, SysRequest::Kill { target: 7777, sig: 15 }),
+            k.syscall(
+                9,
+                SysRequest::Kill {
+                    target: 7777,
+                    sig: 15
+                }
+            ),
             Err(SysError::PermissionDenied)
         ));
     }
@@ -950,7 +1190,10 @@ mod tests {
             .unwrap()
             .caps
             .insert(crate::capability::Capability {
-                resource: crate::capability::Resource::FsNode(crate::vfs::InodeRef { id: 1, generation: 1 }),
+                resource: crate::capability::Resource::FsNode(crate::vfs::InodeRef {
+                    id: 1,
+                    generation: 1,
+                }),
                 rights: crate::capability::Rights::READ.union(crate::capability::Rights::GRANT),
                 generation: 0,
             })
@@ -971,7 +1214,9 @@ mod tests {
                     1,
                     0x5000_0000,
                     4096,
-                    crate::memory::MemFlags::READ | crate::memory::MemFlags::WRITE | crate::memory::MemFlags::EXEC,
+                    crate::memory::MemFlags::READ
+                        | crate::memory::MemFlags::WRITE
+                        | crate::memory::MemFlags::EXEC,
                 );
             }
         };
@@ -983,9 +1228,15 @@ mod tests {
         // Supervised destroy + respawn under the same id.
         k.destroy_domain(1).unwrap();
         k.create_domain(1, service_profile()).unwrap();
-        assert_eq!(k.domain_state(1), Some(DomainState::Running), "respawn is born clean");
         assert_eq!(
-            k.domain_mut(1).unwrap().request_syscall(crate::syscall::SYS_READ),
+            k.domain_state(1),
+            Some(DomainState::Running),
+            "respawn is born clean"
+        );
+        assert_eq!(
+            k.domain_mut(1)
+                .unwrap()
+                .request_syscall(crate::syscall::SYS_READ),
             Decision::Allowed,
             "no quarantine sticks to the id"
         );
@@ -1002,11 +1253,15 @@ mod tests {
         let mut k = Kernel::new();
         for i in 0..100u32 {
             let id = 5000 + i;
-            k.create_domain_with(id, service_profile(), 2000, 100, 0).unwrap();
+            k.create_domain_with(id, service_profile(), 2000, 100, 0)
+                .unwrap();
             let _ = k.audit(id);
             k.destroy_domain(id).unwrap();
         }
-        assert!(!k.monitor_degraded(), "churn must not exhaust the state table");
+        assert!(
+            !k.monitor_degraded(),
+            "churn must not exhaust the state table"
+        );
         // And the supervisor-only reset exists for the rare manual path.
         k.create_domain(2, service_profile()).unwrap();
         let _ = k.audit(2);
@@ -1031,7 +1286,14 @@ mod tests {
             .domain_mut(1)
             .unwrap()
             .caps
-            .insert(Capability { resource: Resource::FsNode(crate::vfs::InodeRef { id: 1, generation: 1 }), rights: Rights::READ.union(Rights::GRANT), generation: 0 })
+            .insert(Capability {
+                resource: Resource::FsNode(crate::vfs::InodeRef {
+                    id: 1,
+                    generation: 1,
+                }),
+                rights: Rights::READ.union(Rights::GRANT),
+                generation: 0,
+            })
             .unwrap();
         let misbehave = |k: &mut Kernel| {
             // Gate refusals (NET_SEND is not on the service surface).
@@ -1044,12 +1306,21 @@ mod tests {
             }
             // Refused mappings (W^X).
             for _ in 0..5 {
-                let _ = k.domain_map(1, 0x5000_0000, 4096, MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC);
+                let _ = k.domain_map(
+                    1,
+                    0x5000_0000,
+                    4096,
+                    MemFlags::READ | MemFlags::WRITE | MemFlags::EXEC,
+                );
             }
         };
         misbehave(&mut k);
         k.tick(10);
-        assert_eq!(k.domain_state(1), Some(DomainState::Running), "hysteresis: first window only logs");
+        assert_eq!(
+            k.domain_state(1),
+            Some(DomainState::Running),
+            "hysteresis: first window only logs"
+        );
         misbehave(&mut k);
         k.tick(20);
         assert_eq!(
@@ -1145,23 +1416,56 @@ mod tests {
         let mut k = Kernel::new();
         // Root builds a world-readable file in a world-executable tree.
         k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
-        k.syscall(1, SysRequest::Mkdir { path: "/pub", mode: Mode(0o777) }).unwrap();
-        k.syscall(1, SysRequest::Open { path: "/pub/x", mode: Mode(0o644), create: true, read: true, write: true, truncate: false }).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/pub/x",
+                mode: Mode(0o644),
+                create: true,
+                read: true,
+                write: true,
+                truncate: false,
+            },
+        )
+        .unwrap();
         // The service (mask: OPEN is on; DAC: /pub is 0o777, /pub/x is
         // 0o644 with other: r) opens it for read — works today ONLY
         // because caps are not enforced (the RED state).
         k.create_domain(2, service_profile()).unwrap();
         let open = |k: &mut Kernel| {
-            k.syscall(2, SysRequest::Open { path: "/pub/x", mode: Mode(0o644), create: false, read: true, write: false, truncate: false })
+            k.syscall(
+                2,
+                SysRequest::Open {
+                    path: "/pub/x",
+                    mode: Mode(0o644),
+                    create: false,
+                    read: true,
+                    write: false,
+                    truncate: false,
+                },
+            )
         };
         // Sanity today: with the minted root capability, the open works.
-        assert!(open(&mut k).is_ok(), "the minted FsNode(ROOT) capability must cover the tree");
+        assert!(
+            open(&mut k).is_ok(),
+            "the minted FsNode(ROOT) capability must cover the tree"
+        );
         // Revoke EVERY FsNode capability the domain holds.
         {
             let d = k.domain_mut(2).unwrap();
             let mut revoked_any = false;
             for _ in 0..crate::capability::MAX_CAPABILITIES {
-                let Some(h) = d.caps.handles().next() else { break };
+                let Some(h) = d.caps.handles().next() else {
+                    break;
+                };
                 // Revoke one at a time; keep only if it was an FsNode —
                 // revoke everything, assert at least one FsNode went.
                 match d.caps.revoke(h) {
@@ -1173,12 +1477,18 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            assert!(revoked_any, "the domain must have held an FsNode capability");
+            assert!(
+                revoked_any,
+                "the domain must have held an FsNode capability"
+            );
         }
         let escalations = k.domain_mut(2).unwrap().stats.escalation_attempts;
         match open(&mut k) {
             Err(SysError::PermissionDenied) => {}
-            other => panic!("mask+DAC pass but no capability must be denied, got {:?}", other.map(|_| ())),
+            other => panic!(
+                "mask+DAC pass but no capability must be denied, got {:?}",
+                other.map(|_| ())
+            ),
         }
         assert_eq!(
             k.domain_mut(2).unwrap().stats.escalation_attempts,
@@ -1205,7 +1515,9 @@ mod tests {
             let d = k.domain_mut(1).unwrap();
             let mut revoked = false;
             for _ in 0..crate::capability::MAX_CAPABILITIES {
-                let Some(h) = d.caps.handles().next() else { break };
+                let Some(h) = d.caps.handles().next() else {
+                    break;
+                };
                 if let Ok(c) = d.caps.revoke(h) {
                     if matches!(c.resource, crate::capability::Resource::Device(_)) {
                         revoked = true;
@@ -1225,21 +1537,29 @@ mod tests {
     /// derivation inserts nothing.
     #[test]
     fn derived_capability_cannot_exceed_parent() {
-        use crate::capability::{Capability, CapError, Resource, Rights};
+        use crate::capability::{CapError, Capability, Resource, Rights};
         let mut k = Kernel::new();
         k.create_domain(1, service_profile()).unwrap();
         let grantor = k
             .domain_mut(1)
             .unwrap()
             .caps
-            .insert(Capability { resource: Resource::FsNode(crate::vfs::ROOT_REF), rights: Rights::READ.union(Rights::GRANT), generation: 0 })
+            .insert(Capability {
+                resource: Resource::FsNode(crate::vfs::ROOT_REF),
+                rights: Rights::READ.union(Rights::GRANT),
+                generation: 0,
+            })
             .unwrap();
         let before = k.domain_mut(1).unwrap().caps.len();
         assert!(matches!(
             k.cap_attenuate(1, grantor, Rights::READ.union(Rights::WRITE)),
             Err(CapError::Escalation)
         ));
-        assert_eq!(k.domain_mut(1).unwrap().caps.len(), before, "a failed derivation inserts nothing");
+        assert_eq!(
+            k.domain_mut(1).unwrap().caps.len(),
+            before,
+            "a failed derivation inserts nothing"
+        );
         // And a legal derivation stays inside the parent's rights.
         let child = k.cap_attenuate(1, grantor, Rights::READ).unwrap();
         let c = k.cap_lookup(1, child).unwrap();
@@ -1254,14 +1574,34 @@ mod tests {
         use crate::vfs::Mode;
         let mut k = Kernel::new();
         k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
-        k.syscall(1, SysRequest::Mkdir { path: "/pub", mode: Mode(0o777) }).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
         k.create_domain(2, service_profile()).unwrap();
         let minted = k.domain_mut(2).unwrap().caps.len();
-        assert!(minted >= 3, "creation mints FsNode/Device/Domain (got {minted})");
+        assert!(
+            minted >= 3,
+            "creation mints FsNode/Device/Domain (got {minted})"
+        );
         // A battery of everything the domain can attempt.
         for req in [
-            SysRequest::Open { path: "/pub/x", mode: Mode(0o644), create: true, read: true, write: true, truncate: false },
-            SysRequest::Mkdir { path: "/pub/d", mode: Mode(0o755) },
+            SysRequest::Open {
+                path: "/pub/x",
+                mode: Mode(0o644),
+                create: true,
+                read: true,
+                write: true,
+                truncate: false,
+            },
+            SysRequest::Mkdir {
+                path: "/pub/d",
+                mode: Mode(0o755),
+            },
             SysRequest::Kill { target: 2, sig: 15 },
             SysRequest::Pipe,
         ] {
@@ -1285,16 +1625,25 @@ mod tests {
         use crate::sys::{SysError, SysRequest};
         let mut k = Kernel::new();
         k.create_domain(1, service_profile()).unwrap(); // uid 1001
-        k.create_domain_with(2, service_profile(), 1001, 100, 0).unwrap(); // same uid
-        // Self-kill: the minted Domain(self) capability passes.
-        assert!(k.syscall(1, SysRequest::Kill { target: 1, sig: 15 }).is_ok());
+        k.create_domain_with(2, service_profile(), 1001, 100, 0)
+            .unwrap(); // same uid
+                       // Self-kill: the minted Domain(self) capability passes.
+        assert!(k
+            .syscall(1, SysRequest::Kill { target: 1, sig: 15 })
+            .is_ok());
         // No Domain(2) capability: denied, existing or not (F14 shape).
         assert!(matches!(
             k.syscall(1, SysRequest::Kill { target: 2, sig: 15 }),
             Err(SysError::PermissionDenied)
         ));
         assert!(matches!(
-            k.syscall(1, SysRequest::Kill { target: 7777, sig: 15 }),
+            k.syscall(
+                1,
+                SysRequest::Kill {
+                    target: 7777,
+                    sig: 15
+                }
+            ),
             Err(SysError::PermissionDenied)
         ));
         // Root is unauthorized too without a grant — same answer for
@@ -1310,14 +1659,24 @@ mod tests {
         k.domain_mut(1)
             .unwrap()
             .caps
-            .insert(Capability { resource: Resource::Domain(2), rights: Rights::WRITE, generation: 0 })
+            .insert(Capability {
+                resource: Resource::Domain(2),
+                rights: Rights::WRITE,
+                generation: 0,
+            })
             .unwrap();
-        assert!(k.syscall(1, SysRequest::Kill { target: 2, sig: 15 }).is_ok());
+        assert!(k
+            .syscall(1, SysRequest::Kill { target: 2, sig: 15 })
+            .is_ok());
         // ...different uid: the DAC layer refuses even with the cap.
         k.domain_mut(1)
             .unwrap()
             .caps
-            .insert(Capability { resource: Resource::Domain(9), rights: Rights::WRITE, generation: 0 })
+            .insert(Capability {
+                resource: Resource::Domain(9),
+                rights: Rights::WRITE,
+                generation: 0,
+            })
             .unwrap();
         assert!(matches!(
             k.syscall(1, SysRequest::Kill { target: 9, sig: 15 }),
@@ -1339,7 +1698,7 @@ mod tests {
         k.set_monitor_window(10);
         let spam = |k: &mut Kernel| {
             for _ in 0..200 {
-                let _ = k.report_unknown_syscall(1).unwrap(); // forged nr
+                k.report_unknown_syscall(1).unwrap(); // forged nr
                 let _ = k.dispatch(1, SYS_NET_SEND).unwrap();
                 let _ = k.dispatch(1, SYS_NET_RECV).unwrap();
                 let _ = k.dispatch(1, SYS_SPAWN).unwrap();
@@ -1347,7 +1706,7 @@ mod tests {
                 let _ = k.dispatch(1, SYS_MMAP).unwrap();
                 // The crossing write: allowed by the mask, refused by
                 // validation -> an organic fault.
-                let _ = k.report_fault(1).unwrap();
+                k.report_fault(1).unwrap();
             }
         };
         spam(&mut k);
@@ -1383,21 +1742,37 @@ mod tests {
         use crate::sys::{SysRequest, SysValue};
         let mut k = Kernel::new();
         k.create_domain(1, service_profile()).unwrap();
-        let pair = |k: &mut Kernel, d: u32| {
-            match k.syscall(d, SysRequest::Pipe).unwrap() {
-                SysValue::FdPair(r, w) => (r, w),
-                other => panic!("{:?}", other),
-            }
+        let pair = |k: &mut Kernel, d: u32| match k.syscall(d, SysRequest::Pipe).unwrap() {
+            SysValue::FdPair(r, w) => (r, w),
+            other => panic!("{:?}", other),
         };
         let (r_a, w_a) = pair(&mut k, 1);
         let (r_b, w_b) = pair(&mut k, 1);
         // dup2(w_a, r_b): pipe B's read end loses its reference here.
-        match k.syscall(1, SysRequest::Dup { fd: w_a, new_fd: r_b }).unwrap() {
+        match k
+            .syscall(
+                1,
+                SysRequest::Dup {
+                    fd: w_a,
+                    new_fd: r_b,
+                },
+            )
+            .unwrap()
+        {
             SysValue::Fd(f) => assert_eq!(f, r_b),
             other => panic!("{:?}", other),
         }
         // dup2(fd, fd) must be a pure no-op (no refcount change).
-        match k.syscall(1, SysRequest::Dup { fd: w_a, new_fd: w_a }).unwrap() {
+        match k
+            .syscall(
+                1,
+                SysRequest::Dup {
+                    fd: w_a,
+                    new_fd: w_a,
+                },
+            )
+            .unwrap()
+        {
             SysValue::Fd(f) => assert_eq!(f, w_a),
             other => panic!("{:?}", other),
         }
@@ -1405,7 +1780,11 @@ mod tests {
             k.syscall(1, SysRequest::Close { fd }).unwrap();
         }
         k.destroy_domain(1).unwrap();
-        assert_eq!(k.pipes.len(), 0, "replaced/self-dup pipe ends must not leak");
+        assert_eq!(
+            k.pipes.len(),
+            0,
+            "replaced/self-dup pipe ends must not leak"
+        );
     }
 
     /// F3 regression: the derived uid must never wrap (id 64536 would be
@@ -1441,9 +1820,7 @@ mod tests {
     /// quarantine is applied — the calibration mode.
     #[test]
     fn audit_only_computes_and_logs_but_never_applies() {
-        use crate::capability::{CapError, CapHandle, Capability, Rights};
-use crate::memory::{MemError, MemFlags};
-use crate::monitor::{MonitorMode, Response};
+        use crate::monitor::{MonitorMode, Response};
         use crate::response::EventAction;
         use crate::sys::{SysRequest, SysValue};
         let mut k = Kernel::new();
@@ -1463,14 +1840,24 @@ use crate::monitor::{MonitorMode, Response};
         };
         make_bad(&mut k);
         let v1 = k.audit(1).unwrap();
-        assert_eq!(v1.response, Response::Log, "hysteresis applies in audit-only too");
+        assert_eq!(
+            v1.response,
+            Response::Log,
+            "hysteresis applies in audit-only too"
+        );
         make_bad(&mut k);
         let v2 = k.audit(1).unwrap();
-        assert_eq!(v2.response, Response::Quarantine, "the verdict is still computed");
+        assert_eq!(
+            v2.response,
+            Response::Quarantine,
+            "the verdict is still computed"
+        );
         // ...but nothing was applied:
         assert_eq!(k.domain_state(1), Some(crate::domain::DomainState::Running));
         assert_eq!(
-            k.domain_mut(1).unwrap().request_syscall(crate::syscall::SYS_READ),
+            k.domain_mut(1)
+                .unwrap()
+                .request_syscall(crate::syscall::SYS_READ),
             crate::domain::Decision::Allowed,
             "mask untouched in AuditOnly"
         );
@@ -1495,10 +1882,7 @@ use crate::monitor::{MonitorMode, Response};
         let mut k = Kernel::new();
         k.create_domain(1, service_profile()).unwrap();
         // Open a pipe through the syscall layer: fds hold both ends.
-        let (r, w) = match k
-            .syscall(1, SysRequest::Pipe)
-            .unwrap()
-        {
+        let (r, w) = match k.syscall(1, SysRequest::Pipe).unwrap() {
             SysValue::FdPair(r, w) => (r, w),
             other => panic!("{:?}", other),
         };
@@ -1567,7 +1951,8 @@ use crate::monitor::{MonitorMode, Response};
         let mut k = Kernel::new();
         for i in 0..1000u32 {
             let id = 10 + (i % 3);
-            k.create_domain(id, crate::profile::plugin_profile()).unwrap();
+            k.create_domain(id, crate::profile::plugin_profile())
+                .unwrap();
             k.destroy_domain(id).unwrap();
         }
         // All slots empty again and the scheduler has no leftover entities.

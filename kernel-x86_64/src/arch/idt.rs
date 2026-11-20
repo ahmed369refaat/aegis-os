@@ -116,7 +116,9 @@ mod load {
         entries: [Entry; VECTORS],
     }
 
-    static mut IDT: Idt = Idt { entries: [Entry::ABSENT; VECTORS] };
+    static mut IDT: Idt = Idt {
+        entries: [Entry::ABSENT; VECTORS],
+    };
 
     #[repr(C, packed)]
     struct PseudoDescriptor {

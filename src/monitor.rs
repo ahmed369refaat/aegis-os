@@ -9,11 +9,11 @@
 //! Response tiers (per profile sensitivity, thresholds shift down as
 //! sensitivity rises):
 //! - `Log`        — default; the event lands in the telemetry ring.
-//! - `Tighten`    — after `hysteresis` consecutive windows at/above the
-//!                  tighten threshold (remove network/spawn/ioctl/mmap/open).
+//! - `Tighten` — after `hysteresis` consecutive windows at/above the
+//!   tighten threshold (the profile's degraded surface, F8).
 //! - `Quarantine` — after `hysteresis` consecutive windows at/above the
-//!                  quarantine threshold, or immediately at the instant
-//!                  threshold (near-max multi-signal misbehavior).
+//!   quarantine threshold, or immediately at the instant threshold
+//!   (near-max multi-signal misbehavior).
 //!
 //! Anti-flap: streaks only reset on a *quiet* window (below the tighten
 //! threshold); a single spiky window never escalates. The *reported* score
@@ -271,7 +271,10 @@ impl BehaviorMonitor {
             } else {
                 self.degraded = true;
             }
-            return Verdict { score: raw, response: Response::Quarantine };
+            return Verdict {
+                score: raw,
+                response: Response::Quarantine,
+            };
         }
 
         let idx = match self.index_of(domain_id) {
@@ -282,7 +285,10 @@ impl BehaviorMonitor {
                     // State table full: no hysteresis available for a new
                     // domain — degrade to Log rather than guess.
                     self.degraded = true;
-                    return Verdict { score: raw, response: Response::Log };
+                    return Verdict {
+                        score: raw,
+                        response: Response::Log,
+                    };
                 }
             },
         };
@@ -294,7 +300,10 @@ impl BehaviorMonitor {
         if st.quarantined {
             // Sticky: only an explicit admin reset revokes quarantine.
             st.last_score = st.last_score.max(raw);
-            return Verdict { score: st.last_score, response: Response::Quarantine };
+            return Verdict {
+                score: st.last_score,
+                response: Response::Quarantine,
+            };
         }
         // Streaks are independent and only reset on a quiet window.
         if raw >= q_eff {
@@ -317,9 +326,15 @@ impl BehaviorMonitor {
         };
 
         // Reported score decays gradually from the last window's level.
-        let smoothed = raw.max(st.last_score.saturating_sub(self.config.decay_per_quiet_window));
+        let smoothed = raw.max(
+            st.last_score
+                .saturating_sub(self.config.decay_per_quiet_window),
+        );
         st.last_score = smoothed;
-        Verdict { score: smoothed, response }
+        Verdict {
+            score: smoothed,
+            response,
+        }
     }
 
     /// Admin-only: clear a domain's monitor state (un-quarantine path).
@@ -344,9 +359,7 @@ impl Default for BehaviorMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syscall::{
-        SYS_EXIT, SYS_MMAP, SYS_NET_SEND, SYS_READ, SYS_SPAWN, SYS_WRITE,
-    };
+    use crate::syscall::{SYS_EXIT, SYS_MMAP, SYS_NET_SEND, SYS_READ, SYS_SPAWN, SYS_WRITE};
 
     fn stats(total: u64, denied: u64, faults: u64, esc: u64, used: &[u8]) -> DomainStats {
         let mut s = DomainStats {
@@ -370,7 +383,13 @@ mod tests {
     fn empty_stats_score_zero_and_log() {
         let mut m = BehaviorMonitor::default();
         let v = m.evaluate(1, &DomainStats::default(), &allowed_all(), 0);
-        assert_eq!(v, Verdict { score: 0, response: Response::Log });
+        assert_eq!(
+            v,
+            Verdict {
+                score: 0,
+                response: Response::Log
+            }
+        );
     }
 
     #[test]
@@ -463,7 +482,10 @@ mod tests {
         // Score 55: den 100 (20) + faults 100 (25) + out 100 (10).
         let mid = stats(2, 2, 5, 0, &[SYS_NET_SEND, SYS_SPAWN, SYS_MMAP, SYS_WRITE]);
         assert_eq!(m.score(&mid, &SyscallMask::NONE), 55);
-        assert_eq!(m.evaluate(1, &mid, &SyscallMask::NONE, 0).response, Response::Log);
+        assert_eq!(
+            m.evaluate(1, &mid, &SyscallMask::NONE, 0).response,
+            Response::Log
+        );
         let v2 = m.evaluate(1, &mid, &SyscallMask::NONE, 0);
         assert_eq!(v2.response, Response::Tighten);
         // Many more windows at 55: tighten streak grows, quarantine never
@@ -485,7 +507,13 @@ mod tests {
             &[SYS_NET_SEND, SYS_SPAWN, SYS_MMAP, SYS_WRITE],
         ); // score 100
         let v = m.evaluate(1, &catastrophic, &SyscallMask::NONE, 0);
-        assert_eq!(v, Verdict { score: 100, response: Response::Quarantine });
+        assert_eq!(
+            v,
+            Verdict {
+                score: 100,
+                response: Response::Quarantine
+            }
+        );
     }
 
     #[test]
@@ -507,7 +535,11 @@ mod tests {
         assert_eq!(first.response, Response::Log);
         for _ in 0..4 {
             let v = calm.evaluate(2, &s, &allowed_all(), 0);
-            assert_eq!(v.response, Response::Tighten, "never quarantine at score 60");
+            assert_eq!(
+                v.response,
+                Response::Tighten,
+                "never quarantine at score 60"
+            );
         }
     }
 
@@ -579,7 +611,10 @@ mod tests {
         let mut s = DomainStats::default();
         s.mark_used(SYS_EXIT);
         s.mark_used(SYS_READ);
-        assert_eq!(s.out_of_profile_bits(&SyscallMask::from_bits(1u64 << SYS_EXIT)), 1);
+        assert_eq!(
+            s.out_of_profile_bits(&SyscallMask::from_bits(1u64 << SYS_EXIT)),
+            1
+        );
         assert_eq!(s.out_of_profile_bits(&SyscallMask::ALL), 0);
     }
 }

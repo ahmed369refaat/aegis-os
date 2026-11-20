@@ -118,9 +118,18 @@ mod tests {
 
     #[test]
     fn non_power_of_two_capacity_rejected() {
-        assert!(matches!(RingBuffer::<u8, 3>::new(), Err(RingError::InvalidCapacity)));
-        assert!(matches!(RingBuffer::<u8, 6>::new(), Err(RingError::InvalidCapacity)));
-        assert!(matches!(RingBuffer::<u8, 12>::new(), Err(RingError::InvalidCapacity)));
+        assert!(matches!(
+            RingBuffer::<u8, 3>::new(),
+            Err(RingError::InvalidCapacity)
+        ));
+        assert!(matches!(
+            RingBuffer::<u8, 6>::new(),
+            Err(RingError::InvalidCapacity)
+        ));
+        assert!(matches!(
+            RingBuffer::<u8, 12>::new(),
+            Err(RingError::InvalidCapacity)
+        ));
         assert!(RingBuffer::<u8, 1>::new().is_ok());
         assert!(RingBuffer::<u8, 2>::new().is_ok());
         assert!(RingBuffer::<u8, 16>::new().is_ok());
@@ -227,7 +236,7 @@ mod tests {
     #[test]
     fn len_empty_full_transitions() {
         let mut rb = RingBuffer::<u32, 2>::new().unwrap();
-        assert!(rb.is_empty() && !rb.is_full() && rb.len() == 0);
+        assert!(rb.is_empty() && !rb.is_full() && rb.is_empty());
         rb.push(1).unwrap();
         assert!(!rb.is_empty() && !rb.is_full() && rb.len() == 1);
         rb.push(2).unwrap();

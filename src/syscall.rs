@@ -80,7 +80,9 @@ impl SyscallMask {
 
     /// Union of two masks. Only used when *building* profiles; never on live masks.
     pub const fn union(self, other: SyscallMask) -> SyscallMask {
-        SyscallMask { bits: self.bits | other.bits }
+        SyscallMask {
+            bits: self.bits | other.bits,
+        }
     }
 
     /// Build from syscall ids. Fails on any id >= `SYSCALL_COUNT`.
@@ -102,7 +104,6 @@ impl SyscallMask {
     }
 
     /// Fast-path check: O(1) AND + bit test. Errors on unknown ids.
-    #[must_use]
     pub fn is_allowed(&self, id: u8) -> Result<bool, MaskError> {
         if id >= SYSCALL_COUNT {
             return Err(MaskError::UnknownSyscall(id));
@@ -114,7 +115,9 @@ impl SyscallMask {
     /// applied to live domain masks. Monotonic by construction.
     #[must_use]
     pub fn attenuate(&self, tighter: &SyscallMask) -> SyscallMask {
-        SyscallMask { bits: self.bits & tighter.bits }
+        SyscallMask {
+            bits: self.bits & tighter.bits,
+        }
     }
 
     /// Derive `other` from `self`; succeeds only if `other` adds no bits.
@@ -208,8 +211,14 @@ mod tests {
 
     #[test]
     fn is_allowed_rejects_out_of_range_ids() {
-        assert_eq!(SyscallMask::ALL.is_allowed(64), Err(MaskError::UnknownSyscall(64)));
-        assert_eq!(SyscallMask::ALL.is_allowed(200), Err(MaskError::UnknownSyscall(200)));
+        assert_eq!(
+            SyscallMask::ALL.is_allowed(64),
+            Err(MaskError::UnknownSyscall(64))
+        );
+        assert_eq!(
+            SyscallMask::ALL.is_allowed(200),
+            Err(MaskError::UnknownSyscall(200))
+        );
     }
 
     #[test]
@@ -241,7 +250,10 @@ mod tests {
 
         assert_eq!(small.try_narrow_to(&bigger), Err(MaskError::WidenForbidden));
         assert_eq!(small.try_narrow_to(&small), Ok(small));
-        assert_eq!(small.try_narrow_to(&SyscallMask::NONE), Ok(SyscallMask::NONE));
+        assert_eq!(
+            small.try_narrow_to(&SyscallMask::NONE),
+            Ok(SyscallMask::NONE)
+        );
         assert_eq!(
             SyscallMask::NONE.try_narrow_to(&SyscallMask::ALL),
             Err(MaskError::WidenForbidden)
@@ -283,12 +295,18 @@ mod tests {
         assert_eq!(gate(&m, false, 200), Decision::BadSyscall(200));
         assert_eq!(gate(&m, true, 200), Decision::BadSyscall(200));
         // Quarantine: only EXIT passes.
-        assert_eq!(gate(&m, true, SYS_READ), Decision::DeniedQuarantined(SYS_READ));
+        assert_eq!(
+            gate(&m, true, SYS_READ),
+            Decision::DeniedQuarantined(SYS_READ)
+        );
         assert_eq!(gate(&m, true, SYS_EXIT), Decision::Allowed);
         // Mask decides the rest.
         assert_eq!(gate(&m, false, SYS_WRITE), Decision::Allowed);
         assert_eq!(gate(&m, false, SYS_KILL), Decision::DeniedByMask(SYS_KILL));
         // Empty mask denies everything except (unquarantined) nothing.
-        assert_eq!(gate(&SyscallMask::NONE, false, SYS_EXIT), Decision::DeniedByMask(SYS_EXIT));
+        assert_eq!(
+            gate(&SyscallMask::NONE, false, SYS_EXIT),
+            Decision::DeniedByMask(SYS_EXIT)
+        );
     }
 }

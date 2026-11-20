@@ -103,7 +103,7 @@ impl AddressSpace {
         if base == 0 {
             return Err(MemError::NullBase);
         }
-        if base % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
+        if !base.is_multiple_of(PAGE_SIZE) || !len.is_multiple_of(PAGE_SIZE) {
             return Err(MemError::Unaligned);
         }
         // Wraparound: the end must be representable and strictly above base.
@@ -237,12 +237,15 @@ mod tests {
         );
         assert!(as_.map(0x1000, PAGE_SIZE, MemFlags::EXEC).is_ok()); // X-only
         assert!(as_.map(0x3000, PAGE_SIZE, MemFlags::WRITE).is_ok()); // W-only
-        // GUARD alone is not an access bit.
+                                                                      // GUARD alone is not an access bit.
         assert_eq!(
             as_.map(0x5000, PAGE_SIZE, MemFlags::GUARD),
             Err(MemError::NoAccessBits)
         );
-        assert_eq!(as_.map(0x5000, PAGE_SIZE, MemFlags(0)), Err(MemError::NoAccessBits));
+        assert_eq!(
+            as_.map(0x5000, PAGE_SIZE, MemFlags(0)),
+            Err(MemError::NoAccessBits)
+        );
     }
 
     #[test]
@@ -257,10 +260,7 @@ mod tests {
         let mut as_ = AddressSpace::new(16);
         as_.map(0x10000, 4 * PAGE_SIZE, R).unwrap();
         // Fully inside.
-        assert_eq!(
-            as_.map(0x11000, PAGE_SIZE, R),
-            Err(MemError::Overlap)
-        );
+        assert_eq!(as_.map(0x11000, PAGE_SIZE, R), Err(MemError::Overlap));
         // Straddling the end.
         assert_eq!(
             as_.map(0x14000 - 0x100, 2 * PAGE_SIZE, R),
@@ -299,10 +299,7 @@ mod tests {
         assert!(as_.map(0x12000, PAGE_SIZE, R).is_ok());
         assert_eq!(as_.used_pages(), 2);
         // Anything more exceeds the quota.
-        assert_eq!(
-            as_.map(0x14000, PAGE_SIZE, R),
-            Err(MemError::QuotaExceeded)
-        );
+        assert_eq!(as_.map(0x14000, PAGE_SIZE, R), Err(MemError::QuotaExceeded));
     }
 
     #[test]
@@ -339,10 +336,7 @@ mod tests {
     fn unmap_releases_quota_for_remap_and_counts_scrub() {
         let mut as_ = AddressSpace::new(1);
         as_.map(0x1000, PAGE_SIZE, R).unwrap();
-        assert_eq!(
-            as_.map(0x3000, PAGE_SIZE, R),
-            Err(MemError::QuotaExceeded)
-        );
+        assert_eq!(as_.map(0x3000, PAGE_SIZE, R), Err(MemError::QuotaExceeded));
         let r = as_.unmap(0x1000).unwrap();
         assert_eq!(r.base, 0x1000);
         assert_eq!(as_.scrubbed_pages(), 1);

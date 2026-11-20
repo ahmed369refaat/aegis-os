@@ -22,7 +22,10 @@ pub enum BuddyError {
     /// Requested order exceeds `MAX_ORDER`.
     OrderTooLarge(u32),
     /// No free block large enough.
-    OutOfMemory { requested_order: u32, largest_free_order: u32 },
+    OutOfMemory {
+        requested_order: u32,
+        largest_free_order: u32,
+    },
     /// Frame index outside the arena (`0..N`).
     InvalidFrame(usize),
     /// Frame was never allocated (or already freed and coalesced away).
@@ -37,7 +40,10 @@ struct FreeList<const N: usize> {
 
 impl<const N: usize> FreeList<N> {
     const fn new() -> Self {
-        FreeList { frames: [0; N], len: 0 }
+        FreeList {
+            frames: [0; N],
+            len: 0,
+        }
     }
     fn push(&mut self, f: usize) {
         self.frames[self.len] = f as u16;
@@ -54,7 +60,10 @@ impl<const N: usize> FreeList<N> {
         Some(f)
     }
     fn remove(&mut self, f: usize) -> bool {
-        if let Some(pos) = self.frames[..self.len].iter().position(|&x| x as usize == f) {
+        if let Some(pos) = self.frames[..self.len]
+            .iter()
+            .position(|&x| x as usize == f)
+        {
             self.frames[pos] = self.frames[self.len - 1];
             self.len -= 1;
             true
@@ -94,7 +103,7 @@ impl<const N: usize> BuddyAllocator<N> {
     /// blocks (e.g. 256 frames = 8 blocks of 32).
     pub fn new_over_arena() -> Self {
         assert!(
-            N % MAX_BLOCK_FRAMES == 0,
+            N.is_multiple_of(MAX_BLOCK_FRAMES),
             "arena must be a multiple of the max block size"
         );
         let mut b = BuddyAllocator {
@@ -146,7 +155,7 @@ impl<const N: usize> BuddyAllocator<N> {
         self.frames_in_use += 1usize << order;
         // Sanitize (defensive): start must be aligned to its block size.
         debug_assert_eq!(start % (1usize << order), 0);
-        if start % (1usize << order) != 0 {
+        if !start.is_multiple_of(1usize << order) {
             return Err(BuddyError::InvalidFrame(start));
         }
         Ok(start)
@@ -259,7 +268,10 @@ mod tests {
         assert_eq!(b.frames_free(), 0);
         assert_eq!(
             b.alloc(0).unwrap_err(),
-            BuddyError::OutOfMemory { requested_order: 0, largest_free_order: u32::MAX }
+            BuddyError::OutOfMemory {
+                requested_order: 0,
+                largest_free_order: u32::MAX
+            }
         );
         // Free everything in reverse: the whole arena comes back.
         for f in blocks.iter().rev() {
@@ -297,8 +309,14 @@ mod tests {
     #[test]
     fn invalid_frame_index_rejected() {
         let mut b = BuddyAllocator::new();
-        assert_eq!(b.free(FRAME_COUNT), Err(BuddyError::InvalidFrame(FRAME_COUNT)));
-        assert_eq!(b.free(usize::MAX), Err(BuddyError::InvalidFrame(usize::MAX)));
+        assert_eq!(
+            b.free(FRAME_COUNT),
+            Err(BuddyError::InvalidFrame(FRAME_COUNT))
+        );
+        assert_eq!(
+            b.free(usize::MAX),
+            Err(BuddyError::InvalidFrame(usize::MAX))
+        );
     }
 
     #[test]
@@ -307,7 +325,11 @@ mod tests {
         // Two order-0 buddies inside the same order-1 block.
         let a = b.alloc(0).unwrap();
         let c = b.alloc(0).unwrap();
-        assert_eq!(a ^ 1, c, "second single page must be the buddy of the first");
+        assert_eq!(
+            a ^ 1,
+            c,
+            "second single page must be the buddy of the first"
+        );
         b.free(a).unwrap();
         // Freeing one buddy leaves the other allocated: no merge yet
         // (one page free; untouched max blocks still span the rest).

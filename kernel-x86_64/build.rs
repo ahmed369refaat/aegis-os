@@ -10,11 +10,17 @@ use std::path::PathBuf;
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
-    println!("cargo:rerun-if-changed={}", manifest.join("linker.ld").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest.join("linker.ld").display()
+    );
     println!("cargo:rerun-if-changed=build.rs");
 
     if target == "x86_64-unknown-none" {
-        println!("cargo:rustc-link-arg=-T{}", manifest.join("linker.ld").display());
+        println!(
+            "cargo:rustc-link-arg=-T{}",
+            manifest.join("linker.ld").display()
+        );
         // Freestanding, position-fixed binary: no PIE, no startup files,
         // no libc. compiler-builtins (provided by rustc) still covers the
         // arithmetic helpers the core needs (e.g. 128-bit division used by

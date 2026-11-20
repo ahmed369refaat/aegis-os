@@ -153,7 +153,10 @@ mod tests {
         let mut touched = [0u64; 8];
         let mut n = 0usize;
         let read = |va: u64| -> u8 {
-            assert!(va >= 0x100 && va < 0x103, "copy read outside the range: {va:#x}");
+            assert!(
+                (0x100..0x103).contains(&va),
+                "copy read outside the range: {va:#x}"
+            );
             (va - 0x100) as u8
         };
         let copied = copy_user_bytes(0x100, 3, &read, |b| {
@@ -164,23 +167,100 @@ mod tests {
         assert_eq!(&touched[..n], &[0, 1, 2]);
     }
 
+    /// G (review round 2): property test — validation NEVER accepts a
+    /// range that touches an unmapped page (xorshift64*, fixed seeds;
+    /// the page map is fixed: 0x1000..0x9000 present except 0x3000).
+    #[test]
+    fn property_validation_never_accepts_unmapped_pages() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+        }
+        let present = |va: u64| (0x1000..0x9000).contains(&va) && va != 0x3000;
+        for seed in [5u64, 0x5EED_5EED, 42] {
+            let mut rng = Rng(seed.max(1));
+            for _ in 0..2000 {
+                let buf = (rng.next() % 0x10) * 0x1000 + rng.next() % 0x1000;
+                let len = rng.next() % 600;
+                let ok = validate_range(buf, len, MAXW, LIMIT, PAGE, &present);
+                // Independent oracle: compute the covering pages and
+                // require ALL of them present iff ok.
+                if len == 0 {
+                    assert!(ok, "empty ranges are always valid");
+                    continue;
+                }
+                if buf.checked_add(len).is_none_or(|e| e <= buf)
+                    || buf >= LIMIT
+                    || buf.checked_add(len).unwrap() > LIMIT
+                    || len > MAXW
+                {
+                    assert!(!ok, "malformed range accepted: {buf:#x}+{len}");
+                    continue;
+                }
+                let first = buf & !(PAGE - 1);
+                let last = (buf + len - 1) & !(PAGE - 1);
+                let mut all_present = true;
+                let mut va = first;
+                while va <= last {
+                    if !present(va) {
+                        all_present = false;
+                        break;
+                    }
+                    va += PAGE;
+                }
+                assert_eq!(
+                    ok, all_present,
+                    "seed {seed}: validation={ok} but oracle={all_present} for {buf:#x}+{len}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn span_arithmetic_edge_cases() {
         // len = 0: no pages, valid.
         assert_eq!(span_pages(0x403000, 0, MAXW, LIMIT, PAGE), Ok(None));
         // len = 1 at the last byte of a page.
-        assert_eq!(span_pages(0x403FFF, 1, MAXW, LIMIT, PAGE), Ok(Some((0x403000, 0x403000))));
+        assert_eq!(
+            span_pages(0x403FFF, 1, MAXW, LIMIT, PAGE),
+            Ok(Some((0x403000, 0x403000)))
+        );
         // len = 3 ending exactly at a page end: still one page.
-        assert_eq!(span_pages(0x403FFD, 3, MAXW, LIMIT, PAGE), Ok(Some((0x403000, 0x403000))));
+        assert_eq!(
+            span_pages(0x403FFD, 3, MAXW, LIMIT, PAGE),
+            Ok(Some((0x403000, 0x403000)))
+        );
         // Crossing into the next page: two pages.
-        assert_eq!(span_pages(0x403FFF, 2, MAXW, LIMIT, PAGE), Ok(Some((0x403000, 0x404000))));
+        assert_eq!(
+            span_pages(0x403FFF, 2, MAXW, LIMIT, PAGE),
+            Ok(Some((0x403000, 0x404000)))
+        );
         // buf + len wraps.
-        assert_eq!(span_pages(u64::MAX, 2, MAXW, LIMIT, PAGE), Err(RangeError::Overflow));
+        assert_eq!(
+            span_pages(u64::MAX, 2, MAXW, LIMIT, PAGE),
+            Err(RangeError::Overflow)
+        );
         // buf at/above the user limit.
-        assert_eq!(span_pages(LIMIT, 1, MAXW, LIMIT, PAGE), Err(RangeError::AboveUserLimit));
-        assert_eq!(span_pages(LIMIT + 5, 1, MAXW, LIMIT, PAGE), Err(RangeError::AboveUserLimit));
+        assert_eq!(
+            span_pages(LIMIT, 1, MAXW, LIMIT, PAGE),
+            Err(RangeError::AboveUserLimit)
+        );
+        assert_eq!(
+            span_pages(LIMIT + 5, 1, MAXW, LIMIT, PAGE),
+            Err(RangeError::AboveUserLimit)
+        );
         // len above the syscall maximum.
-        assert_eq!(span_pages(0x1000, MAXW + 1, MAXW, LIMIT, PAGE), Err(RangeError::TooLong));
+        assert_eq!(
+            span_pages(0x1000, MAXW + 1, MAXW, LIMIT, PAGE),
+            Err(RangeError::TooLong)
+        );
     }
 
     #[test]
@@ -197,6 +277,13 @@ mod tests {
         // Zero length on an unmapped address: nothing to touch.
         assert!(validate_range(0x999_0000, 0, MAXW, LIMIT, PAGE, &one_page));
         // A kernel-half address is never user memory.
-        assert!(!validate_range(0xFFFF_8000_0000_0000, 1, MAXW, LIMIT, PAGE, &one_page));
+        assert!(!validate_range(
+            0xFFFF_8000_0000_0000,
+            1,
+            MAXW,
+            LIMIT,
+            PAGE,
+            &one_page
+        ));
     }
 }

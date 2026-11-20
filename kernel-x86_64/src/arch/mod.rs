@@ -15,9 +15,9 @@ pub mod fault_class;
 pub mod features;
 pub mod frame;
 pub mod gdt;
+pub mod idt;
 #[cfg(not(test))]
 pub mod image_map;
-pub mod idt;
 
 #[cfg(not(test))]
 pub mod exceptions;

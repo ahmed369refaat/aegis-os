@@ -28,7 +28,10 @@ pub struct InodeRef {
 /// The root directory's reference. The root inode is created once in
 /// `Vfs::new` (generation 1) and can never be unlinked, so its
 /// generation is a constant.
-pub const ROOT_REF: InodeRef = InodeRef { id: ROOT_ID, generation: 1 };
+pub const ROOT_REF: InodeRef = InodeRef {
+    id: ROOT_ID,
+    generation: 1,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InodeKind {
@@ -102,7 +105,10 @@ pub struct Vfs {
 
 impl Vfs {
     pub fn new() -> Self {
-        let mut fs = Vfs { inodes: [None; MAX_INODES], generations: [0; MAX_INODES] };
+        let mut fs = Vfs {
+            inodes: [None; MAX_INODES],
+            generations: [0; MAX_INODES],
+        };
         fs.generations[0] = 1;
         fs.inodes[0] = Some(Inode {
             generation: 1,
@@ -292,7 +298,10 @@ impl Vfs {
             }
         }
         let generation = self.inode(cur)?.generation;
-        Ok(InodeRef { id: cur, generation })
+        Ok(InodeRef {
+            id: cur,
+            generation,
+        })
     }
 
     /// Resolve the parent directory of the final component.
@@ -413,9 +422,7 @@ impl Vfs {
         let (parent, name) = self.resolve_parent(root, cwd, path, creds)?;
         self.check_access(parent, creds, Access::Write)?;
         self.check_access(parent, creds, Access::Exec)?;
-        let target = self
-            .child_by_name(parent, name)
-            .ok_or(VfsError::NotFound)?;
+        let target = self.child_by_name(parent, name).ok_or(VfsError::NotFound)?;
         // Sticky-bit-like protection for the tree root.
         if target == ROOT_ID {
             return Err(VfsError::PermissionDenied);
@@ -430,10 +437,7 @@ impl Vfs {
     /// Whether a directory has any entries (no allocation).
     #[must_use]
     pub fn has_children(&self, dir: u32) -> bool {
-        self.inodes
-            .iter()
-            .flatten()
-            .any(|i| i.parent == dir)
+        self.inodes.iter().flatten().any(|i| i.parent == dir)
     }
 
     /// Read file content by inode reference (permission check on the
@@ -499,11 +503,7 @@ impl Vfs {
     }
 
     /// F11(c): explicit truncation (Open with the truncate flag).
-    pub fn truncate(
-        &mut self,
-        r: InodeRef,
-        creds: Credentials,
-    ) -> Result<(), VfsError> {
+    pub fn truncate(&mut self, r: InodeRef, creds: Credentials) -> Result<(), VfsError> {
         let id = self.live(r)?;
         if self.inode(id)?.kind != InodeKind::File {
             return Err(VfsError::IsADirectory);
@@ -515,12 +515,22 @@ impl Vfs {
 
     #[must_use]
     pub fn size_of(&self, r: InodeRef) -> Option<usize> {
-        self.live(r).ok().and_then(|id| self.inodes.get(id as usize).and_then(|s| s.as_ref()).map(|i| i.size))
+        self.live(r).ok().and_then(|id| {
+            self.inodes
+                .get(id as usize)
+                .and_then(|s| s.as_ref())
+                .map(|i| i.size)
+        })
     }
 
     #[must_use]
     pub fn kind_of(&self, r: InodeRef) -> Option<InodeKind> {
-        self.live(r).ok().and_then(|id| self.inodes.get(id as usize).and_then(|s| s.as_ref()).map(|i| i.kind))
+        self.live(r).ok().and_then(|id| {
+            self.inodes
+                .get(id as usize)
+                .and_then(|s| s.as_ref())
+                .map(|i| i.kind)
+        })
     }
 
     pub fn stat(
@@ -576,18 +586,31 @@ mod tests {
     use super::*;
 
     const ROOT_CREDS: Credentials = Credentials { uid: 0, gid: 0 };
-    const USER: Credentials = Credentials { uid: 1000, gid: 1000 };
-    const GROUPIE: Credentials = Credentials { uid: 2000, gid: 1000 };
-    const STRANGER: Credentials = Credentials { uid: 3000, gid: 3000 };
+    const USER: Credentials = Credentials {
+        uid: 1000,
+        gid: 1000,
+    };
+    const GROUPIE: Credentials = Credentials {
+        uid: 2000,
+        gid: 1000,
+    };
+    const STRANGER: Credentials = Credentials {
+        uid: 3000,
+        gid: 3000,
+    };
 
     fn fs_with(user_dir: bool) -> Vfs {
         let mut fs = Vfs::new();
         // /pub: world-readable dir; /home: owned by user 1000.
-        fs.mkdir(ROOT_REF, ROOT_REF, "/pub", ROOT_CREDS, Mode(0o777)).unwrap();
-        fs.mkdir(ROOT_REF, ROOT_REF, "/home", ROOT_CREDS, Mode(0o777)).unwrap();
-        fs.create(ROOT_REF, ROOT_REF, "/home/notes.txt", USER, Mode(0o644)).unwrap();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/pub", ROOT_CREDS, Mode(0o777))
+            .unwrap();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/home", ROOT_CREDS, Mode(0o777))
+            .unwrap();
+        fs.create(ROOT_REF, ROOT_REF, "/home/notes.txt", USER, Mode(0o644))
+            .unwrap();
         if user_dir {
-            fs.mkdir(ROOT_REF, ROOT_REF, "/home/alice", USER, Mode(0o750)).unwrap();
+            fs.mkdir(ROOT_REF, ROOT_REF, "/home/alice", USER, Mode(0o750))
+                .unwrap();
         }
         fs
     }
@@ -595,9 +618,18 @@ mod tests {
     #[test]
     fn root_exists_and_resolves() {
         let fs = Vfs::new();
-        assert_eq!(fs.resolve(ROOT_REF, ROOT_REF, "/", ROOT_CREDS), Ok(ROOT_REF));
-        assert_eq!(fs.resolve(ROOT_REF, ROOT_REF, ".", ROOT_CREDS), Ok(ROOT_REF));
-        assert_eq!(fs.resolve(ROOT_REF, ROOT_REF, "/..", ROOT_CREDS), Ok(ROOT_REF));
+        assert_eq!(
+            fs.resolve(ROOT_REF, ROOT_REF, "/", ROOT_CREDS),
+            Ok(ROOT_REF)
+        );
+        assert_eq!(
+            fs.resolve(ROOT_REF, ROOT_REF, ".", ROOT_CREDS),
+            Ok(ROOT_REF)
+        );
+        assert_eq!(
+            fs.resolve(ROOT_REF, ROOT_REF, "/..", ROOT_CREDS),
+            Ok(ROOT_REF)
+        );
     }
 
     #[test]
@@ -611,7 +643,8 @@ mod tests {
         let mut buf = [0u8; 32];
         assert_eq!(fs.read_by_id(id, USER, &mut buf).unwrap(), 11);
         assert_eq!(&buf[..11], b"hello aegis");
-        let (kind, size, uid, gid, mode) = fs.stat(ROOT_REF, ROOT_REF, "/pub/data.txt", USER).unwrap();
+        let (kind, size, uid, gid, mode) =
+            fs.stat(ROOT_REF, ROOT_REF, "/pub/data.txt", USER).unwrap();
         assert_eq!((kind, size, uid, gid), (InodeKind::File, 11, 1000, 1000));
         assert_eq!(mode, Mode(0o644));
     }
@@ -633,11 +666,17 @@ mod tests {
     fn dot_dotdot_and_double_slashes_normalize() {
         let fs = fs_with(false);
         // /pub/../home/./notes.txt == /home/notes.txt
-        let a = fs.resolve(ROOT_REF, ROOT_REF, "/pub/../home/./notes.txt", USER).unwrap();
-        let b = fs.resolve(ROOT_REF, ROOT_REF, "/home/notes.txt", USER).unwrap();
+        let a = fs
+            .resolve(ROOT_REF, ROOT_REF, "/pub/../home/./notes.txt", USER)
+            .unwrap();
+        let b = fs
+            .resolve(ROOT_REF, ROOT_REF, "/home/notes.txt", USER)
+            .unwrap();
         assert_eq!(a, b);
         // Repeated and trailing slashes.
-        let c = fs.resolve(ROOT_REF, ROOT_REF, "//home//notes.txt//", USER).unwrap();
+        let c = fs
+            .resolve(ROOT_REF, ROOT_REF, "//home//notes.txt//", USER)
+            .unwrap();
         assert_eq!(c, b);
     }
 
@@ -646,7 +685,9 @@ mod tests {
         let fs = fs_with(false);
         let home = fs.resolve(ROOT_REF, ROOT_REF, "/home", USER).unwrap();
         let a = fs.resolve(ROOT_REF, home, "notes.txt", USER).unwrap();
-        let b = fs.resolve(ROOT_REF, ROOT_REF, "/home/notes.txt", USER).unwrap();
+        let b = fs
+            .resolve(ROOT_REF, ROOT_REF, "/home/notes.txt", USER)
+            .unwrap();
         assert_eq!(a, b);
         // ../pub from /home
         let c = fs.resolve(ROOT_REF, home, "../pub", USER).unwrap();
@@ -666,7 +707,13 @@ mod tests {
             Err(VfsError::NotADirectory)
         );
         assert_eq!(
-            fs.mkdir(ROOT_REF, ROOT_REF, "/home/notes.txt/sub", ROOT_CREDS, Mode(0o755)),
+            fs.mkdir(
+                ROOT_REF,
+                ROOT_REF,
+                "/home/notes.txt/sub",
+                ROOT_CREDS,
+                Mode(0o755)
+            ),
             Err(VfsError::NotADirectory)
         );
     }
@@ -676,10 +723,20 @@ mod tests {
         let mut fs = Vfs::new();
         // /vault: readable but not executable for others (can list stat on
         // the dir itself, cannot enter).
-        fs.mkdir(ROOT_REF, ROOT_REF, "/vault", ROOT_CREDS, Mode(0o644)).unwrap();
-        fs.create(ROOT_REF, ROOT_REF, "/vault/secret.txt", ROOT_CREDS, Mode(0o600)).unwrap();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/vault", ROOT_CREDS, Mode(0o644))
+            .unwrap();
+        fs.create(
+            ROOT_REF,
+            ROOT_REF,
+            "/vault/secret.txt",
+            ROOT_CREDS,
+            Mode(0o600),
+        )
+        .unwrap();
         // Owner can traverse.
-        assert!(fs.resolve(ROOT_REF, ROOT_REF, "/vault/secret.txt", ROOT_CREDS).is_ok());
+        assert!(fs
+            .resolve(ROOT_REF, ROOT_REF, "/vault/secret.txt", ROOT_CREDS)
+            .is_ok());
         // Others cannot (no x bit for other).
         assert_eq!(
             fs.resolve(ROOT_REF, ROOT_REF, "/vault/secret.txt", USER),
@@ -691,8 +748,11 @@ mod tests {
     fn owner_group_other_bits() {
         let mut fs = Vfs::new();
         // File owned by 1000:1000, group r, other nothing.
-        fs.mkdir(ROOT_REF, ROOT_REF, "/d", ROOT_CREDS, Mode(0o777)).unwrap();
-        let id = fs.create(ROOT_REF, ROOT_REF, "/d/f", USER, Mode(0o640)).unwrap();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/d", ROOT_CREDS, Mode(0o777))
+            .unwrap();
+        let id = fs
+            .create(ROOT_REF, ROOT_REF, "/d/f", USER, Mode(0o640))
+            .unwrap();
         // Owner: r ok, w ok.
         assert!(fs.read_by_id(id, USER, &mut [0; 8]).is_ok());
         assert!(fs.write_at(id, USER, 0, b"x").is_ok());
@@ -739,15 +799,20 @@ mod tests {
     fn create_denied_without_write_on_parent() {
         let mut fs = Vfs::new();
         // /ro: r-x for others (can enter, cannot create).
-        fs.mkdir(ROOT_REF, ROOT_REF, "/ro", ROOT_CREDS, Mode(0o755)).unwrap();
-        fs.chmod(ROOT_REF, ROOT_REF, "/ro", USER, Mode(0o555)).unwrap_err(); // not owner
-        fs.chmod(ROOT_REF, ROOT_REF, "/ro", ROOT_CREDS, Mode(0o555)).unwrap();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/ro", ROOT_CREDS, Mode(0o755))
+            .unwrap();
+        fs.chmod(ROOT_REF, ROOT_REF, "/ro", USER, Mode(0o555))
+            .unwrap_err(); // not owner
+        fs.chmod(ROOT_REF, ROOT_REF, "/ro", ROOT_CREDS, Mode(0o555))
+            .unwrap();
         assert_eq!(
             fs.create(ROOT_REF, ROOT_REF, "/ro/f.txt", USER, Mode(0o644)),
             Err(VfsError::PermissionDenied)
         );
         // Root creates fine (bypass).
-        assert!(fs.create(ROOT_REF, ROOT_REF, "/ro/f.txt", ROOT_CREDS, Mode(0o644)).is_ok());
+        assert!(fs
+            .create(ROOT_REF, ROOT_REF, "/ro/f.txt", ROOT_CREDS, Mode(0o644))
+            .is_ok());
     }
 
     #[test]
@@ -757,9 +822,15 @@ mod tests {
         // Chroot to /home/alice: ".." cannot climb above it.
         assert_eq!(fs.resolve(alice, alice, "..", USER), Ok(alice));
         assert_eq!(fs.resolve(alice, alice, "../../..", USER), Ok(alice));
-        assert_eq!(fs.resolve(alice, alice, "../../../home/notes.txt", USER), Err(VfsError::NotFound));
+        assert_eq!(
+            fs.resolve(alice, alice, "../../../home/notes.txt", USER),
+            Err(VfsError::NotFound)
+        );
         // Absolute paths are also relative to the chroot root.
-        assert_eq!(fs.resolve(alice, alice, "/home/notes.txt", USER), Err(VfsError::NotFound));
+        assert_eq!(
+            fs.resolve(alice, alice, "/home/notes.txt", USER),
+            Err(VfsError::NotFound)
+        );
     }
 
     #[test]
@@ -781,7 +852,8 @@ mod tests {
     #[test]
     fn unlink_file_and_empty_dir_but_not_nonempty() {
         let mut fs = fs_with(true);
-        fs.unlink(ROOT_REF, ROOT_REF, "/home/notes.txt", USER).unwrap();
+        fs.unlink(ROOT_REF, ROOT_REF, "/home/notes.txt", USER)
+            .unwrap();
         assert_eq!(
             fs.resolve(ROOT_REF, ROOT_REF, "/home/notes.txt", USER),
             Err(VfsError::NotFound)
@@ -804,8 +876,10 @@ mod tests {
     #[test]
     fn unlink_denied_without_parent_write() {
         let mut fs = Vfs::new();
-        fs.mkdir(ROOT_REF, ROOT_REF, "/ro", ROOT_CREDS, Mode(0o555)).unwrap();
-        fs.create(ROOT_REF, ROOT_REF, "/ro/f", ROOT_CREDS, Mode(0o644)).unwrap();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/ro", ROOT_CREDS, Mode(0o555))
+            .unwrap();
+        fs.create(ROOT_REF, ROOT_REF, "/ro/f", ROOT_CREDS, Mode(0o644))
+            .unwrap();
         assert_eq!(
             fs.unlink(ROOT_REF, ROOT_REF, "/ro/f", USER),
             Err(VfsError::PermissionDenied)
@@ -822,11 +896,21 @@ mod tests {
             Err(VfsError::PermissionDenied)
         );
         // Owner changes mode, then others can write.
-        fs.chmod(ROOT_REF, ROOT_REF, "/home/notes.txt", USER, Mode(0o666)).unwrap();
-        let id = fs.resolve(ROOT_REF, ROOT_REF, "/home/notes.txt", USER).unwrap();
+        fs.chmod(ROOT_REF, ROOT_REF, "/home/notes.txt", USER, Mode(0o666))
+            .unwrap();
+        let id = fs
+            .resolve(ROOT_REF, ROOT_REF, "/home/notes.txt", USER)
+            .unwrap();
         assert!(fs.write_at(id, STRANGER, 0, b"now").is_ok());
         // Root can chmod anything.
-        fs.chmod(ROOT_REF, ROOT_REF, "/home/notes.txt", ROOT_CREDS, Mode(0o600)).unwrap();
+        fs.chmod(
+            ROOT_REF,
+            ROOT_REF,
+            "/home/notes.txt",
+            ROOT_CREDS,
+            Mode(0o600),
+        )
+        .unwrap();
         assert_eq!(
             fs.write_at(id, STRANGER, 0, b"nope"),
             Err(VfsError::PermissionDenied)
@@ -836,20 +920,29 @@ mod tests {
     #[test]
     fn oversize_write_and_name_rejected() {
         let mut fs = Vfs::new();
-        let id = fs.create(ROOT_REF, ROOT_REF, "/f", ROOT_CREDS, Mode(0o644)).unwrap();
+        let id = fs
+            .create(ROOT_REF, ROOT_REF, "/f", ROOT_CREDS, Mode(0o644))
+            .unwrap();
         assert_eq!(
             fs.write_at(id, ROOT_CREDS, 0, &[0u8; FILE_DATA_MAX + 1]),
             Err(VfsError::NoSpace)
         );
         // Exactly capacity is fine.
         assert_eq!(
-            fs.write_at(id, ROOT_CREDS, 0, &[1u8; FILE_DATA_MAX]).unwrap(),
+            fs.write_at(id, ROOT_CREDS, 0, &[1u8; FILE_DATA_MAX])
+                .unwrap(),
             FILE_DATA_MAX
         );
         // Long name.
         let long = "a".repeat(NAME_MAX + 1);
         assert_eq!(
-            fs.create(ROOT_REF, ROOT_REF, &format!("/{}", long), ROOT_CREDS, Mode(0o644)),
+            fs.create(
+                ROOT_REF,
+                ROOT_REF,
+                &format!("/{}", long),
+                ROOT_CREDS,
+                Mode(0o644)
+            ),
             Err(VfsError::NameTooLong)
         );
     }
@@ -858,7 +951,8 @@ mod tests {
     fn inode_table_fills_at_max() {
         let mut fs = Vfs::new();
         // Root + 1 dir used; fill the rest.
-        fs.mkdir(ROOT_REF, ROOT_REF, "/d", ROOT_CREDS, Mode(0o755)).unwrap();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/d", ROOT_CREDS, Mode(0o755))
+            .unwrap();
         for i in 0..(MAX_INODES - 2) {
             fs.create(
                 ROOT_REF,
@@ -875,7 +969,9 @@ mod tests {
         );
         // Unlink frees a slot for reuse.
         fs.unlink(ROOT_REF, ROOT_REF, "/d/f0", ROOT_CREDS).unwrap();
-        assert!(fs.create(ROOT_REF, ROOT_REF, "/d/again", ROOT_CREDS, Mode(0o644)).is_ok());
+        assert!(fs
+            .create(ROOT_REF, ROOT_REF, "/d/again", ROOT_CREDS, Mode(0o644))
+            .is_ok());
     }
 
     /// F11(a): `..` requires the x bit on the directory being LEFT —
@@ -885,11 +981,18 @@ mod tests {
     #[test]
     fn dotdot_requires_x_bit_on_the_directory_being_left() {
         let mut fs = Vfs::new();
-        fs.mkdir(ROOT_REF, ROOT_REF, "/nx", ROOT_CREDS, Mode(0o644)).unwrap();
-        fs.mkdir(ROOT_REF, ROOT_REF, "/nx/inner", ROOT_CREDS, Mode(0o755)).unwrap();
-        let inner = fs.resolve(ROOT_REF, ROOT_REF, "/nx/inner", ROOT_CREDS).unwrap();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/nx", ROOT_CREDS, Mode(0o644))
+            .unwrap();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/nx/inner", ROOT_CREDS, Mode(0o755))
+            .unwrap();
+        let inner = fs
+            .resolve(ROOT_REF, ROOT_REF, "/nx/inner", ROOT_CREDS)
+            .unwrap();
         // One ".." leaves inner (x on inner: fine) and lands on /nx.
-        assert_eq!(fs.resolve(ROOT_REF, inner, "..", USER), Ok(fs.resolve(ROOT_REF, ROOT_REF, "/nx", ROOT_CREDS).unwrap()));
+        assert_eq!(
+            fs.resolve(ROOT_REF, inner, "..", USER),
+            Ok(fs.resolve(ROOT_REF, ROOT_REF, "/nx", ROOT_CREDS).unwrap())
+        );
         // The second ".." leaves /nx — no x bit for USER there: denied.
         assert_eq!(
             fs.resolve(ROOT_REF, inner, "../..", USER),

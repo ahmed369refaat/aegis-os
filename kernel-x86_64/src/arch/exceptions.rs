@@ -24,7 +24,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// addition; these statics remain for the vectors that must switch stacks
 /// *before* any allocator exists (ADR-0005 documents the interim).
 #[repr(align(16))]
-struct IstStack([u8; 0x4000]);
+struct IstStack(
+    /// Addressed only through `addr_of!`/`addr_of_mut!` (tops are
+    /// address arithmetic; the field is never read by name).
+    #[allow(dead_code)]
+    [u8; 0x4000],
+);
 
 // F16 (ADR-0006): `static mut` so these land in `.bss` (writable
 // NOBITS). As plain `static` they were immutable data that only worked
@@ -171,13 +176,7 @@ fn dispatch(f: &mut ExceptionFrame) {
         let user_rsp = unsafe { core::ptr::addr_of!(f.rflags).add(1).read() };
         let user_ss = unsafe { core::ptr::addr_of!(f.rflags).add(2).read() };
         let _ = user_ss;
-        crate::sched::context::record_fault(
-            f.vector as u8,
-            cr2,
-            f.error_code,
-            f.rip,
-            user_rsp,
-        );
+        crate::sched::context::record_fault(f.vector as u8, cr2, f.error_code, f.rip, user_rsp);
         // N2 (ADR-0007 §2): the user's death is an organic fault signal
         // on the LIVE domain, and drives the monitor clock.
         crate::sched::context::note_live_fault();
@@ -188,7 +187,9 @@ fn dispatch(f: &mut ExceptionFrame) {
         // ring-3 machinery is armed and host-tested — end the boot with
         // the honest verdict instead of a lost resume jump.
         serial::write_str("[RING3] launch blocked: ring-3 entry faults in this QEMU build\n");
-        serial::write_str("[RING3] (machinery armed + host-tested; see docs/arch/syscall-entry.md)\n");
+        serial::write_str(
+            "[RING3] (machinery armed + host-tested; see docs/arch/syscall-entry.md)\n",
+        );
         serial::write_str("[RING3] ring-3 step concluded: blocked (environment), kernel intact\n");
         hw::shutdown_qemu();
     }
@@ -220,10 +221,7 @@ fn dispatch(f: &mut ExceptionFrame) {
         serial::write_str("[EXC] NX selftest: exec of NX page faulted (I/D), rip advanced\n");
         return;
     }
-    if ARMED_WP.load(Ordering::SeqCst)
-        && f.vector == 14
-        && cr2 == WP_VA.load(Ordering::SeqCst)
-    {
+    if ARMED_WP.load(Ordering::SeqCst) && f.vector == 14 && cr2 == WP_VA.load(Ordering::SeqCst) {
         // CR0.WP: a supervisor write to a read-only page faults. Data
         // faults report the faulting instruction; advance past it.
         f.rip += MOV_LEN;
@@ -259,9 +257,7 @@ fn dispatch(f: &mut ExceptionFrame) {
         serial::write_str("[SEC ] SMEP selftest: kernel exec of user RX page faulted (I/D)\n");
         return;
     }
-    if ARMED_SMAP.load(Ordering::SeqCst)
-        && f.vector == 14
-        && cr2 == SMAP_VA.load(Ordering::SeqCst)
+    if ARMED_SMAP.load(Ordering::SeqCst) && f.vector == 14 && cr2 == SMAP_VA.load(Ordering::SeqCst)
     {
         // SMAP: a CPL0 data access to a user page outside the STAC
         // window. Data faults report the faulting instruction; advance
@@ -271,10 +267,7 @@ fn dispatch(f: &mut ExceptionFrame) {
         serial::write_str("[SEC ] SMAP selftest: kernel read of user page outside STAC faulted\n");
         return;
     }
-    if ARMED_DG.load(Ordering::SeqCst)
-        && f.vector == 14
-        && cr2 == DG_VA.load(Ordering::SeqCst)
-    {
+    if ARMED_DG.load(Ordering::SeqCst) && f.vector == 14 && cr2 == DG_VA.load(Ordering::SeqCst) {
         // A read into a policy guard-gap page: absent PTE by design.
         f.rip += MOV_LEN;
         ARMED_DG.store(false, Ordering::SeqCst);
@@ -313,7 +306,9 @@ fn dispatch(f: &mut ExceptionFrame) {
         ) {
             super::fault_class::FaultOwner::KernelBugUserCopy => {
                 serial::write_str("[SEC ] KERNEL BUG: #PF inside the user-copy routine (copy escaped the validated span)\n");
-                serial::write_str("[EXC] halting: this is unreachable by construction (ADR-0007)\n");
+                serial::write_str(
+                    "[EXC] halting: this is unreachable by construction (ADR-0007)\n",
+                );
                 hw::halt_forever()
             }
             super::fault_class::FaultOwner::KernelBug => {
@@ -333,13 +328,7 @@ fn dispatch(f: &mut ExceptionFrame) {
         } else {
             0
         };
-        crate::sched::context::record_fault(
-            f.vector as u8,
-            cr2,
-            f.error_code,
-            f.rip,
-            user_rsp,
-        );
+        crate::sched::context::record_fault(f.vector as u8, cr2, f.error_code, f.rip, user_rsp);
         serial::write_str("[RING3] user fault: domain terminated, kernel resumes\n");
         // If the launch swapped GS into user mode, undo it (a fault from
         // ring-3 arrives with GS already user-side; one from CPL0 during
@@ -357,11 +346,15 @@ fn dispatch(f: &mut ExceptionFrame) {
         // honestly: the machinery is armed and host-tested, the kernel
         // is intact, and the ring-3 step reports itself as blocked.
         serial::write_str("[RING3] launch blocked: ring-3 entry faults in this QEMU build\n");
-        serial::write_str("[RING3] (machinery armed + host-tested; see docs/arch/syscall-entry.md)\n");
+        serial::write_str(
+            "[RING3] (machinery armed + host-tested; see docs/arch/syscall-entry.md)\n",
+        );
         serial::write_str("[RING3] ring-3 step concluded: blocked (environment), kernel intact\n");
         hw::shutdown_qemu();
     }
-    serial::write_str("[EXC] unexpected fault — halting (kernel bug; see docs/arch/exceptions.md)\n");
+    serial::write_str(
+        "[EXC] unexpected fault — halting (kernel bug; see docs/arch/exceptions.md)\n",
+    );
     hw::halt_forever()
 }
 

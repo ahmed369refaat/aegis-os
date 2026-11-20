@@ -48,9 +48,9 @@ pub extern "C" fn aegis_entry_64() {
         // AT&T syntax: every operand is explicit about immediate vs memory.
         // (1) Save the stub-passed values in callee-saved registers while
         //     .bss is still unsafe to touch (it is about to be zeroed).
-        "movl    %edi, %ebx",          // magic
-        "movl    %esi, %r12d",         // info address
-        "movq    %rdx, %rbp",          // boot TSC
+        "movl    %edi, %ebx",  // magic
+        "movl    %esi, %r12d", // info address
+        "movq    %rdx, %rbp",  // boot TSC
         // 2. Zero .bss: [ _bss_start, _bss_end ), 8 bytes at a time.
         //    The multiboot loader zeroed the *stub's* bss only; the
         //    kernel's .bss (beyond the embedded blob) is ours to clear.

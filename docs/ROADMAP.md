@@ -40,7 +40,7 @@ a bootable two-stage x86_64 kernel (ELF32 multiboot stub → ELF64 kernel)
 with a real 256-frame pool, scrub-on-free verified by read-back, kernel-
 resident domains, and a CI boot test asserting the M1 exit criteria — 23
 kernel host tests; 219 total, zero external dependencies, unsafe confined
-to a three-module allowlist.
+to the allowlist (arch/, boot/, hw.rs, memops.rs, sched/ — as defined in scripts/check_unsafe.sh).
 
 **Not present at all (each gets its stage below):** Ring-3 isolation,
 per-domain page tables, interrupts/exceptions, timers, IPC, block devices,

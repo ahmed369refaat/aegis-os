@@ -78,7 +78,10 @@ fn escalating_parser_is_tightened_then_quarantined() {
     assert_eq!(k.domain_state(1), Some(DomainState::Tightened));
     // The tightened surface actually removed the dangerous syscalls.
     let mask = k.domain_mask(1).unwrap();
-    assert!(!mask.is_allowed(SYS_MMAP).unwrap(), "MMAP dropped by tighten");
+    assert!(
+        !mask.is_allowed(SYS_MMAP).unwrap(),
+        "MMAP dropped by tighten"
+    );
     assert!(mask.is_allowed(SYS_READ).unwrap(), "READ survives tighten");
     assert!(mask.is_subset_of(&parser_profile().syscalls));
 
@@ -166,7 +169,14 @@ fn quarantine_is_isolated_per_domain() {
     assert_eq!(v.response, Response::Quarantine, "score {}", v.score);
 
     // The service domain keeps working through the entire incident.
-    for syscall in [SYS_READ, SYS_WRITE, SYS_OPEN, SYS_CLOSE, SYS_IPC_SEND, SYS_IPC_RECV] {
+    for syscall in [
+        SYS_READ,
+        SYS_WRITE,
+        SYS_OPEN,
+        SYS_CLOSE,
+        SYS_IPC_SEND,
+        SYS_IPC_RECV,
+    ] {
         assert_eq!(k.dispatch(2, syscall).unwrap(), Decision::Allowed);
     }
     let v2 = k.audit(2).unwrap();
@@ -229,7 +239,9 @@ fn domain_memory_policy_and_capabilities() {
 
     // Quota comes from the profile (64 pages).
     assert_eq!(d.space.quota_pages(), 64);
-    d.space.map(0x10000, 16 * PAGE_SIZE, MemFlags::READ).unwrap();
+    d.space
+        .map(0x10000, 16 * PAGE_SIZE, MemFlags::READ)
+        .unwrap();
     assert_eq!(d.space.used_pages(), 16);
     // W^X holds for domains too.
     assert_eq!(
@@ -242,7 +254,9 @@ fn domain_memory_policy_and_capabilities() {
         Err(MemError::QuotaExceeded)
     );
     // Exact remaining quota fits.
-    d.space.map(0x50000, 48 * PAGE_SIZE, MemFlags::READ).unwrap();
+    d.space
+        .map(0x50000, 48 * PAGE_SIZE, MemFlags::READ)
+        .unwrap();
     assert_eq!(d.space.used_pages(), 64);
 
     // Capability: driver-style grant + attenuation, escalation rejected.

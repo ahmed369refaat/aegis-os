@@ -41,14 +41,16 @@ pub struct FdTable {
 
 impl FdTable {
     pub const fn new() -> Self {
-        FdTable { slots: [None; MAX_FDS] }
+        FdTable {
+            slots: [None; MAX_FDS],
+        }
     }
 
     /// Allocate the lowest free descriptor (Linux behavior).
     pub fn alloc(&mut self, target: FdTarget) -> Result<u8, FdError> {
-        for i in 0..MAX_FDS {
-            if self.slots[i].is_none() {
-                self.slots[i] = Some(FdEntry { target, pos: 0 });
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(FdEntry { target, pos: 0 });
                 return Ok(i as u8);
             }
         }
@@ -111,7 +113,10 @@ mod tests {
     use super::*;
 
     fn file(i: u32) -> FdTarget {
-        FdTarget::File(crate::vfs::InodeRef { id: i, generation: 1 })
+        FdTarget::File(crate::vfs::InodeRef {
+            id: i,
+            generation: 1,
+        })
     }
 
     #[test]
@@ -203,10 +208,20 @@ mod tests {
         let mut t = FdTable::new();
         t.alloc(FdTarget::PipeRead(0)).unwrap();
         t.alloc(FdTarget::PipeWrite(0)).unwrap();
-        t.alloc(FdTarget::File(crate::vfs::InodeRef { id: 3, generation: 1 })).unwrap();
+        t.alloc(FdTarget::File(crate::vfs::InodeRef {
+            id: 3,
+            generation: 1,
+        }))
+        .unwrap();
         assert_eq!(t.get(0).unwrap().target, FdTarget::PipeRead(0));
         assert_eq!(t.get(1).unwrap().target, FdTarget::PipeWrite(0));
-        assert_eq!(t.get(2).unwrap().target, FdTarget::File(crate::vfs::InodeRef { id: 3, generation: 1 }));
+        assert_eq!(
+            t.get(2).unwrap().target,
+            FdTarget::File(crate::vfs::InodeRef {
+                id: 3,
+                generation: 1
+            })
+        );
         assert_eq!(t.len(), 3);
     }
 }

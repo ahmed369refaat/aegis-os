@@ -89,9 +89,10 @@ logging while instant quarantine still fires.
 - **Zero external dependencies** — the dependency graph is this
   repository (CI-enforced, workspace-wide).
 - The policy core is `#![forbid(unsafe_code)]`.
-- The bootable kernel is `#![deny(unsafe_code)]` with a three-module
-  allowlist (`boot/`, `hw.rs`, `memops.rs`), every item carrying a
-  `SAFETY` note — enforced by `scripts/check_unsafe.sh` in CI.
+- The bootable kernel is `#![deny(unsafe_code)]` with a five-entry
+  allowlist (`arch/`, `boot/`, `hw.rs`, `memops.rs`, `sched/`), every
+  item carrying a `SAFETY` note — enforced by `scripts/check_unsafe.sh`
+  in CI, with the count ratcheted in `scripts/unsafe-count.txt`.
 - `no_std` throughout; the core also builds for bare-metal ARM
   (thumbv7em) to prove no host assumptions leak in.
 

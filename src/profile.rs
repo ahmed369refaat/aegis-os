@@ -119,10 +119,7 @@ pub const fn driver_profile() -> DomainProfile {
         // Degraded driver: IOCTL is the whole point — it stays; the
         // side channels (IPC) drop.
         degraded_syscalls: SyscallMask::from_bits(
-            (1u64 << SYS_READ)
-                | (1u64 << SYS_WRITE)
-                | (1u64 << SYS_IOCTL)
-                | (1u64 << SYS_EXIT),
+            (1u64 << SYS_READ) | (1u64 << SYS_WRITE) | (1u64 << SYS_IOCTL) | (1u64 << SYS_EXIT),
         ),
         quota_pages: 128,
         base_rights: Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
@@ -143,9 +140,7 @@ pub const fn plugin_profile() -> DomainProfile {
         // Degraded plugin: keep its IPC lifeline, stop reading new
         // inputs.
         degraded_syscalls: SyscallMask::from_bits(
-            (1u64 << SYS_IPC_SEND)
-                | (1u64 << SYS_IPC_RECV)
-                | (1u64 << SYS_EXIT),
+            (1u64 << SYS_IPC_SEND) | (1u64 << SYS_IPC_RECV) | (1u64 << SYS_EXIT),
         ),
         quota_pages: 32,
         base_rights: Rights::READ,
@@ -189,8 +184,8 @@ pub const fn netd_profile() -> DomainProfile {
 mod degraded_tests {
     use super::*;
     use crate::syscall::{
-        SYS_CLOSE, SYS_DUP, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_MMAP, SYS_NET_RECV,
-        SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_WRITE,
+        SYS_CLOSE, SYS_DUP, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_MMAP,
+        SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_WRITE,
     };
 
     /// F8: every profile's degraded surface is a STRICT subset of its
@@ -210,24 +205,101 @@ mod degraded_tests {
         ];
         for p in all {
             let d = p.degraded_syscalls;
-            assert!(d.is_subset_of(&p.syscalls), "{}: degraded must be a subset", p.name);
-            assert_ne!(d, p.syscalls, "{}: degraded must actually drop something", p.name);
-            assert!(d.is_allowed(SYS_EXIT).unwrap(), "{}: EXIT always reachable", p.name);
+            assert!(
+                d.is_subset_of(&p.syscalls),
+                "{}: degraded must be a subset",
+                p.name
+            );
+            assert_ne!(
+                d, p.syscalls,
+                "{}: degraded must actually drop something",
+                p.name
+            );
+            assert!(
+                d.is_allowed(SYS_EXIT).unwrap(),
+                "{}: EXIT always reachable",
+                p.name
+            );
         }
         // Core functions survive degradation:
-        assert!(service_profile().degraded_syscalls.is_allowed(SYS_WRITE).unwrap(), "service: local I/O");
-        assert!(service_profile().degraded_syscalls.is_allowed(SYS_PIPE).unwrap());
-        assert!(service_profile().degraded_syscalls.is_allowed(SYS_DUP).unwrap());
-        assert!(driver_profile().degraded_syscalls.is_allowed(SYS_IOCTL).unwrap(), "driver: its whole purpose");
-        assert!(netd_profile().degraded_syscalls.is_allowed(SYS_NET_SEND).unwrap(), "netd: egress");
-        assert!(netd_profile().degraded_syscalls.is_allowed(SYS_NET_RECV).unwrap(), "netd: ingress");
-        assert!(plugin_profile().degraded_syscalls.is_allowed(SYS_IPC_SEND).unwrap(), "plugin: IPC");
-        assert!(plugin_profile().degraded_syscalls.is_allowed(SYS_IPC_RECV).unwrap());
+        assert!(
+            service_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_WRITE)
+                .unwrap(),
+            "service: local I/O"
+        );
+        assert!(service_profile()
+            .degraded_syscalls
+            .is_allowed(SYS_PIPE)
+            .unwrap());
+        assert!(service_profile()
+            .degraded_syscalls
+            .is_allowed(SYS_DUP)
+            .unwrap());
+        assert!(
+            driver_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_IOCTL)
+                .unwrap(),
+            "driver: its whole purpose"
+        );
+        assert!(
+            netd_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_NET_SEND)
+                .unwrap(),
+            "netd: egress"
+        );
+        assert!(
+            netd_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_NET_RECV)
+                .unwrap(),
+            "netd: ingress"
+        );
+        assert!(
+            plugin_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_IPC_SEND)
+                .unwrap(),
+            "plugin: IPC"
+        );
+        assert!(plugin_profile()
+            .degraded_syscalls
+            .is_allowed(SYS_IPC_RECV)
+            .unwrap());
         // The dangerous paths really drop:
-        assert!(!service_profile().degraded_syscalls.is_allowed(SYS_OPEN).unwrap(), "no new opens degraded");
-        assert!(!parser_profile().degraded_syscalls.is_allowed(SYS_MMAP).unwrap(), "no new mappings degraded");
-        assert!(!service_profile().degraded_syscalls.is_allowed(SYS_READ).unwrap() || true);
-        let _ = (SYS_CLOSE, SYS_READ, SYS_WRITE, SYS_IPC_SEND, SYS_IPC_RECV, SYS_NET_RECV);
+        assert!(
+            !service_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_OPEN)
+                .unwrap(),
+            "no new opens degraded"
+        );
+        assert!(
+            !parser_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_MMAP)
+                .unwrap(),
+            "no new mappings degraded"
+        );
+        // G: a REAL assertion (was `|| true`, a no-op): the degraded
+        // service keeps reading — existing local I/O stays alive.
+        assert!(
+            service_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_READ)
+                .unwrap(),
+            "the degraded service keeps its local I/O lifeline"
+        );
+        let _ = (
+            SYS_CLOSE,
+            SYS_WRITE,
+            SYS_IPC_SEND,
+            SYS_IPC_RECV,
+            SYS_NET_RECV,
+        );
     }
 
     /// The degraded surface must be what `apply_response` uses for
@@ -244,7 +316,12 @@ mod degraded_tests {
         ] {
             let mut d = crate::domain::Domain::new(7, p);
             d.tighten(&p.degraded_syscalls);
-            assert_eq!(d.mask(), p.degraded_syscalls, "{}: tighten = degraded", p.name);
+            assert_eq!(
+                d.mask(),
+                p.degraded_syscalls,
+                "{}: tighten = degraded",
+                p.name
+            );
         }
     }
 }
@@ -265,7 +342,11 @@ mod tests {
     fn every_profile_mask_is_subset_of_all() {
         for p in ALL_PROFILES {
             assert!(p.syscalls.is_subset_of(&SyscallMask::ALL), "{}", p.name);
-            assert!(!p.syscalls.is_allowed(SYS_SPAWN).unwrap(), "{} may not spawn", p.name);
+            assert!(
+                !p.syscalls.is_allowed(SYS_SPAWN).unwrap(),
+                "{} may not spawn",
+                p.name
+            );
         }
     }
 
@@ -295,7 +376,11 @@ mod tests {
             SYS_NET_SEND,
             SYS_NET_RECV,
         ] {
-            assert!(!p.syscalls.is_allowed(denied).unwrap(), "parser must not use {}", denied);
+            assert!(
+                !p.syscalls.is_allowed(denied).unwrap(),
+                "parser must not use {}",
+                denied
+            );
         }
     }
 
@@ -321,7 +406,12 @@ mod tests {
     #[test]
     fn only_the_broker_profile_has_network_egress() {
         // Every non-broker profile must be NET-free...
-        for p in [service_profile(), parser_profile(), driver_profile(), plugin_profile()] {
+        for p in [
+            service_profile(),
+            parser_profile(),
+            driver_profile(),
+            plugin_profile(),
+        ] {
             assert!(!p.syscalls.is_allowed(SYS_NET_SEND).unwrap(), "{}", p.name);
             assert!(!p.syscalls.is_allowed(SYS_NET_RECV).unwrap(), "{}", p.name);
         }
@@ -330,17 +420,33 @@ mod tests {
         assert!(netd.syscalls.is_allowed(SYS_NET_SEND).unwrap());
         assert!(netd.syscalls.is_allowed(SYS_NET_RECV).unwrap());
         assert!(!netd.syscalls.is_allowed(SYS_SPAWN).unwrap());
-        assert!(!netd.syscalls.is_allowed(SYS_KILL).unwrap(), "the broker may not kill");
+        assert!(
+            !netd.syscalls.is_allowed(SYS_KILL).unwrap(),
+            "the broker may not kill"
+        );
     }
 
     #[test]
     fn service_holds_the_linux_like_syscalls_exclusively() {
         let s = service_profile();
-        for allowed in [SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT, SYS_MKDIR, SYS_UNLINK] {
-            assert!(s.syscalls.is_allowed(allowed).unwrap(), "service may use {}", allowed);
+        for allowed in [
+            SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT, SYS_MKDIR, SYS_UNLINK,
+        ] {
+            assert!(
+                s.syscalls.is_allowed(allowed).unwrap(),
+                "service may use {}",
+                allowed
+            );
         }
-        for p in [parser_profile(), driver_profile(), plugin_profile(), netd_profile()] {
-            for denied in [SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT, SYS_MKDIR, SYS_UNLINK] {
+        for p in [
+            parser_profile(),
+            driver_profile(),
+            plugin_profile(),
+            netd_profile(),
+        ] {
+            for denied in [
+                SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT, SYS_MKDIR, SYS_UNLINK,
+            ] {
                 assert!(
                     !p.syscalls.is_allowed(denied).unwrap(),
                     "{} may not use {}",
@@ -366,6 +472,8 @@ mod tests {
     fn base_rights_follow_least_privilege() {
         assert!(parser_profile().base_rights.is_subset_of(Rights::READ));
         assert!(plugin_profile().base_rights.is_subset_of(Rights::READ));
-        assert!(service_profile().base_rights.is_subset_of(Rights::READ | Rights::WRITE));
+        assert!(service_profile()
+            .base_rights
+            .is_subset_of(Rights::READ | Rights::WRITE));
     }
 }

@@ -31,4 +31,7 @@
 #      the IMAGE_PT static-mut fill in arch/image_map.rs, the armed
 #      WP-write trigger, the armed image-exec trigger and its resume
 #      slot read.
-78
+# 77 -> G (review round 2): -1 — clippy flagged a redundant nested
+#      unsafe in sched/context.rs::take (addr_of_mut form needs one,
+#      not two). Shrinking is always allowed: lower it.
+77

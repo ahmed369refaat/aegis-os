@@ -55,7 +55,12 @@ impl<const N: usize> FramePool<N> {
     /// tests pass the same function over a real host buffer.
     #[must_use]
     pub fn new(base_pa: u64, scrub: fn(u64)) -> Self {
-        FramePool { base_pa, scrub, owner: [None; N], scrub_calls: 0 }
+        FramePool {
+            base_pa,
+            scrub,
+            owner: [None; N],
+            scrub_calls: 0,
+        }
     }
 
     /// Physical address of frame index `f`.
@@ -69,7 +74,7 @@ impl<const N: usize> FramePool<N> {
         if pa < self.base_pa || pa >= self.base_pa + N as u64 * FRAME_SIZE {
             return Err(FrameError::NotInPool(pa));
         }
-        if pa % FRAME_SIZE != 0 {
+        if !pa.is_multiple_of(FRAME_SIZE) {
             return Err(FrameError::Unaligned(pa));
         }
         Ok(((pa - self.base_pa) / FRAME_SIZE) as usize)
@@ -218,6 +223,77 @@ mod tests {
         ));
     }
 
+    /// G (review round 2): property test — frame conservation under
+    /// random alloc/free/free_all interleavings (xorshift64*, fixed
+    /// seeds). In-use frames and owner tags move together, and freeing
+    /// every owner returns the pool to pristine.
+    #[test]
+    fn property_free_all_owned_and_alloc_conserve_frames() {
+        use crate::mm::PAGE; // (page size constant for the buffer math)
+        let _ = PAGE;
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n.max(1)
+            }
+        }
+        const N: usize = 256;
+        for seed in [3u64, 0xFEED_FACE, 777] {
+            let mut rng = Rng(seed.max(1));
+            let mem = vec![0u64; N * 512 + 1024];
+            let base = ((mem.as_ptr() as u64) + 4095) & !4095u64;
+            let mut pool = FramePool::<N>::new(base, memops::scrub_frame);
+            let mut buddy = BuddyAllocator::<N>::new_over_arena();
+            let mut live: [Vec<u64>; 6] = Default::default();
+            for step in 0..1000usize {
+                let owner = (1 + rng.below(5)) as usize;
+                match rng.below(4) {
+                    0 | 1 => {
+                        if let Ok(pa) = pool.alloc_for(&mut buddy, owner as u32) {
+                            live[owner].push(pa);
+                        }
+                    }
+                    2 => {
+                        let o = (1 + rng.below(5)) as usize;
+                        if let Some(pa) = live[o].pop() {
+                            pool.free(&mut buddy, pa, o as u32).unwrap();
+                        }
+                    }
+                    _ => {
+                        let o = (1 + rng.below(5)) as usize;
+                        pool.free_all_owned(&mut buddy, o as u32);
+                        live[o].clear();
+                    }
+                }
+                assert_eq!(
+                    buddy.frames_in_use(),
+                    pool.owned_count(),
+                    "seed {seed} step {step}: in-use frames and owner tags diverged"
+                );
+                let live_total: usize = live.iter().map(|v| v.len()).sum();
+                assert_eq!(
+                    buddy.frames_in_use(),
+                    live_total,
+                    "seed {seed} step {step}: tracking diverged from the pool"
+                );
+            }
+            for o in 1..=5u32 {
+                pool.free_all_owned(&mut buddy, o);
+                live[o as usize].clear();
+            }
+            assert!(pool.is_clear());
+            assert_eq!(buddy.frames_free(), N);
+        }
+    }
+
     /// F1 regression: `free_all_owned` used to loop `0..FRAME_COUNT`
     /// (256) instead of `0..N`, so a FramePool<4096> silently leaked —
     /// and never scrubbed — every frame past index 256 on destroy.
@@ -236,10 +312,16 @@ mod tests {
             last_pa = pool.alloc_for(&mut buddy, 77).unwrap();
         }
         let idx = ((last_pa - POOL_BASE) / FRAME_SIZE) as usize;
-        assert!(idx >= 256, "test must reach past the old bound (last idx {idx})");
+        assert!(
+            idx >= 256,
+            "test must reach past the old bound (last idx {idx})"
+        );
         let before = SCRUBS.load(Ordering::SeqCst);
         let released = pool.free_all_owned(&mut buddy, 77);
-        assert_eq!(released, 260, "every owned frame released, not just the first 256");
+        assert_eq!(
+            released, 260,
+            "every owned frame released, not just the first 256"
+        );
         assert!(pool.is_clear(), "no owner tags survive");
         assert_eq!(buddy.frames_free(), 4096, "every frame back to the buddy");
         assert_eq!(

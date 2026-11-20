@@ -46,7 +46,11 @@ use aegis_os::memory::MemFlags;
 use aegis_os::Kernel;
 
 fn on_off(b: bool) -> &'static str {
-    if b { "on" } else { "off" }
+    if b {
+        "on"
+    } else {
+        "off"
+    }
 }
 
 fn line(out: &mut dyn FnMut(&str), parts: &[&str]) {
@@ -57,7 +61,11 @@ fn line(out: &mut dyn FnMut(&str), parts: &[&str]) {
 }
 
 fn yes_no(v: bool) -> &'static str {
-    if v { "yes" } else { "NO" }
+    if v {
+        "yes"
+    } else {
+        "NO"
+    }
 }
 
 fn describe_err(e: &M1Error) -> &'static str {
@@ -88,20 +96,33 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     {
         let bounds = mm::image::section_bounds();
         let (text, rodata, data, _bss, _guard) = bounds;
-        line(&mut out, &["[ARCH] image W^X selftest: writing .text and .rodata"]);
+        line(
+            &mut out,
+            &["[ARCH] image W^X selftest: writing .text and .rodata"],
+        );
         arch::exceptions::arm_wp_write(text.0);
         arch::exceptions::arm_wp_write(rodata.0);
-        line(&mut out, &["[SEC ] image W^X: write to .text faulted (WP)",
-            " / write to .rodata faulted (WP)"]);
+        line(
+            &mut out,
+            &[
+                "[SEC ] image W^X: write to .text faulted (WP)",
+                " / write to .rodata faulted (WP)",
+            ],
+        );
         line(&mut out, &["[ARCH] image W^X selftest: executing .data"]);
         arch::exceptions::arm_image_exec(data.0);
-        line(&mut out, &["[SEC ] image W^X: exec from .data faulted (I/D)"]);
+        line(
+            &mut out,
+            &["[SEC ] image W^X: exec from .data faulted (I/D)"],
+        );
     }
-
 
     // ── 2. multiboot validation ─────────────────────────────────────
     if magic != multiboot::BOOT_MAGIC {
-        line(&mut out, &["[BOOT] ERROR: not started by a multiboot loader (magic mismatch); halting"]);
+        line(
+            &mut out,
+            &["[BOOT] ERROR: not started by a multiboot loader (magic mismatch); halting"],
+        );
         hw::halt_forever();
     }
     // The info-struct words: flags, mem_lower, mem_upper — physical
@@ -112,12 +133,28 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let mi = multiboot::parse(flags, mem_lower, mem_upper);
     {
         let mut b = [0u8; 20];
-        line(&mut out, &["[BOOT] multiboot ok: mem_lower=", strutil::dec(mem_lower as u64, &mut b)]);
+        line(
+            &mut out,
+            &[
+                "[BOOT] multiboot ok: mem_lower=",
+                strutil::dec(mem_lower as u64, &mut b),
+            ],
+        );
         let mut b2 = [0u8; 20];
-        line(&mut out, &["       mem_upper=", strutil::dec(mem_upper as u64, &mut b2), " KiB"]);
+        line(
+            &mut out,
+            &[
+                "       mem_upper=",
+                strutil::dec(mem_upper as u64, &mut b2),
+                " KiB",
+            ],
+        );
     }
     if !mi.contains(POOL_BASE, KERNEL_POOL_LEN) {
-        line(&mut out, &["[MEM ] ERROR: frame pool (16..32 MiB) does not fit reported low memory; halting"]);
+        line(
+            &mut out,
+            &["[MEM ] ERROR: frame pool (16..32 MiB) does not fit reported low memory; halting"],
+        );
         hw::halt_forever();
     }
 
@@ -128,7 +165,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     for f in 0..(KERNEL_POOL_LEN / FRAME_SIZE) {
         memops::scrub_frame(POOL_BASE + f * FRAME_SIZE);
     }
-    line(&mut out, &["[MEM ] frame pool claimed: 4096 frames @ 16 MiB..32 MiB, scrubbed"]);
+    line(
+        &mut out,
+        &["[MEM ] frame pool claimed: 4096 frames @ 16 MiB..32 MiB, scrubbed"],
+    );
 
     let mut k = Kernel::<KERNEL_POOL_FRAMES>::new_over_arena();
     // N2 (ADR-0007 §2): the ring-3 syscall path gates through this live
@@ -146,8 +186,16 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let mon = runtime::monitor_demo(&mut k, &mut out);
     // Supervised cleanup of the quarantined attacker — the respawn path.
     let cleanup = k.destroy_domain(2);
-    line(&mut out, &["[MON ] supervised cleanup of quarantined attacker: ",
-        match cleanup { Ok(()) => "ok", Err(_) => "FAILED" }]);
+    line(
+        &mut out,
+        &[
+            "[MON ] supervised cleanup of quarantined attacker: ",
+            match cleanup {
+                Ok(()) => "ok",
+                Err(_) => "FAILED",
+            },
+        ],
+    );
     let stress = runtime::stress_create_destroy(&mut k, &mut pool, 1000, &mut out);
 
     // ── 5. exit-criteria line (CI greps this) ───────────────────────
@@ -155,9 +203,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let cycles = t_end.wrapping_sub(t_boot);
 
     let pass = match (&hello, &mon, &stress) {
-        (Ok(h), Ok(m), Ok(s)) => {
-            m1_pass(h, m, s) && cleanup.is_ok()
-        }
+        (Ok(h), Ok(m), Ok(s)) => m1_pass(h, m, s) && cleanup.is_ok(),
         _ => false,
     };
     // On any sequence error, say which stage failed before the verdict.
@@ -172,8 +218,14 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
 
     let mut b = [0u8; 20];
-    line(&mut out, &["[TIME] entry -> M1 complete: ", strutil::dec(cycles, &mut b),
-        " TSC cycles (host wall-clock is measured by the boot runner)"]);
+    line(
+        &mut out,
+        &[
+            "[TIME] entry -> M1 complete: ",
+            strutil::dec(cycles, &mut b),
+            " TSC cycles (host wall-clock is measured by the boot runner)",
+        ],
+    );
 
     let verdict = if pass { "PASS" } else { "FAIL" };
     match (&hello, &mon, &stress) {
@@ -182,24 +234,42 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             let mut b2 = [0u8; 20];
             let mut b3 = [0u8; 20];
             let mut b4 = [0u8; 20];
-            line(&mut out, &[
-                "[VERDICT] M1-EXIT-CRITERIA: ", verdict,
-                " boot=ok",
-                " hello=yes",
-                " guard-gap-live=", yes_no(h.guard_gap_rejected),
-                " frames-backed=", strutil::dec(h.frames_backed as u64, &mut b1),
-                " cfs-slices=", strutil::dec(h.slices as u64, &mut b2),
-                " monitor-quarantined=", yes_no(m.quarantined),
-                " neighbor-healthy=", yes_no(m.neighbor_healthy),
-                " stress-cycles=", strutil::dec(s.cycles as u64, &mut b3),
-                " leaked-frames=", strutil::dec(s.leaked_frames as u64, &mut b4),
-                " scrub-verified=", yes_no(s.scrub_verified),
-                " scores=55/50/37/80/80",
-            ]);
+            line(
+                &mut out,
+                &[
+                    "[VERDICT] M1-EXIT-CRITERIA: ",
+                    verdict,
+                    " boot=ok",
+                    " hello=yes",
+                    " guard-gap-live=",
+                    yes_no(h.guard_gap_rejected),
+                    " frames-backed=",
+                    strutil::dec(h.frames_backed as u64, &mut b1),
+                    " cfs-slices=",
+                    strutil::dec(h.slices as u64, &mut b2),
+                    " monitor-quarantined=",
+                    yes_no(m.quarantined),
+                    " neighbor-healthy=",
+                    yes_no(m.neighbor_healthy),
+                    " stress-cycles=",
+                    strutil::dec(s.cycles as u64, &mut b3),
+                    " leaked-frames=",
+                    strutil::dec(s.leaked_frames as u64, &mut b4),
+                    " scrub-verified=",
+                    yes_no(s.scrub_verified),
+                    " scores=55/50/37/80/80",
+                ],
+            );
         }
         _ => {
-            line(&mut out, &["[VERDICT] M1-EXIT-CRITERIA: ", verdict,
-                " (a sequence stage failed — see above)"]);
+            line(
+                &mut out,
+                &[
+                    "[VERDICT] M1-EXIT-CRITERIA: ",
+                    verdict,
+                    " (a sequence stage failed — see above)",
+                ],
+            );
         }
     }
 
@@ -211,14 +281,20 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // and the markers would be missing — loud either way.
     line(&mut out, &["[ARCH] exception selftest: forcing #DE"]);
     arch::exceptions::arm_and_trigger_de();
-    line(&mut out, &["[ARCH] back from the #DE handler: unwind path live"]);
+    line(
+        &mut out,
+        &["[ARCH] back from the #DE handler: unwind path live"],
+    );
 
     // ── 7. per-domain page tables (PR-1.3) ─────────────────────────
     // The M1 policy stays the gate; its decisions become hardware: two
     // domains with disjoint tables, the same virtual address resolving
     // to different frames, W^X enforced by NX, and the policy's guard
     // gaps as real absent pages that fault when touched.
-    line(&mut out, &["[MM ] per-domain tables: building domain A (owner 3) and B (owner 4)"]);
+    line(
+        &mut out,
+        &["[MM ] per-domain tables: building domain A (owner 3) and B (owner 4)"],
+    );
     let kernel_cr3 = hw::read_cr3();
     const VA: u64 = 0x20_0000; // 2 MiB — a classic user mapping address
     const GUARD_GAP_VA: u64 = VA + 2 * mm::PAGE;
@@ -230,28 +306,52 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let mut tables_a = match mm::page_table::PageTables::new(&mut src) {
         Ok(t) => t,
         Err(_) => {
-            line(&mut out, &["[MM ] ERROR: domain A tables alloc failed; halting"]);
+            line(
+                &mut out,
+                &["[MM ] ERROR: domain A tables alloc failed; halting"],
+            );
             hw::halt_forever();
         }
     };
     tables_a.install_kernel_entries();
     let mut space_a = aegis_os::memory::AddressSpace::new(16);
     if tables_a
-        .map_region(&mut space_a, VA, 2 * mm::PAGE as usize, MemFlags::READ | MemFlags::WRITE, &mut src)
+        .map_region(
+            &mut space_a,
+            VA,
+            2 * mm::PAGE as usize,
+            MemFlags::READ | MemFlags::WRITE,
+            &mut src,
+        )
         .is_err()
     {
-        line(&mut out, &["[MM ] ERROR: domain A RW region refused; halting"]);
+        line(
+            &mut out,
+            &["[MM ] ERROR: domain A RW region refused; halting"],
+        );
         hw::halt_forever();
     }
     if tables_a
-        .map_region(&mut space_a, RX_VA, mm::PAGE as usize, MemFlags::READ | MemFlags::EXEC, &mut src)
+        .map_region(
+            &mut space_a,
+            RX_VA,
+            mm::PAGE as usize,
+            MemFlags::READ | MemFlags::EXEC,
+            &mut src,
+        )
         .is_err()
     {
-        line(&mut out, &["[MM ] ERROR: domain A RX region refused; halting"]);
+        line(
+            &mut out,
+            &["[MM ] ERROR: domain A RX region refused; halting"],
+        );
         hw::halt_forever();
     }
     let (Some(pa_a), Some(pa_ax)) = (tables_a.translate(VA), tables_a.translate(RX_VA)) else {
-        line(&mut out, &["[MM ] ERROR: domain A translate failed; halting"]);
+        line(
+            &mut out,
+            &["[MM ] ERROR: domain A translate failed; halting"],
+        );
         hw::halt_forever();
     };
     memops::write_u64(pa_a, PATTERN_A);
@@ -262,55 +362,100 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let mut tables_b = match mm::page_table::PageTables::new(&mut src) {
         Ok(t) => t,
         Err(_) => {
-            line(&mut out, &["[MM ] ERROR: domain B tables alloc failed; halting"]);
+            line(
+                &mut out,
+                &["[MM ] ERROR: domain B tables alloc failed; halting"],
+            );
             hw::halt_forever();
         }
     };
     tables_b.install_kernel_entries();
     let mut space_b = aegis_os::memory::AddressSpace::new(16);
     if tables_b
-        .map_region(&mut space_b, VA, mm::PAGE as usize, MemFlags::READ | MemFlags::WRITE, &mut src)
+        .map_region(
+            &mut space_b,
+            VA,
+            mm::PAGE as usize,
+            MemFlags::READ | MemFlags::WRITE,
+            &mut src,
+        )
         .is_err()
     {
-        line(&mut out, &["[MM ] ERROR: domain B RW region refused; halting"]);
+        line(
+            &mut out,
+            &["[MM ] ERROR: domain B RW region refused; halting"],
+        );
         hw::halt_forever();
     }
     let Some(pa_b) = tables_b.translate(VA) else {
-        line(&mut out, &["[MM ] ERROR: domain B translate failed; halting"]);
+        line(
+            &mut out,
+            &["[MM ] ERROR: domain B translate failed; halting"],
+        );
         hw::halt_forever();
     };
     memops::write_u64(pa_b, PATTERN_B);
 
     // ── A's tables active: user half belongs to A ──
     tables_a.activate();
-    line(&mut out, &["[MM ] domain A tables active (CR3 switched): user half is A's"]);
+    line(
+        &mut out,
+        &["[MM ] domain A tables active (CR3 switched): user half is A's"],
+    );
     let via_va = memops::read_u64_va(VA);
     let via_dm = memops::read_u64(pa_a);
     if via_va != PATTERN_A || via_dm != PATTERN_A {
-        line(&mut out, &["[MM ] ERROR: A's page disagrees with its frame; halting"]);
+        line(
+            &mut out,
+            &["[MM ] ERROR: A's page disagrees with its frame; halting"],
+        );
         hw::halt_forever();
     }
-    line(&mut out, &["[MM ] A: VA reads back its pattern (direct-map frame agrees)"]);
-    line(&mut out, &["[ARCH] NX selftest: calling into A's RW (non-executable) page"]);
+    line(
+        &mut out,
+        &["[MM ] A: VA reads back its pattern (direct-map frame agrees)"],
+    );
+    line(
+        &mut out,
+        &["[ARCH] NX selftest: calling into A's RW (non-executable) page"],
+    );
     arch::exceptions::arm_nx_call(VA);
-    line(&mut out, &["[ARCH] RX selftest: calling into A's RX page (executes ret)"]);
+    line(
+        &mut out,
+        &["[ARCH] RX selftest: calling into A's RX page (executes ret)"],
+    );
     arch::exceptions::call_user(RX_VA);
-    line(&mut out, &["[MM ] A: RW page NX-faulted on exec, RX page executed (W^X live)"]);
+    line(
+        &mut out,
+        &["[MM ] A: RW page NX-faulted on exec, RX page executed (W^X live)"],
+    );
 
     // ── B's tables active: the same VA is a different frame ──
     tables_b.activate();
     let via_b = memops::read_u64_va(VA);
     if via_b != PATTERN_B || via_b == via_va {
-        line(&mut out, &["[MM ] ERROR: B's VA must resolve to a different frame; halting"]);
+        line(
+            &mut out,
+            &["[MM ] ERROR: B's VA must resolve to a different frame; halting"],
+        );
         hw::halt_forever();
     }
-    line(&mut out, &["[MM ] B: same VA resolves to a different frame (disjoint tables)"]);
+    line(
+        &mut out,
+        &["[MM ] B: same VA resolves to a different frame (disjoint tables)"],
+    );
 
     // ── A's guard gap: the policy-forced absent page between regions ──
     tables_a.activate();
-    line(&mut out, &["[ARCH] domain guard selftest: reading A's guard-gap page"]);
+    line(
+        &mut out,
+        &["[ARCH] domain guard selftest: reading A's guard-gap page"],
+    );
     arch::exceptions::arm_guard_read(GUARD_GAP_VA);
-    line(&mut out, &["[MM ] per-domain tables: 2 domains, W^X + guards live"]);
+    line(
+        &mut out,
+        &["[MM ] per-domain tables: 2 domains, W^X + guards live"],
+    );
 
     // ── N4 (ADR-0008): SMEP/SMAP — enabled only after the selftests
     // above (the RX selftest legitimately executes a user page from
@@ -322,18 +467,33 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let smap = arch::features::has_smap(leaf7);
     hw::write_cr4(arch::features::cr4_image(hw::read_cr4(), smep, smap));
     hw::set_smap_active(smap);
-    line(&mut out, &["[ARCH] smep=", on_off(smep), " smap=", on_off(smap)]);
+    line(
+        &mut out,
+        &["[ARCH] smep=", on_off(smep), " smap=", on_off(smap)],
+    );
     if smep {
         // A's tables are needed (RX_VA is mapped only there).
         tables_a.activate();
-        line(&mut out, &["[ARCH] SMEP selftest: jumping into A's user RX page from CPL=0"]);
+        line(
+            &mut out,
+            &["[ARCH] SMEP selftest: jumping into A's user RX page from CPL=0"],
+        );
         arch::exceptions::arm_sme_call(RX_VA);
-        line(&mut out, &["[SEC ] SMEP selftest: kernel jump into user page faulted, resumed"]);
+        line(
+            &mut out,
+            &["[SEC ] SMEP selftest: kernel jump into user page faulted, resumed"],
+        );
     }
     if smap {
-        line(&mut out, &["[ARCH] SMAP selftest: reading A's user RW page from CPL=0, no STAC"]);
+        line(
+            &mut out,
+            &["[ARCH] SMAP selftest: reading A's user RW page from CPL=0, no STAC"],
+        );
         arch::exceptions::arm_smap_read(VA);
-        line(&mut out, &["[SEC ] SMAP selftest: kernel read outside the window faulted, resumed"]);
+        line(
+            &mut out,
+            &["[SEC ] SMAP selftest: kernel read outside the window faulted, resumed"],
+        );
     }
 
     // Back on the kernel's own tables for the remaining selftests.
@@ -345,11 +505,17 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // the SAME word through the direct map at the frame's physical
     // address (both views must agree), free (scrub-on-free per frame),
     // then the terminal proof: write through a fresh guard page → #PF.
-    line(&mut out, &["[MM ] guarded-stack selftest: alloc/map/cross-view/free"]);
+    line(
+        &mut out,
+        &["[MM ] guarded-stack selftest: alloc/map/cross-view/free"],
+    );
     let stack = match mm::stacks::alloc(&mut pool, &mut k.frames, 2) {
         Ok(st) => st,
         Err(_) => {
-            line(&mut out, &["[MM ] ERROR: guarded-stack alloc failed; halting"]);
+            line(
+                &mut out,
+                &["[MM ] ERROR: guarded-stack alloc failed; halting"],
+            );
             hw::halt_forever();
         }
     };
@@ -362,14 +528,23 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         .map(|pa| memops::read_u64(pa + 4088))
         .unwrap_or(0);
     if via_stack_va != PATTERN || via_direct_map != PATTERN {
-        line(&mut out, &["[MM ] ERROR: stack/direct-map views disagree; halting"]);
+        line(
+            &mut out,
+            &["[MM ] ERROR: stack/direct-map views disagree; halting"],
+        );
         hw::halt_forever();
     }
     let freed = mm::stacks::free(&mut pool, &mut k.frames, stack);
     match freed {
-        Ok(()) => line(&mut out, &["[MM ] guarded stacks: alloc+map+cross-view ok, free+scrub ok"]),
+        Ok(()) => line(
+            &mut out,
+            &["[MM ] guarded stacks: alloc+map+cross-view ok, free+scrub ok"],
+        ),
         Err(_) => {
-            line(&mut out, &["[MM ] ERROR: guarded-stack free failed; halting"]);
+            line(
+                &mut out,
+                &["[MM ] ERROR: guarded-stack free failed; halting"],
+            );
             hw::halt_forever();
         }
     }
@@ -383,7 +558,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let syscall_stack = match mm::stacks::alloc(&mut pool, &mut k.frames, 2) {
         Ok(st) => st,
         Err(_) => {
-            line(&mut out, &["[RING3] ERROR: syscall stack alloc failed; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: syscall stack alloc failed; halting"],
+            );
             hw::halt_forever();
         }
     };
@@ -391,12 +569,19 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     arch::percpu::set_kstack_top(syscall_stack.top_va());
     arch::syscall_entry::set_entry_stack(syscall_stack.top_va());
     arch::syscall_entry::init();
-    line(&mut out, &["[RING3] syscall entry armed: rsp0/kstack = guarded stack, STAR/LSTAR/SFMASK/SCE live"]);
+    line(
+        &mut out,
+        &["[RING3] syscall entry armed: rsp0/kstack = guarded stack, STAR/LSTAR/SFMASK/SCE live"],
+    );
 
     // ── Run 1: the good citizen — hello from ring-3, then exit(0). ──
     let spawn = match mm::user::spawn_user_blob(
-        &mut k, &mut pool, 5, aegis_os::profile::service_profile(),
-        RING3_HELLO, RING3_MSG,
+        &mut k,
+        &mut pool,
+        5,
+        aegis_os::profile::service_profile(),
+        RING3_HELLO,
+        RING3_MSG,
     ) {
         Ok(sp) => sp,
         Err(_) => {
@@ -404,7 +589,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             hw::halt_forever();
         }
     };
-    line(&mut out, &["[RING3] launching domain 5 (service profile) at CPL=3"]);
+    line(
+        &mut out,
+        &["[RING3] launching domain 5 (service profile) at CPL=3"],
+    );
     let kernel_cr3 = hw::read_cr3();
     spawn.run.tables.activate();
     crate::sched::context::begin(spawn.run);
@@ -417,32 +605,58 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let trip = arch::syscall_entry::roundtrip();
     match run.exit {
         crate::sched::context::ExitKind::Exited(0) if run.write_bytes == RING3_MSG.len() as u64 => {
-            line(&mut out, &["[RING3] hello domain exited(0): message written from CPL=3"]);
+            line(
+                &mut out,
+                &["[RING3] hello domain exited(0): message written from CPL=3"],
+            );
         }
         crate::sched::context::ExitKind::Fault { .. } => {
             // The entry itself faulted before user code could run — the
             // environment-blocked case (full investigation in
             // docs/arch/syscall-entry.md). Report honestly, skip the
             // remaining runs, and let the boot finish.
-            line(&mut out, &["[RING3] launch blocked: ring-3 entry faults in this QEMU build"]);
-            line(&mut out, &["[RING3] (machinery armed + host-tested; see docs/arch/syscall-entry.md)"]);
+            line(
+                &mut out,
+                &["[RING3] launch blocked: ring-3 entry faults in this QEMU build"],
+            );
+            line(
+                &mut out,
+                &["[RING3] (machinery armed + host-tested; see docs/arch/syscall-entry.md)"],
+            );
             mm::user::destroy_user(&mut k, &mut pool, 5);
-            line(&mut out, &["[RING3] ring-3 step concluded: blocked (environment), kernel intact"]);
+            line(
+                &mut out,
+                &["[RING3] ring-3 step concluded: blocked (environment), kernel intact"],
+            );
             hw::shutdown_qemu();
         }
         _ => {
-            line(&mut out, &["[RING3] ERROR: hello run ended unexpectedly; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: hello run ended unexpectedly; halting"],
+            );
             hw::halt_forever();
         }
     }
     let mut bt = [0u8; 20];
-    line(&mut out, &["[SYSC] syscall round-trip: ", strutil::dec(trip, &mut bt), " cycles"]);
+    line(
+        &mut out,
+        &[
+            "[SYSC] syscall round-trip: ",
+            strutil::dec(trip, &mut bt),
+            " cycles",
+        ],
+    );
     mm::user::destroy_user(&mut k, &mut pool, 5);
 
     // ── Run 2: attack the NX bit — call into the data page. ──
     let spawn = match mm::user::spawn_user_blob(
-        &mut k, &mut pool, 6, aegis_os::profile::service_profile(),
-        RING3_ROGUE, &[0u8],
+        &mut k,
+        &mut pool,
+        6,
+        aegis_os::profile::service_profile(),
+        RING3_ROGUE,
+        &[0u8],
     ) {
         Ok(sp) => sp,
         Err(_) => {
@@ -450,7 +664,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             hw::halt_forever();
         }
     };
-    line(&mut out, &["[RING3] launching domain 6: calls into its NX data page"]);
+    line(
+        &mut out,
+        &["[RING3] launching domain 6: calls into its NX data page"],
+    );
     let kernel_cr3 = hw::read_cr3();
     spawn.run.tables.activate();
     crate::sched::context::begin(spawn.run);
@@ -460,15 +677,27 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let run = crate::sched::context::take();
     hw::write_cr3(kernel_cr3);
     match run.exit {
-        crate::sched::context::ExitKind::Fault { vector: 14, error_code, cr2, .. }
-            if (error_code & 0x10) != 0 && (error_code & 0x4) != 0 =>
-        {
+        crate::sched::context::ExitKind::Fault {
+            vector: 14,
+            error_code,
+            cr2,
+            ..
+        } if (error_code & 0x10) != 0 && (error_code & 0x4) != 0 => {
             let mut bc = [0u8; 18];
-            line(&mut out, &["[SEC ] ring3 NX-exec blocked: #PF (I/D) at cr2=",
-                strutil::hex(cr2, &mut bc), " — MMU-enforced W^X"]);
+            line(
+                &mut out,
+                &[
+                    "[SEC ] ring3 NX-exec blocked: #PF (I/D) at cr2=",
+                    strutil::hex(cr2, &mut bc),
+                    " — MMU-enforced W^X",
+                ],
+            );
         }
         _ => {
-            line(&mut out, &["[RING3] ERROR: NX attack did not fault as expected; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: NX attack did not fault as expected; halting"],
+            );
             hw::halt_forever();
         }
     }
@@ -476,16 +705,26 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
 
     // ── Run 3: read through the kernel direct map. ──
     let spawn = match mm::user::spawn_user_blob(
-        &mut k, &mut pool, 7, aegis_os::profile::service_profile(),
-        RING3_ROGUE, &[1u8],
+        &mut k,
+        &mut pool,
+        7,
+        aegis_os::profile::service_profile(),
+        RING3_ROGUE,
+        &[1u8],
     ) {
         Ok(sp) => sp,
         Err(_) => {
-            line(&mut out, &["[RING3] ERROR: rogue-kva spawn failed; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: rogue-kva spawn failed; halting"],
+            );
             hw::halt_forever();
         }
     };
-    line(&mut out, &["[RING3] launching domain 7: reads the kernel direct map"]);
+    line(
+        &mut out,
+        &["[RING3] launching domain 7: reads the kernel direct map"],
+    );
     let kernel_cr3 = hw::read_cr3();
     spawn.run.tables.activate();
     crate::sched::context::begin(spawn.run);
@@ -495,15 +734,27 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let run = crate::sched::context::take();
     hw::write_cr3(kernel_cr3);
     match run.exit {
-        crate::sched::context::ExitKind::Fault { vector: 14, error_code, cr2, .. }
-            if (error_code & 0x4) != 0 && (error_code & 0x1) != 0 =>
-        {
+        crate::sched::context::ExitKind::Fault {
+            vector: 14,
+            error_code,
+            cr2,
+            ..
+        } if (error_code & 0x4) != 0 && (error_code & 0x1) != 0 => {
             let mut bc = [0u8; 18];
-            line(&mut out, &["[SEC ] ring3 kernel-VA read blocked: #PF (U/S) at cr2=",
-                strutil::hex(cr2, &mut bc), " — supervisor page"]);
+            line(
+                &mut out,
+                &[
+                    "[SEC ] ring3 kernel-VA read blocked: #PF (U/S) at cr2=",
+                    strutil::hex(cr2, &mut bc),
+                    " — supervisor page",
+                ],
+            );
         }
         _ => {
-            line(&mut out, &["[RING3] ERROR: kernel-VA read did not fault as expected; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: kernel-VA read did not fault as expected; halting"],
+            );
             hw::halt_forever();
         }
     }
@@ -511,16 +762,26 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
 
     // ── Run 4: forged syscall 200 — must return -ENOSYS, audited. ──
     let spawn = match mm::user::spawn_user_blob(
-        &mut k, &mut pool, 8, aegis_os::profile::service_profile(),
-        RING3_ROGUE, &[2u8],
+        &mut k,
+        &mut pool,
+        8,
+        aegis_os::profile::service_profile(),
+        RING3_ROGUE,
+        &[2u8],
     ) {
         Ok(sp) => sp,
         Err(_) => {
-            line(&mut out, &["[RING3] ERROR: rogue-syscall spawn failed; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: rogue-syscall spawn failed; halting"],
+            );
             hw::halt_forever();
         }
     };
-    line(&mut out, &["[RING3] launching domain 8: forged syscall 200"]);
+    line(
+        &mut out,
+        &["[RING3] launching domain 8: forged syscall 200"],
+    );
     let kernel_cr3 = hw::read_cr3();
     spawn.run.tables.activate();
     crate::sched::context::begin(spawn.run);
@@ -531,10 +792,16 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     hw::write_cr3(kernel_cr3);
     match run.exit {
         crate::sched::context::ExitKind::Exited(42) if run.bad_syscalls == 1 => {
-            line(&mut out, &["[SEC ] ring3 unauthorized syscall refused (-ENOSYS, audited)"]);
+            line(
+                &mut out,
+                &["[SEC ] ring3 unauthorized syscall refused (-ENOSYS, audited)"],
+            );
         }
         _ => {
-            line(&mut out, &["[RING3] ERROR: forged syscall not refused properly; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: forged syscall not refused properly; halting"],
+            );
             hw::halt_forever();
         }
     }
@@ -545,8 +812,12 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // validated bytes), and a write crossing into the absent next page
     // must return -EFAULT without the kernel faulting. ──
     let spawn = match mm::user::spawn_user_blob(
-        &mut k, &mut pool, 9, aegis_os::profile::service_profile(),
-        RING3_EDGE, &[0u8],
+        &mut k,
+        &mut pool,
+        9,
+        aegis_os::profile::service_profile(),
+        RING3_EDGE,
+        &[0u8],
     ) {
         Ok(sp) => sp,
         Err(_) => {
@@ -554,7 +825,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             hw::halt_forever();
         }
     };
-    line(&mut out, &["[RING3] launching domain 9: tail-of-page + page-crossing writes"]);
+    line(
+        &mut out,
+        &["[RING3] launching domain 9: tail-of-page + page-crossing writes"],
+    );
     let kernel_cr3 = hw::read_cr3();
     spawn.run.tables.activate();
     crate::sched::context::begin(spawn.run);
@@ -569,7 +843,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             line(&mut out, &["[SEC ] ring3 crossing write refused (-EFAULT)"]);
         }
         _ => {
-            line(&mut out, &["[RING3] ERROR: edge write run ended unexpectedly; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: edge write run ended unexpectedly; halting"],
+            );
             hw::halt_forever();
         }
     }
@@ -583,16 +860,26 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // ──
     let _ = k.create_domain_with(11, aegis_os::profile::service_profile(), 1011, 100, 0);
     let spawn = match mm::user::spawn_user_blob(
-        &mut k, &mut pool, 10, aegis_os::profile::service_profile(),
-        RING3_ROGUE, &[3u8],
+        &mut k,
+        &mut pool,
+        10,
+        aegis_os::profile::service_profile(),
+        RING3_ROGUE,
+        &[3u8],
     ) {
         Ok(sp) => sp,
         Err(_) => {
-            line(&mut out, &["[RING3] ERROR: rogue-monitor spawn failed; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: rogue-monitor spawn failed; halting"],
+            );
             hw::halt_forever();
         }
     };
-    line(&mut out, &["[RING3] launching domain 10: forbidden-syscall spam (live-monitor quarantine)"]);
+    line(
+        &mut out,
+        &["[RING3] launching domain 10: forbidden-syscall spam (live-monitor quarantine)"],
+    );
     let kernel_cr3 = hw::read_cr3();
     spawn.run.tables.activate();
     crate::sched::context::begin(spawn.run);
@@ -607,7 +894,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             line(&mut out, &["[SEC ] ring3 domain 10 quarantined by monitor"]);
         }
         _ => {
-            line(&mut out, &["[RING3] ERROR: rogue not quarantined by the live monitor; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: rogue not quarantined by the live monitor; halting"],
+            );
             hw::halt_forever();
         }
     }
@@ -616,7 +906,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             line(&mut out, &["[MON ] healthy domain still running: yes"]);
         }
         _ => {
-            line(&mut out, &["[RING3] ERROR: healthy witness domain was not left alone; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: healthy witness domain was not left alone; halting"],
+            );
             hw::halt_forever();
         }
     }
@@ -627,16 +920,26 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // verdicts computed and logged to telemetry, nothing applied. ──
     k.set_monitor_mode(aegis_os::monitor::MonitorMode::AuditOnly);
     let spawn = match mm::user::spawn_user_blob(
-        &mut k, &mut pool, 12, aegis_os::profile::service_profile(),
-        RING3_ROGUE, &[3u8],
+        &mut k,
+        &mut pool,
+        12,
+        aegis_os::profile::service_profile(),
+        RING3_ROGUE,
+        &[3u8],
     ) {
         Ok(sp) => sp,
         Err(_) => {
-            line(&mut out, &["[RING3] ERROR: rogue-audit spawn failed; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: rogue-audit spawn failed; halting"],
+            );
             hw::halt_forever();
         }
     };
-    line(&mut out, &["[RING3] launching domain 12: same spam under MonitorMode::AuditOnly"]);
+    line(
+        &mut out,
+        &["[RING3] launching domain 12: same spam under MonitorMode::AuditOnly"],
+    );
     let kernel_cr3 = hw::read_cr3();
     spawn.run.tables.activate();
     crate::sched::context::begin(spawn.run);
@@ -645,9 +948,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     hw::write_cr3(kernel_cr3);
     let mut logged_a_verdict = false;
     while let Some(ev) = k.pop_event() {
-        if ev.domain_id == 12
-            && ev.action == aegis_os::response::EventAction::Quarantine
-        {
+        if ev.domain_id == 12 && ev.action == aegis_os::response::EventAction::Quarantine {
             logged_a_verdict = true;
         }
     }
@@ -656,10 +957,16 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             crate::sched::context::ExitKind::Exited(0),
             Some(aegis_os::domain::DomainState::Running),
         ) if logged_a_verdict => {
-            line(&mut out, &["[SEC ] ring3 audit-only: verdicts logged, mask unchanged"]);
+            line(
+                &mut out,
+                &["[SEC ] ring3 audit-only: verdicts logged, mask unchanged"],
+            );
         }
         _ => {
-            line(&mut out, &["[RING3] ERROR: audit-only run did not behave as specified; halting"]);
+            line(
+                &mut out,
+                &["[RING3] ERROR: audit-only run did not behave as specified; halting"],
+            );
             hw::halt_forever();
         }
     }
@@ -672,9 +979,11 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // marker, and power off cleanly (CI greps it). Reached only when
     // the whole ring-3 sequence completed — the blocked path powers
     // off inside step 10.
-    line(&mut out, &["[ARCH] guard selftest: writing through the boot-stack guard page"]);
+    line(
+        &mut out,
+        &["[ARCH] guard selftest: writing through the boot-stack guard page"],
+    );
     arch::exceptions::arm_guard_write(arch::image_map::boot_stack_guard_va());
-
 }
 
 /// The M1 exit criteria, evaluated from the three stage reports.

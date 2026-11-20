@@ -39,10 +39,20 @@ pub struct PteFlags {
 
 impl PteFlags {
     /// The classic user data page: RW, no execute.
-    pub const USER_RW: PteFlags = PteFlags { r: true, w: true, x: false, user: true };
+    pub const USER_RW: PteFlags = PteFlags {
+        r: true,
+        w: true,
+        x: false,
+        user: true,
+    };
     /// The classic user code page: RX (write is refused by policy and by
     /// the W bit; NX clear).
-    pub const USER_RX: PteFlags = PteFlags { r: true, w: false, x: true, user: true };
+    pub const USER_RX: PteFlags = PteFlags {
+        r: true,
+        w: false,
+        x: true,
+        user: true,
+    };
 
     /// Leaf PTE bits for a data/code page: present, W/U per flags, and
     /// **NX whenever the page is not executable** — W^X is a PTE
@@ -144,8 +154,9 @@ mod tests {
     #[test]
     fn user_limit_is_the_canonical_boundary() {
         assert_eq!(USER_LIMIT, 0x0000_8000_0000_0000);
-        // The kernel image and direct map are far above it.
-        assert!(super::super::KERNEL_BASE > USER_LIMIT);
-        assert!(super::super::direct_map::DIRECT_MAP_BASE > USER_LIMIT);
+        // The kernel image and direct map are far above it — checked
+        // at COMPILE time (clippy: assert_on_constants).
+        const _: () = assert!(super::super::KERNEL_BASE > USER_LIMIT);
+        const _: () = assert!(super::super::direct_map::DIRECT_MAP_BASE > USER_LIMIT);
     }
 }

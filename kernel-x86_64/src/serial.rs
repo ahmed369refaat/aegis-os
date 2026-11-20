@@ -11,7 +11,7 @@ const COM1: u16 = 0x3F8;
 pub fn init() {
     crate::hw::outb(COM1 + 1, 0x00); // disable interrupts
     crate::hw::outb(COM1 + 3, 0x80); // DLAB on
-    crate::hw::outb(COM1 + 0, 0x01); // divisor low = 1 → 115200 baud
+    crate::hw::outb(COM1, 0x01); // divisor low = 1 → 115200 baud
     crate::hw::outb(COM1 + 1, 0x00); // divisor high
     crate::hw::outb(COM1 + 3, 0x03); // 8 bits, no parity, 1 stop; DLAB off
     crate::hw::outb(COM1 + 2, 0xC7); // FIFO enable + clear, 14-byte threshold

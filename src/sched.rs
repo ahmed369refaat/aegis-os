@@ -17,9 +17,9 @@ pub const NICE0_WEIGHT: u32 = 1024;
 
 /// Linux `sched_prio_to_weight` for nice -20..=19 (index = nice + 20).
 pub const NICE_TO_WEIGHT: [u32; 40] = [
-    88761, 71055, 56483, 45083, 35808, 28672, 22898, 18255, 14564, 11603, 9244, 7372, 5869,
-    4674, 3723, 2966, 2362, 1881, 1496, 1193, 1024, 820, 655, 524, 420, 336, 272, 217, 173,
-    138, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+    88761, 71055, 56483, 45083, 35808, 28672, 22898, 18255, 14564, 11603, 9244, 7372, 5869, 4674,
+    3723, 2966, 2362, 1881, 1496, 1193, 1024, 820, 655, 524, 420, 336, 272, 217, 173, 138, 110, 87,
+    70, 56, 45, 36, 29, 23, 18, 15,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,12 +49,20 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub const fn new() -> Self {
-        Scheduler { min_vruntime: 0, entities: [None; MAX_SCHED_ENTITIES] }
+        Scheduler {
+            min_vruntime: 0,
+            entities: [None; MAX_SCHED_ENTITIES],
+        }
     }
 
     /// Register a domain with a nice level (clamped to -20..=19).
     pub fn register(&mut self, domain_id: u32, nice: i8) -> Result<(), SchedError> {
-        if self.entities.iter().flatten().any(|e| e.domain_id == domain_id) {
+        if self
+            .entities
+            .iter()
+            .flatten()
+            .any(|e| e.domain_id == domain_id)
+        {
             return Ok(()); // idempotent re-registration
         }
         for slot in self.entities.iter_mut() {
@@ -210,7 +218,10 @@ mod f12_tests {
         }
         s.set_runnable(2, true).unwrap();
         let woken = s.entity(2).unwrap().vruntime;
-        assert!(woken >= 50, "woken domain placed at min_vruntime (got {woken})");
+        assert!(
+            woken >= 50,
+            "woken domain placed at min_vruntime (got {woken})"
+        );
         // Fair competition, no monopoly: 3 (behind at 50) is picked
         // first, catches up to the floor, and then the tie breaks by id
         // — a late birth buys at most a catch-up, never the CPU.
@@ -325,7 +336,7 @@ mod tests {
     fn tick_progress_guarantee_prevents_starvation() {
         let mut s = Scheduler::new();
         s.register(1, 19).unwrap(); // weight 15
-        // A tiny tick still advances vruntime by at least 1.
+                                    // A tiny tick still advances vruntime by at least 1.
         let v = s.tick(1, 0).unwrap();
         assert_eq!(v, 1);
         let v = s.tick(1, 0).unwrap();

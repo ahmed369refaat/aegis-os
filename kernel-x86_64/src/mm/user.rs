@@ -23,7 +23,7 @@ use aegis_os::memory::AddressSpace;
 use aegis_os::profile::DomainProfile;
 use aegis_os::Kernel;
 
-use crate::frames::{FrameError, FramePool};
+use crate::frames::FramePool;
 use crate::memops;
 use crate::mm::page_table::{MapError, PageTables, PoolSource};
 use crate::mm::user_layout as layout;
@@ -84,7 +84,8 @@ pub fn spawn_user_blob<const N: usize>(
     }
     // Lib identity first (audit/accounting; the frame owner tag below
     // matches this id so a destroy reclaims everything at once).
-    k.create_domain(id, profile).map_err(|_| SpawnError::Domain)?;
+    k.create_domain(id, profile)
+        .map_err(|_| SpawnError::Domain)?;
     // N3: transactional from here on — the old code returned early on
     // any failure (PML4 alloc, a region map, pool exhaustion), leaving
     // the lib domain registered and frames owned by the id. Every
@@ -185,8 +186,8 @@ mod tests {
     #[test]
     fn blob_capacity_covers_the_examples() {
         // The examples are a few dozen bytes of asm; one code page is
-        // orders of magnitude more than enough.
-        assert!(layout::CODE_PAGES * 4096 >= 128);
+        // orders of magnitude more than enough — compile-time.
+        const _: () = assert!(layout::CODE_PAGES * 4096 >= 128);
     }
 }
 
@@ -207,7 +208,7 @@ mod transaction_tests {
     fn setup() -> (Kernel<N>, FramePool<N>, Phys) {
         // Page-align the backing buffer: the map path requires
         // page-aligned physical frames, and a Vec is only 8-aligned.
-        let mut mem = vec![0u64; N * 512 + 1024];
+        let mem = vec![0u64; N * 512 + 1024];
         let base = ((mem.as_ptr() as u64) + 4095) & !4095u64;
         (
             Kernel::new_over_arena(),
@@ -227,7 +228,14 @@ mod transaction_tests {
         let (mut k, mut pool, _p) = setup();
         k.create_domain(7, service_profile()).unwrap();
         let b = state(&k, &pool);
-        let r = spawn_user_blob(&mut k, &mut pool, 7, service_profile(), &[0u8; 16], &[0u8; 4]);
+        let r = spawn_user_blob(
+            &mut k,
+            &mut pool,
+            7,
+            service_profile(),
+            &[0u8; 16],
+            &[0u8; 4],
+        );
         assert!(matches!(r, Err(SpawnError::Domain)));
         assert_eq!(state(&k, &pool), b);
     }
@@ -253,10 +261,21 @@ mod transaction_tests {
     fn spawn_rolls_back_at_every_allocation_point() {
         // Measure what a successful spawn costs.
         let (mut k, mut pool, _p) = setup();
-        spawn_user_blob(&mut k, &mut pool, 7, service_profile(), &[0u8; 16], &[0u8; 4]).unwrap();
+        spawn_user_blob(
+            &mut k,
+            &mut pool,
+            7,
+            service_profile(),
+            &[0u8; 16],
+            &[0u8; 4],
+        )
+        .unwrap();
         let needed = k.frames.frames_in_use();
-        assert!(needed >= 4, "sanity: tables + regions cost frames (got {needed})");
-        drop(k);
+        assert!(
+            needed >= 4,
+            "sanity: tables + regions cost frames (got {needed})"
+        );
+        // (k is simply shadowed by the loop's fresh bindings below)
 
         for deficit in 1..=needed {
             let (mut k, mut pool, _p) = setup();
@@ -264,8 +283,18 @@ mod transaction_tests {
             for _ in 0..ballast {
                 pool.alloc_for(&mut k.frames, 999).unwrap();
             }
-            let r = spawn_user_blob(&mut k, &mut pool, 7, service_profile(), &[0u8; 16], &[0u8; 4]);
-            assert!(r.is_err(), "deficit {deficit}: the pool is short by exactly {deficit}");
+            let r = spawn_user_blob(
+                &mut k,
+                &mut pool,
+                7,
+                service_profile(),
+                &[0u8; 16],
+                &[0u8; 4],
+            );
+            assert!(
+                r.is_err(),
+                "deficit {deficit}: the pool is short by exactly {deficit}"
+            );
             assert_eq!(
                 k.frames.frames_in_use(),
                 ballast,

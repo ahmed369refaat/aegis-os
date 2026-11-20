@@ -8,13 +8,13 @@
 //! path (the behavior monitor) reads asynchronously.
 
 use crate::capability::CapabilityTable;
+use crate::capability::{Capability, Resource, Rights};
 use crate::fd::FdTable;
 use crate::memory::AddressSpace;
 use crate::monitor::DomainStats;
 use crate::profile::DomainProfile;
 use crate::signal::SignalState;
 use crate::syscall::{SyscallMask, SYS_EXIT};
-use crate::capability::{Capability, Resource, Rights};
 use crate::vfs::{Credentials, InodeRef, ROOT_REF};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +112,10 @@ impl Domain {
 
     #[must_use]
     pub fn creds(&self) -> Credentials {
-        Credentials { uid: self.uid, gid: self.gid }
+        Credentials {
+            uid: self.uid,
+            gid: self.gid,
+        }
     }
 
     #[must_use]
@@ -191,12 +194,18 @@ impl Domain {
 
     /// A failed capability escalation or mask-widening attempt.
     pub fn record_escalation_attempt(&mut self) {
-        self.stats.escalation_attempts =
-            self.stats.escalation_attempts.saturating_add(1);
+        self.stats.escalation_attempts = self.stats.escalation_attempts.saturating_add(1);
     }
 
     pub fn record_violation(&mut self) {
         self.violations = self.violations.saturating_add(1);
+    }
+}
+
+impl Decision {
+    #[must_use]
+    pub fn is_denied(&self) -> bool {
+        !matches!(self, Decision::Allowed)
     }
 }
 
@@ -322,14 +331,10 @@ mod tests {
         let mut d = Domain::new(4, parser_profile());
         d.tighten(&SyscallMask::from_ids(&[SYS_READ, SYS_EXIT]).unwrap());
         d.quarantine();
-        assert_eq!(d.request_syscall(SYS_READ), Decision::DeniedQuarantined(SYS_READ));
+        assert_eq!(
+            d.request_syscall(SYS_READ),
+            Decision::DeniedQuarantined(SYS_READ)
+        );
         assert_eq!(d.request_syscall(SYS_EXIT), Decision::Allowed);
-    }
-}
-
-impl Decision {
-    #[must_use]
-    pub fn is_denied(&self) -> bool {
-        !matches!(self, Decision::Allowed)
     }
 }

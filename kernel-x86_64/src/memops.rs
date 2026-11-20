@@ -74,7 +74,7 @@ pub fn read_u8_va(va: u64) -> u8 {
 /// (ADR-0007 §1): user-controlled addresses must never reach this
 /// primitive — the alignment is asserted, and it touches 8 bytes.
 pub fn read_u64_va(va: u64) -> u64 {
-    debug_assert!(va % 8 == 0, "read_u64_va on unaligned va {va:#x}");
+    debug_assert!(va.is_multiple_of(8), "read_u64_va on unaligned va {va:#x}");
     // SAFETY: see function docs.
     unsafe { (va as *const u64).read_volatile() }
 }
@@ -83,7 +83,7 @@ pub fn read_u64_va(va: u64) -> u64 {
 ///
 /// SAFETY: `va` must be 8-byte aligned, mapped and writable.
 pub fn write_u64_va(va: u64, val: u64) {
-    debug_assert!(va % 8 == 0, "write_u64_va on unaligned va {va:#x}");
+    debug_assert!(va.is_multiple_of(8), "write_u64_va on unaligned va {va:#x}");
     // SAFETY: see function docs.
     unsafe { (va as *mut u64).write_volatile(val) }
 }
