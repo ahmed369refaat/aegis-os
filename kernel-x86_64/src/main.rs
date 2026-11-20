@@ -52,6 +52,8 @@ pub mod arch;
 #[cfg(not(test))]
 pub mod boot;
 #[cfg(not(test))]
+pub mod drvstack;
+#[cfg(not(test))]
 pub mod kmain;
 pub mod mm;
 #[cfg(not(test))]

@@ -1072,6 +1072,13 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     #[cfg(feature = "preempt-demo")]
     preempt_demo(&mut k, &mut pool, &mut out);
 
+    // ── 14. driver stack, step 1 (ADR-0013, PR 0.3): ACPI/DMAR
+    //      discovery. Runs before the terminal guard proof so the
+    //      `[IOMMU]` markers are on every lane (pc, q35, q35-neg).
+    //      Absence is a verdict, not a crash: the boot continues and
+    //      later claim paths fail closed on it.
+    crate::drvstack::acpi_step(&mut out);
+
     // ── 13. the terminal guard-page proof: the write must #PF, the
     // dispatch must confirm CR2 is exactly the guard page, print the
     // marker, and power off cleanly (CI greps it). Reached only when

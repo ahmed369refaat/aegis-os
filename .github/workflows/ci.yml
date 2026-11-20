@@ -96,6 +96,21 @@ jobs:
       - name: Build, boot, and verify the M1 + exception/higher-half markers
         run: ./boot.sh --verify
 
+  boot-test-q35:
+    name: Boot test (q35 + intel-iommu: ADR-0013 DMAR discovery + fail-closed negative)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
+        with:
+          targets: x86_64-unknown-none
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      - name: q35 + intel-iommu + virtio-blk: DMAR found (haw, DRHD inventory)
+        run: ./boot.sh --verify-q35
+      - name: q35 without iommu: the fail-closed absent proof
+        run: ./boot.sh --verify-q35-noiommu
+
   no-deps:
     name: Supply-chain audit
     runs-on: ubuntu-latest

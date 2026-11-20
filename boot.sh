@@ -58,19 +58,63 @@ if [ "${1:-}" = "--build-only" ]; then
   exit 0
 fi
 
+# Lane selection (ADR-0013): `pc` is the M1/M2 acceptance machine;
+# `q35` adds the IOMMU + a virtio-blk disk (the driver-stack machine,
+# DMAR present); `q35-neg` is the same machine WITHOUT intel-iommu —
+# the fail-closed negative proof (`[IOMMU] dmar: absent`).
+MODE=run
+MACHINE_ARGS=(-machine pc -cpu max -m 128M)
+EXTRA_GREPS=()
+case "${1:-}" in
+  --verify)
+    MODE=verify
+    ;;
+  --verify-q35)
+    MODE=verify
+    MACHINE_ARGS=(-machine q35 -cpu max -m 128M
+                  -device intel-iommu,intremap=off
+                  -device virtio-blk-pci,disable-legacy=on,iommu_platform=on,drive=vd0
+                  -drive id=vd0,if=none,format=raw,file=target/vdisk0.img)
+    EXTRA_GREPS=(
+      "[IOMMU] dmar: pa="
+      "[IOMMU] dmar: pa=0x"  # placeholder replaced below; see lane block
+    )
+    ;;
+  --verify-q35-noiommu)
+    MODE=verify
+    MACHINE_ARGS=(-machine q35 -cpu max -m 128M)
+    EXTRA_GREPS=()
+    ;;
+esac
+
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
   echo "error: qemu-system-x86_64 not found (Debian/Ubuntu: apt-get install qemu-system-x86)" >&2
   exit 127
 fi
 
-# -machine pc keeps the ACPI poweroff port (0x604) stable; -no-reboot
-# turns a triple fault into a clean QEMU exit instead of a loop.
-QEMU_ARGS=(-machine pc -cpu max -m 128M -kernel "$IMAGE" -display none -serial stdio -no-reboot)
+# -no-reboot turns a triple fault into a clean QEMU exit instead of a loop.
+QEMU_ARGS=("${MACHINE_ARGS[@]}" -kernel "$IMAGE" -display none -serial stdio -no-reboot)
 
-if [ "${1:-}" = "--verify" ]; then
+# The q35 driver-stack lane needs its disk image (64 KiB of noise is
+# enough — the kernel reads a sector, it does not care about content).
+if [ "$MODE" = "verify" ] && [ "${1:-}" = "--verify-q35" ]; then
+  dd if=/dev/urandom of=target/vdisk0.img bs=1K count=64 status=none
+fi
+
+if [ "$MODE" = "verify" ]; then
   LOG=$(mktemp)
   trap 'rm -f "$LOG"' EXIT
-  echo "==> [4/4] booting in QEMU (TCG) — M1 exit-criteria + PR-1.1/1.2/1.3 selftests run"
+  case "${1:-}" in
+    --verify-q35)
+      echo "==> [4/4] booting in QEMU (TCG, q35 + intel-iommu) — M1/M2 markers + ADR-0013 DMAR discovery"
+      ;;
+    --verify-q35-noiommu)
+      echo "==> [4/4] booting in QEMU (TCG, q35, NO iommu) — M1/M2 markers + the fail-closed absent proof"
+      ;;
+    *)
+      echo "==> [4/4] booting in QEMU (TCG) — M1 exit-criteria + PR-1.1/1.2/1.3 selftests run"
+      ;;
+  esac
   # Risk treatment 5: surface the exact emulator the markers run under
   # — if a CI runner's QEMU lacks SMEP/SMAP, the failure message below
   # carries the version context right next to it.
@@ -134,6 +178,19 @@ if [ "${1:-}" = "--verify" ]; then
   if ! grep -qF "[RING3] launch blocked: ring-3 entry faults in this QEMU build" "$LOG"; then
     grep -qF "[EXC] guard selftest: stack guard #PF ok" "$LOG" || { echo "VERIFY FAIL: guard-page #PF marker missing"; ok=0; }
   fi
+  # ── ADR-0013 lane markers (driver stack, PR 0.3) ──
+  case "${1:-}" in
+    --verify-q35)
+      grep -qF "[IOMMU] dmar: pa=" "$LOG" || { echo "VERIFY FAIL: q35 lane must find the DMAR"; ok=0; }
+      grep -qF "[IOMMU] dmar: pa=0x" "$LOG" || { echo "VERIFY FAIL: DMAR address missing"; ok=0; }
+      grep -qF " haw=48 " "$LOG" || { echo "VERIFY FAIL: q35 must report a 48-bit host address width"; ok=0; }
+      grep -qF "[IOMMU] drhd[0]: seg=0 base=0x" "$LOG" || { echo "VERIFY FAIL: DRHD inventory marker missing"; ok=0; }
+      grep -qF "include_all=no" "$LOG" || { echo "VERIFY FAIL: QEMU's DRHD is scoped, not include-all"; ok=0; }
+      ;;
+    --verify-q35-noiommu)
+      grep -qF "[IOMMU] dmar: absent" "$LOG" || { echo "VERIFY FAIL: the no-iommu lane must report dmar: absent (fail-closed)"; ok=0; }
+      ;;
+  esac
   if [ "$ok" = 1 ]; then
     echo "BOOT VERIFY: PASS"
   else

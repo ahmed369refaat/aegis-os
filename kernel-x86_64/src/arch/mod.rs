@@ -11,6 +11,7 @@
 //! so their layouts are unit-tested; the runtime modules (`stubs`,
 //! `exceptions`, `percpu`, the `load` fns) are target-only.
 
+pub mod acpi;
 pub mod fault_class;
 pub mod features;
 pub mod frame;
