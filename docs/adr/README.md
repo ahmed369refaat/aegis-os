@@ -31,3 +31,4 @@ it does not merge.
 | [0010](0010-ring3-reliability-four-root-causes.md) | Ring-3 reliability: four root causes | Accepted (M2-W2) |
 | [0011](0011-multi-architecture-hal-bsp.md) | Multi-architecture HAL/BSP strategy | Accepted (design; restructure = Phase 2 of GAP-ANALYSIS-v2) |
 | [0012](0012-timer-preemption.md) | Timer preemption: LAPIC tick, parked runs, frame-rewrite switch | Accepted (machinery landed; boot demo feature-gated pending open issues) |
+| [0013](0013-iommu-vtd-dma-isolation.md) | IOMMU/VT-d: kernel-brokered DMA isolation for driver domains | Proposed (Phase-0 GO 2026-11-20; implementation PRs 0.2–0.5) |
