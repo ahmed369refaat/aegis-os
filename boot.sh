@@ -186,9 +186,19 @@ if [ "$MODE" = "verify" ]; then
       grep -qF " haw=48 " "$LOG" || { echo "VERIFY FAIL: q35 must report a 48-bit host address width"; ok=0; }
       grep -qF "[IOMMU] drhd[0]: seg=0 base=0x" "$LOG" || { echo "VERIFY FAIL: DRHD inventory marker missing"; ok=0; }
       grep -qF "include_all=no" "$LOG" || { echo "VERIFY FAIL: QEMU's DRHD is scoped, not include-all"; ok=0; }
+      grep -qF "[IOMMU] vtd: verdict: available haw=48" "$LOG" || { echo "VERIFY FAIL: VT-d bring-up did not reach translation enable"; ok=0; }
+      grep -qF "[IOMMU] vtd: hw-proof: ctx entry present=yes" "$LOG" || { echo "VERIFY FAIL: context-entry proof missing"; ok=0; }
+      grep -qF "[IOMMU] vtd: hw-proof: mapped 1 page (pte present+rw" "$LOG" || { echo "VERIFY FAIL: map proof missing"; ok=0; }
+      grep -qF "[IOMMU] vtd: hw-proof: unmapped + iotlb invalidated (pte absent" "$LOG" || { echo "VERIFY FAIL: unmap+invalidation proof missing"; ok=0; }
+      grep -qF "[IOMMU] broker: map ok cookie=" "$LOG" || { echo "VERIFY FAIL: broker map proof missing"; ok=0; }
+      grep -qF "[IOMMU] broker: unmap refused (AbortRequired)" "$LOG" || { echo "VERIFY FAIL: abort-before-unmap ordering not proven"; ok=0; }
+      grep -qF "[IOMMU] broker: quota enforced" "$LOG" || { echo "VERIFY FAIL: quota enforcement not proven"; ok=0; }
+      grep -qF "[IOMMU] broker: revoke_all(0)" "$LOG" || { echo "VERIFY FAIL: teardown path not proven"; ok=0; }
+      grep -qF "[IOMMU] dma-drivers=1 (broker live over VT-d)" "$LOG" || { echo "VERIFY FAIL: dma-drivers verdict must be 1 on the IOMMU lane"; ok=0; }
       ;;
     --verify-q35-noiommu)
       grep -qF "[IOMMU] dmar: absent" "$LOG" || { echo "VERIFY FAIL: the no-iommu lane must report dmar: absent (fail-closed)"; ok=0; }
+      grep -qF "[IOMMU] dma-drivers=0 (fail-closed: no broker)" "$LOG" || { echo "VERIFY FAIL: dma-drivers must be 0 on the negative lane"; ok=0; }
       ;;
   esac
   if [ "$ok" = 1 ]; then

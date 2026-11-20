@@ -58,7 +58,12 @@ pub fn driver_stack_step<const N: usize>(
             dmar,
         } => {
             print_found(out, rsdp_pa, &rsdp, dir_pa, dir_entries, dmar_pa, &dmar);
-            vtd_step(k, pool, out, &dmar);
+            if let Some(mut unit) = vtd_step(k, pool, out, &dmar) {
+                proof_step(k, pool, out, &dmar, &mut unit);
+                broker_step(k, pool, out, unit);
+            } else {
+                line(out, &["[IOMMU] dma-drivers=0 (fail-closed: no broker)"]);
+            }
         }
         Discovery::NoDmar { rsdp_pa, .. } => {
             let mut h = [0u8; 18];
@@ -70,6 +75,7 @@ pub fn driver_stack_step<const N: usize>(
                     ", no DMAR in the directory) — DMA device claims will be refused",
                 ],
             );
+            line(out, &["[IOMMU] dma-drivers=0 (fail-closed: no broker)"]);
         }
         Discovery::Failed(err) => {
             line(
@@ -80,6 +86,7 @@ pub fn driver_stack_step<const N: usize>(
                     ") — fail-closed, DMA device claims will be refused",
                 ],
             );
+            line(out, &["[IOMMU] dma-drivers=0 (fail-closed: no broker)"]);
         }
     }
 }
@@ -209,15 +216,15 @@ fn describe_discovery_error(err: arch::acpi::DiscoveryError) -> &'static str {
 
 /// PR 0.4: bring the VT-d unit up on a machine whose DMAR parsed —
 /// caps validated, root table + invalidation queue programmed,
-/// SRTP/QIE/TE sequenced with bounded spins, then the hardware
-/// proofs (`proof_step`). Every refusal is a marker + verdict line,
-/// never a halting guess.
+/// SRTP/QIE/TE sequenced with bounded spins. Every refusal is a
+/// marker + verdict line, never a halting guess. Returns the live
+/// unit for the hardware proofs and the broker (PR 0.5) to sit on.
 fn vtd_step<const N: usize>(
     k: &mut aegis_os::Kernel<N>,
     pool: &mut FramePool<N>,
     out: &mut dyn FnMut(&str),
     dmar: &Dmar,
-) {
+) -> Option<crate::arch::vtd::Vtd> {
     use crate::arch::vtd;
 
     // The MMIO window first: caps are read before a Vtd exists.
@@ -230,7 +237,7 @@ fn vtd_step<const N: usize>(
         // plan() would refuse the same thing; discovery found a DMAR
         // with no DRHD — state it and stop here (fail closed).
         line(out, &["[IOMMU] vtd: no DRHD to program — verdict: absent"]);
-        return;
+        return None;
     };
     let ver = crate::memops::read_u32(drhd.reg_base + vtd::REG_VER);
     let cap = crate::memops::read_u64(drhd.reg_base + vtd::REG_CAP);
@@ -251,7 +258,7 @@ fn vtd_step<const N: usize>(
                         " — verdict: absent (fail-closed)",
                     ],
                 );
-                return;
+                return None;
             }
         }
     }
@@ -266,6 +273,7 @@ fn vtd_step<const N: usize>(
                     ") — verdict: absent",
                 ],
             );
+            None
         }
         Ok(mut unit) => match unit.program_and_enable() {
             Err(e) => {
@@ -277,6 +285,7 @@ fn vtd_step<const N: usize>(
                         ") — verdict: absent",
                     ],
                 );
+                None
             }
             Ok((srtp, qie, te)) => {
                 let mut h1 = [0u8; 18];
@@ -318,7 +327,7 @@ fn vtd_step<const N: usize>(
                         " — translation enabled (unmapped device DMA now faults)",
                     ],
                 );
-                proof_step(k, pool, out, dmar, &mut unit);
+                Some(unit)
             }
         },
     }
@@ -480,4 +489,148 @@ fn hw_code(e: &aegis_os::dma::DmaError) -> &'static str {
         aegis_os::dma::DmaError::Hardware(_) => "arch refusal",
         _ => "policy refusal",
     }
+}
+
+/// PR 0.5: the kernel DMA broker over the live VT-d — the ADR-0013 D6
+/// protocol, proven on the boot lane end to end: a map returns a view
+/// with a cookie and length ONLY (no addresses), unmapping before the
+/// abort handshake refuses, the handshake releases, quotas refuse
+/// loudly, and `revoke_all` tears a domain down without the handshake
+/// (teardown semantics). The runtime claim path and the
+/// domain-destroy hook arrive with Phase 1's driver model; the
+/// `dma-drivers` verdict line below is what gates them.
+fn broker_step<const N: usize>(
+    k: &mut aegis_os::Kernel<N>,
+    pool: &mut FramePool<N>,
+    out: &mut dyn FnMut(&str),
+    unit: crate::arch::vtd::Vtd,
+) {
+    use aegis_os::dma::{DmaBroker, DmaDir, DmaError, DmaQuotas};
+
+    // Small quotas so the refusal itself is provable in one boot.
+    let quotas = DmaQuotas {
+        max_regions: 2,
+        max_bytes: 64 * 1024,
+    };
+    let mut broker = DmaBroker::new(unit, quotas);
+
+    // One fresh page as the region (the kernel allocates; the driver
+    // domain would only ever see the cookie).
+    let Ok(page_pa) = pool.alloc_for(&mut k.frames, VTD_TABLE_OWNER) else {
+        line(
+            out,
+            &["[IOMMU] broker: pool exhausted before the broker proof"],
+        );
+        return;
+    };
+    let view = match broker.map_region(0, page_pa, 4096, DmaDir::Bidirectional) {
+        Ok(v) => v,
+        Err(e) => {
+            line(out, &["[IOMMU] broker: map refused (", hw_code(&e), ")"]);
+            return;
+        }
+    };
+    let mut n1 = [0u8; 20];
+    let mut n2 = [0u8; 20];
+    line(
+        out,
+        &[
+            "[IOMMU] broker: map ok cookie=",
+            strutil::dec(view.cookie, &mut n1),
+            " len=",
+            strutil::dec(view.len, &mut n2),
+            " (the view carries no addresses)",
+        ],
+    );
+
+    // Abort-before-unmap: with work in flight the unmap must refuse.
+    match broker.unmap_region(view.cookie) {
+        Err(DmaError::AbortRequired) => {
+            line(
+                out,
+                &["[IOMMU] broker: unmap refused (AbortRequired) — in-flight work must complete first"],
+            );
+        }
+        Ok(()) => {
+            line(
+                out,
+                &["[IOMMU] broker: unmap ordering check SUCCEEDED (BUG: in-flight unmap)"],
+            );
+            return;
+        }
+        Err(e) => {
+            line(
+                out,
+                &[
+                    "[IOMMU] broker: unmap ordering check refused (",
+                    hw_code(&e),
+                    ")",
+                ],
+            );
+            return;
+        }
+    }
+    broker.region_complete(view.cookie).expect("fresh complete");
+    broker
+        .unmap_region(view.cookie)
+        .expect("complete released the region");
+    line(
+        out,
+        &["[IOMMU] broker: complete → unmap ok (abort handshake honored)"],
+    );
+
+    // Quotas: fill the region budget, watch the third map refuse.
+    for _ in 0..2u64 {
+        let Ok(pa) = pool.alloc_for(&mut k.frames, VTD_TABLE_OWNER) else {
+            break;
+        };
+        if broker.map_region(0, pa, 4096, DmaDir::ToDevice).is_err() {
+            break;
+        }
+    }
+    let live = broker.live_regions(0);
+    let mut n3 = [0u8; 20];
+    let mut n4 = [0u8; 20];
+    line(
+        out,
+        &[
+            "[IOMMU] broker: live regions=",
+            strutil::dec(live as u64, &mut n3),
+            "/",
+            strutil::dec(quotas.max_regions as u64, &mut n4),
+        ],
+    );
+    let Ok(extra_pa) = pool.alloc_for(&mut k.frames, VTD_TABLE_OWNER) else {
+        return;
+    };
+    match broker.map_region(0, extra_pa, 4096, DmaDir::ToDevice) {
+        Err(DmaError::QuotaRegions) => {
+            line(
+                out,
+                &["[IOMMU] broker: quota enforced (region budget exhausted → QuotaRegions)"],
+            );
+        }
+        _ => {
+            line(
+                out,
+                &["[IOMMU] broker: QUOTA CHECK FAILED (map went through)"],
+            );
+        }
+    }
+
+    // Teardown semantics: revoke_all unmaps everything the domain
+    // holds, handshake or not (the domain is dying).
+    let revoked = broker.revoke_all(0);
+    let mut n5 = [0u8; 20];
+    line(
+        out,
+        &[
+            "[IOMMU] broker: revoke_all(0) → ",
+            strutil::dec(revoked as u64, &mut n5),
+            " region(s) unmapped (teardown path)",
+        ],
+    );
+
+    // The verdict line Phase 1's claim path gates on.
+    line(out, &["[IOMMU] dma-drivers=1 (broker live over VT-d)"]);
 }
