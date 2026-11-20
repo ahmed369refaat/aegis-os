@@ -34,6 +34,9 @@ use crate::frames::{FramePool, FRAME_SIZE, KERNEL_POOL_FRAMES, KERNEL_POOL_LEN, 
 /// `examples/ring3-{hello,rogue}` and embedded here — PR-1.4).
 static RING3_HELLO: &[u8] = include_bytes!("../blob/ring3-hello.bin");
 static RING3_ROGUE: &[u8] = include_bytes!("../blob/ring3-rogue.bin");
+/// The N1 edge blob: tail-of-page writes that must succeed and a
+/// page-crossing write that must return -EFAULT (ADR-0007 §1).
+static RING3_EDGE: &[u8] = include_bytes!("../blob/ring3-edge.bin");
 /// The exact message the hello blob writes from ring-3 (its length is
 /// baked into the blob's `mov edx, 26`).
 const RING3_MSG: &[u8] = b"hello from ring 3 (CPL=3)\n";
@@ -484,7 +487,42 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
     }
     mm::user::destroy_user(&mut k, &mut pool, 8);
-    line(&mut out, &["[RING3] ring-3 isolation live: 4 runs (hello/NX/kernel-VA/forged syscall), kernel intact"]);
+
+    // ── Run 5 (N1, ADR-0007 §1): writes that end exactly at the data
+    // page's last byte must succeed (the copy may touch ONLY the
+    // validated bytes), and a write crossing into the absent next page
+    // must return -EFAULT without the kernel faulting. ──
+    let spawn = match mm::user::spawn_user_blob(
+        &mut k, &mut pool, 9, aegis_os::profile::service_profile(),
+        RING3_EDGE, &[0u8],
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(&mut out, &["[RING3] ERROR: edge spawn failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    line(&mut out, &["[RING3] launching domain 9: tail-of-page + page-crossing writes"]);
+    let kernel_cr3 = hw::read_cr3();
+    spawn.run.tables.activate();
+    crate::sched::context::begin(spawn.run);
+    crate::sched::context::launch(&spawn.ctx);
+    // Reached only via resume_kernel's jump (the launch itself never
+    // returns): the post-run code below runs exactly once per run.
+    let run = crate::sched::context::take();
+    hw::write_cr3(kernel_cr3);
+    match run.exit {
+        crate::sched::context::ExitKind::Exited(42) if run.write_bytes == 4 => {
+            line(&mut out, &["[SEC ] ring3 tail-of-page write ok"]);
+            line(&mut out, &["[SEC ] ring3 crossing write refused (-EFAULT)"]);
+        }
+        _ => {
+            line(&mut out, &["[RING3] ERROR: edge write run ended unexpectedly; halting"]);
+            hw::halt_forever();
+        }
+    }
+    mm::user::destroy_user(&mut k, &mut pool, 9);
+    line(&mut out, &["[RING3] ring-3 isolation live: 5 runs (hello/NX/kernel-VA/forged syscall/edge), kernel intact"]);
 
     // ── 11. the terminal guard-page proof: the write must #PF, the
     // dispatch must confirm CR2 is exactly the guard page, print the

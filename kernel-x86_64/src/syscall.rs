@@ -21,6 +21,18 @@
 //! `sched::context` (allowlisted).
 
 use aegis_os::domain::Decision;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// N1 (ADR-0007 §1): armed around the user-copy routine. The copy is
+/// provably fault-free (it touches exactly the validated bytes), so a
+/// CPL0 fault while this is set can only mean the invariant broke —
+/// the exception path reports it as loudly as possible.
+pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
+
+/// N1 (ADR-0007 §1): set by the first successful dispatch for the
+/// active run — a CPL0 fault *before* this is the documented
+/// launch-relay limitation; after it, a CPL0 fault is a kernel bug.
+pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
 use aegis_os::syscall::{gate, SyscallMask, SYSCALL_COUNT, SYS_EXIT, SYS_WRITE};
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -106,6 +118,7 @@ mod exec {
     /// arg4 rides R10 per the syscall convention, not RCX). Returns the
     /// value RAX carries back to ring-3.
     pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 {
+    SYSCALLS_SERVED.store(true, Ordering::SeqCst);
         let run = context::current();
 
         // Full-width bounds check first (see `normalize_nr`), then the
@@ -157,22 +170,18 @@ mod exec {
         if !validate_user_range(run, buf, len) {
             return (-EFAULT) as u64;
         }
-        // copy_from_user: the domain's CR3 is active, so these reads go
-        // through the domain's own tables (u64 at a time; x86 tolerates
-        // the possibly-unaligned head/tail).
-        let mut chunk = [0u8; 8];
-        let mut written = 0u64;
-        let mut off = 0u64;
-        while off < len {
-            let n = core::cmp::min(8, (len - off) as usize);
-            let word = memops::read_u64_va(buf + off);
-            chunk.copy_from_slice(&word.to_le_bytes());
-            for b in chunk.iter().take(n) {
-                serial::write_byte(*b);
-            }
-            written += n as u64;
-            off += n as u64;
-        }
+        // copy_from_user (N1, ADR-0007 §1): byte-exact — the copy span
+        // equals the validated span by construction, so it cannot
+        // fault. IN_USER_COPY is armed so that if this invariant ever
+        // breaks, the fault is named, not billed to the user.
+        IN_USER_COPY.store(true, Ordering::SeqCst);
+        let written = crate::mm::user_range::copy_user_bytes(
+            buf,
+            len,
+            &memops::read_u8_va,
+            |b| serial::write_byte(b),
+        );
+        IN_USER_COPY.store(false, Ordering::SeqCst);
         run.write_bytes += written;
         written
     }
@@ -185,25 +194,20 @@ mod exec {
         buf: u64,
         len: u64,
     ) -> bool {
-        if len == 0 {
-            return true;
-        }
-        let end = match buf.checked_add(len) {
-            Some(e) if e > buf => e,
-            _ => return false,
-        };
-        if buf >= pte::USER_LIMIT || end > pte::USER_LIMIT {
-            return false;
-        }
-        let mut va = buf & !(pte::PAGE_SIZE_U64 - 1);
-        while va < end {
-            match run.tables.pte_of(va) {
-                Some(e) if e & pte::PTE_U != 0 && e & pte::PTE_P != 0 => {}
-                _ => return false,
-            }
-            va += 4096;
-        }
-        true
+        // N1 (ADR-0007 §1): the arithmetic lives in the pure, host-
+        // tested mm::user_range; this adapter only walks the domain's
+        // own tables (the same tables its CR3 points at).
+        crate::mm::user_range::validate_range(
+            buf,
+            len,
+            MAX_WRITE as u64,
+            pte::USER_LIMIT,
+            pte::PAGE_SIZE_U64,
+            &|va| match run.tables.pte_of(va) {
+                Some(e) => e & pte::PTE_U != 0 && e & pte::PTE_P != 0,
+                None => false,
+            },
+        )
     }
 
     fn log_denied(domain: u32, nr: u64, why: &str, errno: i64) {

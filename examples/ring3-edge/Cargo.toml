@@ -1,0 +1,9 @@
+[package]
+name = "ring3-edge"
+version = "0.2.0"
+edition = "2021"
+description = "AegisOS ring-3 security-example blob (N1): writes ending exactly at the data-page end (must succeed) and a write crossing into the absent next page (must return -EFAULT). Verifies every return value; exits 42 only if the kernel answered everything correctly. Built to a flat blob by boot.sh (rustc --emit=obj + objcopy); NOT a workspace member."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"

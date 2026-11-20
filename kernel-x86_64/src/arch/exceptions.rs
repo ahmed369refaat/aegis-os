@@ -223,6 +223,30 @@ fn dispatch(f: &mut ExceptionFrame) {
     // entry blocked by the environment takes; see
     // docs/arch/syscall-entry.md).
     if crate::sched::context::active() {
+        // N1 (ADR-0007 §1): classify BEFORE billing anyone. Only a CPL3
+        // frame is the user's death; a CPL0 fault while a run is active
+        // is a kernel bug (inside the user-copy routine: a validated-
+        // span violation) and must halt loudly — the PR-1.4 code
+        // resumed either way, hiding the user-copy over-read crash.
+        match super::fault_class::fault_owner(
+            (f.cs & 3) as u8,
+            crate::syscall::IN_USER_COPY.load(Ordering::SeqCst),
+            crate::syscall::SYSCALLS_SERVED.load(Ordering::SeqCst),
+        ) {
+            super::fault_class::FaultOwner::KernelBugUserCopy => {
+                serial::write_str("[SEC ] KERNEL BUG: #PF inside the user-copy routine (copy escaped the validated span)\n");
+                serial::write_str("[EXC] halting: this is unreachable by construction (ADR-0007)\n");
+                hw::halt_forever()
+            }
+            super::fault_class::FaultOwner::KernelBug => {
+                serial::write_str("[EXC] KERNEL BUG: CPL0 fault while a user run is active\n");
+                hw::halt_forever()
+            }
+            super::fault_class::FaultOwner::LaunchRelayLimitation => {
+                serial::write_str("[RING3] launch fault (CPL0, pre-syscall): the documented entry-relay limitation\n");
+            }
+            super::fault_class::FaultOwner::User => {}
+        }
         // SAFETY: CPL3 frames carry the rsp/ss tail; for a CPL0 frame
         // (the entry-blocked case) read zeros — the record only feeds
         // the security log.

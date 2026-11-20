@@ -61,10 +61,20 @@ pub fn write_u64(pa: u64, val: u64) {
     unsafe { (translate(pa) as *mut u64).write_volatile(val) }
 }
 
+/// Read one byte at a user (or kernel) VA — the only volatile reader
+/// the user-copy path is allowed to use (N1, ADR-0007 §1): it touches
+/// exactly one byte, so a validated `[buf, buf+len)` can never fault.
+pub fn read_u8_va(va: u64) -> u8 {
+    unsafe { (va as *const u8).read_volatile() }
+}
+
 /// Volatile 64-bit read at the *virtual* address `va` (no translation).
 ///
-/// SAFETY: `va` must be 8-byte aligned, mapped and readable.
+/// SAFETY: `va` must be 8-byte aligned, mapped and readable. N1
+/// (ADR-0007 §1): user-controlled addresses must never reach this
+/// primitive — the alignment is asserted, and it touches 8 bytes.
 pub fn read_u64_va(va: u64) -> u64 {
+    debug_assert!(va % 8 == 0, "read_u64_va on unaligned va {va:#x}");
     // SAFETY: see function docs.
     unsafe { (va as *const u64).read_volatile() }
 }
@@ -73,6 +83,7 @@ pub fn read_u64_va(va: u64) -> u64 {
 ///
 /// SAFETY: `va` must be 8-byte aligned, mapped and writable.
 pub fn write_u64_va(va: u64, val: u64) {
+    debug_assert!(va % 8 == 0, "write_u64_va on unaligned va {va:#x}");
     // SAFETY: see function docs.
     unsafe { (va as *mut u64).write_volatile(val) }
 }

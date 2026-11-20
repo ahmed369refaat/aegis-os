@@ -24,6 +24,14 @@ KBIN=target/kernel.bin
 STUB_OBJ=target/stub.o
 IMAGE=target/aegis-boot.elf
 
+echo "==> [0/4] building the ring-3 example blobs (rustc --emit=obj + objcopy)"
+for b in ring3-hello ring3-rogue ring3-edge; do
+    rustc --edition 2021 --crate-type=lib --emit=obj \
+          --target x86_64-unknown-none -O "examples/$b/src/lib.rs" \
+          -o "target/$b.o"
+    objcopy -O binary -j .text.ring3 "target/$b.o" "kernel-x86_64/blob/$b.bin"
+done
+
 echo "==> [1/4] building the 64-bit kernel (x86_64-unknown-none, release)"
 cargo build -p aegis-kernel --release --target x86_64-unknown-none
 
@@ -93,6 +101,8 @@ if [ "${1:-}" = "--verify" ]; then
     # (step 11) only runs on the full-success path.
   else
     grep -qF "hello from ring 3 (CPL=3)" "$LOG" || { echo "VERIFY FAIL: ring-3 hello marker missing"; ok=0; }
+    grep -qF "[SEC ] ring3 tail-of-page write ok" "$LOG" || { echo "VERIFY FAIL: N1 tail-of-page marker missing"; ok=0; }
+    grep -qF "[SEC ] ring3 crossing write refused (-EFAULT)" "$LOG" || { echo "VERIFY FAIL: N1 crossing-write marker missing"; ok=0; }
     grep -qF "[RING3] hello domain exited(0): message written from CPL=3" "$LOG" || { echo "VERIFY FAIL: ring-3 exit marker missing"; ok=0; }
     grep -qF "[SYSC] syscall round-trip: " "$LOG" || { echo "VERIFY FAIL: round-trip marker missing"; ok=0; }
     grep -qF "[RING3] user fault: domain terminated, kernel resumes" "$LOG" || { echo "VERIFY FAIL: user-fault resume marker missing"; ok=0; }

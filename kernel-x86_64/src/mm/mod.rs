@@ -29,6 +29,7 @@ pub mod pte;
 pub mod stacks;
 pub mod user;
 pub mod user_layout;
+pub mod user_range;
 
 /// The kernel link base (one 2 MiB huge page at PA 2 MiB).
 pub const KERNEL_BASE: u64 = 0xFFFF_FFFF_8000_0000;
