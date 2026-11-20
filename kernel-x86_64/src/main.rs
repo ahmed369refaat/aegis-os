@@ -64,6 +64,7 @@ pub mod frames;
 pub mod hw;
 pub mod memops;
 pub mod multiboot;
+pub mod pci;
 pub mod runtime;
 pub mod sched;
 pub mod strutil;

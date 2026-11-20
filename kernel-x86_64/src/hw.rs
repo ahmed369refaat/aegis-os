@@ -33,6 +33,18 @@ pub fn outw(port: u16, val: u16) {
     unsafe { asm!("out dx, ax", in("dx") port, in("ax") val, options(nostack, preserves_flags)) }
 }
 
+/// Write one dword to an I/O port. PCI config cycles REQUIRE this
+/// width for the 0xCF8 address register: byte-wise writes land on
+/// 0xCF9 — the chipset reset control register on q35 — not on the
+/// address register's second byte (observed live: the driver-stack
+/// bus scan read garbage until this primitive existed).
+///
+/// SAFETY: as `outb`; callers own the port's semantics.
+pub fn outl(port: u16, val: u32) {
+    // SAFETY: ring-0 CPL; no memory effects beyond the device.
+    unsafe { asm!("out dx, eax", in("dx") port, in("eax") val, options(nostack, preserves_flags)) }
+}
+
 /// Read one byte from an I/O port.
 ///
 /// SAFETY: as `outb`.
@@ -40,6 +52,17 @@ pub fn inb(port: u16) -> u8 {
     let val: u8;
     // SAFETY: ring-0 CPL; a pure device read.
     unsafe { asm!("in al, dx", out("al") val, in("dx") port, options(nostack, preserves_flags)) }
+    val
+}
+
+/// Read one dword from an I/O port — the natural width of the PCI
+/// config data register (0xCFC).
+///
+/// SAFETY: as `inb`.
+pub fn inl(port: u16) -> u32 {
+    let val: u32;
+    // SAFETY: ring-0 CPL; a pure device read.
+    unsafe { asm!("in eax, dx", out("eax") val, in("dx") port, options(nostack, preserves_flags)) }
     val
 }
 

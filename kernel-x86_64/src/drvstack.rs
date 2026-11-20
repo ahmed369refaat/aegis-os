@@ -60,7 +60,8 @@ pub fn driver_stack_step<const N: usize>(
             print_found(out, rsdp_pa, &rsdp, dir_pa, dir_entries, dmar_pa, &dmar);
             if let Some(mut unit) = vtd_step(k, pool, out, &dmar) {
                 proof_step(k, pool, out, &dmar, &mut unit);
-                broker_step(k, pool, out, unit);
+                let mut broker = broker_step(k, pool, out, unit);
+                pci_step(out, &dmar, &mut broker);
             } else {
                 line(out, &["[IOMMU] dma-drivers=0 (fail-closed: no broker)"]);
             }
@@ -504,7 +505,7 @@ fn broker_step<const N: usize>(
     pool: &mut FramePool<N>,
     out: &mut dyn FnMut(&str),
     unit: crate::arch::vtd::Vtd,
-) {
+) -> aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd> {
     use aegis_os::dma::{DmaBroker, DmaDir, DmaError, DmaQuotas};
 
     // Small quotas so the refusal itself is provable in one boot.
@@ -521,13 +522,13 @@ fn broker_step<const N: usize>(
             out,
             &["[IOMMU] broker: pool exhausted before the broker proof"],
         );
-        return;
+        return broker;
     };
     let view = match broker.map_region(0, page_pa, 4096, DmaDir::Bidirectional) {
         Ok(v) => v,
         Err(e) => {
             line(out, &["[IOMMU] broker: map refused (", hw_code(&e), ")"]);
-            return;
+            return broker;
         }
     };
     let mut n1 = [0u8; 20];
@@ -556,7 +557,7 @@ fn broker_step<const N: usize>(
                 out,
                 &["[IOMMU] broker: unmap ordering check SUCCEEDED (BUG: in-flight unmap)"],
             );
-            return;
+            return broker;
         }
         Err(e) => {
             line(
@@ -567,7 +568,7 @@ fn broker_step<const N: usize>(
                     ")",
                 ],
             );
-            return;
+            return broker;
         }
     }
     broker.region_complete(view.cookie).expect("fresh complete");
@@ -601,7 +602,7 @@ fn broker_step<const N: usize>(
         ],
     );
     let Ok(extra_pa) = pool.alloc_for(&mut k.frames, VTD_TABLE_OWNER) else {
-        return;
+        return broker;
     };
     match broker.map_region(0, extra_pa, 4096, DmaDir::ToDevice) {
         Err(DmaError::QuotaRegions) => {
@@ -633,4 +634,188 @@ fn broker_step<const N: usize>(
 
     // The verdict line Phase 1's claim path gates on.
     line(out, &["[IOMMU] dma-drivers=1 (broker live over VT-d)"]);
+    broker
+}
+
+/// Phase 1 (checklist item 2 + item 4's first slice): enumerate bus 0
+/// over CF8/CFC, print the inventory (one line per function: ids,
+/// class, the driver stack's honest name for it, sized BARs, the
+/// capability list), then exercise the REAL claim gate on the first
+/// virtio-blk: endpoint + not-bridge-class + IOMMU verdict + not
+/// RMRR-covered, then the broker's `assign_device`. On machines
+/// without the IOMMU the claim refuses — the negative proof.
+fn pci_step(
+    out: &mut dyn FnMut(&str),
+    dmar: &Dmar,
+    broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
+) {
+    use crate::pci;
+
+    let inv = pci::enumerate_bus0();
+    let mut n = [0u8; 20];
+    line(
+        out,
+        &[
+            "[PCI ] scan bus 0: ",
+            strutil::dec(inv.count as u64, &mut n),
+            " device(s)",
+        ],
+    );
+    let mut b1 = [0u8; 20];
+    let mut b2 = [0u8; 20];
+    for d in &inv.devices[..inv.count] {
+        let mut h = [0u8; 6];
+        let mut parts: [&str; 8] = [""; 8];
+        parts[0] = "[PCI ] ";
+        parts[1] = strutil::dec(u64::from(d.dev), &mut b1);
+        parts[2] = ".";
+        parts[3] = strutil::dec(u64::from(d.func), &mut b2);
+        parts[4] = " ";
+        parts[5] = hex4(d.vendor, &mut h);
+        parts[6] = ":";
+        // vendor:device + class + name, then BARs and caps on their
+        // own lines (the array is fixed-size: no formatting crutches).
+        line(out, &parts[..7]);
+        let mut h2 = [0u8; 6];
+        let mut c = [0u8; 6];
+        line(
+            out,
+            &[
+                "       ",
+                hex4(d.device, &mut h2),
+                " class=",
+                hex4(d.class, &mut c),
+                " ",
+                pci::describe(d.vendor, d.device),
+            ],
+        );
+        for b in d.bars[..d.bar_count].iter().flatten() {
+            let mut hb = [0u8; 18];
+            let mut hs = [0u8; 18];
+            line(
+                out,
+                &[
+                    "       BAR[",
+                    match b.kind {
+                        pci::BarKind::Mem64 => "mem64",
+                        pci::BarKind::Mem32 => "mem32",
+                        pci::BarKind::Io => "io  ",
+                    },
+                    "] base=",
+                    strutil::hex(b.base, &mut hb),
+                    " size=",
+                    strutil::hex(b.size, &mut hs),
+                    if b.prefetchable {
+                        " (prefetchable)"
+                    } else {
+                        ""
+                    },
+                ],
+            );
+        }
+        if d.cap_count > 0 {
+            for i in 0..d.cap_count {
+                let mut hc = [0u8; 6];
+                line(
+                    out,
+                    &[
+                        "       cap[",
+                        strutil::dec(u64::from(d.cap_ptrs[i]), &mut b1),
+                        "] ",
+                        cap_name(d.cap_ids[i]),
+                        " (id=",
+                        hex4(u16::from(d.cap_ids[i]), &mut hc),
+                        ")",
+                    ],
+                );
+            }
+        }
+    }
+
+    // The claim gate, live: virtio-blk (vendor 0x1AF4, class 01xx).
+    match inv.find_by(0x1AF4, 0x01) {
+        None => {
+            line(
+                out,
+                &["[PCI ] claim: no virtio-blk on this machine (nothing to claim)"],
+            );
+        }
+        Some(dev) => {
+            let mut bd = [0u8; 20];
+            let mut bf = [0u8; 20];
+            let rmrr = dmar.rmrr_covers(0, dev.bus, dev.dev, dev.func);
+            let claim = pci::check_claim(dev, broker.verdict(), rmrr);
+            match claim {
+                Err(e) => {
+                    line(
+                        out,
+                        &[
+                            "[PCI ] claim: ",
+                            strutil::dec(u64::from(dev.dev), &mut bd),
+                            ".",
+                            strutil::dec(u64::from(dev.func), &mut bf),
+                            " REFUSED (",
+                            describe_claim_error(e),
+                            ")",
+                        ],
+                    );
+                }
+                Ok(()) => match broker.assign_device(0, 0, dev.bus, (dev.dev, dev.func)) {
+                    Ok(()) => {
+                        line(
+                            out,
+                            &[
+                                "[PCI ] claim: bus=0 dev=",
+                                strutil::dec(u64::from(dev.dev), &mut bd),
+                                " fn=",
+                                strutil::dec(u64::from(dev.func), &mut bf),
+                                " (virtio-blk) → dom 0 ok (broker assigned)",
+                            ],
+                        );
+                    }
+                    Err(e) => {
+                        line(
+                            out,
+                            &[
+                                "[PCI ] claim: broker refused the assignment (",
+                                hw_code(&e),
+                                ")",
+                            ],
+                        );
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// Capability names for the inventory (diagnostics; unknown = "?").
+fn cap_name(id: u8) -> &'static str {
+    match id {
+        0x05 => "msi",
+        0x11 => "msix",
+        0x09 => "virtio",
+        _ => "?",
+    }
+}
+
+fn describe_claim_error(e: crate::pci::ClaimError) -> &'static str {
+    match e {
+        crate::pci::ClaimError::NotEndpoint => "bridge header",
+        crate::pci::ClaimError::BridgeClass => "bridge class",
+        crate::pci::ClaimError::NoIommu => "no IOMMU (fail-closed)",
+        crate::pci::ClaimError::RmrrCovered => "RMRR-covered (unusable, D2)",
+    }
+}
+
+/// 0x-prefixed 4-digit hex (the marker-friendly form for ids).
+fn hex4(v: u16, buf: &mut [u8; 6]) -> &str {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..4 {
+        let shift = 12 - 4 * i as u32;
+        buf[2 + i] = DIGITS[((v >> shift) & 0xF) as usize];
+    }
+    core::str::from_utf8(&buf[..6]).unwrap_or("0x????")
 }

@@ -43,3 +43,11 @@
 #      park/unpark tail writes, enter_ring3_parked/resume_parked,
 #      cpuid1_ecx (ADR-0008 pattern), the full-frame fault dump.
 89
+
+# 91 -> Driver stack Phase 1 (ADR-0013): +2 — hw::inl/outl, dword
+#      port I/O. PCI config cycles require dword width: byte-wise
+#      writes to CF8+1 land on 0xCF9, the chipset RESET CONTROL
+#      register on q35 — the address register never latches and the
+#      bus scan reads noise (measured live: vendor 0x0008 on every
+#      slot until these primitives existed).
+91
