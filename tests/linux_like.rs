@@ -272,6 +272,20 @@ fn kill_permissions_and_fatal_signal_delivery() {
         k.syscall(SERVICE, SysRequest::Kill { target: SERVICE, sig: SIGUSR1 }),
         Ok(SysValue::Unit)
     );
+    // F18 (ADR-0009): even the supervisor needs Domain capabilities to
+    // signal other domains — the supervisor grant path inserts them
+    // (both targets, before any kill the test asserts on).
+    for target in [PARSER, SERVICE] {
+        k.domain_mut(SUPERVISOR)
+            .unwrap()
+            .caps
+            .insert(Capability {
+                resource: Resource::Domain(target),
+                rights: Rights::WRITE,
+                generation: 0,
+            })
+            .unwrap();
+    }
     // Invalid signal numbers are rejected.
     assert_eq!(
         k.syscall(SUPERVISOR, SysRequest::Kill { target: SERVICE, sig: 0 }),
@@ -298,10 +312,13 @@ fn kill_permissions_and_fatal_signal_delivery() {
     );
     assert_eq!(k.deliver_signals(SERVICE).unwrap(), Some(SIGUSR1));
     assert_eq!(k.domain_state(SERVICE), Some(DomainState::Running));
-    // Killing an unknown domain fails cleanly.
+    // F18 (ADR-0009): the capability gate precedes existence — an
+    // unauthorized sender (no Domain capability for the target) gets
+    // PermissionDenied for a MISSING target too, so ids cannot be
+    // enumerated (the F14 property, preserved under the new order).
     assert_eq!(
         k.syscall(SUPERVISOR, SysRequest::Kill { target: 99, sig: SIGKILL }),
-        Err(SysError::UnknownDomain(99))
+        Err(SysError::PermissionDenied)
     );
 }
 

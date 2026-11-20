@@ -66,13 +66,18 @@ impl core::ops::BitOrAssign for Rights {
     }
 }
 
-/// What a capability points at.
+/// What a capability points at (F18, ADR-0009): the full resource
+/// model the syscall layer enforces. `FsNode` carries the inode
+/// reference (id + generation, F10) so a stale capability fails closed
+/// exactly like a stale fd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resource {
-    FsNode(u32),
-    IpcChannel(u32),
+    FsNode(crate::vfs::InodeRef),
     Device(u32),
-    MemRegion(u32),
+    Domain(u32),
+    /// IPC endpoints — reserved for the IPC executor slices (ADR-0009
+    /// TODO); nothing enforces them yet.
+    Endpoint(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +181,22 @@ impl CapabilityTable {
         Ok(Capability { resource: p.resource, rights, generation: 0 })
     }
 
+    /// F18: iterate live capabilities (the syscall gates scan for a
+    /// covering capability).
+    pub fn iter(&self) -> impl Iterator<Item = &Capability> {
+        self.slots.iter().flatten()
+    }
+
+    /// F18: live handles with their true generations (tests and
+    /// supervisors enumerate to revoke; generation 0 is reserved, so
+    /// guessing handles never works).
+    pub fn handles(&self) -> impl Iterator<Item = CapHandle> + use<'_> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|c| CapHandle { index: i, generation: c.generation }))
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
@@ -198,7 +219,7 @@ mod tests {
     use super::*;
 
     fn file_cap(rights: Rights) -> Capability {
-        Capability { resource: Resource::FsNode(7), rights, generation: 0 }
+        Capability { resource: Resource::FsNode(crate::vfs::InodeRef { id: 7, generation: 1 }), rights, generation: 0 }
     }
 
     #[test]
@@ -207,7 +228,7 @@ mod tests {
         assert!(t.is_empty());
         let h = t.insert(file_cap(Rights::READ | Rights::GRANT)).unwrap();
         let c = t.lookup(h).unwrap();
-        assert_eq!(c.resource, Resource::FsNode(7));
+        assert_eq!(c.resource, Resource::FsNode(crate::vfs::InodeRef { id: 7, generation: 1 }));
         assert!(c.rights.contains(Rights::READ));
         assert_eq!(t.len(), 1);
     }
@@ -217,7 +238,7 @@ mod tests {
         let mut t = CapabilityTable::new();
         for i in 0..MAX_CAPABILITIES {
             t.insert(Capability {
-                resource: Resource::FsNode(i as u32),
+                resource: Resource::FsNode(crate::vfs::InodeRef { id: i as u32, generation: 1 }),
                 rights: Rights::READ,
                 generation: 0,
             })
@@ -232,7 +253,7 @@ mod tests {
         let mut t = CapabilityTable::new();
         let h = t.insert(file_cap(Rights::READ)).unwrap();
         let revoked = t.revoke(h).unwrap();
-        assert_eq!(revoked.resource, Resource::FsNode(7));
+        assert_eq!(revoked.resource, Resource::FsNode(crate::vfs::InodeRef { id: 7, generation: 1 }));
         assert_eq!(t.lookup(h), Err(CapError::InvalidHandle));
     }
 
@@ -290,7 +311,7 @@ mod tests {
         let h = t.insert(file_cap(Rights::READ | Rights::GRANT)).unwrap();
         let child = t.attenuate(h, Rights::NONE).unwrap();
         assert!(child.rights.is_empty());
-        assert_eq!(child.resource, Resource::FsNode(7));
+        assert_eq!(child.resource, Resource::FsNode(crate::vfs::InodeRef { id: 7, generation: 1 }));
     }
 
     #[test]
@@ -304,7 +325,7 @@ mod tests {
             .attenuate(h, Rights::READ | Rights::WRITE | Rights::GRANT)
             .unwrap();
         assert!(child.rights.is_subset_of(h_lookup(&t, h).rights));
-        assert_eq!(child.resource, Resource::FsNode(7));
+        assert_eq!(child.resource, Resource::FsNode(crate::vfs::InodeRef { id: 7, generation: 1 }));
         // Attenuation of an attenuation still cannot exceed the parent.
         let h2 = t.insert(child).unwrap();
         let grandchild = t.attenuate(h2, Rights::READ).unwrap();

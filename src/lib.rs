@@ -630,13 +630,13 @@ mod tests {
             .domain_mut(1)
             .unwrap()
             .caps
-            .insert(Capability { resource: Resource::FsNode(1), rights: Rights::READ.union(Rights::GRANT), generation: 0 })
+            .insert(Capability { resource: Resource::FsNode(crate::vfs::InodeRef { id: 1, generation: 1 }), rights: Rights::READ.union(Rights::GRANT), generation: 0 })
             .unwrap();
         let bare = k
             .domain_mut(1)
             .unwrap()
             .caps
-            .insert(Capability { resource: Resource::FsNode(9), rights: Rights::READ, generation: 0 })
+            .insert(Capability { resource: Resource::FsNode(crate::vfs::InodeRef { id: 9, generation: 1 }), rights: Rights::READ, generation: 0 })
             .unwrap();
         let before = k.domain_mut(1).unwrap().stats.escalation_attempts;
         // Widening: child wants WRITE the parent never had.
@@ -924,11 +924,13 @@ mod tests {
         // Self still works, and a missing *own-uid* target... self-target
         // is domain 1 itself (exists): fine.
         assert!(k.syscall(1, SysRequest::Kill { target: 1, sig: 15 }).is_ok());
-        // Root gets the truthful UnknownDomain for a missing target.
+        // Root without a Domain capability is unauthorized too (F18,
+        // ADR-0009 supersedes the old root-UnknownDomain expectation) —
+        // and gets the SAME answer for a missing target: no enumeration.
         k.create_domain_with(9, service_profile(), 0, 0, 0).unwrap(); // uid 0
         assert!(matches!(
             k.syscall(9, SysRequest::Kill { target: 7777, sig: 15 }),
-            Err(SysError::UnknownDomain(7777))
+            Err(SysError::PermissionDenied)
         ));
     }
 
@@ -948,7 +950,7 @@ mod tests {
             .unwrap()
             .caps
             .insert(crate::capability::Capability {
-                resource: crate::capability::Resource::FsNode(1),
+                resource: crate::capability::Resource::FsNode(crate::vfs::InodeRef { id: 1, generation: 1 }),
                 rights: crate::capability::Rights::READ.union(crate::capability::Rights::GRANT),
                 generation: 0,
             })
@@ -1029,7 +1031,7 @@ mod tests {
             .domain_mut(1)
             .unwrap()
             .caps
-            .insert(Capability { resource: Resource::FsNode(1), rights: Rights::READ.union(Rights::GRANT), generation: 0 })
+            .insert(Capability { resource: Resource::FsNode(crate::vfs::InodeRef { id: 1, generation: 1 }), rights: Rights::READ.union(Rights::GRANT), generation: 0 })
             .unwrap();
         let misbehave = |k: &mut Kernel| {
             // Gate refusals (NET_SEND is not on the service surface).
@@ -1130,6 +1132,197 @@ mod tests {
             Decision::DeniedQuarantined(crate::syscall::SYS_WRITE)
         );
         let _ = SysRequest::Pipe; // (import shape check)
+    }
+
+    /// F18: the capability layer is load-bearing — a domain with the
+    /// right syscall mask and passing Unix DAC is STILL denied when it
+    /// holds no FsNode capability covering the operation, and the
+    /// failure feeds the escalation signal.
+    #[test]
+    fn right_mask_but_no_capability_is_denied_and_recorded() {
+        use crate::sys::{SysError, SysRequest, SysValue};
+        use crate::vfs::Mode;
+        let mut k = Kernel::new();
+        // Root builds a world-readable file in a world-executable tree.
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(1, SysRequest::Mkdir { path: "/pub", mode: Mode(0o777) }).unwrap();
+        k.syscall(1, SysRequest::Open { path: "/pub/x", mode: Mode(0o644), create: true, read: true, write: true, truncate: false }).unwrap();
+        // The service (mask: OPEN is on; DAC: /pub is 0o777, /pub/x is
+        // 0o644 with other: r) opens it for read — works today ONLY
+        // because caps are not enforced (the RED state).
+        k.create_domain(2, service_profile()).unwrap();
+        let open = |k: &mut Kernel| {
+            k.syscall(2, SysRequest::Open { path: "/pub/x", mode: Mode(0o644), create: false, read: true, write: false, truncate: false })
+        };
+        // Sanity today: with the minted root capability, the open works.
+        assert!(open(&mut k).is_ok(), "the minted FsNode(ROOT) capability must cover the tree");
+        // Revoke EVERY FsNode capability the domain holds.
+        {
+            let d = k.domain_mut(2).unwrap();
+            let mut revoked_any = false;
+            for _ in 0..crate::capability::MAX_CAPABILITIES {
+                let Some(h) = d.caps.handles().next() else { break };
+                // Revoke one at a time; keep only if it was an FsNode —
+                // revoke everything, assert at least one FsNode went.
+                match d.caps.revoke(h) {
+                    Ok(c) => {
+                        if matches!(c.resource, crate::capability::Resource::FsNode(_)) {
+                            revoked_any = true;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            assert!(revoked_any, "the domain must have held an FsNode capability");
+        }
+        let escalations = k.domain_mut(2).unwrap().stats.escalation_attempts;
+        match open(&mut k) {
+            Err(SysError::PermissionDenied) => {}
+            other => panic!("mask+DAC pass but no capability must be denied, got {:?}", other.map(|_| ())),
+        }
+        assert_eq!(
+            k.domain_mut(2).unwrap().stats.escalation_attempts,
+            escalations + 1,
+            "the failed capability check is an escalation signal"
+        );
+        let _ = SysValue::Unit;
+    }
+
+    /// F18: revocation bites on the very next syscall — netd loses its
+    /// Device capability and NetSend is refused (mask still on, bucket
+    /// still full).
+    #[test]
+    fn revoked_device_capability_fails_the_next_syscall() {
+        use crate::sys::{SysError, SysRequest};
+        let mut k = Kernel::new();
+        k.create_domain(1, crate::profile::netd_profile()).unwrap();
+        // A send with the minted Device(0) capability: passes the cap
+        // gate; the token bucket is fresh, so the only refusal reason
+        // left would be the (unimplemented) executor — count attempts.
+        let _ = k.syscall(1, SysRequest::NetSend { len: 4 });
+        // Revoke the Device capability.
+        {
+            let d = k.domain_mut(1).unwrap();
+            let mut revoked = false;
+            for _ in 0..crate::capability::MAX_CAPABILITIES {
+                let Some(h) = d.caps.handles().next() else { break };
+                if let Ok(c) = d.caps.revoke(h) {
+                    if matches!(c.resource, crate::capability::Resource::Device(_)) {
+                        revoked = true;
+                        break;
+                    }
+                }
+            }
+            assert!(revoked, "netd must have held a Device capability");
+        }
+        assert!(matches!(
+            k.syscall(1, SysRequest::NetSend { len: 4 }),
+            Err(SysError::PermissionDenied)
+        ));
+    }
+
+    /// F18: derivation never exceeds the parent, and the failed
+    /// derivation inserts nothing.
+    #[test]
+    fn derived_capability_cannot_exceed_parent() {
+        use crate::capability::{Capability, CapError, Resource, Rights};
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        let grantor = k
+            .domain_mut(1)
+            .unwrap()
+            .caps
+            .insert(Capability { resource: Resource::FsNode(crate::vfs::ROOT_REF), rights: Rights::READ.union(Rights::GRANT), generation: 0 })
+            .unwrap();
+        let before = k.domain_mut(1).unwrap().caps.len();
+        assert!(matches!(
+            k.cap_attenuate(1, grantor, Rights::READ.union(Rights::WRITE)),
+            Err(CapError::Escalation)
+        ));
+        assert_eq!(k.domain_mut(1).unwrap().caps.len(), before, "a failed derivation inserts nothing");
+        // And a legal derivation stays inside the parent's rights.
+        let child = k.cap_attenuate(1, grantor, Rights::READ).unwrap();
+        let c = k.cap_lookup(1, child).unwrap();
+        assert!(c.rights.is_subset_of(Rights::READ));
+    }
+
+    /// F18: a domain cannot mint capabilities — no syscall grows its
+    /// table; only supervisor APIs can.
+    #[test]
+    fn a_domain_cannot_mint_capabilities() {
+        use crate::sys::SysRequest;
+        use crate::vfs::Mode;
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(1, SysRequest::Mkdir { path: "/pub", mode: Mode(0o777) }).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        let minted = k.domain_mut(2).unwrap().caps.len();
+        assert!(minted >= 3, "creation mints FsNode/Device/Domain (got {minted})");
+        // A battery of everything the domain can attempt.
+        for req in [
+            SysRequest::Open { path: "/pub/x", mode: Mode(0o644), create: true, read: true, write: true, truncate: false },
+            SysRequest::Mkdir { path: "/pub/d", mode: Mode(0o755) },
+            SysRequest::Kill { target: 2, sig: 15 },
+            SysRequest::Pipe,
+        ] {
+            let _ = k.syscall(2, req);
+        }
+        assert_eq!(
+            k.domain_mut(2).unwrap().caps.len(),
+            minted,
+            "no syscall may grow a domain's capability table"
+        );
+    }
+
+    /// F18 + F14 layering: Kill needs a Domain capability (self-kill
+    /// always works through the minted self-capability); with a granted
+    /// capability the Unix DAC layer still applies; an unauthorized
+    /// sender — root included — gets the same PermissionDenied for
+    /// existing and missing targets (no enumeration).
+    #[test]
+    fn kill_requires_a_domain_capability_then_unix_rules() {
+        use crate::capability::{Capability, Resource, Rights};
+        use crate::sys::{SysError, SysRequest};
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap(); // uid 1001
+        k.create_domain_with(2, service_profile(), 1001, 100, 0).unwrap(); // same uid
+        // Self-kill: the minted Domain(self) capability passes.
+        assert!(k.syscall(1, SysRequest::Kill { target: 1, sig: 15 }).is_ok());
+        // No Domain(2) capability: denied, existing or not (F14 shape).
+        assert!(matches!(
+            k.syscall(1, SysRequest::Kill { target: 2, sig: 15 }),
+            Err(SysError::PermissionDenied)
+        ));
+        assert!(matches!(
+            k.syscall(1, SysRequest::Kill { target: 7777, sig: 15 }),
+            Err(SysError::PermissionDenied)
+        ));
+        // Root is unauthorized too without a grant — same answer for
+        // existing and missing (this supersedes F14's root-UnknownDomain
+        // expectation; ADR-0009 §3).
+        k.create_domain_with(9, service_profile(), 0, 0, 0).unwrap();
+        assert!(matches!(
+            k.syscall(9, SysRequest::Kill { target: 2, sig: 15 }),
+            Err(SysError::PermissionDenied)
+        ));
+        // Supervisor grants a Domain(2) capability: now the cap gate
+        // passes and the Unix layer decides — same uid: allowed.
+        k.domain_mut(1)
+            .unwrap()
+            .caps
+            .insert(Capability { resource: Resource::Domain(2), rights: Rights::WRITE, generation: 0 })
+            .unwrap();
+        assert!(k.syscall(1, SysRequest::Kill { target: 2, sig: 15 }).is_ok());
+        // ...different uid: the DAC layer refuses even with the cap.
+        k.domain_mut(1)
+            .unwrap()
+            .caps
+            .insert(Capability { resource: Resource::Domain(9), rights: Rights::WRITE, generation: 0 })
+            .unwrap();
+        assert!(matches!(
+            k.syscall(1, SysRequest::Kill { target: 9, sig: 15 }),
+            Err(SysError::PermissionDenied)
+        ));
     }
 
     /// N2 mirror of ring3-rogue mode 3: per iteration six forbidden

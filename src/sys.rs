@@ -20,6 +20,7 @@ use crate::net::{NetError, TokenBucket, DEFAULT_BURST_BYTES, DEFAULT_RATE_BYTES_
 use crate::pipe::PipeError;
 use crate::signal::{DefaultAction, SignalError};
 use crate::vfs::{Access, InodeKind, Mode, VfsError};
+use crate::capability::Rights;
 use crate::memory::MemFlags;
 use crate::{
     Kernel, KernelError,
@@ -155,6 +156,23 @@ impl Kernel {
         };
         match req {
             SysRequest::Open { path, mode, create, read, write, truncate } => {
+                // F18 (ADR-0009): the capability gate runs BEFORE any
+                // resolution work — an FsNode capability covering the
+                // path's parent directory, with the requested access.
+                let parent = self
+                    .vfs
+                    .parent_ref(root, cwd, path, creds)
+                    .map_err(SysError::Vfs)?;
+                let mut access = crate::capability::Rights::NONE;
+                if read {
+                    access = access.union(Rights::READ);
+                }
+                if write || create {
+                    access = access.union(Rights::WRITE);
+                }
+                if !access.is_empty() {
+                    self.require_fs_cap(domain_id, parent, access)?;
+                }
                 let r = if create {
                     match self.vfs.resolve(root, cwd, path, creds) {
                         Ok(found) => {
@@ -417,6 +435,13 @@ impl Kernel {
                 // (pending, unblockable) but this sample kernel has no
                 // Stopped scheduling state — stopping is documented as
                 // unsupported (see SECURITY-MODEL.md).
+                // F18 (ADR-0009): the capability gate precedes the Unix
+                // rules (and existence — F14's no-enumeration property
+                // is preserved: an unauthorized sender gets the same
+                // PermissionDenied for existing and missing targets).
+                if target != domain_id {
+                    self.require_domain_cap(domain_id, target)?;
+                }
                 let sender_uid = self.domain_mut(domain_id).map_err(into_sys)?.uid;
                 if sender_uid != 0 && target != domain_id {
                     let same_uid = self
@@ -452,14 +477,21 @@ impl Kernel {
                 Ok(SysValue::Unit)
             }
             SysRequest::Mkdir { path, mode } => {
+                let parent = self.vfs.parent_ref(root, cwd, path, creds).map_err(SysError::Vfs)?;
+                self.require_fs_cap(domain_id, parent, Rights::WRITE)?;
                 self.vfs.mkdir(root, cwd, path, creds, mode).map_err(SysError::Vfs)?;
                 Ok(SysValue::Unit)
             }
             SysRequest::Unlink { path } => {
+                let parent = self.vfs.parent_ref(root, cwd, path, creds).map_err(SysError::Vfs)?;
+                self.require_fs_cap(domain_id, parent, Rights::WRITE)?;
                 self.vfs.unlink(root, cwd, path, creds).map_err(SysError::Vfs)?;
                 Ok(SysValue::Unit)
             }
             SysRequest::NetSend { len } => {
+                // F18 (ADR-0009): the brokered NIC needs the Device
+                // capability with WRITE, before any socket work.
+                self.require_device_cap(domain_id, Rights::WRITE)?;
                 let sock = self
                     .sockets
                     .open_socket_of(domain_id)
@@ -549,6 +581,97 @@ impl Kernel {
 
 impl Kernel {
     /// Best-effort fd close used by rollback paths (never fails the caller).
+    /// F18 (ADR-0009): require an FsNode capability covering `parent`
+    /// (the operation's parent directory) with `access`. Unix DAC
+    /// remains the second layer. A failure is an escalation signal on
+    /// the live domain — the same recording path as the cap_* wrappers.
+    fn require_fs_cap(
+        &mut self,
+        domain_id: u32,
+        parent: crate::vfs::InodeRef,
+        access: Rights,
+    ) -> Result<(), SysError> {
+        // no_std: a fixed-size snapshot (the table is bounded by
+        // MAX_CAPABILITIES).
+        let mut caps =
+            [(crate::capability::Resource::Domain(0), Rights::NONE); crate::capability::MAX_CAPABILITIES];
+        let mut n = 0usize;
+        {
+            let d = self.domain_mut(domain_id).map_err(into_sys)?;
+            for c in d.caps.iter() {
+                if n < caps.len() {
+                    caps[n] = (c.resource, c.rights);
+                    n += 1;
+                }
+            }
+        }
+        for (res, rights) in caps.iter().take(n) {
+            if let crate::capability::Resource::FsNode(r) = res {
+                if rights.contains(access) && self.vfs.is_within(*r, parent) {
+                    return Ok(());
+                }
+            }
+        }
+        let d = self.domain_mut(domain_id).map_err(into_sys)?;
+        d.stats.escalation_attempts = d.stats.escalation_attempts.saturating_add(1);
+        Err(SysError::PermissionDenied)
+    }
+
+    /// F18 (ADR-0009): require the Device capability (the brokered NIC
+    /// is device 0) with `access`.
+    fn require_device_cap(&mut self, domain_id: u32, access: Rights) -> Result<(), SysError> {
+        let mut caps =
+            [(crate::capability::Resource::Domain(0), Rights::NONE); crate::capability::MAX_CAPABILITIES];
+        let mut n = 0usize;
+        {
+            let d = self.domain_mut(domain_id).map_err(into_sys)?;
+            for c in d.caps.iter() {
+                if n < caps.len() {
+                    caps[n] = (c.resource, c.rights);
+                    n += 1;
+                }
+            }
+        }
+        for (res, rights) in caps.iter().take(n) {
+            if let crate::capability::Resource::Device(dev) = res {
+                if *dev == 0 && rights.contains(access) {
+                    return Ok(());
+                }
+            }
+        }
+        let d = self.domain_mut(domain_id).map_err(into_sys)?;
+        d.stats.escalation_attempts = d.stats.escalation_attempts.saturating_add(1);
+        Err(SysError::PermissionDenied)
+    }
+
+    /// F18 (ADR-0009): require a Domain capability on `target` with
+    /// WRITE. Self-signaling is always allowed: creation minted
+    /// Domain(id), so the normal check passes with no special case.
+    fn require_domain_cap(&mut self, domain_id: u32, target: u32) -> Result<(), SysError> {
+        let mut caps =
+            [(crate::capability::Resource::Domain(0), Rights::NONE); crate::capability::MAX_CAPABILITIES];
+        let mut n = 0usize;
+        {
+            let d = self.domain_mut(domain_id).map_err(into_sys)?;
+            for c in d.caps.iter() {
+                if n < caps.len() {
+                    caps[n] = (c.resource, c.rights);
+                    n += 1;
+                }
+            }
+        }
+        for (res, rights) in caps.iter().take(n) {
+            if let crate::capability::Resource::Domain(t) = res {
+                if *t == target && rights.contains(Rights::WRITE) {
+                    return Ok(());
+                }
+            }
+        }
+        let d = self.domain_mut(domain_id).map_err(into_sys)?;
+        d.stats.escalation_attempts = d.stats.escalation_attempts.saturating_add(1);
+        Err(SysError::PermissionDenied)
+    }
+
     fn drop_quietly(&mut self, domain_id: u32, fd: u8) {
         if let Ok(d) = self.domain_mut(domain_id) {
             let _ = d.fds.close(fd);

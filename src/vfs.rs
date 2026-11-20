@@ -196,6 +196,46 @@ impl Vfs {
         }
     }
 
+    /// F18 (ADR-0009): the parent directory of a path's final
+    /// component, as a reference (the capability gate checks coverage
+    /// of the *parent* — the directory an operation modifies).
+    pub fn parent_ref(
+        &self,
+        root: InodeRef,
+        cwd: InodeRef,
+        path: &str,
+        creds: Credentials,
+    ) -> Result<InodeRef, VfsError> {
+        let (id, _) = self.resolve_parent(root, cwd, path, creds)?;
+        let generation = self.inode(id)?.generation;
+        Ok(InodeRef { id, generation })
+    }
+
+    /// F18 (ADR-0009): is `node` inside `ancestor`'s subtree (or equal
+    /// to it)? A capability on a directory covers operations whose
+    /// parent directory lies within it. Bounded by the inode table —
+    /// the parent chain cannot cycle (each mkdir sets a live parent).
+    pub fn is_within(&self, ancestor: InodeRef, node: InodeRef) -> bool {
+        let anc = match self.live(ancestor) {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let mut cur = match self.live(node) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        for _ in 0..MAX_INODES {
+            if cur == anc {
+                return true;
+            }
+            match self.inode(cur) {
+                Ok(i) => cur = i.parent,
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
     /// F11(b): DAC check through a reference (stale fails closed) —
     /// used by Open to check the requested access at open time.
     pub fn check_access_ref(

@@ -14,6 +14,7 @@ use crate::monitor::DomainStats;
 use crate::profile::DomainProfile;
 use crate::signal::SignalState;
 use crate::syscall::{SyscallMask, SYS_EXIT};
+use crate::capability::{Capability, Resource, Rights};
 use crate::vfs::{Credentials, InodeRef, ROOT_REF};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +67,10 @@ pub struct Domain {
 impl Domain {
     pub fn new(id: u32, profile: DomainProfile) -> Self {
         let mask = profile.syscalls;
-        Domain {
+        // F18 (ADR-0009): captured before the profile moves into the
+        // domain — the base_rights mint the initial capabilities below.
+        let base_rights = profile.base_rights;
+        let mut d = Domain {
             id,
             space: AddressSpace::new(profile.quota_pages),
             profile,
@@ -81,7 +85,29 @@ impl Domain {
             chroot_root: ROOT_REF,
             fds: FdTable::new(),
             signals: SignalState::new(),
-        }
+        };
+        // F18 (ADR-0009): the base_rights mint the initial
+        // capabilities — FsNode(ROOT_REF) (covers the whole VFS tree,
+        // ancestor semantics via Vfs::is_within), Device(0) (the
+        // brokered NIC), and Domain(id) (self-signaling; self-kill
+        // needs no special case). Nothing else: cross-domain kills and
+        // deeper scoping require supervisor grants.
+        let _ = d.caps.insert(Capability {
+            resource: Resource::FsNode(ROOT_REF),
+            rights: base_rights,
+            generation: 0,
+        });
+        let _ = d.caps.insert(Capability {
+            resource: Resource::Device(0),
+            rights: base_rights,
+            generation: 0,
+        });
+        let _ = d.caps.insert(Capability {
+            resource: Resource::Domain(id),
+            rights: Rights::WRITE,
+            generation: 0,
+        });
+        d
     }
 
     #[must_use]
