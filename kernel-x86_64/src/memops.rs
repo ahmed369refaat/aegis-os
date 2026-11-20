@@ -71,6 +71,28 @@ pub fn write_u32(pa: u64, val: u32) {
     unsafe { (translate(pa) as *mut u32).write_volatile(val) }
 }
 
+/// Volatile 16-bit write at physical address `pa` — exact-width
+/// MMIO access. Device register files (virtio common-config, for
+/// one) dispatch on the ACCESS address and width: a u32 RMW at the
+/// aligned base writes a DIFFERENT register — virtio's QUEUE_SEL was
+/// silently swallowed that way, leaving queue selection stuck at 0.
+///
+/// SAFETY: `pa` must be 2-byte aligned and point to a writable
+/// register.
+pub fn write_u16(pa: u64, val: u16) {
+    // SAFETY: see function docs.
+    unsafe { (translate(pa) as *mut u16).write_volatile(val) }
+}
+
+/// Volatile 16-bit read at physical address `pa` (the read side of
+/// the exact-width MMIO discipline above).
+///
+/// SAFETY: `pa` must be 2-byte aligned and readable.
+pub fn read_u16(pa: u64) -> u16 {
+    // SAFETY: see function docs.
+    unsafe { (translate(pa) as *const u16).read_volatile() }
+}
+
 /// Read one byte at a user (or kernel) VA — the only volatile reader
 /// the user-copy path is allowed to use (N1, ADR-0007 §1): it touches
 /// exactly one byte, so a validated `[buf, buf+len)` can never fault.

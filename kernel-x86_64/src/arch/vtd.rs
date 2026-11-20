@@ -704,7 +704,7 @@ impl Vtd {
         // IQT write was then ignored, and the device's first ring DMA
         // hit an untranslated IOVA.
         let mut gcmd: u32 = 0; // bring-up: nothing enabled yet
-        // Root table: legacy RTT (bit 0 clear), 4 KiB-aligned address.
+                               // Root table: legacy RTT (bit 0 clear), 4 KiB-aligned address.
         crate::memops::write_u64(self.reg_base + REG_RTADDR, self.root_pa & ADDR_MASK);
         gcmd |= GCMD_SRTP;
         self.write32(REG_GCMD, gcmd);
@@ -836,7 +836,11 @@ mod tests {
         let lo = context_entry(0x2000, 5);
         assert_eq!(lo & 0xFFF, 0x9, "P | TT=0b10 (the 4-level walk)");
         assert_eq!(lo & ADDR_MASK, 0x2000);
-        assert_eq!(lo & (3 << 2), 0, "translation-type 0");
+        assert_eq!(
+            lo & (3 << 2),
+            0b10 << 2,
+            "TT=0b10 (QEMU's 4-level walk selector)"
+        );
         assert_eq!(context_entry_hi(5), 5);
         // SLPT leaves: P, W per direction, frame address.
         assert_eq!(slpte_leaf(0x7000, false), 0x7001);

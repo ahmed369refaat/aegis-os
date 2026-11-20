@@ -51,3 +51,9 @@
 #      bus scan reads noise (measured live: vendor 0x0008 on every
 #      slot until these primitives existed).
 91
+#
+# 93 -> Driver stack Phase 2 (ADR-0013 lane): +2 — memops write_u16/read_u16,
+# exact-width 2-byte MMIO primitives. QEMU dispatches device registers on
+# access width+address; the u32-RMW form silently corrupted virtio QUEUE_SEL
+# (queue selection stuck at 0 — measured on the net TX queue).
+93

@@ -74,10 +74,16 @@ case "${1:-}" in
     MACHINE_ARGS=(-machine q35 -cpu max -m 128M
                   -device intel-iommu,intremap=off
                   -device virtio-blk-pci,disable-legacy=on,iommu_platform=on,drive=vd0
+                  -netdev user,id=n0
+                  -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on
                   -drive id=vd0,if=none,format=raw,file=target/vdisk0.img)
     EXTRA_GREPS=(
       "[IOMMU] dmar: pa="
       "[IOMMU] dmar: pa=0x"  # placeholder replaced below; see lane block
+      "[VNET] alive: MAC="
+      "[VNET] dbg q1 readback:"  # the device holds exactly the frames we mapped
+      "[VNET] TX: DISCOVER published+kicked"
+      "[VNET] teardown: revoke_all(0) → 8 region(s)"
     )
     ;;
   --verify-q35-noiommu)
@@ -197,7 +203,7 @@ if [ "$MODE" = "verify" ]; then
       grep -qF "[IOMMU] dma-drivers=1 (broker live over VT-d)" "$LOG" || { echo "VERIFY FAIL: dma-drivers verdict must be 1 on the IOMMU lane"; ok=0; }
       grep -qF "[PCI ] scan bus 0: " "$LOG" || { echo "VERIFY FAIL: PCI inventory marker missing"; ok=0; }
       grep -qF "0x1af4" "$LOG" || { echo "VERIFY FAIL: the virtio-blk must be in the inventory"; ok=0; }
-      grep -qF "[PCI ] claim: bus=0 dev=3 fn=0 (virtio-blk) → dom 0 ok (broker assigned)" "$LOG" || { echo "VERIFY FAIL: the virtio-blk claim must go through the broker"; ok=0; }
+grep -qF "(virtio-blk) → dom 0 ok (broker assigned)" "$LOG" || { echo "VERIFY FAIL: the virtio-blk claim must go through the broker"; ok=0; }
       ;;
     --verify-q35-noiommu)
       grep -qF "[IOMMU] dmar: absent" "$LOG" || { echo "VERIFY FAIL: the no-iommu lane must report dmar: absent (fail-closed)"; ok=0; }

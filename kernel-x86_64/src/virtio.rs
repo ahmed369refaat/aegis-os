@@ -200,6 +200,16 @@ pub fn read_u8_pa(pa: u64) -> u8 {
     ((w >> (8 * (pa & 3))) & 0xFF) as u8
 }
 
+/// Write the u8 at `pa` via its containing u32 word (read-modify-
+/// write; byte-granular stores for hand-built packets).
+pub fn write_u8_pa(pa: u64, v: u8) {
+    let base = pa & !3;
+    let shift = 8 * (pa & 3);
+    let w = memops::read_u32(base);
+    let cleared = w & !(0xFF << shift);
+    memops::write_u32(base, cleared | (u32::from(v) << shift));
+}
+
 /// Write one descriptor table entry (16 bytes at `desc_pa`).
 pub fn write_desc(desc_pa: u64, addr: u64, len: u32, flags: u16, next: u16) {
     memops::write_u64(desc_pa, addr);
@@ -226,6 +236,48 @@ pub fn used_idx(used_pa: u64) -> u16 {
 pub fn used_entry_id(used_pa: u64, i: u16) -> u32 {
     let pa = used_pa + 4 + 8 * u64::from(i);
     memops::read_u32(pa)
+}
+
+// ── virtio-net additions (the second driver on this transport) ──
+
+/// The virtio-net header WITHOUT mergeable-rxbuf (we do not negotiate
+/// VIRTIO_NET_F_MRG_RXBUF): 10 bytes, all zero for a plain
+/// checksum-offload-free frame — flags=0, gso_type=NONE.
+pub const NET_HDR_LEN: u32 = 10;
+
+/// Write the 10-byte virtio-net header at `pa` (plain frame: no
+/// offloads, no GSO — everything this driver sends is
+/// self-contained).
+pub fn write_net_header(pa: u64) {
+    memops::write_u64(pa, 0);
+    write_u16_pa(pa + 8, 0);
+}
+
+/// The Internet checksum (RFC 1071) over `len` bytes at `pa` —
+/// 16-bit big-endian words, ones-complement fold. Used for the IPv4
+/// header built in-kernel; the UDP checksum stays 0 (legal on IPv4).
+pub fn ip_checksum(pa: u64, len: u32) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0u32;
+    while i + 1 < len {
+        let hi = read_u8_pa(pa + u64::from(i));
+        let lo = read_u8_pa(pa + u64::from(i + 1));
+        sum += (u32::from(hi) << 8) | u32::from(lo);
+        i += 2;
+    }
+    if i < len {
+        sum += u32::from(read_u8_pa(pa + u64::from(i))) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Length of completed transfer `i` in the used ring (the u32 at
+/// entry+4 — the RX driver reads the frame size from here).
+pub fn used_entry_len(used_pa: u64, i: u16) -> u32 {
+    (memops::read_u64(used_pa + 4 + 8 * u64::from(i)) >> 32) as u32
 }
 
 /// The virtio-blk request header (16 bytes): type, reserved, sector.
@@ -258,6 +310,7 @@ pub struct MmioVirtio {
     notify_base_pa: u64,
     multiplier: u32,
     device_cfg_pa: u64,
+    isr_pa: u64,
 }
 
 #[cfg(not(test))]
@@ -268,11 +321,13 @@ impl MmioVirtio {
         let common_base = crate::pci::mem_bar_base(dev, caps.common.bar)?;
         let notify_base = crate::pci::mem_bar_base(dev, caps.notify.bar)?;
         let device_base = crate::pci::mem_bar_base(dev, caps.device.bar)?;
+        let isr_base = crate::pci::mem_bar_base(dev, caps.isr.bar)?;
         Some(MmioVirtio {
             common_pa: common_base + u64::from(caps.common.offset),
             notify_base_pa: notify_base + u64::from(caps.notify.offset),
             multiplier: caps.notify_multiplier,
             device_cfg_pa: device_base + u64::from(caps.device.offset),
+            isr_pa: isr_base + u64::from(caps.isr.offset),
         })
     }
 
@@ -284,12 +339,19 @@ impl MmioVirtio {
         memops::write_u32(self.common_pa + off, v);
     }
 
+    /// Exact-width, exact-address 2-byte common-config access.
+    /// QEMU's common-config dispatches on the access address+width:
+    /// the old u32-RMW-at-the-aligned-base form was dispatched as a
+    /// STATUS write, silently eating QUEUE_SEL (queue selection was
+    /// stuck at 0 — invisible for queue-0-only devices, fatal for
+    /// queue 1).
     fn r16(&self, off: u64) -> u16 {
-        read_u16_pa(self.common_pa + off)
+        memops::read_u16(self.common_pa + off)
     }
 
+    /// Exact-width 2-byte common-config write (see `r16`).
     fn w16(&self, off: u64, v: u16) {
-        write_u16_pa(self.common_pa + off, v);
+        memops::write_u16(self.common_pa + off, v)
     }
 
     /// Read a device feature word (`select` 0 = bits 0..31, 1 = 32..).
@@ -338,22 +400,111 @@ impl MmioVirtio {
         self.w16(CC_QUEUE_ENABLE, 1);
     }
 
-    /// Kick a queue (the address carries the queue; the value is the
-    /// queue index).
-    pub fn notify(&self, queue_notify_off: u16) {
+    /// Kick a queue. Per virtio 1.x §4.1.5.2 the VALUE written is the
+    /// queue index (QEMU's modern notify dispatches on the value —
+    /// measured: a value of 0 always kicks queue 0, which hid the
+    /// net TX queue behind the RX kick); the address is still the
+    /// queue's own notify slot from QUEUE_NOTIFY_OFF × multiplier.
+    pub fn notify(&self, queue_index: u16, queue_notify_off: u16) {
         let pa = notify_addr(self.notify_base_pa, queue_notify_off, self.multiplier);
-        memops::write_u32(pa, 0);
+        // EXACTLY Linux's kick: `iowrite16(index, notify_base +
+        // off * multiplier)` — a 2-byte store at the queue's own
+        // slot. A 4-byte store was measured to be split by QEMU into
+        // two 2-byte dispatches (two queue_notify traces per kick);
+        // the RMW lane is forbidden (notify reads are undefined).
+        memops::write_u16(pa, queue_index);
     }
 
     /// The disk capacity in 512-byte sectors (device config +0).
     pub fn capacity_sectors(&self) -> u64 {
         memops::read_u64(self.device_cfg_pa)
     }
+
+    /// The ISR register (bit 0 = queue-activity poke). Diagnostics
+    /// for the kick path: set when the device updates a used ring.
+    #[must_use]
+    pub fn isr(&self) -> u8 {
+        read_u8_pa(self.isr_pa)
+    }
+
+    /// The SELECTED queue's ring addresses + enable bit, read back
+    /// from common config (bring-up: proves the device holds what we
+    /// mapped).
+    #[must_use]
+    pub fn queue_addresses(&self) -> (u64, u64, u64, u16) {
+        (
+            memops::read_u64(self.common_pa + CC_QUEUE_DESC),
+            memops::read_u64(self.common_pa + CC_QUEUE_AVAIL),
+            memops::read_u64(self.common_pa + CC_QUEUE_USED),
+            self.r16(CC_QUEUE_ENABLE),
+        )
+    }
+
+    /// The resolved notify lane (base physical address + the
+    /// multiplier) — bring-up diagnostics for the kick path.
+    #[must_use]
+    pub fn notify_lane(&self) -> (u64, u32) {
+        (self.notify_base_pa, self.multiplier)
+    }
+
+    /// The device-specific config base (blk: capacity; net: the MAC
+    /// at +0 and status at +6).
+    #[must_use]
+    pub fn device_cfg_pa(&self) -> u64 {
+        self.device_cfg_pa
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The net header is 10 zero bytes (no offloads, no GSO).
+    #[test]
+    fn net_header_is_ten_zero_bytes() {
+        let pa = 0x1234_5000;
+        memops::write_u64(pa, 0xFFFF_FFFF_FFFF_FFFF);
+        write_u16_pa(pa + 8, 0xFFFF);
+        write_net_header(pa);
+        assert_eq!(memops::read_u64(pa), 0);
+        assert_eq!(read_u16_pa(pa + 8), 0);
+        assert_eq!(NET_HDR_LEN, 10);
+    }
+
+    /// The Internet checksum against the canonical worked example
+    /// (4500 0073 0000 4000 4011 0000 c0a8 0001 c0a8 00c7 → b861).
+    #[test]
+    fn ip_checksum_matches_the_reference_vector() {
+        let pa = 0x1234_5100;
+        let bytes: [u8; 20] = [
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
+            0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
+        ];
+        for (i, &b) in bytes.iter().enumerate() {
+            write_u8_pa(pa + i as u64, b);
+        }
+        assert_eq!(ip_checksum(pa, 20), 0xB861);
+    }
+
+    /// The used ring's completed-length field (entry+4).
+    #[test]
+    fn used_entry_len_reads_the_second_word() {
+        let used = 0x1234_5200;
+        memops::write_u64(used + 4, (0x2A_u64) << 32 | 7);
+        assert_eq!(used_entry_id(used, 0), 7);
+        assert_eq!(used_entry_len(used, 0), 0x2A);
+    }
+
+    /// Byte-granular writes land byte-exactly (the RMW lane).
+    #[test]
+    fn write_u8_pa_is_byte_exact() {
+        let pa = 0x1234_5300;
+        memops::write_u64(pa, 0x1111_1111_1111_1111);
+        write_u8_pa(pa + 3, 0xAB);
+        assert_eq!(read_u8_pa(pa + 3), 0xAB);
+        assert_eq!(read_u8_pa(pa + 2), 0x11);
+        assert_eq!(read_u8_pa(pa + 4), 0x11);
+    }
 
     /// A fake config space: dwords in a plain buffer, a virtio cap
     /// chain planted at 0x40.
