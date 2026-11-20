@@ -26,11 +26,18 @@
                       │ guard), stack pages after it; PD + PT allo- │
                       │ cated from the frame pool on demand.        │
 0xFFFF_FFFF_8000_0000 ├────────────────────────────────────────────┤ PML4[511]·PDPT[510]
-                      │ KERNEL IMAGE — RX text, RO data, RW data +  │
-                      │ bss + boot stack. Linked at this base,      │
-                      │ loaded at PA 2 MiB (linker AT()), mapped by │
-                      │ one 2 MiB huge page. Fits, or the link      │
-                      │ fails (linker.ld ASSERT).                   │
+                      │ KERNEL IMAGE (F15, ADR-0006) — the stub     │
+                      │ maps it as one RWX 2 MiB leaf just to enter │
+                      │ the kernel; mm::init then swaps that leaf   │
+                      │ for a page table of 4 KiB PTEs: .text RX,  │
+                      │ .rodata RO+NX, .data/.bss RW+NX (all glo-  │
+                      │ bal), inter-section gaps ABSENT, and one   │
+                      │ absent guard page below the boot stack.    │
+                      │ CR0.WP is set, so read-only means read-    │
+                      │ only for CPL0 too. Linked at this base,    │
+                      │ loaded at PA 2 MiB (linker AT()); the im-  │
+                      │ age must still fit the 2 MiB window        │
+                      │ (linker.ld ASSERT).                        │
                       └────────────────────────────────────────────┘
 ```
 
@@ -75,11 +82,15 @@
    addresses (guarded stacks).
 4. **A guard page is an absent PTE, not a check**: kernel stacks are
    unusable past their end — the MMU is the enforcer, proven by the
-   live #PF selftest. Slots are 2 MiB apart and never reused
-   (monotonic cursor).
-5. **The kernel image must fit one 2 MiB huge page** (PA 2..4 MiB) —
-   the linker ASSERT fails the build otherwise, which is also what
-   keeps it clear of the frame pool at 16 MiB.
+   live #PF selftest. Guarded-stack slots are reused after free (a
+   free-list bitmap, F17), and the boot stack carries its own guard
+   page (the linker reserves it below `stack_bottom`; the terminal
+   boot proof writes through it).
+5. **The kernel image must fit one 2 MiB window** (PA 2..4 MiB) — the
+   linker ASSERT fails the build otherwise, which is also what keeps
+   it clear of the frame pool at 16 MiB. Inside that window the
+   mapping is per-4KiB with W^X semantics (see the diagram above and
+   ADR-0006).
 6. **Per-domain ownership even for kernel objects**: guarded-stack
    frames carry pool owner 0 (`OWNER_KERNEL`); domain ids start at 1,
    so `free_all_owned(domain)` can never sweep kernel frames.

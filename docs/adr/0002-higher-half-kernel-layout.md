@@ -21,7 +21,7 @@ Adopt a fixed three-region virtual layout (KASLR later slides within it):
 |---|---|---|
 | User | `0x0000_0000_0000_0000` – `0x0000_7FFF_FFFF_FFFF` | per-domain tables, lowest region at 0x1000 (NULL page never mapped) |
 | Direct map | `0xFFFF_8880_0000_0000` + PA | RW only, never executable, kernel-only |
-| Kernel image | `0xFFFF_FFFF_8000_0000` (2 MiB-aligned) | RX text, RO data, RW data+bss; mapped into every table as global entries |
+| Kernel image | `0xFFFF_FFFF_8000_0000` (2 MiB-aligned) | RX text, RO+NX rodata, RW+NX data/bss — per-4KiB PTEs since F15 (ADR-0006); the stub's initial 2 MiB RWX leaf is replaced by mm::init before any domain runs; mapped into every table as global entries |
 
 The boot stub (ADR-0001) additionally maps the higher-half window at
 bring-up and the kernel enters at the high base. Frame-pool accesses

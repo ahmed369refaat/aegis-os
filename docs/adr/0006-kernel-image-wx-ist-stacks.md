@@ -1,6 +1,7 @@
 # ADR-0006: Kernel image W^X, writable IST stacks, reusable guarded stacks
 
-- Status: Accepted
+- Status: Implemented (F15, second review round; the first round
+  landed the ADR + F16/F17, this one landed the image split)
 - Date: 2026-11-19 (deep-review remediation, Phase 3)
 - Deciders: kernel maintainers
 - Supersedes: part of ADR-0002 (image mapping description); ADR-0002 stays
@@ -46,6 +47,20 @@ bootable kernel:
    frame it allocated if any step fails; `free` returns the slot.
    Infinite alloc/free cycling is now bounded by memory, not by a
    boot-lifetime counter.
+
+## Implementation notes (what the boot taught us)
+
+- The PT lives in a `#[repr(align(4096))] static mut` in .bss — a PD
+  entry pointing at a non-4KiB-aligned table triple-faults.
+- The PD entry that points at the PT needs P|W: x86 checks W at every
+  level, so a W-clear directory entry makes the whole image read-only
+  regardless of the leaf bits (the first boot died on a stack push).
+- `.got` is an orphan the script must place (in .data) — an orphaned
+  section lands between .data and .bss, inside what the pure mapping
+  leaves absent (the second boot died reading it).
+- `cpuid7_ebx` must not move EBX through an `out(reg)` temporary: if
+  the allocator picks RBX itself, the restore-pop clobbers the result.
+  The store-into-the-pushed-slot pattern is immune.
 
 ## Consequences
 

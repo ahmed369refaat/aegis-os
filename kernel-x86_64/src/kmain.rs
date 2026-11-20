@@ -82,6 +82,22 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     //      `[MM ] higher-half ok` line goes out.
     arch::init();
     mm::init();
+    // ── F15 (ADR-0006): prove the rebuilt image mapping — .text/.rodata
+    // are read-only (CR0.WP faults supervisor writes) and .data is
+    // non-executable (NX faults supervisor fetches). ──
+    {
+        let bounds = mm::image::section_bounds();
+        let (text, rodata, data, _bss, _guard) = bounds;
+        line(&mut out, &["[ARCH] image W^X selftest: writing .text and .rodata"]);
+        arch::exceptions::arm_wp_write(text.0);
+        arch::exceptions::arm_wp_write(rodata.0);
+        line(&mut out, &["[SEC ] image W^X: write to .text faulted (WP)",
+            " / write to .rodata faulted (WP)"]);
+        line(&mut out, &["[ARCH] image W^X selftest: executing .data"]);
+        arch::exceptions::arm_image_exec(data.0);
+        line(&mut out, &["[SEC ] image W^X: exec from .data faulted (I/D)"]);
+    }
+
 
     // ── 2. multiboot validation ─────────────────────────────────────
     if magic != multiboot::BOOT_MAGIC {
@@ -656,15 +672,8 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // marker, and power off cleanly (CI greps it). Reached only when
     // the whole ring-3 sequence completed — the blocked path powers
     // off inside step 10.
-    let guard_stack = match mm::stacks::alloc(&mut pool, &mut k.frames, 1) {
-        Ok(st) => st,
-        Err(_) => {
-            line(&mut out, &["[MM ] ERROR: guard-selftest stack alloc failed; halting"]);
-            hw::halt_forever();
-        }
-    };
-    line(&mut out, &["[ARCH] guard selftest: writing through the guard page"]);
-    arch::exceptions::arm_guard_write(guard_stack.guard_va());
+    line(&mut out, &["[ARCH] guard selftest: writing through the boot-stack guard page"]);
+    arch::exceptions::arm_guard_write(arch::image_map::boot_stack_guard_va());
 
 }
 

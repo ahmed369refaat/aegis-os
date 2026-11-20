@@ -74,6 +74,17 @@ static mut SMEP_RESUME: u64 = 0;
 /// (SMAP), not a bug.
 static ARMED_SMAP: AtomicBool = AtomicBool::new(false);
 static SMAP_VA: AtomicU64 = AtomicU64::new(0);
+/// F15 (ADR-0006): armed write-permission selftest — the next data #PF
+/// at exactly this address is the deliberate CPL0 write to a read-only
+/// image page (CR0.WP enforced), not a bug.
+static ARMED_WP: AtomicBool = AtomicBool::new(false);
+static WP_VA: AtomicU64 = AtomicU64::new(0);
+/// F15 (ADR-0006): armed image-exec selftest — the next instruction-
+/// fetch #PF at exactly this address is the deliberate CPL0 execution
+/// of a non-executable image page (.data NX), not a bug.
+static ARMED_IEXEC: AtomicBool = AtomicBool::new(false);
+static IEXEC_VA: AtomicU64 = AtomicU64::new(0);
+static mut IEXEC_RESUME: u64 = 0;
 /// Set by `arm_guard_write`: the next #PF at exactly this address is the
 /// (terminal) stack-guard selftest; 0 = unarmed.
 static GUARD_VA: AtomicU64 = AtomicU64::new(0);
@@ -207,6 +218,31 @@ fn dispatch(f: &mut ExceptionFrame) {
         f.rip = unsafe { core::ptr::addr_of!(NX_RESUME).read_volatile() };
         ARMED_NX.store(false, Ordering::SeqCst);
         serial::write_str("[EXC] NX selftest: exec of NX page faulted (I/D), rip advanced\n");
+        return;
+    }
+    if ARMED_WP.load(Ordering::SeqCst)
+        && f.vector == 14
+        && cr2 == WP_VA.load(Ordering::SeqCst)
+    {
+        // CR0.WP: a supervisor write to a read-only page faults. Data
+        // faults report the faulting instruction; advance past it.
+        f.rip += MOV_LEN;
+        ARMED_WP.store(false, Ordering::SeqCst);
+        serial::write_str("[SEC ] image W^X: write to read-only page faulted (CR0.WP)\n");
+        return;
+    }
+    if ARMED_IEXEC.load(Ordering::SeqCst)
+        && f.vector == 14
+        && cr2 == IEXEC_VA.load(Ordering::SeqCst)
+        && (f.error_code & PF_INSTRUCTION_FETCH) != 0
+    {
+        // NX on an image data page: the fetch never retired; the saved
+        // RIP is the target, so resume at the trigger's label.
+        // SAFETY: written by arm_image_exec's trigger before the fault;
+        // single CPU, read exactly once here.
+        f.rip = unsafe { core::ptr::addr_of!(IEXEC_RESUME).read_volatile() };
+        ARMED_IEXEC.store(false, Ordering::SeqCst);
+        serial::write_str("[SEC ] image W^X: exec from non-executable page faulted (I/D)\n");
         return;
     }
     if ARMED_SMEP.load(Ordering::SeqCst)
@@ -426,6 +462,47 @@ pub fn call_user(va: u64) {
 /// PR-1.3: read through `va`, which must be a policy guard-gap page
 /// (absent PTE). The #PF is diagnosed, RIP advanced past the 3-byte
 /// `movq (%rax), %rax`, and execution resumes here.
+/// F15 (ADR-0006): write to a read-only image page (.text/.rodata)
+/// from CPL0 — CR0.WP must fault it. Resumable (the guard-read pattern).
+pub fn arm_wp_write(va: u64) {
+    ARMED_WP.store(true, Ordering::SeqCst);
+    WP_VA.store(va, Ordering::SeqCst);
+    // SAFETY: deliberately stores to a read-only page → #PF under WP;
+    // dispatch advances RIP by MOV_LEN.
+    unsafe {
+        core::arch::asm!(
+            "movq %rax, (%rax)",
+            in("rax") va,
+            options(att_syntax, preserves_flags),
+        );
+    }
+    ARMED_WP.store(false, Ordering::SeqCst);
+}
+
+/// F15 (ADR-0006): execute a non-executable image page (.data, NX)
+/// from CPL0 — must fault. A JMP (not a call) so RSP stays exact (the
+/// arm_nx_call rationale).
+pub fn arm_image_exec(va: u64) {
+    ARMED_IEXEC.store(true, Ordering::SeqCst);
+    IEXEC_VA.store(va, Ordering::SeqCst);
+    // SAFETY: deliberately fetches an instruction from an NX page →
+    // #PF; never completes.
+    unsafe {
+        let slot = core::ptr::addr_of_mut!(IEXEC_RESUME) as u64;
+        core::arch::asm!(
+            "lea 9f(%rip), %rcx",
+            "movq %rcx, (%rdx)",
+            "jmpq *%rax",
+            "9:",
+            in("rax") va,
+            in("rdx") slot,
+            out("rcx") _,
+            options(att_syntax),
+        );
+    }
+    ARMED_IEXEC.store(false, Ordering::SeqCst);
+}
+
 /// N4 (ADR-0008): jump into a *user* RX page from CPL0 — SMEP must
 /// fault the fetch. A JMP (not a call) so the fault leaves RSP exact
 /// (the arm_nx_call rationale).

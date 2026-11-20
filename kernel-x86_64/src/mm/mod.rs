@@ -24,6 +24,7 @@
 //! ```
 
 pub mod direct_map;
+pub mod image;
 pub mod page_table;
 pub mod pte;
 pub mod stacks;
@@ -83,6 +84,12 @@ pub fn init() {
     let hh = memops::read_u64(pml4_pa + 511 * 8) & ADDR_MASK;
     let pd = memops::read_u64(hh + 510 * 8) & ADDR_MASK;
     memops::write_u64(pd, memops::read_u64(pd) | pte::PTE_G);
+
+    // F15 (ADR-0006): replace the image's single RWX 2 MiB leaf with
+    // per-4KiB PTEs (.text RX, .rodata RO+NX, .data/.bss RW+NX, gaps
+    // and the boot-stack guard absent) and set CR0.WP — BEFORE the CR3
+    // reload below, so one flush covers both.
+    arch::image_map::install();
 
     // Reload CR3 (same value): flushes every non-global entry and
     // rebuilds the TLB under the new NXE/PGE semantics.

@@ -87,15 +87,19 @@ pub fn cpuid7_ebx() -> u64 {
     let b: u64;
     let c: u32;
     let d: u32;
-    // SAFETY: CPUID is unprivileged. RBX is reserved for LLVM's use as
-    // an asm operand, so the classic push/mov/pop dance moves EBX into
-    // an allocatable register (stack balanced by the push/pop pair).
+    // SAFETY: CPUID is unprivileged. RBX cannot be an asm operand
+    // (LLVM reserves it), and an `out(reg)` temporary is allocation
+    // luck — if the allocator picks RBX itself, the restore-pop
+    // clobbers the result (observed: SMEP/SMAP read as off in one
+    // build, on in another). Bulletproof pattern instead: push a slot,
+    // CPUID, store EBX INTO the slot, and pop the slot straight into
+    // the operand — no intermediate register at all.
     unsafe {
         core::arch::asm!(
             "push %rbx",
             "cpuid",
-            "movq %rbx, {b}",
-            "pop %rbx",
+            "movq %rbx, (%rsp)",
+            "pop {b}",
             in("eax") 7u32,
             in("ecx") 0u32,
             lateout("eax") a,
@@ -209,6 +213,21 @@ pub fn swapgs() {
 /// Read control register CR4 (feature flags: PAE, PGE, ...).
 ///
 /// SAFETY: a pure register read.
+/// F15 (ADR-0006): CR0 read — WP (bit 16) makes R-only pages stick
+/// for supervisor writes too.
+pub fn read_cr0() -> u64 {
+    let v: u64;
+    // SAFETY: reading CR0 is unprivileged-safe and touches no memory.
+    unsafe { core::arch::asm!("movq %cr0, %rax", out("rax") v, options(att_syntax, nostack, preserves_flags)) };
+    v
+}
+
+/// F15 (ADR-0006): CR0 write.
+pub fn write_cr0(v: u64) {
+    // SAFETY: the caller owns the value written (mm::init sets WP).
+    unsafe { core::arch::asm!("movq %rax, %cr0", in("rax") v, options(att_syntax, nostack, preserves_flags)) };
+}
+
 pub fn read_cr4() -> u64 {
     let v: u64;
     // SAFETY: no memory access; the ISA guarantees no side effects.

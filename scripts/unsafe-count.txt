@@ -27,3 +27,8 @@
 #      stac, clac (hw); the armed SMEP jump, the armed SMAP read, and
 #      the SMEP resume-slot read (arch/exceptions).
 72
+# 78 -> F15 review fix (ADR-0006, second round): +6 — read/write_cr0,
+#      the IMAGE_PT static-mut fill in arch/image_map.rs, the armed
+#      WP-write trigger, the armed image-exec trigger and its resume
+#      slot read.
+78

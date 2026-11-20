@@ -23,33 +23,54 @@ SECTIONS
 {
     . = KERNEL_BASE;
 
-    .text : AT(KERNEL_PHYS_BASE) ALIGN(16)
+    /* F15 (ADR-0006): every section page-aligned with exported
+     * boundaries — mm::init rebuilds the image as 4 KiB PTEs:
+     * .text RX, .rodata RO+NX, .data/.bss RW+NX, inter-section gaps
+     * and the boot-stack guard page absent. */
+    .text : AT(KERNEL_PHYS_BASE) ALIGN(4096)
     {
+        __text_start = .;
         KEEP(*(.text.entry))
         *(.text .text.*)
+        . = ALIGN(4096);
+        __text_end = .;
     }
 
     .rodata : ALIGN(4096)
     {
+        __rodata_start = .;
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
+        . = ALIGN(4096);
+        __rodata_end = .;
     }
 
     .data : ALIGN(4096)
     {
+        __data_start = .;
         *(.data .data.*)
-        . = ALIGN(8);
+        *(.got .got.*) /* orphaned by nothing: writable, belongs here */
+        . = ALIGN(4096);
+        __data_end = .;
     }
 
     .bss : ALIGN(4096)
     {
+        __bss_start = .;
         _bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
-        . = ALIGN(16);
+        . = ALIGN(4096);
+        /* F15: one absent guard page below the boot stack — an
+         * overflow writes it and faults instead of corrupting
+         * whatever sits below. */
+        __stack_guard = .;
+        . += 4096;
         stack_bottom = .;
         . += 256K;
         stack_top = .;
+        . = ALIGN(4096);
+        __bss_end = .;
         _bss_end = .;
     }
 

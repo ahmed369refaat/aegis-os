@@ -15,8 +15,9 @@ import sys
 kelf = sys.argv[1]
 NAMES = ("IST_DF", "IST_NMI", "IST_MC", "IST_SS", "IST_PF")
 
+nm_out = subprocess.run(["nm", kelf], capture_output=True, text=True).stdout
 syms = []
-for line in subprocess.run(["nm", kelf], capture_output=True, text=True).stdout.splitlines():
+for line in nm_out.splitlines():
     parts = line.split()
     if len(parts) == 3 and parts[2].endswith(NAMES):
         syms.append((int(parts[0], 16), parts[1], parts[2]))
@@ -52,7 +53,23 @@ if missing:
     print(f"FAIL: IST symbols missing: {sorted(missing)}")
     fail = 1
 
+# F15 (ADR-0006): general form — every *mutable* symbol (nm type d/D
+# for .data, b/B for .bss) must live in a writable section, and no
+# mutable symbol may hide inside .text/.rodata. This catches any future
+# `static mut` that lands somewhere the W^X image maps read-only.
+for line in nm_out.splitlines():
+    parts = line.split()
+    if len(parts) == 3 and parts[1] in ("d", "D", "b", "B"):
+        addr, nmtype, name = int(parts[0], 16), parts[1], parts[2]
+        sec = next(((n, t) for n, t, a, sz in secs if a <= addr < a + sz), None)
+        if sec is None:
+            continue  # absolute/linker symbols (e.g. section bounds)
+        n, t = sec
+        if n in (".text", ".rodata"):
+            print(f"FAIL: mutable symbol {name} ({nmtype}) at {addr:#x} is in {n} — the W^X image maps it read-only")
+            fail = 1
+
 if not fail:
-    print("IST SECTIONS: PASS (all IST_* in writable NOBITS .bss)")
+    print("IST SECTIONS: PASS (all IST_* in writable NOBITS .bss; no mutable symbol in .text/.rodata)")
 sys.exit(1 if fail else 0)
 PY
