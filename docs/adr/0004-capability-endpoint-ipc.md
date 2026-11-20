@@ -1,8 +1,28 @@
 # ADR-0004: Capability-endpoint IPC
 
-- **Status:** Proposed
+- **Status:** Accepted — async half (§2) implemented; sync fast path
+  (§1), page grants (§3) and pipes-over-endpoints (§5) remain staged
 - **Stage:** 2 (IPC)
-- **Date:** 2026-11-19
+- **Date:** 2026-11-19; implementation note 2026-11-20
+
+### Implementation note (async half, `src/ipc.rs`)
+
+- Rights mapping onto the existing bitset: **SEND = WRITE, RECV = READ,
+  GRANT = GRANT** — derivation and revocation reuse the capability table
+  unchanged (`try_narrow_to` semantics preserved).
+- **Endpoint ids are monotonic and never reused**: destroying an endpoint
+  frees its slot but kills the id forever, so a stale capability can
+  never reach a reincarnated queue (no ABA; distinct from the FsNode
+  answer, which is per-slot generation counters).
+- Creation/grant/destruction are **uid-0 supervisor APIs**
+  (`ipc_endpoint_create/grant/destroy`), consistent with ADR-0009's
+  grant-path decision; creation is transactional (a full capability
+  table rolls the endpoint back).
+- RECV is owner-only in this slice (queues are per-domain, §2);
+  delegating queue ownership is an explicit later slice.
+- Bounded FIFO depth 4, message size ≤ 64 bytes (§1), overflow =
+  `QueueFull` (the EAGAIN-style refusal), send returns the remaining
+  free-slot budget (mirroring NetSend's token count).
 
 ## Context
 

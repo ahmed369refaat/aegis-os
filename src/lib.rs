@@ -43,6 +43,7 @@ pub mod buddy;
 pub mod capability;
 pub mod domain;
 pub mod fd;
+pub mod ipc;
 pub mod memory;
 pub mod monitor;
 pub mod net;
@@ -90,6 +91,9 @@ pub enum KernelError {
     /// Risk treatment 3 (ADR-0009 addendum): a supervisor-only API was
     /// called by a non-privileged domain (carries the caller's id).
     NotAuthorized(u32),
+    /// ADR-0004: endpoint-table refusals crossing the supervisor API
+    /// boundary (table exhaustion, dead ids, non-conferable rights).
+    Ipc(crate::ipc::IpcError),
 }
 
 /// The sample kernel: owns domains, the behavior monitor, the telemetry
@@ -110,6 +114,8 @@ pub struct Kernel<const N: usize = { crate::buddy::FRAME_COUNT }> {
     pub(crate) pipes: PipeTable,
     /// Brokered sockets (owned by domains, rate-limited per domain).
     pub(crate) sockets: SocketTable,
+    /// ADR-0004 endpoints: per-domain queues behind capability gates.
+    pub(crate) endpoints: ipc::EndpointTable,
     /// Per-domain token buckets (indexed by free slot, keyed by domain id).
     pub(crate) buckets: [Option<(u32, TokenBucket)>; MAX_DOMAINS],
     /// CFS-style fair scheduler over runnable domains.
@@ -150,6 +156,7 @@ impl<const N: usize> Kernel<N> {
             pipes: PipeTable::new(),
             sockets: SocketTable::new(),
             buckets: [None; MAX_DOMAINS],
+            endpoints: ipc::EndpointTable::new(),
             sched: Scheduler::new(),
             frames: BuddyAllocator::new_over_arena(),
             clock: 0,
@@ -481,6 +488,96 @@ impl<const N: usize> Kernel<N> {
         };
         let d = self.domain_mut(supervisor_id)?;
         d.caps.insert(cap).map_err(|_| KernelError::TooManyDomains)
+    }
+
+    /// ADR-0004 §2: create an endpoint owned by `owner_id` and mint
+    /// the full conferable capability (READ|WRITE|GRANT) into the
+    /// OWNER's table. Supervisor only (uid 0): endpoint creation is a
+    /// grant, and grants never happen without a privileged, auditable
+    /// caller. Transactional: if the owner's capability table is full,
+    /// the endpoint is destroyed again — no orphaned queues.
+    pub fn ipc_endpoint_create(
+        &mut self,
+        supervisor_id: u32,
+        owner_id: u32,
+    ) -> Result<(u32, crate::capability::CapHandle), KernelError> {
+        if self.domain_mut(supervisor_id)?.uid != 0 {
+            return Err(KernelError::NotAuthorized(supervisor_id));
+        }
+        self.domain_mut(owner_id)?; // the owner must exist
+        let id = self.endpoints.create(owner_id).map_err(KernelError::Ipc)?;
+        let cap = crate::capability::Capability {
+            resource: crate::capability::Resource::Endpoint(id),
+            rights: crate::capability::Rights::READ
+                | crate::capability::Rights::WRITE
+                | crate::capability::Rights::GRANT,
+            generation: 0,
+        };
+        let inserted = {
+            let d = self.domain_mut(owner_id)?;
+            d.caps.insert(cap)
+        };
+        match inserted {
+            Ok(h) => Ok((id, h)),
+            Err(_) => {
+                // Roll back: never leave an endpoint nobody can reach.
+                let _ = self.endpoints.destroy(id);
+                Err(KernelError::Ipc(crate::ipc::IpcError::TableFull))
+            }
+        }
+    }
+
+    /// ADR-0004 §4: delegate (a subset of) an endpoint's conferable
+    /// rights to another domain. Supervisor only (uid 0); the rights
+    /// must be a subset of READ|WRITE|GRANT — derivation is
+    /// attenuation-only by construction.
+    pub fn ipc_endpoint_grant(
+        &mut self,
+        supervisor_id: u32,
+        endpoint_id: u32,
+        target_id: u32,
+        rights: crate::capability::Rights,
+    ) -> Result<crate::capability::CapHandle, KernelError> {
+        if self.domain_mut(supervisor_id)?.uid != 0 {
+            return Err(KernelError::NotAuthorized(supervisor_id));
+        }
+        if self.endpoints.owner_of(endpoint_id).is_none() {
+            return Err(KernelError::Ipc(crate::ipc::IpcError::InvalidHandle));
+        }
+        let conferable = crate::capability::Rights::READ
+            | crate::capability::Rights::WRITE
+            | crate::capability::Rights::GRANT;
+        if !rights.is_subset_of(conferable) {
+            return Err(KernelError::Ipc(crate::ipc::IpcError::Escalation));
+        }
+        self.domain_mut(target_id)?;
+        let cap = crate::capability::Capability {
+            resource: crate::capability::Resource::Endpoint(endpoint_id),
+            rights,
+            generation: 0,
+        };
+        let d = self.domain_mut(target_id)?;
+        d.caps
+            .insert(cap)
+            .map_err(|_| KernelError::Ipc(crate::ipc::IpcError::TableFull))
+    }
+
+    /// ADR-0004: destroy an endpoint. Its queue is dropped with it and
+    /// the id is dead forever — every capability on it fails closed on
+    /// the next use (ids are never reused). Supervisor only (uid 0);
+    /// revoking the *capabilities* themselves stays the normal
+    /// capability-revocation path (`cap_revoke`).
+    pub fn ipc_endpoint_destroy(
+        &mut self,
+        supervisor_id: u32,
+        endpoint_id: u32,
+    ) -> Result<(), KernelError> {
+        if self.domain_mut(supervisor_id)?.uid != 0 {
+            return Err(KernelError::NotAuthorized(supervisor_id));
+        }
+        self.endpoints
+            .destroy(endpoint_id)
+            .map_err(KernelError::Ipc)
     }
 
     pub fn cap_lookup(
@@ -1559,6 +1656,349 @@ mod tests {
         ));
         // Granting for an unknown target fails cleanly.
         assert!(k.cap_grant_domain(9, 7777).is_err());
+    }
+
+    // ── ADR-0004 slice 1: capability-endpoint IPC (async half) ──
+    // Rights mapping (ADR-0004 §4 → the existing Rights bitset):
+    // SEND = WRITE, RECV = READ, GRANT = GRANT. Derivation stays
+    // subset-only through the existing `attenuate`.
+
+    /// The gate: no Endpoint capability, no send. The refusal is
+    /// counted as an escalation attempt (an organic monitor signal),
+    /// exactly like the FsNode/Device/Domain gates.
+    #[test]
+    fn ipc_send_requires_the_endpoint_capability() {
+        use crate::capability::Rights;
+        use crate::sys::{SysError, SysRequest, SysValue};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        k.create_domain(3, service_profile()).unwrap();
+        let (ep, _h) = k.ipc_endpoint_create(1, 3).unwrap();
+        // Domain 2 holds no Endpoint capability: refused and counted.
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 8
+                }
+            ),
+            Err(SysError::PermissionDenied)
+        ));
+        assert_eq!(k.domain_mut(2).unwrap().stats.escalation_attempts, 1);
+        // The supervisor grants a WRITE-only capability: the send passes.
+        k.ipc_endpoint_grant(1, ep, 2, Rights::WRITE).unwrap();
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 8
+                }
+            ),
+            Ok(SysValue::Count(_))
+        ));
+    }
+
+    /// ADR-0004 §2: bounded per-endpoint queue, FIFO, EAGAIN-style
+    /// failure when full — never a block, never a silent drop.
+    #[test]
+    fn ipc_queue_is_bounded_and_fifo_with_eagain() {
+        use crate::ipc::IpcError;
+        use crate::sys::{SysError, SysRequest, SysValue};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        let (ep, _h) = k.ipc_endpoint_create(1, 2).unwrap();
+        // The owner's minted cap is WRITE+READ+GRANT: fill the queue.
+        for len in [8u32, 16, 24, 32] {
+            assert!(matches!(
+                k.syscall(2, SysRequest::IpcSend { channel: ep, len }),
+                Ok(SysValue::Count(_))
+            ));
+        }
+        // Depth exhausted: the 5th send fails EAGAIN-style.
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 40
+                }
+            ),
+            Err(SysError::Ipc(IpcError::QueueFull))
+        ));
+        // Delivery order is FIFO (asserted through the lengths).
+        for len in [8u32, 16, 24, 32] {
+            assert!(matches!(
+                k.syscall(2, SysRequest::IpcRecv { channel: ep }),
+                Ok(SysValue::Count(n)) if n == len as usize
+            ));
+        }
+        // Drained: a further recv reports empty, not a block.
+        assert!(matches!(
+            k.syscall(2, SysRequest::IpcRecv { channel: ep }),
+            Err(SysError::Ipc(IpcError::QueueEmpty))
+        ));
+    }
+
+    /// ADR-0004 §2: queues are per-domain — RECV is owner-only. A
+    /// delegated READ capability proves knowledge of the endpoint but
+    /// does not move the queue (that is a later, explicit slice).
+    #[test]
+    fn ipc_recv_is_owner_only_and_capability_gated() {
+        use crate::capability::Rights;
+        use crate::ipc::IpcError;
+        use crate::sys::{SysError, SysRequest, SysValue};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        k.create_domain(3, service_profile()).unwrap();
+        let (ep, h) = k.ipc_endpoint_create(1, 2).unwrap();
+        // Put one message in the queue.
+        assert!(k
+            .syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 8
+                }
+            )
+            .is_ok());
+        // Domain 3 gets a READ+WRITE delegation: it may send, but it
+        // is still not the owner — the queue does not move for it.
+        k.ipc_endpoint_grant(1, ep, 3, Rights::READ | Rights::WRITE)
+            .unwrap();
+        assert!(matches!(
+            k.syscall(3, SysRequest::IpcRecv { channel: ep }),
+            Err(SysError::Ipc(IpcError::NotOwner(_)))
+        ));
+        // The owner without its capability: the cap gate fires first.
+        k.cap_revoke(2, h).unwrap();
+        assert!(matches!(
+            k.syscall(2, SysRequest::IpcRecv { channel: ep }),
+            Err(SysError::PermissionDenied)
+        ));
+        // The owner, re-granted a READ capability, drains the queue.
+        let _ = k.syscall(
+            3,
+            SysRequest::IpcSend {
+                channel: ep,
+                len: 12,
+            },
+        );
+        k.ipc_endpoint_grant(1, ep, 2, Rights::READ).unwrap();
+        // FIFO: the owner's earlier self-send (8) precedes domain 3's
+        // message (12) — order is preserved end to end.
+        assert!(matches!(
+            k.syscall(2, SysRequest::IpcRecv { channel: ep }),
+            Ok(SysValue::Count(8))
+        ));
+        assert!(matches!(
+            k.syscall(2, SysRequest::IpcRecv { channel: ep }),
+            Ok(SysValue::Count(12))
+        ));
+    }
+
+    /// Revocation and endpoint destruction both fail closed — a stale
+    /// handle (revoked cap) and a dead endpoint id (destroyed table
+    /// entry) are distinct, precise refusals.
+    #[test]
+    fn ipc_revoked_and_stale_capabilities_fail_closed() {
+        use crate::ipc::IpcError;
+        use crate::sys::{SysError, SysRequest};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        k.create_domain(3, service_profile()).unwrap();
+        let (ep, h) = k.ipc_endpoint_create(1, 2).unwrap();
+        assert!(k
+            .syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 8
+                }
+            )
+            .is_ok());
+        // Revoked cap: the capability gate refuses (PermissionDenied).
+        k.cap_revoke(2, h).unwrap();
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 8
+                }
+            ),
+            Err(SysError::PermissionDenied)
+        ));
+        // Destroyed endpoint: domains 2 and 3 keep live caps in their
+        // tables, but the endpoint id is dead forever (never reused).
+        k.ipc_endpoint_grant(1, ep, 3, crate::capability::Rights::WRITE)
+            .unwrap();
+        k.ipc_endpoint_grant(1, ep, 2, crate::capability::Rights::READ)
+            .unwrap();
+        k.ipc_endpoint_destroy(1, ep).unwrap();
+        // Both now fail at the LIVENESS check — the capability gates
+        // pass, the dead id does not (the no-ABA guarantee).
+        assert!(matches!(
+            k.syscall(
+                3,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 8
+                }
+            ),
+            Err(SysError::Ipc(IpcError::InvalidHandle))
+        ));
+        assert!(matches!(
+            k.syscall(2, SysRequest::IpcRecv { channel: ep }),
+            Err(SysError::Ipc(IpcError::InvalidHandle))
+        ));
+    }
+
+    /// Delegation is attenuation-only: a grant can never carry rights
+    /// the endpoint does not confer, and a delegated WRITE cap cannot
+    /// be used to receive.
+    #[test]
+    fn ipc_delegation_attenuation_only() {
+        use crate::capability::Rights;
+        use crate::sys::SysRequest;
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        let (ep, h) = k.ipc_endpoint_create(1, 2).unwrap();
+        // EXEC is not among the endpoint's conferable rights: refused.
+        assert!(k.ipc_endpoint_grant(1, ep, 2, Rights::EXEC).is_err());
+        // WRITE-only delegation: the child can send...
+        let child = k.cap_attenuate(2, h, Rights::WRITE).unwrap();
+        assert!(k
+            .syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 4
+                }
+            )
+            .is_ok());
+        // ...and the derivation is recorded as a strict subset.
+        let c = k.cap_lookup(2, child).unwrap();
+        assert!(c
+            .rights
+            .is_subset_of(Rights::READ | Rights::WRITE | Rights::GRANT));
+        assert!(!c.rights.contains(Rights::READ));
+        // Escalation through the table is still refused.
+        assert!(k
+            .cap_attenuate(2, child, Rights::READ | Rights::WRITE)
+            .is_err());
+    }
+
+    /// ADR-0004 §1: messages are fixed-size (<= 64 bytes). The size
+    /// check is the cheapest test and runs before any capability work.
+    #[test]
+    fn ipc_message_size_limit_is_64_bytes() {
+        use crate::ipc::IpcError;
+        use crate::sys::{SysError, SysRequest};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        let (ep, _h) = k.ipc_endpoint_create(1, 2).unwrap();
+        assert!(k
+            .syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 64
+                }
+            )
+            .is_ok());
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 65
+                }
+            ),
+            Err(SysError::Ipc(IpcError::TooLong(65)))
+        ));
+    }
+
+    /// Quarantine cuts IPC like every other syscall: only EXIT passes.
+    #[test]
+    fn quarantined_domain_cannot_ipc() {
+        use crate::sys::{SysError, SysRequest};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        let (ep, _h) = k.ipc_endpoint_create(1, 2).unwrap();
+        assert!(k
+            .syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 8
+                }
+            )
+            .is_ok());
+        k.domain_mut(2).unwrap().quarantine();
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 8
+                }
+            ),
+            Err(SysError::Quarantined(crate::syscall::SYS_IPC_SEND))
+        ));
+        assert!(matches!(
+            k.syscall(2, SysRequest::IpcRecv { channel: ep }),
+            Err(SysError::Quarantined(crate::syscall::SYS_IPC_RECV))
+        ));
+    }
+
+    /// The supervisor APIs are uid-0 only and fail loud on every
+    /// boundary: non-root callers, unknown owners, exhausted tables.
+    #[test]
+    fn ipc_supervisor_apis_are_uid0_only_and_fail_loud() {
+        use crate::ipc::{IpcError, MAX_ENDPOINTS};
+        use crate::KernelError;
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        // Non-root cannot create, grant, or destroy.
+        assert!(matches!(
+            k.ipc_endpoint_create(2, 2),
+            Err(KernelError::NotAuthorized(2))
+        ));
+        assert!(matches!(
+            k.ipc_endpoint_destroy(2, 0),
+            Err(KernelError::NotAuthorized(2))
+        ));
+        // Unknown owner: precise refusal, no side effects.
+        assert!(matches!(
+            k.ipc_endpoint_create(1, 7777),
+            Err(KernelError::UnknownDomain(7777))
+        ));
+        // Table exhaustion is surfaced (F14 discipline: never silent).
+        let mut made = 0;
+        loop {
+            match k.ipc_endpoint_create(1, 2) {
+                Ok(_) => made += 1,
+                Err(KernelError::Ipc(IpcError::TableFull)) => break,
+                Err(e) => panic!("unexpected: {e:?}"),
+            }
+        }
+        assert_eq!(made, MAX_ENDPOINTS);
+        // Destroy frees a slot (a later create succeeds), and the
+        // freed endpoint's id is never handed out again.
+        let first_id = 1; // ids start at 1, monotonic
+        k.ipc_endpoint_destroy(1, first_id).unwrap();
+        let (new_id, _h) = k.ipc_endpoint_create(1, 2).unwrap();
+        assert_ne!(new_id, first_id, "endpoint ids are never reused");
     }
 
     /// F18: the capability layer is load-bearing — a domain with the

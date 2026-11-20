@@ -61,8 +61,11 @@ resource-touching syscalls, with Unix DAC remaining as a second layer.
 - The whole layer is host-tested (the lib owns it; the ring-3 executor
   surface only implements WRITE/EXIT today, so no kernel-side changes
   were needed).
-- TODO (explicit, not implemented): `Endpoint` enforcement when IPC
-  syscalls get executors.
+- CLOSED (M2 week 1): `Endpoint` enforcement is live — IpcSend/IpcRecv
+  executors gate on `Resource::Endpoint` capabilities (WRITE = SEND,
+  READ = RECV; owner-only recv), per ADR-0004. Remaining ADR-0004 TODOs
+  (sync fast path, page grants, pipes-over-endpoints) are tracked in
+  `docs/M2-PLAN.md`.
 - CLOSED (post-review hardening, risk treatments): per-inode scoping —
   **chroot is now a capability boundary**: `Chroot` mints
   `FsNode(jail)` with the profile's base_rights and drops every FsNode

@@ -26,6 +26,11 @@ a shell, a VFS server over a block device, and passes basic POSIX tests
 process in Ring-3; W^X enforced by the MMU; ASLR; capability-based
 permissions; an audit trail for every sensitive syscall.
 
+**Execution plan:** stages 2–4 (plus full Ring-3 dispatch, ELF loader,
+demand paging/COW, configurable limits) are scheduled week-by-week in
+[`docs/M2-PLAN.md`](M2-PLAN.md) — gap analysis, adopter-usability
+mitigations, exit criteria and metrics live there.
+
 Mapping: Ring-3 → Stage 1 · IPC → Stage 2 · block+FS → Stage 3 ·
 preemption/SMP → Stage 4 · POSIX ABI → Stage 5 · drivers → Stage 6 ·
 hardening (ASLR/audit) → Stage 7 · compliance → Stage 8.
@@ -126,6 +131,12 @@ focused effort ≈ 4–6 weeks total.
 synchronous call/reply fast path, async endpoints, shared memory grants,
 and signals; pipes become a wrapper over endpoints (the existing lib pipe
 semantics preserved on top).
+
+**Status (M2 week 1):** task 2 (async endpoints) is DONE in the lib —
+`src/ipc.rs` + the IpcSend/IpcRecv executors, capability-gated, bounded
+FIFO, monotonic never-reused ids; see ADR-0004's implementation note.
+Tasks 1 (sync fast path), 3 (page grants) and 4 (pipes-over-endpoints)
+follow per M2-PLAN.
 
 **Tasks:**
 1. Endpoint objects with capability handles (grant/revoke via the existing

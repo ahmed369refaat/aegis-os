@@ -162,6 +162,9 @@ pub enum SysError {
     Pipe(PipeError),
     Signal(SignalError),
     Net(NetError),
+    /// ADR-0004: endpoint-IPC refusals (dead ids, bounded queues,
+    /// size limits, owner mismatches).
+    Ipc(crate::ipc::IpcError),
     Buddy(BuddyError),
     /// kill() denied: sender is not uid 0 and not the same uid.
     PermissionDenied,
@@ -648,8 +651,44 @@ impl Kernel {
                     .map_err(SysError::Mem)
             }
             SysRequest::Spawn { .. } => Err(SysError::NotImplemented(SYS_SPAWN)),
-            SysRequest::IpcSend { .. } => Err(SysError::NotImplemented(SYS_IPC_SEND)),
-            SysRequest::IpcRecv { .. } => Err(SysError::NotImplemented(SYS_IPC_RECV)),
+            SysRequest::IpcSend { channel, len } => {
+                // ADR-0004 slice 1 (async send). Cheapest check first:
+                // the fixed message size (§1), before any capability
+                // work — the fast path stays trivial on the common
+                // in-policy case.
+                if len > crate::ipc::IPC_MAX_MSG_BYTES {
+                    return Err(SysError::Ipc(crate::ipc::IpcError::TooLong(len)));
+                }
+                // The capability gate: WRITE == SEND (§4 mapping).
+                self.require_endpoint_cap(domain_id, channel, Rights::WRITE)?;
+                // A live capability on a destroyed endpoint fails
+                // closed (ids are never reused — no ABA).
+                self.endpoints
+                    .owner_of(channel)
+                    .ok_or(SysError::Ipc(crate::ipc::IpcError::InvalidHandle))?;
+                self.endpoints
+                    .push(channel, domain_id, len)
+                    // Count = free queue slots after the push (the
+                    // EAGAIN budget, mirroring NetSend's token count).
+                    .map(SysValue::Count)
+                    .map_err(SysError::Ipc)
+            }
+            SysRequest::IpcRecv { channel } => {
+                // ADR-0004 slice 1 (async recv): READ == RECV, and the
+                // queue is per-domain — only the owner drains it.
+                self.require_endpoint_cap(domain_id, channel, Rights::READ)?;
+                let owner = self
+                    .endpoints
+                    .owner_of(channel)
+                    .ok_or(SysError::Ipc(crate::ipc::IpcError::InvalidHandle))?;
+                if owner != domain_id {
+                    return Err(SysError::Ipc(crate::ipc::IpcError::NotOwner(domain_id)));
+                }
+                self.endpoints
+                    .pop(channel)
+                    .map(|m| SysValue::Count(m.len as usize))
+                    .map_err(SysError::Ipc)
+            }
             SysRequest::Ioctl { .. } => Err(SysError::NotImplemented(SYS_IOCTL)),
             SysRequest::NetRecv { .. } => Err(SysError::NotImplemented(SYS_NET_RECV)),
         }
@@ -770,6 +809,41 @@ impl Kernel {
     /// F18 (ADR-0009): require a Domain capability on `target` with
     /// WRITE. Self-signaling is always allowed: creation minted
     /// Domain(id), so the normal check passes with no special case.
+    /// ADR-0004 (ADR-0009 discipline): require an Endpoint capability
+    /// on THIS endpoint with `access`. Rights mapping: WRITE = SEND,
+    /// READ = RECV. A capability on a dead (destroyed) endpoint still
+    /// passes this gate — the executor's liveness check closes that
+    /// hole with `IpcError::InvalidHandle`.
+    fn require_endpoint_cap(
+        &mut self,
+        domain_id: u32,
+        endpoint_id: u32,
+        access: Rights,
+    ) -> Result<(), SysError> {
+        let mut caps = [(crate::capability::Resource::Domain(0), Rights::NONE);
+            crate::capability::MAX_CAPABILITIES];
+        let mut n = 0usize;
+        {
+            let d = self.domain_mut(domain_id).map_err(into_sys)?;
+            for c in d.caps.iter() {
+                if n < caps.len() {
+                    caps[n] = (c.resource, c.rights);
+                    n += 1;
+                }
+            }
+        }
+        for (res, rights) in caps.iter().take(n) {
+            if let crate::capability::Resource::Endpoint(eid) = res {
+                if *eid == endpoint_id && rights.contains(access) {
+                    return Ok(());
+                }
+            }
+        }
+        let d = self.domain_mut(domain_id).map_err(into_sys)?;
+        d.stats.escalation_attempts = d.stats.escalation_attempts.saturating_add(1);
+        Err(SysError::PermissionDenied)
+    }
+
     fn require_domain_cap(&mut self, domain_id: u32, target: u32) -> Result<(), SysError> {
         let mut caps = [(crate::capability::Resource::Domain(0), Rights::NONE);
             crate::capability::MAX_CAPABILITIES];
@@ -837,5 +911,6 @@ fn into_sys(e: KernelError) -> SysError {
         // Risk treatment 3: a supervisor-only API called by a
         // non-privileged domain is a permission denial, full stop.
         KernelError::NotAuthorized(_) => SysError::PermissionDenied,
+        KernelError::Ipc(e) => SysError::Ipc(e),
     }
 }
