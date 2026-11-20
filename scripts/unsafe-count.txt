@@ -17,3 +17,9 @@
 #      byte-exact user-copy reader; read_u64_va/write_u64_va gain
 #      alignment debug_asserts.
 62
+# 66 -> N2 review fix (ADR-0007 §2): +4 — hw::read_tsc (the monitor's
+#      TSC window clock until a real timer exists) and the three
+#      single-CPU static-mut touches of the Kernel singleton in
+#      sched/context.rs (set, map-deref, USER_RUN peek) — the same
+#      documented pattern as USER_RUN itself.
+66

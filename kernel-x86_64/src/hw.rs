@@ -77,6 +77,19 @@ pub fn read_cr2() -> u64 {
 /// active PML4 (flag/PCID bits must be masked by the caller).
 ///
 /// SAFETY: a pure register read.
+/// N2 (ADR-0007 §2): the monitor's window clock (until a real timer
+/// exists). Raw RDTSC — only window *boundaries* matter, so ordering
+/// against speculation is irrelevant here.
+pub fn read_tsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: RDTSC is unprivileged and touches no memory.
+    unsafe {
+        core::arch::asm!("rdtsc", lateout("eax") lo, lateout("edx") hi, options(nostack));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
 pub fn read_cr3() -> u64 {
     let v: u64;
     // SAFETY: no memory access; the ISA guarantees no side effects.

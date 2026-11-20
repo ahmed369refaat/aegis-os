@@ -154,6 +154,9 @@ fn dispatch(f: &mut ExceptionFrame) {
             f.rip,
             user_rsp,
         );
+        // N2 (ADR-0007 §2): the user's death is an organic fault signal
+        // on the LIVE domain, and drives the monitor clock.
+        crate::sched::context::note_live_fault();
         serial::write_str("[RING3] user fault: domain terminated, kernel resumes\n");
         // This environment cannot relay the first user-context fault's
         // resume cleanly (fully investigated in

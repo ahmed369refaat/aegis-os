@@ -103,6 +103,9 @@ if [ "${1:-}" = "--verify" ]; then
     grep -qF "hello from ring 3 (CPL=3)" "$LOG" || { echo "VERIFY FAIL: ring-3 hello marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 tail-of-page write ok" "$LOG" || { echo "VERIFY FAIL: N1 tail-of-page marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 crossing write refused (-EFAULT)" "$LOG" || { echo "VERIFY FAIL: N1 crossing-write marker missing"; ok=0; }
+    grep -qF "[SEC ] ring3 domain 10 quarantined by monitor" "$LOG" || { echo "VERIFY FAIL: N2 monitor-quarantine marker missing"; ok=0; }
+    grep -qF "healthy domain still running: yes" "$LOG" || { echo "VERIFY FAIL: N2 healthy-witness marker missing"; ok=0; }
+    grep -qF "[SEC ] ring3 audit-only: verdicts logged, mask unchanged" "$LOG" || { echo "VERIFY FAIL: N2 audit-only marker missing"; ok=0; }
     grep -qF "[RING3] hello domain exited(0): message written from CPL=3" "$LOG" || { echo "VERIFY FAIL: ring-3 exit marker missing"; ok=0; }
     grep -qF "[SYSC] syscall round-trip: " "$LOG" || { echo "VERIFY FAIL: round-trip marker missing"; ok=0; }
     grep -qF "[RING3] user fault: domain terminated, kernel resumes" "$LOG" || { echo "VERIFY FAIL: user-fault resume marker missing"; ok=0; }

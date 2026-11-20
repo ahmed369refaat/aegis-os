@@ -125,14 +125,40 @@ mod exec {
         // shared policy gate — before any argument is examined.
         let Some(nr8) = normalize_nr(nr) else {
             run.bad_syscalls = run.bad_syscalls.saturating_add(1);
+            // N2 (ADR-0007 §2): an unnormalizable nr is a denial on the
+            // LIVE domain (out-of-profile by definition) and drives the
+            // monitor clock.
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_unknown_syscall(run.domain);
+                k.tick(crate::hw::read_tsc());
+            }
             log_denied(run.domain, nr, "unknown syscall", -ENOSYS);
             return (-ENOSYS) as u64;
         };
-        let decision = gate(&run.mask, run.quarantined, nr8);
+        // N2 (ADR-0007 §2): the LIVE lib domain is the gate — stats,
+        // used-bits and denials land where the monitor reads them, and
+        // Tighten/Quarantine apply to the very next syscall. The
+        // snapshot fields remain only as a no-kernel fallback (host
+        // tests) and for display.
+        let decision = match context::kernel_mut() {
+            Some(k) => {
+                k.tick(crate::hw::read_tsc());
+                match k.dispatch(run.domain, nr8) {
+                    Ok(d) => d,
+                    // Unreachable: the run's domain was spawned by kmain.
+                    Err(_) => Decision::BadSyscall(nr8),
+                }
+            }
+            None => gate(&run.mask, run.quarantined, nr8),
+        };
         match decision {
             Decision::Allowed if nr8 == SYS_WRITE => sys_write(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_EXIT => {
                 run.exit = ExitKind::Exited(a1);
+                // N2: close the window bookkeeping on the way out.
+                if let Some(k) = context::kernel_mut() {
+                    k.tick(crate::hw::read_tsc());
+                }
                 // GS back to the kernel view, then jump to the launch
                 // point — SYSRET never happens for EXIT.
                 hw::swapgs();
@@ -168,6 +194,12 @@ mod exec {
             return (-EINVAL) as u64;
         }
         if !validate_user_range(run, buf, len) {
+            // N2: a failed user-pointer validation is an organic fault
+            // signal on the live domain (the exact feed the rogue
+            // blob's crossing writes exercise).
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_fault(run.domain);
+            }
             return (-EFAULT) as u64;
         }
         // copy_from_user (N1, ADR-0007 §1): byte-exact — the copy span

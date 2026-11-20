@@ -6,6 +6,11 @@
 //!   mode 2 — call unknown syscall 200 (must return -ENOSYS, audited),
 //!            then verify the errno and exit 42 on success / 99 if the
 //!            kernel answered anything else.
+//!   mode 3 — spam six forbidden syscalls plus one crossing write per
+//!            iteration (N2): denials, out-of-profile bits, a rate
+//!            spike and -EFAULT faults, across many monitor windows —
+//!            the live monitor must quarantine the domain while the
+//!            kernel keeps running.
 //! The hostile act always terminates the run (fault) or verifies the
 //! kernel's answer (exit code); the program never loops.
 #![no_std]
@@ -22,6 +27,8 @@ _ring3_start:
     jz 2f                              /* mode 0: NX exec */
     cmp al, 1
     je 1f                              /* mode 1: kernel-VA read */
+    cmp al, 3
+    je 5f                              /* mode 3: monitor spam */
     /* ── mode 2: forged syscall, verify -ENOSYS ── */
     mov eax, 200
     syscall
@@ -32,6 +39,34 @@ _ring3_start:
     syscall
 3:  mov eax, 63
     mov edi, 99                        /* exit(99): WRONG answer — loud */
+    syscall
+5:  /* ── mode 3 (N2): quarantine spam — six forbidden syscalls and a
+       crossing write per iteration; the counter lives in the data page
+       because SYSCALL destroys RCX/R11. ── */
+    mov dword ptr [0x00403008], 30000
+6:  mov eax, 200                      /* unknown nr: a denial */
+    syscall
+    mov eax, 9                        /* SYS_NET_SEND: off-profile */
+    syscall
+    mov eax, 10                       /* SYS_NET_RECV */
+    syscall
+    mov eax, 6                        /* SYS_SPAWN */
+    syscall
+    mov eax, 11                       /* SYS_IOCTL */
+    syscall
+    mov eax, 4                        /* SYS_MMAP */
+    syscall
+    mov eax, 1                        /* SYS_WRITE with a crossing
+                                          pointer: -EFAULT = a fault */
+    mov edi, 1
+    mov rsi, 0x00404000
+    mov edx, 1
+    syscall
+    sub dword ptr [0x00403008], 1
+    jnz 6b
+    mov eax, 63                       /* SYS_EXIT (open even when
+                                          quarantined) */
+    mov edi, 0
     syscall
 1:  /* ── mode 1: read through the kernel direct map ── */
     mov rax, [0xFFFF888000000000]      /* must #PF (supervisor page) */

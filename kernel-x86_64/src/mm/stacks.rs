@@ -172,7 +172,7 @@ impl KernelStack {
 #[cfg(not(test))]
 mod target {
     use super::{
-        slot_base, KernelStack, StackError, MAX_PAGES, MAX_SLOTS, OWNER_KERNEL, PAGE, SLOT_BYTES,
+        slot_base, KernelStack, StackError, MAX_PAGES, MAX_SLOTS, OWNER_KERNEL, PAGE,
     };
     use crate::frames::FramePool;
     use crate::mm::{ADDR_MASK, PTE_P_RW};

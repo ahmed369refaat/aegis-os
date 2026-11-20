@@ -172,6 +172,19 @@ mod entry {
     /// The active run, or `None` between runs.
     static mut USER_RUN: Option<UserRun> = None;
 
+    /// N2 (ADR-0007 §2): the live lib Kernel, set once by kmain before
+    /// the first ring-3 launch. The ring-3 syscall path gates through
+    /// it (stats, denials, Tighten/Quarantine apply to the very next
+    /// syscall) and drives its monitor windows from the TSC.
+    /// SAFETY POLICY: part of the documented unsafe allowlist (sched/),
+    /// same single-CPU static-mut pattern as USER_RUN above: set once
+    /// during bring-up, read-only afterwards, never aliased
+    /// concurrently (the dispatch runs on the kernel stack of the only
+    /// CPU; nested entry is impossible — SYSCALL never re-enters the
+    /// kernel — and the fault path runs after the dispatch returned).
+    static mut KERNEL: Option<*mut aegis_os::Kernel<{ crate::frames::KERNEL_POOL_FRAMES }>> =
+        None;
+
     /// Install the run state. Called from kmain just before
     /// `enter_ring3`.
     pub fn begin(run: UserRun) {
@@ -201,6 +214,50 @@ mod entry {
     }
 
     /// Record a ring-3 fault as the run's exit reason (exception path).
+    /// N2: install the live kernel pointer (kmain, once, before the
+    /// first ring-3 launch).
+    pub fn set_kernel(k: *mut aegis_os::Kernel<{ crate::frames::KERNEL_POOL_FRAMES }>) {
+        // SAFETY: single CPU, bring-up phase, before any ring-3 launch.
+        unsafe {
+            KERNEL = Some(k);
+        }
+    }
+
+    /// N2: the live kernel, when installed (host tests never install
+    /// one — callers fall back to the snapshot).
+    pub fn kernel_mut() -> Option<&'static mut aegis_os::Kernel<{ crate::frames::KERNEL_POOL_FRAMES }>> {
+        // SAFETY: the pointer was set once from a live `&mut Kernel`
+        // that outlives every ring-3 run (kmain owns it for the whole
+        // boot); single CPU, no nesting (see the static's comment).
+        unsafe { KERNEL.map(|p| &mut *p) }
+    }
+
+    /// N2: the active run's domain id (for the fault-path live feeds).
+    pub fn active_domain() -> Option<u32> {
+        // SAFETY: single CPU; a read-only peek at the installed run.
+        unsafe {
+            USER_RUN
+                .as_ref()
+                .map(|r| r.domain)
+        }
+    }
+
+    /// N2 (ADR-0007 §2): feed a user-context fault to the LIVE domain
+    /// (organic fault signal) and drive the monitor clock. Called from
+    /// the exception dispatch's user-death branch, after the run's
+    /// exit was recorded.
+    #[cfg(not(test))]
+    pub fn note_live_fault() {
+        let Some(id) = active_domain() else { return };
+        if let Some(k) = kernel_mut() {
+            let _ = k.report_fault(id);
+            k.tick(crate::hw::read_tsc());
+        }
+    }
+
+    #[cfg(test)]
+    pub fn note_live_fault() {}
+
     pub fn record_fault(vector: u8, cr2: u64, error_code: u64, rip: u64, user_rsp: u64) {
         // SAFETY: single CPU; called only from the exception dispatch,
         // which runs strictly inside a launched run (checked by the
@@ -320,4 +377,7 @@ mod entry {
 }
 
 #[cfg(not(test))]
-pub use entry::{active, begin, current, enter_ring3, launch, record_fault, resume_kernel, saved_rip, saved_rsp, take};
+pub use entry::{
+    active, active_domain, begin, current, enter_ring3, kernel_mut, launch, note_live_fault,
+    record_fault, resume_kernel, saved_rip, saved_rsp, set_kernel, take,
+};

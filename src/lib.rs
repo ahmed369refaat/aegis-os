@@ -275,6 +275,17 @@ impl<const N: usize> Kernel<N> {
         Ok(())
     }
 
+    /// N2 (ADR-0007 §2): an unnormalizable syscall number (>=
+    /// SYSCALL_COUNT) attempted from ring 3 — counted as a denial on
+    /// the live domain (out-of-profile by definition; the used-bits
+    /// signal only has room for the 64 real ids).
+    pub fn report_unknown_syscall(&mut self, domain_id: u32) -> Result<(), KernelError> {
+        let d = self.domain_mut(domain_id)?;
+        d.stats.denied_syscalls = d.stats.denied_syscalls.saturating_add(1);
+        d.stats.syscalls_total = d.stats.syscalls_total.saturating_add(1);
+        Ok(())
+    }
+
     /// Escalation hook (failed capability derivation, mask-widening attempts).
     pub fn report_escalation_attempt(&mut self, domain_id: u32) -> Result<(), KernelError> {
         self.domain_mut(domain_id)?.record_escalation_attempt();
@@ -1044,6 +1055,130 @@ mod tests {
             Some(DomainState::Quarantined),
             "two bad windows of organic events quarantine"
         );
+    }
+
+    /// N2 (ADR-0007 §2): a ring-3-shaped event sequence — gate refusals
+    /// through the LIVE domain, faults, unknown syscalls — driven across
+    /// windows by tick with a fake clock — must reach Tighten first
+    /// (mask reduced to the profile's degraded surface) and Quarantine
+    /// after (only SYS_EXIT passes the live gate).
+    #[test]
+    fn ring3_shaped_sequence_reaches_tighten_then_quarantine() {
+        use crate::domain::{Decision, DomainState};
+        use crate::sys::SysRequest;
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        k.set_monitor_window(10);
+        // The rogue escalates (the exact signals the ring-3 dispatch
+        // feeds, N2). Phase 1 — under the spike baseline (128/window),
+        // one forbidden id: denied 20 + faults 25 + out-bits 2.5 = 47.5
+        // — tighten territory [35, 65) for the service profile.
+        let misbehave_low = |k: &mut Kernel| {
+            for _ in 0..100 {
+                let _ = k.dispatch(1, crate::syscall::SYS_NET_SEND).unwrap();
+            }
+            for _ in 0..5 {
+                k.report_fault(1).unwrap();
+            }
+        };
+        // Phase 2 — full volume, three distinct forbidden ids: denied
+        // 20 + faults 25 + out-bits 7.5 + spike 15 = 67.5 — quarantine
+        // territory (>= 65).
+        let misbehave_high = |k: &mut Kernel| {
+            for _ in 0..100 {
+                let _ = k.dispatch(1, crate::syscall::SYS_NET_SEND).unwrap();
+                let _ = k.dispatch(1, crate::syscall::SYS_SPAWN).unwrap();
+                let _ = k.dispatch(1, crate::syscall::SYS_IOCTL).unwrap();
+            }
+            for _ in 0..5 {
+                k.report_fault(1).unwrap();
+            }
+        };
+        // Window 1: tighten territory, but hysteresis wants two.
+        misbehave_low(&mut k);
+        k.tick(10);
+        assert_eq!(k.domain_state(1), Some(DomainState::Running));
+        misbehave_low(&mut k);
+        k.tick(20);
+        // Two hot windows: Tighten has applied — the LIVE mask is the
+        // profile's degraded surface now (OPEN dropped, local I/O kept).
+        assert_eq!(
+            k.dispatch(1, crate::syscall::SYS_OPEN).unwrap(),
+            Decision::DeniedByMask(crate::syscall::SYS_OPEN),
+            "tightened live mask refuses new opens"
+        );
+        assert_eq!(
+            k.dispatch(1, crate::syscall::SYS_WRITE).unwrap(),
+            Decision::Allowed,
+            "the core function stays alive while degraded"
+        );
+        assert_eq!(k.domain_state(1), Some(DomainState::Tightened));
+        // Escalate: the next tier is quarantine.
+        misbehave_high(&mut k);
+        k.tick(30);
+        misbehave_high(&mut k);
+        k.tick(40);
+        assert_eq!(k.domain_state(1), Some(DomainState::Quarantined));
+        // Only SYS_EXIT passes the live gate now.
+        assert_eq!(
+            k.dispatch(1, crate::syscall::SYS_EXIT).unwrap(),
+            Decision::Allowed,
+            "quarantine keeps the exit door open"
+        );
+        assert_eq!(
+            k.dispatch(1, crate::syscall::SYS_WRITE).unwrap(),
+            Decision::DeniedQuarantined(crate::syscall::SYS_WRITE)
+        );
+        let _ = SysRequest::Pipe; // (import shape check)
+    }
+
+    /// N2 mirror of ring3-rogue mode 3: per iteration six forbidden
+    /// syscalls (unknown 200 + NET_SEND/NET_RECV/SPAWN/IOCTL/MMAP — all
+    /// off the service surface) and one allowed-but-refused crossing
+    /// write (-EFAULT -> fault signal). Denied ratio 6/7, faults, a
+    /// rate spike and 5 out-of-profile bits -> quarantine territory.
+    #[test]
+    fn rogue_blob_shape_quarantines_the_service_domain() {
+        use crate::domain::DomainState;
+        use crate::syscall::{SYS_IOCTL, SYS_MMAP, SYS_NET_RECV, SYS_NET_SEND, SYS_SPAWN};
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        k.set_monitor_window(10);
+        let spam = |k: &mut Kernel| {
+            for _ in 0..200 {
+                let _ = k.report_unknown_syscall(1).unwrap(); // forged nr
+                let _ = k.dispatch(1, SYS_NET_SEND).unwrap();
+                let _ = k.dispatch(1, SYS_NET_RECV).unwrap();
+                let _ = k.dispatch(1, SYS_SPAWN).unwrap();
+                let _ = k.dispatch(1, SYS_IOCTL).unwrap();
+                let _ = k.dispatch(1, SYS_MMAP).unwrap();
+                // The crossing write: allowed by the mask, refused by
+                // validation -> an organic fault.
+                let _ = k.report_fault(1).unwrap();
+            }
+        };
+        spam(&mut k);
+        k.tick(10);
+        spam(&mut k);
+        k.tick(20);
+        assert_eq!(
+            k.domain_state(1),
+            Some(DomainState::Quarantined),
+            "the rogue's own signals must quarantine it (service sensitivity 40)"
+        );
+    }
+
+    /// N2: unknown syscall numbers (>= SYSCALL_COUNT, unnormalizable)
+    /// feed the monitor's denied signal through the live domain.
+    #[test]
+    fn unknown_syscalls_feed_the_denied_signal() {
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        let before = k.domain_mut(1).unwrap().stats.denied_syscalls;
+        k.report_unknown_syscall(1).unwrap();
+        k.report_unknown_syscall(1).unwrap();
+        let after = k.domain_mut(1).unwrap().stats.denied_syscalls;
+        assert_eq!(after - before, 2, "every forged nr is a denial");
     }
 
     /// F2 regression: dup2 onto an open fd used to discard the replaced

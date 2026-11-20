@@ -111,6 +111,14 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     line(&mut out, &["[MEM ] frame pool claimed: 4096 frames @ 16 MiB..32 MiB, scrubbed"]);
 
     let mut k = Kernel::<KERNEL_POOL_FRAMES>::new_over_arena();
+    // N2 (ADR-0007 §2): the ring-3 syscall path gates through this live
+    // kernel (stats, denials, Tighten/Quarantine on the very next
+    // syscall) and drives the monitor's windows from the TSC. The
+    // window length below: ~40 ms at a 2.5 GHz reference TSC; only
+    // window *boundaries* matter, so TCG's variable rate is harmless.
+    const MONITOR_WINDOW_TSC: u64 = 100_000_000;
+    k.set_monitor_window(MONITOR_WINDOW_TSC);
+    crate::sched::context::set_kernel(&mut k as *mut Kernel<KERNEL_POOL_FRAMES>);
     let t_boot = hw::boot_tsc();
 
     // ── 4. the M1 sequence (identical code to the host tests) ──────
@@ -522,7 +530,98 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
     }
     mm::user::destroy_user(&mut k, &mut pool, 9);
-    line(&mut out, &["[RING3] ring-3 isolation live: 5 runs (hello/NX/kernel-VA/forged syscall/edge), kernel intact"]);
+
+    // ── Run 6 (N2, ADR-0007 §2): a rogue spamming forbidden syscalls
+    // and crossing writes across many monitor windows is quarantined
+    // BY ITS OWN BEHAVIOR — every signal (gate denials, out-of-profile
+    // bits, rate spikes, -EFAULT faults) is fed from the ring-3 path,
+    // and the healthy witness domain is untouched by the same windows.
+    // ──
+    let _ = k.create_domain_with(11, aegis_os::profile::service_profile(), 1011, 100, 0);
+    let spawn = match mm::user::spawn_user_blob(
+        &mut k, &mut pool, 10, aegis_os::profile::service_profile(),
+        RING3_ROGUE, &[3u8],
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(&mut out, &["[RING3] ERROR: rogue-monitor spawn failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    line(&mut out, &["[RING3] launching domain 10: forbidden-syscall spam (live-monitor quarantine)"]);
+    let kernel_cr3 = hw::read_cr3();
+    spawn.run.tables.activate();
+    crate::sched::context::begin(spawn.run);
+    crate::sched::context::launch(&spawn.ctx);
+    let run = crate::sched::context::take();
+    hw::write_cr3(kernel_cr3);
+    match (run.exit, k.domain_state(10)) {
+        (
+            crate::sched::context::ExitKind::Exited(0),
+            Some(aegis_os::domain::DomainState::Quarantined),
+        ) => {
+            line(&mut out, &["[SEC ] ring3 domain 10 quarantined by monitor"]);
+        }
+        _ => {
+            line(&mut out, &["[RING3] ERROR: rogue not quarantined by the live monitor; halting"]);
+            hw::halt_forever();
+        }
+    }
+    match k.domain_state(11) {
+        Some(aegis_os::domain::DomainState::Running) => {
+            line(&mut out, &["[MON ] healthy domain still running: yes"]);
+        }
+        _ => {
+            line(&mut out, &["[RING3] ERROR: healthy witness domain was not left alone; halting"]);
+            hw::halt_forever();
+        }
+    }
+    mm::user::destroy_user(&mut k, &mut pool, 10);
+    let _ = k.destroy_domain(11);
+
+    // ── Run 7 (N2): AuditOnly — the same rogue, the same windows:
+    // verdicts computed and logged to telemetry, nothing applied. ──
+    k.set_monitor_mode(aegis_os::monitor::MonitorMode::AuditOnly);
+    let spawn = match mm::user::spawn_user_blob(
+        &mut k, &mut pool, 12, aegis_os::profile::service_profile(),
+        RING3_ROGUE, &[3u8],
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(&mut out, &["[RING3] ERROR: rogue-audit spawn failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    line(&mut out, &["[RING3] launching domain 12: same spam under MonitorMode::AuditOnly"]);
+    let kernel_cr3 = hw::read_cr3();
+    spawn.run.tables.activate();
+    crate::sched::context::begin(spawn.run);
+    crate::sched::context::launch(&spawn.ctx);
+    let run = crate::sched::context::take();
+    hw::write_cr3(kernel_cr3);
+    let mut logged_a_verdict = false;
+    while let Some(ev) = k.pop_event() {
+        if ev.domain_id == 12
+            && ev.action == aegis_os::response::EventAction::Quarantine
+        {
+            logged_a_verdict = true;
+        }
+    }
+    match (run.exit, k.domain_state(12)) {
+        (
+            crate::sched::context::ExitKind::Exited(0),
+            Some(aegis_os::domain::DomainState::Running),
+        ) if logged_a_verdict => {
+            line(&mut out, &["[SEC ] ring3 audit-only: verdicts logged, mask unchanged"]);
+        }
+        _ => {
+            line(&mut out, &["[RING3] ERROR: audit-only run did not behave as specified; halting"]);
+            hw::halt_forever();
+        }
+    }
+    k.set_monitor_mode(aegis_os::monitor::MonitorMode::Enforce);
+    mm::user::destroy_user(&mut k, &mut pool, 12);
+    line(&mut out, &["[RING3] ring-3 isolation live: 7 runs (hello/NX/kernel-VA/forged/edge/monitor-quarantine/audit-only), kernel intact"]);
 
     // ── 11. the terminal guard-page proof: the write must #PF, the
     // dispatch must confirm CR2 is exactly the guard page, print the
