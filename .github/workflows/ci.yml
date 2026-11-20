@@ -98,6 +98,10 @@ jobs:
         run: |
           cargo build -p aegis-kernel --release --target x86_64-unknown-none
           scripts/check-ist-sections.sh
+      - name: Inline-asm pattern guard (ADR-0008 push/pop %rbx)
+        run: |
+          scripts/check-asm-patterns.sh --self-test
+          scripts/check-asm-patterns.sh
 
   fmt:
     name: Formatting (rustfmt)

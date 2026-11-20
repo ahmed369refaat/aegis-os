@@ -520,11 +520,68 @@ impl Kernel {
                 if self.vfs.kind_of(id) != Some(InodeKind::Dir) {
                     return Err(SysError::Vfs(VfsError::NotADirectory));
                 }
+                // Risk treatment 2 (ADR-0009 addendum): chroot is also a
+                // CAPABILITY boundary. Mint the jail capability (with the
+                // profile's base_rights) and drop every FsNode capability
+                // outside the jail — the table now matches the resolve
+                // confinement instead of holding the tree-wide ROOT.
+                // Attenuation-only: the scope can only ever shrink.
+                // (`resolve` already returned a live InodeRef — the
+                // generation is current by construction.)
+                let jail = id;
+                let base_rights = self
+                    .domain_mut(domain_id)
+                    .map_err(into_sys)?
+                    .profile
+                    .base_rights;
+                // Mint first (a free slot may be needed), then prune.
+                let _ = self.domain_mut(domain_id).map_err(into_sys)?.caps.insert(
+                    crate::capability::Capability {
+                        resource: crate::capability::Resource::FsNode(jail),
+                        rights: base_rights,
+                        generation: 0,
+                    },
+                );
+                // Snapshot the live handles, then revoke every FsNode
+                // capability whose directory is not within the jail.
+                let mut handles = [crate::capability::CapHandle {
+                    index: 0,
+                    generation: 0,
+                }; crate::capability::MAX_CAPABILITIES];
+                let mut n = 0usize;
+                {
+                    let d = self.domain_mut(domain_id).map_err(into_sys)?;
+                    for h in d.caps.handles() {
+                        if n < handles.len() {
+                            handles[n] = h;
+                            n += 1;
+                        }
+                    }
+                }
+                for h in handles.iter().take(n) {
+                    let outside = {
+                        let d = self.domain_mut(domain_id).map_err(into_sys)?;
+                        match d.caps.lookup(*h) {
+                            Ok(crate::capability::Capability {
+                                resource: crate::capability::Resource::FsNode(r),
+                                ..
+                            }) => !self.vfs.is_within(jail, r),
+                            _ => false, // not an FsNode cap: untouched
+                        }
+                    };
+                    if outside {
+                        let _ = self
+                            .domain_mut(domain_id)
+                            .map_err(into_sys)?
+                            .caps
+                            .revoke(*h);
+                    }
+                }
                 let d = self.domain_mut(domain_id).map_err(into_sys)?;
-                d.chroot_root = id;
+                d.chroot_root = jail;
                 // Hardening beyond Linux: the cwd moves with the new root,
                 // closing the classic chroot-escape-with-old-cwd attack.
-                d.cwd = id;
+                d.cwd = jail;
                 Ok(SysValue::Unit)
             }
             SysRequest::Mkdir { path, mode } => {
@@ -777,5 +834,8 @@ fn into_sys(e: KernelError) -> SysError {
         KernelError::TooManyDomains => SysError::TooManyDomains,
         KernelError::DuplicateDomain(id) => SysError::DuplicateDomain(id),
         KernelError::InvalidId(id) => SysError::InvalidId(id),
+        // Risk treatment 3: a supervisor-only API called by a
+        // non-privileged domain is a permission denial, full stop.
+        KernelError::NotAuthorized(_) => SysError::PermissionDenied,
     }
 }

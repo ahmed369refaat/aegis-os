@@ -83,3 +83,17 @@ a threat-model delta in the relevant `docs/<component>.md`.
 ## License
 
 MIT (see [LICENSE](LICENSE)). Contributions land under the same license.
+
+## Compile-time traps (learned the hard way)
+
+- **Const-generic paths in type position need braces**: `Kernel<{ CONST }>`
+  compiles; `Kernel<CONST>` fails with a confusing "cannot find type" —
+  the compiler resolves the argument in the TYPE namespace first. In
+  expression position (turbofish) braces are optional.
+- **Inline asm that saves RBX must store through the pushed stack slot**
+  (`movq %rbx, (%rsp)` / `pop {x}`) — an `out(reg)` temporary can be
+  allocated RBX itself and the restore-pop silently clobbers the result.
+  `scripts/check-asm-patterns.sh` enforces this in CI.
+- **`static mut` alignment is load-bearing for page tables**: a PD entry
+  pointing at a non-4 KiB-aligned table triple-faults. Use
+  `#[repr(align(4096))]` wrappers (see `arch/image_map.rs`).

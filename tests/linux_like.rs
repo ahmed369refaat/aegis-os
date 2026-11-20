@@ -603,18 +603,10 @@ fn kill_permissions_and_fatal_signal_delivery() {
         Ok(SysValue::Unit)
     );
     // F18 (ADR-0009): even the supervisor needs Domain capabilities to
-    // signal other domains — the supervisor grant path inserts them
-    // (both targets, before any kill the test asserts on).
+    // signal other domains — granted through the official, uid-0-only
+    // API (risk treatment 3: no raw supervisor table pokes).
     for target in [PARSER, SERVICE] {
-        k.domain_mut(SUPERVISOR)
-            .unwrap()
-            .caps
-            .insert(Capability {
-                resource: Resource::Domain(target),
-                rights: Rights::WRITE,
-                generation: 0,
-            })
-            .unwrap();
+        k.cap_grant_domain(SUPERVISOR, target).unwrap();
     }
     // Invalid signal numbers are rejected.
     assert_eq!(

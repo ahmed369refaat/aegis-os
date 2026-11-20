@@ -87,6 +87,9 @@ pub enum KernelError {
     /// id's uid). Explicit credentials via `create_domain_with` are the
     /// only way to such uids.
     InvalidId(u32),
+    /// Risk treatment 3 (ADR-0009 addendum): a supervisor-only API was
+    /// called by a non-privileged domain (carries the caller's id).
+    NotAuthorized(u32),
 }
 
 /// The sample kernel: owns domains, the behavior monitor, the telemetry
@@ -454,6 +457,32 @@ impl<const N: usize> Kernel<N> {
     }
 
     /// F6: supervisor wrapper; a stale handle is an escalation signal.
+    /// Risk treatment 3 (ADR-0009 addendum): the supervisor grant
+    /// path for Domain capabilities — the ONLY way a domain other than
+    /// the target itself ever holds a Domain capability. Supervisor
+    /// only: the caller must be uid 0. Returns the inserted handle
+    /// through the normal capability table (generation-assigned,
+    /// revocable, auditable).
+    pub fn cap_grant_domain(
+        &mut self,
+        supervisor_id: u32,
+        target_domain: u32,
+    ) -> Result<crate::capability::CapHandle, KernelError> {
+        if self.domain_mut(supervisor_id)?.uid != 0 {
+            return Err(KernelError::NotAuthorized(supervisor_id));
+        }
+        // The target must exist — a capability for a missing domain is
+        // meaningless (and would silently fail every later check).
+        self.domain_mut(target_domain)?;
+        let cap = crate::capability::Capability {
+            resource: crate::capability::Resource::Domain(target_domain),
+            rights: crate::capability::Rights::WRITE,
+            generation: 0,
+        };
+        let d = self.domain_mut(supervisor_id)?;
+        d.caps.insert(cap).map_err(|_| KernelError::TooManyDomains)
+    }
+
     pub fn cap_lookup(
         &mut self,
         domain_id: u32,
@@ -1403,6 +1432,133 @@ mod tests {
             Decision::DeniedQuarantined(crate::syscall::SYS_WRITE)
         );
         let _ = SysRequest::Pipe; // (import shape check)
+    }
+
+    /// Risk treatment 2 (ADR-0009 addendum): chroot is also a
+    /// capability boundary — the jail capability is minted and every
+    /// FsNode capability outside the jail is dropped (attenuation-only;
+    /// resolve already confined the paths, now the capability table
+    /// matches that confinement instead of holding the tree-wide ROOT).
+    #[test]
+    fn chroot_attenuates_the_fs_capability_to_the_jail() {
+        use crate::capability::Resource;
+        use crate::sys::{SysRequest, SysValue};
+        use crate::vfs::{Mode, ROOT_REF};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/home",
+                mode: Mode(0o755),
+            },
+        )
+        .unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/home/jail",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        // Sanity: creation minted the tree-wide root capability.
+        {
+            let d = k.domain_mut(2).unwrap();
+            assert!(
+                d.caps
+                    .iter()
+                    .any(|c| c.resource == Resource::FsNode(ROOT_REF)),
+                "creation mints FsNode(ROOT)"
+            );
+        }
+        k.syscall(2, SysRequest::Chroot { path: "/home/jail" })
+            .unwrap();
+        let jail = k.domain_mut(2).unwrap().chroot_root;
+        assert_ne!(jail, ROOT_REF);
+        {
+            let d = k.domain_mut(2).unwrap();
+            assert!(
+                !d.caps
+                    .iter()
+                    .any(|c| c.resource == Resource::FsNode(ROOT_REF)),
+                "the tree-wide ROOT capability must be dropped at chroot"
+            );
+            assert!(
+                d.caps.iter().any(|c| c.resource == Resource::FsNode(jail)),
+                "the jail capability must be minted at chroot"
+            );
+        }
+        // The domain still works inside the jail — the fresh capability
+        // covers it; only the scope shrank, nothing else changed.
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::Mkdir {
+                    path: "/inside",
+                    mode: Mode(0o755)
+                }
+            ),
+            Ok(SysValue::Unit)
+        ));
+        // Deepening: a second chroot drops the previous jail capability
+        // too — the scope only ever shrinks (attenuation-only).
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/home/jail/deeper",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        k.syscall(2, SysRequest::Chroot { path: "/deeper" })
+            .unwrap();
+        let deeper = k.domain_mut(2).unwrap().chroot_root;
+        assert_ne!(deeper, jail);
+        {
+            let d = k.domain_mut(2).unwrap();
+            assert!(
+                !d.caps.iter().any(|c| c.resource == Resource::FsNode(jail)),
+                "the previous jail capability must be dropped on a deeper chroot"
+            );
+            assert!(d
+                .caps
+                .iter()
+                .any(|c| c.resource == Resource::FsNode(deeper)));
+        }
+    }
+
+    /// Risk treatment 3 (ADR-0009 addendum): the supervisor grant path
+    /// is a real, checked API — uid-0 callers only, unknown targets
+    /// refused, the minted capability recorded through the normal
+    /// table (no raw supervisor pokes required anywhere).
+    #[test]
+    fn cap_grant_domain_is_supervisor_only() {
+        use crate::capability::{Resource, Rights};
+        use crate::sys::{SysRequest, SysValue};
+        let mut k = Kernel::new();
+        k.create_domain_with(2, service_profile(), 4242, 100, 0)
+            .unwrap();
+        k.create_domain_with(9, service_profile(), 0, 0, 0).unwrap();
+        // A non-root domain cannot grant itself anything.
+        assert!(
+            k.cap_grant_domain(2, 2).is_err(),
+            "non-root grant must be refused"
+        );
+        // Root grants a Domain(2) capability to itself...
+        let h = k.cap_grant_domain(9, 2).unwrap();
+        let c = k.cap_lookup(9, h).unwrap();
+        assert_eq!(c.resource, Resource::Domain(2));
+        assert!(c.rights.contains(Rights::WRITE));
+        // ...and can then signal domain 2 (the capability gate passes;
+        // uid 0 passes the Unix layer).
+        assert!(matches!(
+            k.syscall(9, SysRequest::Kill { target: 2, sig: 15 }),
+            Ok(SysValue::Unit)
+        ));
+        // Granting for an unknown target fails cleanly.
+        assert!(k.cap_grant_domain(9, 7777).is_err());
     }
 
     /// F18: the capability layer is load-bearing — a domain with the

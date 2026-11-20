@@ -62,12 +62,32 @@ resource-touching syscalls, with Unix DAC remaining as a second layer.
   surface only implements WRITE/EXIT today, so no kernel-side changes
   were needed).
 - TODO (explicit, not implemented): `Endpoint` enforcement when IPC
-  syscalls get executors; per-inode grants (today a capability on the
-  root covers the whole tree — least privilege is delegated to profiles
-  and future grant syscalls); a supervisor grant API for Domain
-  capabilities beyond self.
+  syscalls get executors.
+- CLOSED (post-review hardening, risk treatments): per-inode scoping —
+  **chroot is now a capability boundary**: `Chroot` mints
+  `FsNode(jail)` with the profile's base_rights and drops every FsNode
+  capability outside the jail (attenuation-only; resolve already
+  confined the paths, the table now matches it); supervisor grants —
+  **`Kernel::cap_grant_domain(supervisor, target)`** is the uid-0-only
+  API for Domain capabilities beyond self (unknown targets refused,
+  `KernelError::NotAuthorized` for non-root callers).
 
 ## Slices
 
 Landed in one slice: the full FsNode/Device/Domain set above (the lib
 surface is small enough to land complete; no partial-doc risk).
+
+## Post-review hardening (definitive risk treatment)
+
+The second-round report flagged five residual risks; the two capability
+ones are closed here, the other three by guards/docs elsewhere
+(`scripts/check-asm-patterns.sh`, CONTRIBUTING's compile-time traps,
+boot.sh's emulator-version context):
+
+1. Tree-wide `FsNode(ROOT)` — closed by the chroot capability boundary
+   above (test: `chroot_attenuates_the_fs_capability_to_the_jail`,
+   red-then-green on the unattenuated code).
+2. Supervisor table pokes for Domain grants — closed by
+   `cap_grant_domain` (test: `cap_grant_domain_is_supervisor_only`;
+   red = the missing-API compile error, green = refusal for non-root,
+   mint for root, clean refusal for unknown targets).

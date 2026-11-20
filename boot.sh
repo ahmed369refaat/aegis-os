@@ -71,6 +71,10 @@ if [ "${1:-}" = "--verify" ]; then
   LOG=$(mktemp)
   trap 'rm -f "$LOG"' EXIT
   echo "==> [4/4] booting in QEMU (TCG) — M1 exit-criteria + PR-1.1/1.2/1.3 selftests run"
+  # Risk treatment 5: surface the exact emulator the markers run under
+  # — if a CI runner's QEMU lacks SMEP/SMAP, the failure message below
+  # carries the version context right next to it.
+  echo "    $(qemu-system-x86_64 --version | head -1)"
   START=$(date +%s.%N)
   timeout 60 qemu-system-x86_64 "${QEMU_ARGS[@]}" | tee "$LOG"
   END=$(date +%s.%N)
@@ -106,7 +110,7 @@ if [ "${1:-}" = "--verify" ]; then
     grep -qF "[SEC ] ring3 domain 10 quarantined by monitor" "$LOG" || { echo "VERIFY FAIL: N2 monitor-quarantine marker missing"; ok=0; }
     grep -qF "healthy domain still running: yes" "$LOG" || { echo "VERIFY FAIL: N2 healthy-witness marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 audit-only: verdicts logged, mask unchanged" "$LOG" || { echo "VERIFY FAIL: N2 audit-only marker missing"; ok=0; }
-    grep -qF "[ARCH] smep=on smap=on" "$LOG" || { echo "VERIFY FAIL: N4 SMEP/SMAP not both on (-cpu max required)"; ok=0; }
+    grep -qF "[ARCH] smep=on smap=on" "$LOG" || { echo "VERIFY FAIL: N4 SMEP/SMAP not both on — this QEMU build's -cpu max lacks them ($(qemu-system-x86_64 --version | head -1))"; ok=0; }
     grep -qF "[SEC ] SMEP selftest: kernel jump into user page faulted, resumed" "$LOG" || { echo "VERIFY FAIL: N4 SMEP selftest marker missing"; ok=0; }
     grep -qF "[SEC ] SMAP selftest: kernel read outside the window faulted, resumed" "$LOG" || { echo "VERIFY FAIL: N4 SMAP selftest marker missing"; ok=0; }
     grep -qF "[SEC ] image W^X: write to .text faulted (WP)" "$LOG" || { echo "VERIFY FAIL: F15 .text WP marker missing"; ok=0; }
