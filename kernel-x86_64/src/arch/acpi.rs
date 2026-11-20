@@ -34,7 +34,7 @@
 //! [`discover_boot`] hardcodes the real 0x40E/0xE0000 windows and is
 //! target-only.
 
-use aegis_os::dmar::{self, Dmar, DmarError, Rsdp, TableDir};
+use aegis_os::dmar::{self, Dmar, DmarError, Rsdp};
 
 /// The BDA word holding the EBDA segment (real-mode segment number).
 pub const EBDA_SEG_PTR: u64 = 0x40E;
