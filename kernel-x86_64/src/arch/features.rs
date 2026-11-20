@@ -18,6 +18,14 @@ pub const fn has_smap(leaf7_ebx: u64) -> bool {
     leaf7_ebx & (1 << 20) != 0
 }
 
+/// CPUID leaf 1, ECX bit 24: TSC-deadline timer mode (the LAPIC timer
+/// can take an absolute TSC deadline via MSR 0x6E0 — the deterministic
+/// mode, same clock as every other measurement in the kernel).
+#[must_use]
+pub const fn has_tsc_deadline(leaf1_ecx: u64) -> bool {
+    leaf1_ecx & (1 << 24) != 0
+}
+
 /// CR4.SMEP is bit 20, CR4.SMAP is bit 21.
 pub const CR4_SMEP: u64 = 1 << 20;
 pub const CR4_SMAP: u64 = 1 << 21;
@@ -51,6 +59,15 @@ mod tests {
         assert!(!has_smap(0));
         assert!(!has_smep(1 << 20), "SMAP's bit is not SMEP's");
         assert!(!has_smap(1 << 7), "SMEP's bit is not SMAP's");
+    }
+
+    #[test]
+    fn tsc_deadline_bit_decodes() {
+        // CPUID.01H:ECX bit 24 (QEMU -cpu max reports it).
+        assert!(has_tsc_deadline(1 << 24));
+        assert!(has_tsc_deadline(1 << 24 | 1 << 7));
+        assert!(!has_tsc_deadline(0));
+        assert!(!has_tsc_deadline(1 << 23), "neighbor bit must not decode");
     }
 
     #[test]

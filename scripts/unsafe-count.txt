@@ -39,3 +39,7 @@
 #      arch/exceptions.rs (eight words above the frame + CR2/CR3 at
 #      fault time; the frame tail the CPU pushed, read where it lies).
 78
+# ADR-0012 (timer preemption): the parked-run table, the frame
+#      park/unpark tail writes, enter_ring3_parked/resume_parked,
+#      cpuid1_ecx (ADR-0008 pattern), the full-frame fault dump.
+89

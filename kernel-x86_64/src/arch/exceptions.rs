@@ -137,6 +137,25 @@ const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
 /// Print the diagnosis, then handle / halt / power off (see the module
 /// doc for the policy).
 fn dispatch(f: &mut ExceptionFrame) {
+    // ── the LAPIC timer (ADR-0012): route to the tick BEFORE anything
+    // else. The frame is CPL3 (the kernel runs IF=0 — a tick can only
+    // interrupt user code), so the CPL3-fault branch below would
+    // otherwise mistake it for the domain's death. The tick either
+    // leaves the frame alone (a keep) or rewrites it (a switch to the
+    // parked domain the preemptor named); the unwind's iretq then
+    // enters whichever domain the frame now describes.
+    if f.vector as u8 == super::lapic::TIMER_VECTOR {
+        crate::sched::preempt::on_timer_tick(f);
+        return;
+    }
+    // A spurious LAPIC delivery (the SVR vector): a named no-op —
+    // notably WITHOUT an EOI (the SDM: acknowledging a spurious vector
+    // wedges the APIC's in-service state).
+    if f.vector as u8 == super::lapic::SPURIOUS_VECTOR {
+        serial::write_str("[IRQ ] lapic spurious vector — ignored (no EOI)\n");
+        return;
+    }
+
     let mut bv = [0u8; 20];
     let mut brip = [0u8; 18];
     let mut bcs = [0u8; 18];
@@ -407,6 +426,51 @@ fn dispatch(f: &mut ExceptionFrame) {
     serial::write_str(
         "[EXC] unexpected fault — halting (kernel bug; see docs/arch/exceptions.md)\n",
     );
+    // ADR-0010's lesson: print the FULL frame — every GPR, the iret
+    // words, and the raw stack tail — so the next investigation starts
+    // from data instead of guesses. `rbp` of a kernel frame is a chain
+    // pointer only when built with frame pointers; treat all words as
+    // data.
+    let names = [
+        "r15", "r14", "r13", "r12", "r11", "r10", "r9", "r8", "rbp", "rdi", "rsi", "rdx", "rcx",
+        "rbx", "rax",
+    ];
+    for (i, name) in names.iter().enumerate() {
+        let v = crate::sched::context::gpr_at(f, i);
+        let mut bv = [0u8; 18];
+        serial::write_str("[EXC]   ");
+        serial::write_str(name);
+        serial::write_str("=");
+        serial::write_str(strutil::hex(v, &mut bv));
+        serial::write_str("\n");
+    }
+    {
+        let mut b1 = [0u8; 18];
+        let mut b2 = [0u8; 18];
+        serial::write_str("[EXC]   vector=");
+        serial::write_str(strutil::hex(f.vector, &mut b1));
+        serial::write_str(" err=");
+        serial::write_str(strutil::hex(f.error_code, &mut b2));
+        serial::write_str("\n");
+    }
+    // The caller chain: the frame itself sits on the interrupted
+    // stack — the caller's rsp = frame address + 20 words (the whole
+    // ExceptionFrame) for a CPL0 fault (no rsp/ss tail).
+    {
+        let rsp = core::ptr::from_mut(f) as u64 + 20 * 8;
+        for i in 0..6u64 {
+            let v = crate::memops::read_u64_va(rsp + i * 8);
+            let mut bi = [0u8; 18];
+            let mut bv = [0u8; 18];
+            let idx = strutil::hex(i * 8, &mut bi);
+            let val = strutil::hex(v, &mut bv);
+            serial::write_str("[EXC]   [rsp+");
+            serial::write_str(idx);
+            serial::write_str("]=");
+            serial::write_str(val);
+            serial::write_str("\n");
+        }
+    }
     hw::halt_forever()
 }
 

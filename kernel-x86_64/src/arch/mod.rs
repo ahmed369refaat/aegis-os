@@ -18,6 +18,7 @@ pub mod gdt;
 pub mod idt;
 #[cfg(not(test))]
 pub mod image_map;
+pub mod lapic;
 
 #[cfg(not(test))]
 pub mod exceptions;

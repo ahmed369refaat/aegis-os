@@ -48,6 +48,7 @@ pub mod memory;
 pub mod monitor;
 pub mod net;
 pub mod pipe;
+pub mod preempt;
 pub mod profile;
 pub mod response;
 pub mod ringbuf;
@@ -682,6 +683,7 @@ pub mod prelude {
         NetError, Socket, SocketState, SocketTable, TokenBucket, RATE_WINDOW_TICKS,
     };
     pub use crate::pipe::{PipeError, PipeTable, MAX_PIPES, PIPE_CAPACITY};
+    pub use crate::preempt::{Preemptor, TickDecision};
     pub use crate::ringbuf::{RingBuffer, RingError};
     pub use crate::sched::{SchedEntity, SchedError, Scheduler, NICE0_WEIGHT, NICE_TO_WEIGHT};
     pub use crate::signal::{

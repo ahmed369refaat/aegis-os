@@ -28,6 +28,7 @@
 use aegis_os::memory::AddressSpace;
 use aegis_os::syscall::SyscallMask;
 
+use crate::arch::frame::ExceptionFrame;
 use crate::mm::page_table::PageTables;
 
 /// RFLAGS for a freshly launched user context: interrupts on (IF, bit 1
@@ -131,6 +132,98 @@ impl UserRun {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Parked contexts (M2-W2 / ADR-0012): the register image of a ring-3 run
+// that is runnable but NOT the one on the CPU — preempted by the timer,
+// or freshly spawned and not yet entered. Pure data + pure mapping
+// helpers, host-tested; the table and the naked entry live in `entry`.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The complete register image of a parked run: the 15 GPRs in
+/// `ExceptionFrame` order, then the iret-frame words. `from_user_context`
+/// builds the not-yet-started image (GPRs zeroed — blobs are written not
+/// to depend on entry register state); the timer tick builds it from a
+/// live interrupt frame.
+///
+/// The naked resume entry reads this struct at FIXED OFFSETS — pinned by
+/// the host test below (the M2-W2 mirror-inversion lesson: an asm offset
+/// table is only trustworthy when a test pins it against the struct).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ParkedContext {
+    /// r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax —
+    /// exactly `ExceptionFrame`'s field order.
+    pub gprs: [u64; 15],
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    /// The user stack pointer (the CPL3 iret tail, word 1).
+    pub rsp: u64,
+    /// The user stack selector (the CPL3 iret tail, word 2).
+    pub ss: u64,
+}
+
+impl ParkedContext {
+    /// The not-yet-started image of a freshly spawned domain.
+    #[must_use]
+    pub fn from_user_context(ctx: &UserContext) -> Self {
+        ParkedContext {
+            gprs: [0; 15],
+            rip: ctx.rip,
+            cs: ctx.cs,
+            rflags: ctx.rflags,
+            rsp: ctx.rsp,
+            ss: ctx.ss,
+        }
+    }
+}
+
+/// Read GPR `i` of a frame (0=r15 … 14=rax) — the one place the
+/// frame-order mapping is spelled out, host-tested against the struct.
+#[must_use]
+pub fn gpr_at(frame: &ExceptionFrame, i: usize) -> u64 {
+    match i {
+        0 => frame.r15,
+        1 => frame.r14,
+        2 => frame.r13,
+        3 => frame.r12,
+        4 => frame.r11,
+        5 => frame.r10,
+        6 => frame.r9,
+        7 => frame.r8,
+        8 => frame.rbp,
+        9 => frame.rdi,
+        10 => frame.rsi,
+        11 => frame.rdx,
+        12 => frame.rcx,
+        13 => frame.rbx,
+        14 => frame.rax,
+        _ => panic!("gpr_at: not a frame GPR index"),
+    }
+}
+
+/// Write GPR `i` of a frame (the park/unpark pair of `gpr_at`).
+pub fn set_gpr_at(frame: &mut ExceptionFrame, i: usize, v: u64) {
+    match i {
+        0 => frame.r15 = v,
+        1 => frame.r14 = v,
+        2 => frame.r13 = v,
+        3 => frame.r12 = v,
+        4 => frame.r11 = v,
+        5 => frame.r10 = v,
+        6 => frame.r9 = v,
+        7 => frame.r8 = v,
+        8 => frame.rbp = v,
+        9 => frame.rdi = v,
+        10 => frame.rsi = v,
+        11 => frame.rdx = v,
+        12 => frame.rcx = v,
+        13 => frame.rbx = v,
+        14 => frame.rax = v,
+        _ => panic!("set_gpr_at: not a frame GPR index"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +243,90 @@ mod tests {
         assert_eq!(c.rflags & (1 << 8), 0, "TF clear");
         assert_eq!(c.rflags & (1 << 10), 0, "DF clear");
     }
+
+    /// The naked resume entry (`enter_ring3_parked`) reads ParkedContext
+    /// at literal offsets — pin them against the struct (the M2-W2
+    /// mirror-inversion lesson, applied before the bug can exist).
+    #[test]
+    fn parked_context_offsets_match_the_asm_table() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(ParkedContext, gprs), 0);
+        assert_eq!(offset_of!(ParkedContext, rip), 15 * 8, "asm reads 120");
+        assert_eq!(offset_of!(ParkedContext, rflags), 17 * 8, "asm reads 136");
+        assert_eq!(offset_of!(ParkedContext, rsp), 18 * 8, "asm reads 144");
+        assert_eq!(size_of::<ParkedContext>(), 20 * 8);
+        // The gprs array and the frame's 15 GPR fields are layout-identical.
+        assert_eq!(
+            core::mem::offset_of!(ExceptionFrame, vector),
+            15 * 8,
+            "the frame's GPR block is 15 words — gprs mirrors it"
+        );
+    }
+
+    #[test]
+    fn fresh_parked_context_zeroes_gprs_and_carries_the_iret_frame() {
+        let uc = UserContext::new(0x40_0000, 0x40_9000);
+        let pc = ParkedContext::from_user_context(&uc);
+        assert_eq!(pc.gprs, [0; 15]);
+        assert_eq!(pc.rip, 0x40_0000);
+        assert_eq!(pc.rsp, 0x40_9000);
+        assert_eq!(pc.cs & 3, 3);
+        assert_eq!(pc.ss & 3, 3);
+        assert_eq!(pc.rflags, USER_RFLAGS);
+    }
+
+    /// gpr_at/set_gpr_at must agree with the frame field order exactly —
+    /// a park/unpark round-trip through every index preserves every
+    /// register (a swapped pair here is a silently corrupted domain).
+    #[test]
+    fn gpr_indexing_round_trips_every_frame_register() {
+        let mut f = ExceptionFrame {
+            r15: 1,
+            r14: 2,
+            r13: 3,
+            r12: 4,
+            r11: 5,
+            r10: 6,
+            r9: 7,
+            r8: 8,
+            rbp: 9,
+            rdi: 10,
+            rsi: 11,
+            rdx: 12,
+            rcx: 13,
+            rbx: 14,
+            rax: 15,
+            vector: 48,
+            error_code: 0,
+            rip: 0x40_0000,
+            cs: 0x2b,
+            rflags: 0x202,
+        };
+        let snapshot: [u64; 15] = core::array::from_fn(|i| gpr_at(&f, i));
+        assert_eq!(
+            snapshot,
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        // Write a distinct pattern through the mapping, read it back by field.
+        for i in 0..15 {
+            set_gpr_at(&mut f, i, 0x1000 + i as u64);
+        }
+        assert_eq!(f.r15, 0x1000);
+        assert_eq!(f.r14, 0x1001);
+        assert_eq!(f.r13, 0x1002);
+        assert_eq!(f.r12, 0x1003);
+        assert_eq!(f.r11, 0x1004);
+        assert_eq!(f.r10, 0x1005);
+        assert_eq!(f.r9, 0x1006);
+        assert_eq!(f.r8, 0x1007);
+        assert_eq!(f.rbp, 0x1008);
+        assert_eq!(f.rdi, 0x1009);
+        assert_eq!(f.rsi, 0x100a);
+        assert_eq!(f.rdx, 0x100b);
+        assert_eq!(f.rcx, 0x100c);
+        assert_eq!(f.rbx, 0x100d);
+        assert_eq!(f.rax, 0x100e);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -157,7 +334,8 @@ mod tests {
 // ─────────────────────────────────────────────────────────────────────────
 #[cfg(not(test))]
 mod entry {
-    use super::{ExitKind, UserContext, UserRun};
+    use super::{ExitKind, ParkedContext, UserContext, UserRun};
+    use crate::arch::frame::ExceptionFrame;
     use core::arch::naked_asm;
 
     /// Where `enter_ring3` parked the kernel's resume point (RSP holding
@@ -273,6 +451,118 @@ mod entry {
 
     #[cfg(test)]
     pub fn note_live_fault() {}
+
+    // ── parked runs (M2-W2 / ADR-0012) ────────────────────────────────
+    // Every runnable ring-3 run that is NOT the one on the CPU: parked
+    // by the timer tick (preempted mid-execution) or stashed by kmain
+    // (spawned, not yet entered). Single CPU, one active run: the table
+    // is touched only from the tick path (interrupts masked) or kmain
+    // between runs — never concurrently, never nested.
+
+    /// How many ring-3 runs may be parked at once. Small, fixed, and
+    /// fail-loud: a full table is a bookkeeping bug, never something to
+    /// paper over (the F14 discipline).
+    pub const MAX_PARKED_RUNS: usize = 4;
+
+    static mut PARKED: [Option<(UserRun, ParkedContext)>; MAX_PARKED_RUNS] =
+        [const { None }; MAX_PARKED_RUNS];
+
+    /// Store a run + its register image. Panics on a full table.
+    pub fn stash_parked(run: UserRun, ctx: ParkedContext) {
+        // SAFETY: single CPU; touched only from the tick path (IF=0)
+        // or kmain between runs — see the table's doc.
+        let table = core::ptr::addr_of_mut!(PARKED);
+        unsafe {
+            for slot in (*table).iter_mut() {
+                if slot.is_none() {
+                    *slot = Some((run, ctx));
+                    return;
+                }
+            }
+        }
+        panic!("stash_parked: the parked-run table is full (bookkeeping bug)");
+    }
+
+    /// Withdraw the parked run of `domain`, if it is parked.
+    pub fn take_parked(domain: u32) -> Option<(UserRun, ParkedContext)> {
+        // SAFETY: as stash_parked.
+        let table = core::ptr::addr_of_mut!(PARKED);
+        unsafe {
+            for slot in (*table).iter_mut() {
+                if matches!(&*slot, Some((r, _)) if r.domain == domain) {
+                    return (*slot).take();
+                }
+            }
+        }
+        None
+    }
+
+    /// Is `domain` parked right now? (kmain's starvation-freedom
+    /// assertion reads this: the writer finishing while the spinner is
+    /// still parked IS the proof.)
+    pub fn is_parked(domain: u32) -> bool {
+        // SAFETY: a read-only peek under the same single-CPU contract.
+        let table = core::ptr::addr_of!(PARKED);
+        unsafe { (*table).iter().flatten().any(|(r, _)| r.domain == domain) }
+    }
+
+    /// How many runs are parked (diagnostics).
+    pub fn parked_count() -> usize {
+        // SAFETY: as is_parked.
+        let table = core::ptr::addr_of!(PARKED);
+        unsafe { (*table).iter().flatten().count() }
+    }
+
+    /// Park the CURRENT run: withdraw USER_RUN and capture the
+    /// interrupted register image from the timer's interrupt frame —
+    /// the 15 frame GPRs, the iret words, and the CPL3 tail (user
+    /// rsp/ss) the CPU pushed above rflags. Called from the tick path,
+    /// which has verified a run is active and the frame is CPL3.
+    pub fn park_from_frame(frame: &mut ExceptionFrame) -> (UserRun, ParkedContext) {
+        // Withdraw the active run FIRST (single CPU; take() panics if
+        // missing — the tick checked active() before calling).
+        let run = take();
+        let mut ctx = ParkedContext {
+            gprs: [0; 15],
+            rip: frame.rip,
+            cs: frame.cs,
+            rflags: frame.rflags,
+            rsp: 0,
+            ss: 0,
+        };
+        for i in 0..15 {
+            ctx.gprs[i] = super::gpr_at(frame, i);
+        }
+        // SAFETY: the frame is CPL3 (the tick asserted it before
+        // calling): the CPU physically pushed the user rsp/ss two and
+        // three words above rflags — in-bounds reads of the frame tail.
+        unsafe {
+            let tail = core::ptr::addr_of!(frame.rflags);
+            ctx.rsp = tail.add(1).read();
+            ctx.ss = tail.add(2).read();
+        }
+        (run, ctx)
+    }
+
+    /// Install a parked image into the interrupt frame: the unwind's
+    /// pop-registers + iretq will enter THAT domain instead of
+    /// returning to the interrupted one. The frame rewrite IS the
+    /// context switch; CR3 and USER_RUN are the caller's half.
+    pub fn unpark_into_frame(frame: &mut ExceptionFrame, ctx: &ParkedContext) {
+        for i in 0..15 {
+            super::set_gpr_at(frame, i, ctx.gprs[i]);
+        }
+        frame.rip = ctx.rip;
+        frame.cs = ctx.cs;
+        frame.rflags = ctx.rflags;
+        // SAFETY: the frame carries the CPL3 tail (it arrived from
+        // CPL3); the writes land exactly on those two words.
+        unsafe {
+            let tail = core::ptr::addr_of_mut!(frame.rflags);
+            tail.add(1).write(ctx.rsp);
+            tail.add(2).write(ctx.ss);
+        }
+    }
 
     pub fn record_fault(vector: u8, cr2: u64, error_code: u64, rip: u64, user_rsp: u64) {
         // SAFETY: single CPU; called only from the exception dispatch,
@@ -423,10 +713,104 @@ mod entry {
             options(att_syntax),
         );
     }
+
+    /// Resume a PARKED run from kmain (the handover path: another domain
+    /// exited, the preemptor named the next one). Same discipline as
+    /// `launch`: park the kernel caller's resume point + callee-saved
+    /// registers into the shared slots (only one excursion is ever
+    /// active), then tail-jump into the parked entry. When the resumed
+    /// domain later exits (SYS_EXIT or a fault), `resume_kernel` lands
+    /// on the label below and this call returns to kmain exactly once.
+    ///
+    /// ABI note (ADR-0012): the SYSRET-based entry cannot restore the
+    /// target's RCX/R11 — the instruction loads them with RIP/RFLAGS.
+    /// The interrupt-frame switch (the tick path) preserves every
+    /// register; only this handover path costs the SYSCALL-ABI pair,
+    /// the same two registers every syscall already clobbers.
+    pub fn resume_parked(ctx: &ParkedContext) {
+        // SAFETY: writes the shared park slots once per excursion
+        // (single CPU, single excursion — see PARK_*'s doc), then
+        // tail-jumps to the naked parked entry. The label is reached
+        // only via resume_kernel's jump, on the saved stack.
+        unsafe {
+            core::arch::asm!(
+                "lea 9f(%rip), %rax",
+                "movq %rax, {rip_slot}(%rip)",
+                "movq %rsp, {rsp_slot}(%rip)",
+                "movq %rbx, {rbx_slot}(%rip)",
+                "movq %rbp, {rbp_slot}(%rip)",
+                "movq %r12, {r12_slot}(%rip)",
+                "movq %r13, {r13_slot}(%rip)",
+                "movq %r14, {r14_slot}(%rip)",
+                "movq %r15, {r15_slot}(%rip)",
+                "jmp {enter}",
+                "9:",
+                "movq {rbx_slot}(%rip), %rbx",
+                "movq {rbp_slot}(%rip), %rbp",
+                "movq {r12_slot}(%rip), %r12",
+                "movq {r13_slot}(%rip), %r13",
+                "movq {r14_slot}(%rip), %r14",
+                "movq {r15_slot}(%rip), %r15",
+                enter = sym enter_ring3_parked,
+                rip_slot = sym RESUME_RIP,
+                rsp_slot = sym RESUME_RSP,
+                rbx_slot = sym PARK_RBX,
+                rbp_slot = sym PARK_RBP,
+                r12_slot = sym PARK_R12,
+                r13_slot = sym PARK_R13,
+                r14_slot = sym PARK_R14,
+                r15_slot = sym PARK_R15,
+                options(att_syntax),
+                in("rdi") ctx,
+            );
+        }
+    }
+
+    /// Enter a parked ring-3 context via `sysretq`, restoring every GPR
+    /// the frame carries. Naked; offsets are the ParkedContext struct's,
+    /// pinned by the host test (`parked_context_offsets_match_the_asm_table`).
+    ///
+    /// Why SYSRET (like `enter_ring3`, unlike the tick path's iretq):
+    /// SYSRET performs no descriptor-validation stack-switch cycle, so
+    /// the entry cannot fault mid-switch (ADR-0010 root cause 4). The
+    /// price: RCX/R11 carry RIP/RFLAGS, not the parked values.
+    #[unsafe(no_mangle)]
+    #[unsafe(naked)]
+    pub extern "C" fn enter_ring3_parked(ctx: &ParkedContext) {
+        naked_asm!(
+            // rdi = ctx. Load the SYSRET carriers and the user stack
+            // first (they live outside the gprs array), then every GPR;
+            // rdi itself last. gprs: r15(0) r14(8) r13(16) r12(24)
+            // r11(32) r10(40) r9(48) r8(56) rbp(64) rdi(72) rsi(80)
+            // rdx(88) rcx(96) rbx(104) rax(112); rip(120) rflags(136)
+            // rsp(144).
+            "movq 120(%rdi), %rcx", // rip → RCX (SYSRET target)
+            "movq 136(%rdi), %r11", // rflags → R11 (SYSRET restores)
+            "movq 144(%rdi), %rsp", // user rsp
+            "movq 0(%rdi), %r15",
+            "movq 8(%rdi), %r14",
+            "movq 16(%rdi), %r13",
+            "movq 24(%rdi), %r12",
+            "movq 40(%rdi), %r10",
+            "movq 48(%rdi), %r9",
+            "movq 56(%rdi), %r8",
+            "movq 64(%rdi), %rbp",
+            "movq 80(%rdi), %rsi",
+            "movq 88(%rdi), %rdx",
+            "movq 104(%rdi), %rbx",
+            "movq 112(%rdi), %rax",
+            "movq 72(%rdi), %rdi", // user rdi — the pointer's last use
+            "swapgs",              // GS ← user / KERNEL_GS_BASE ← percpu
+            "sysretq",             // CPL=3, IF from R11
+            options(att_syntax),
+        );
+    }
 }
 
 #[cfg(not(test))]
 pub use entry::{
-    active, active_domain, begin, current, enter_ring3, kernel_mut, launch, note_live_fault,
-    record_fault, resume_kernel, saved_rip, saved_rsp, set_kernel, take,
+    active, active_domain, begin, current, enter_ring3, enter_ring3_parked, is_parked, kernel_mut,
+    launch, note_live_fault, park_from_frame, parked_count, record_fault, resume_kernel,
+    resume_parked, saved_rip, saved_rsp, set_kernel, stash_parked, take, take_parked,
+    unpark_into_frame,
 };

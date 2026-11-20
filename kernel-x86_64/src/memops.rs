@@ -61,6 +61,16 @@ pub fn write_u64(pa: u64, val: u64) {
     unsafe { (translate(pa) as *mut u64).write_volatile(val) }
 }
 
+/// Volatile 32-bit write at physical address `pa` — the natural width
+/// of MMIO registers (the LAPIC, ADR-0012): devices may reject or split
+/// wider accesses, so the 8-byte primitive must not be used on them.
+///
+/// SAFETY: `pa` must be 4-byte aligned and point to a writable register.
+pub fn write_u32(pa: u64, val: u32) {
+    // SAFETY: see function docs.
+    unsafe { (translate(pa) as *mut u32).write_volatile(val) }
+}
+
 /// Read one byte at a user (or kernel) VA — the only volatile reader
 /// the user-copy path is allowed to use (N1, ADR-0007 §1): it touches
 /// exactly one byte, so a validated `[buf, buf+len)` can never fault.

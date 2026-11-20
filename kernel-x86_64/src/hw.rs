@@ -113,6 +113,39 @@ pub fn cpuid7_ebx() -> u64 {
     b
 }
 
+/// CPUID leaf 1's ECX — the feature word carrying TSC-deadline (bit 24;
+/// decoded in arch/features). Same ADR-0008 bulletproof pattern as
+/// `cpuid7_ebx`: RBX cannot be an asm operand (LLVM reserves it), so
+/// the wanted value travels through the pushed stack slot, never a
+/// temporary register the allocator might recycle.
+pub fn cpuid1_ecx() -> u64 {
+    let a: u32;
+    let c: u64;
+    let d: u32;
+    let e: u32;
+    // SAFETY: CPUID is unprivileged; the push/store/pop sequence moves
+    // ECX's result through the pushed slot (see cpuid7_ebx for the
+    // allocation-luck failure this avoids). ECX's final register value
+    // is dead (the slot already saved it), hence the throwaway `e`.
+    unsafe {
+        core::arch::asm!(
+            "push %rbx",
+            "cpuid",
+            "movq %rcx, (%rsp)",
+            "pop {c}",
+            in("eax") 1u32,
+            in("ecx") 0u32,
+            lateout("eax") a,
+            lateout("ecx") e,
+            lateout("edx") d,
+            c = out(reg) c,
+            options(att_syntax),
+        );
+    }
+    let _ = (a, d, e);
+    c
+}
+
 /// N4 (ADR-0008): set once at boot when SMAP is enabled — the user-copy
 /// path wraps itself in STAC/CLAC only when the CPU supports it (STAC
 /// on a CPU without it is #UD).
@@ -148,7 +181,7 @@ pub fn read_tsc() -> u64 {
     unsafe {
         core::arch::asm!("rdtsc", lateout("eax") lo, lateout("edx") hi, options(nostack));
     }
-    ((hi as u64) << 32) | (lo as u64)
+    ((hi as u64) << 32) | lo as u64
 }
 
 pub fn read_cr3() -> u64 {

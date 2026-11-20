@@ -5,6 +5,17 @@
 - **Date:** 2026-11-20
 - **Progress log:**
   - M2-W1 (commit `d94d25a`): ADR-0004 async IPC landed (15 tests).
+  - M2-W2 (ADR-0012, in flight): the preemption machinery landed —
+    LAPIC timer (periodic fallback proven in CI's TCG), vector 48 +
+    spurious wiring, `src/preempt.rs` policy (8 host tests), the
+    parked-run table, the interrupt-frame context switch, and the
+    SYSRET handover resume. The end-to-end interleaving was
+    demonstrated in bring-up builds (switch → writer runs → exits
+    while the spinner is parked → handover → spinner resumes
+    mid-loop); the boot demo is feature-gated `preempt-demo` pending
+    the release+LTO codegen anomaly documented in ADR-0012 §Open
+    issues. Also fixed in-tree: SYSCALL does not clear IF in this
+    environment (stub now self-enforces with `cli`).
   - M2-W2 (ADR-0010): **ring-3 reliability closed** — the PR-1.4
     "environment-blocked" verdict was four local bugs (stray IRQ at the
     IF boundary + absent IDT gates; mirror-inverted stub offsets; the

@@ -1,0 +1,9 @@
+[package]
+name = "ring3-preempt"
+version = "0.2.0"
+edition = "2021"
+description = "AegisOS ring-3 preemption example: the spinner (mode 0) and the writer (mode 1) of the M2-W2 starvation-freedom proof. Built to a flat blob by boot.sh (rustc --emit=obj + objcopy); NOT a workspace member."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"

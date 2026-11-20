@@ -1,4 +1,8 @@
-//! Scheduling context (PR-1.4): today the single-run ring-3 launch
-//! pair; Stage 4 grows this into real per-CPU runqueues around the same
-//! `UserContext`/`UserRun` types.
+//! Scheduling context (PR-1.4 → M2-W2): the ring-3 launch/resume pair
+//! (`context`), the parked-run table and the timer-driven context
+//! switch (`preempt`, ADR-0012). Stage 4 (SMP) grows per-CPU runqueues
+//! around the same `UserContext`/`UserRun`/`ParkedContext` types.
 pub mod context;
+
+#[cfg(not(test))]
+pub mod preempt;

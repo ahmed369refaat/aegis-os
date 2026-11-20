@@ -30,3 +30,4 @@ it does not merge.
 | [0009](0009-load-bearing-capabilities.md) | Load-bearing capabilities on resource syscalls | Accepted (F/F18) |
 | [0010](0010-ring3-reliability-four-root-causes.md) | Ring-3 reliability: four root causes | Accepted (M2-W2) |
 | [0011](0011-multi-architecture-hal-bsp.md) | Multi-architecture HAL/BSP strategy | Accepted (design; restructure = Phase 2 of GAP-ANALYSIS-v2) |
+| [0012](0012-timer-preemption.md) | Timer preemption: LAPIC tick, parked runs, frame-rewrite switch | Accepted (machinery landed; boot demo feature-gated pending open issues) |

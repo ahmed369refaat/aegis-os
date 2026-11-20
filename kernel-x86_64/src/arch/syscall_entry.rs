@@ -11,7 +11,12 @@
 //!   (RPL 3 added by the instruction itself).
 //! - **SFMASK = IF|TF|DF**: the kernel always starts a syscall with
 //!   interrupts off, no trap flag, no direction flag — SYSRET restores
-//!   the user RFLAGS from R11 untouched.
+//!   the user RFLAGS from R11 untouched. Since ADR-0012 the stub also
+//!   executes an explicit `cli` right after `swapgs`: in this
+//!   environment (QEMU 10.0.13 TCG, `-cpu max`) SYSCALL demonstrably
+//!   does NOT apply FMASK.IF — the dispatch was measured running with
+//!   IF=1 — so the no-nesting invariant is self-enforced, not trusted
+//!   to the MSR.
 //! - **SYSCALL does not switch stacks.** The stub loads RSP from the
 //!   per-CPU `kstack_top` via `%gs:` right after `swapgs`; the TSS
 //!   RSP0 (same stack) only serves the *interrupt/exception* path.
@@ -106,6 +111,14 @@ pub fn init() {
 pub extern "C" fn syscall_entry() {
     naked_asm!(
         "swapgs",                      // GS ← percpu (KERNEL_GS_BASE ↔ user)
+        "cli",                         // self-enforcing: interrupts OFF for
+                                       // the whole kernel side of the syscall
+                                       // (ADR-0012: SYSCALL's FMASK path does
+                                       // NOT clear IF in this environment —
+                                       // observed QEMU 10.0.13 TCG, -cpu max —
+                                       // so the stub enforces the no-nesting
+                                       // invariant itself; SYSRET restores the
+                                       // user's IF from R11)
         "movq {srsp}(%rip), %rsp",     // SYSCALL switches no stack; we do
         // ── park the user registers (SyscallFrame order) ──
         "pushq $0",                    // pad (alignment)

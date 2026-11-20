@@ -25,7 +25,7 @@ STUB_OBJ=target/stub.o
 IMAGE=target/aegis-boot.elf
 
 echo "==> [0/4] building the ring-3 example blobs (rustc --emit=obj + objcopy)"
-for b in ring3-hello ring3-rogue ring3-edge; do
+for b in ring3-hello ring3-rogue ring3-edge ring3-preempt; do
     rustc --edition 2021 --crate-type=lib --emit=obj \
           --target x86_64-unknown-none -O "examples/$b/src/lib.rs" \
           -o "target/$b.o"
@@ -123,6 +123,12 @@ if [ "${1:-}" = "--verify" ]; then
     grep -qF "[SEC ] ring3 kernel-VA read blocked: #PF (U/S)" "$LOG" || { echo "VERIFY FAIL: ring-3 U/S security marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 unauthorized syscall refused (-ENOSYS, audited)" "$LOG" || { echo "VERIFY FAIL: ring-3 syscall gate marker missing"; ok=0; }
     grep -qF "[RING3] ring-3 isolation live: 7 runs" "$LOG" || { echo "VERIFY FAIL: ring-3 acceptance marker missing"; ok=0; }
+  fi
+  # M2-W2 / ADR-0012: the preemption demo boots only under
+  # `--features preempt-demo` (see ADR-0012's open-issues section); the
+  # default boot asserts the seven-run sequence above only.
+  if grep -qF "[SCHD] preempt: switches=" "$LOG"; then
+    grep -qF "[VERDICT] M2-W2 PREEMPTION: PASS" "$LOG" || { echo "VERIFY FAIL: M2-W2 preemption verdict failed"; ok=0; }
   fi
   grep -qF "[MM ] guarded stacks: alloc+map+cross-view ok, free+scrub ok" "$LOG" || { echo "VERIFY FAIL: guarded-stack marker missing"; ok=0; }
   if ! grep -qF "[RING3] launch blocked: ring-3 entry faults in this QEMU build" "$LOG"; then

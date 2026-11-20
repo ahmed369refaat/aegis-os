@@ -128,27 +128,27 @@ mod load {
 
     static mut IDTR: PseudoDescriptor = PseudoDescriptor { limit: 0, base: 0 };
 
-    /// Fill vectors 0..=31 (exceptions) and 32..=47 (legacy IRQ range)
-    /// from the stub registry and `lidt`. Called exactly once from
-    /// `arch::init()`. No device IRQ is armed yet (the LAPIC timer
-    /// arrives with preemption, M2-W2) and `hw::pic_mask_all` keeps
-    /// every 8259 line masked — but the CPL3 boundary runs IF=1, so a
-    /// stray line would fire exactly there. The 32..=47 catch-all makes
-    /// that a NAMED halt instead of a #DF carrying a shifted frame (the
-    /// PR-1.4 "environment-blocked" failure, root-caused in M2-W2);
-    /// vectors 48.. stay absent — nothing on this machine delivers
-    /// above the legacy pair until MSI exists.
+    /// Fill the wired vectors and `lidt`. Called exactly once from
+    /// `arch::init()`. Wired: 0..=31 (exceptions), 32..=47 (the legacy
+    /// IRQ catch-alls — ADR-0010: a stray line must be a NAMED halt,
+    /// never a #DF with a shifted frame), 48 (the LAPIC timer —
+    /// ADR-0012), and 255 (the LAPIC spurious vector from SVR, a named
+    /// no-op). Everything else stays absent: nothing on this machine
+    /// delivers on an unwired vector until MSI exists.
     pub fn load() {
         // SAFETY: single-CPU bring-up: the table is filled once, before
         // lidt publishes it to the CPU, and is never written again.
         unsafe {
             let i = &raw mut IDT;
             let idtr = &raw mut IDTR;
-            for vector in 0u8..48 {
+            for vector in 0u8..=48 {
                 let (handler, ist) = crate::arch::stubs::vector_handler(vector);
                 (*i).entries[vector as usize] =
                     Entry::encode(handler, crate::arch::gdt::KERNEL_CODE, ist, 0);
             }
+            // The spurious vector lives at the top of the table.
+            let (handler, ist) = crate::arch::stubs::vector_handler(255);
+            (*i).entries[255] = Entry::encode(handler, crate::arch::gdt::KERNEL_CODE, ist, 0);
             (*idtr).limit = (VECTORS * 16 - 1) as u16;
             (*idtr).base = i as u64;
             asm!("lidt (%rax)", in("rax") idtr, options(att_syntax, nostack, preserves_flags));

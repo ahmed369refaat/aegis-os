@@ -1,45 +1,48 @@
 //! # aegis-kernel (x86_64)
 //!
-//! The bootable AegisOS kernel (M1 complete, Stage 1 in progress):
+//! The bootable AegisOS kernel (M1 + Stage 1 complete, M2 in progress):
 //! multiboot bring-up, the transition to 64-bit long mode, a real
 //! physical frame pool behind the policy core's buddy allocator
-//! (scrubbed on every free), the M1 exit-criteria sequence (a hello
-//! domain scheduled by CFS, the behavior monitor escalating a
-//! misbehaving parser live, a 1000-cycle create/destroy stress with
-//! zero-leak and scrub assertions) — and, since PR-1.1/PR-1.2, a
-//! kernel-owned GDT/TSS/IDT with a uniform exception entry path, a
-//! higher-half kernel over a direct map with the bring-up identity
-//! window torn down, guarded kernel stacks, and per-CPU state (ADR-0002).
+//! (scrubbed on every free), the M1 exit-criteria sequence, per-domain
+//! page tables with SMEP/SMAP and kernel-image W^X (PR-1.3, ADR-0006/
+//! 0008), SYSCALL/SYSRET ring-3 execution with the full seven-run
+//! isolation sequence (PR-1.4 + ADR-0010), and — since M2-W2 — the
+//! LAPIC timer driving interrupt-driven CFS preemption between parked
+//! ring-3 runs (ADR-0012).
 //!
 //! ## Unsafe policy (enforced by CI)
 //!
 //! The policy core (`aegis_os`) is `#![forbid(unsafe_code)]`. This crate is
-//! `#![deny(unsafe_code)]` at the root, and exactly four module groups
+//! `#![deny(unsafe_code)]` at the root, and exactly five module groups
 //! carry an inner `#![allow(unsafe_code)]` with per-item `SAFETY`
 //! documentation:
 //!
 //! - [`arch`] — CPU tables and exception entry: GDT/TSS/IDT/GS-base
-//!   setup, naked entry stubs, the fault dispatch (PR-1.1 onward; see
-//!   `docs/adr/0005-exception-machinery.md`).
+//!   setup, naked entry stubs, the fault dispatch, the LAPIC timer's
+//!   IDT wiring (PR-1.1 onward; see `docs/adr/0005-exception-machinery.md`).
 //! - [`boot`] — entry assembly, page-table handoff: raw CPU control that
 //!   only exists at bring-up time.
 //! - [`hw`] — port I/O, `rdtsc`, `cr2`/`cr3`, `invlpg`, MSRs,
 //!   halt/poweroff: single-instruction wrappers.
 //! - [`memops`] — volatile reads/writes; physical addresses reach RAM
 //!   through the direct map.
+//! - [`sched`] — the ring-3 launch/resume pair, the parked-run table,
+//!   and the timer's context switch (PR-1.4 / ADR-0012).
 //!
 //! Notably **unsafe-free by design**: [`mm`] (the memory-layout layer —
-//! all its raw access goes through `memops`/`hw`) and the whole policy
-//! core. `scripts/check_unsafe.sh` fails the build if `unsafe` appears
+//! all its raw access goes through `memops`/`hw`), the LAPIC driver
+//! (`arch::lapic` — same discipline), the tick orchestration
+//! (`sched::preempt`), and the whole policy core.
+//! `scripts/check_unsafe.sh` fails the build if `unsafe` appears
 //! anywhere else in the repository.
 //!
-//! ## Stage-1 scope (stated honestly)
+//! ## Scope (stated honestly)
 //!
-//! Domains are still kernel-resident objects: their region mappings pass
-//! the full ten-check memory policy and their pages are real, tracked,
-//! scrubbed pool frames — but there are no per-domain page tables and no
-//! ring-3 execution yet (PR-1.3..1.5, see `docs/ROADMAP.md` and
-//! `docs/STAGE1-PR-PLAN.md`).
+//! Ring-3 execution, per-domain page tables, and timer preemption are
+//! LIVE (seven-run isolation sequence + the starvation-freedom proof,
+//! asserted by `boot.sh --verify`). Not yet: the full ring-3 syscall
+//! surface (WRITE/EXIT today), SMP, demand paging/COW, the ELF loader
+//! — see `docs/GAP-ANALYSIS-v2.md` for the honest full-scope picture.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]

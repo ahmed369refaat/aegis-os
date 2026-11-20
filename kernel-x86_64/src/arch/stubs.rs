@@ -80,6 +80,14 @@ vector_stub!(irq44, 44, noerr);
 vector_stub!(irq45, 45, noerr);
 vector_stub!(irq46, 46, noerr);
 vector_stub!(irq47, 47, noerr);
+// 48: the LAPIC timer (ADR-0012) — the preemption entry. No CPU error
+// code; the dispatch routes it to the tick before anything else.
+vector_stub!(irq48, 48, noerr);
+// 255: the LAPIC spurious vector (from SVR). Wired so a spurious
+// delivery is a named no-op in the dispatch instead of an absent-gate
+// #GP — the ADR-0010 lesson (absent gates turn surprises into
+// frame-shifted #DFs) applied to the first interrupt source.
+vector_stub!(v255, 255, noerr);
 
 // 0..=31, with error-code vectors marked (8, 10-14, 17, 21).
 vector_stub!(v00, 0, noerr);
@@ -163,8 +171,10 @@ pub extern "C" fn exception_common() {
     );
 }
 
-/// The registry the IDT is filled from: (stub address, IST index) for a
-/// CPU exception vector. Valid for `vector < 32` only.
+/// The registry the IDT is filled from: (stub address, IST index) for
+/// a wired vector. Valid for the exceptions (0..=31), the legacy IRQ
+/// catch-alls (32..=47), the LAPIC timer (48) and the LAPIC spurious
+/// vector (255) — see `idt::load` for the wiring policy.
 pub fn vector_handler(vector: u8) -> (u64, u8) {
     let stub: extern "C" fn() = match vector {
         0 => v00,
@@ -215,7 +225,9 @@ pub fn vector_handler(vector: u8) -> (u64, u8) {
         45 => irq45,
         46 => irq46,
         47 => irq47,
-        _ => panic!("vector_handler: not a CPU exception or legacy IRQ vector"),
+        48 => irq48,
+        255 => v255,
+        _ => panic!("vector_handler: not a wired vector (0..=48, 255)"),
     };
     (stub as usize as u64, ist_for(vector))
 }

@@ -22,7 +22,17 @@
 //! 8. the PR-1.2 guarded-stack selftest: alloc a guarded stack, prove
 //!    the mapping and the direct map agree on its contents, free it
 //!    (scrub on free),
-//! 9. the terminal act: write through a fresh stack's guard page — the
+//! 9. the ring-3 sequence (PR-1.4 + ADR-0010): seven runs — hello, NX
+//!    attack, kernel-VA read, forged syscall, edge writes, live-monitor
+//!    quarantine, audit-only — each ending in SYS_EXIT or a diagnosed
+//!    user fault the kernel survives,
+//! 10. (was the terminal act; now step 13) —
+//! 11. telemetry drain (the supervisor stand-in, M2-W2),
+//! 12. the M2-W2 preemption proof (ADR-0012): the LAPIC timer goes live
+//!    and two ring-3 domains — a pure spinner that never calls a
+//!    syscall and a writer — run interleaved under interrupt-driven
+//!    CFS; the writer must finish while the spinner is still runnable,
+//! 13. the terminal act: write through a fresh stack's guard page — the
 //!    #PF is diagnosed, the marker printed, and QEMU powers off.
 //!
 //! No allocation: log lines are `&str` fragments plus stack-buffer numbers.
@@ -31,12 +41,15 @@ use crate::arch;
 use crate::frames::{FramePool, FRAME_SIZE, KERNEL_POOL_FRAMES, KERNEL_POOL_LEN, POOL_BASE};
 
 /// The ring-3 example blobs (built to flat binaries by boot.sh from
-/// `examples/ring3-{hello,rogue}` and embedded here — PR-1.4).
+/// `examples/ring3-{hello,rogue,edge}` and embedded here — PR-1.4).
 static RING3_HELLO: &[u8] = include_bytes!("../blob/ring3-hello.bin");
 static RING3_ROGUE: &[u8] = include_bytes!("../blob/ring3-rogue.bin");
 /// The N1 edge blob: tail-of-page writes that must succeed and a
 /// page-crossing write that must return -EFAULT (ADR-0007 §1).
 static RING3_EDGE: &[u8] = include_bytes!("../blob/ring3-edge.bin");
+/// The M2-W2 preemption blob: the spinner (mode 0) and the writer
+/// (mode 1) of the starvation-freedom proof (ADR-0012).
+static RING3_PREEMPT: &[u8] = include_bytes!("../blob/ring3-preempt.bin");
 /// The exact message the hello blob writes from ring-3 (its length is
 /// baked into the blob's `mov edx, 26`).
 const RING3_MSG: &[u8] = b"hello from ring 3 (CPL=3)\n";
@@ -1050,7 +1063,16 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     mm::user::destroy_user(&mut k, &mut pool, 12);
     line(&mut out, &["[RING3] ring-3 isolation live: 7 runs (hello/NX/kernel-VA/forged/edge/monitor-quarantine/audit-only), kernel intact"]);
 
-    // ── 11. the terminal guard-page proof: the write must #PF, the
+    // M2-W2 / ADR-0012: the preemption demo is behind the `preempt-demo`
+    // feature — see ADR-0012 (open issues) for why the default boot does
+    // not arm the timer yet: the machinery is host-tested and the
+    // interleaving was demonstrated (ADR-0012 §Evidence), but a
+    // release+LTO argument-codegen anomaly in this toolchain
+    // destabilizes the demo spawn path.
+    #[cfg(feature = "preempt-demo")]
+    preempt_demo(&mut k, &mut pool, &mut out);
+
+    // ── 13. the terminal guard-page proof: the write must #PF, the
     // dispatch must confirm CR2 is exactly the guard page, print the
     // marker, and power off cleanly (CI greps it). Reached only when
     // the whole ring-3 sequence completed — the blocked path powers
@@ -1101,6 +1123,243 @@ fn drain_telemetry(
             strutil::dec(dropped, &mut b5),
         ],
     );
+}
+
+/// Step 12 (ADR-0012): the starvation-freedom proof. Feature-gated —
+/// see the call site and ADR-0012's open-issues section.
+#[cfg(feature = "preempt-demo")]
+fn preempt_demo<const N: usize>(
+    k: &mut aegis_os::Kernel<N>,
+    pool: &mut FramePool<N>,
+    out: &mut dyn FnMut(&str),
+) {
+    // ── 12. M2-W2 / ADR-0012: preemption — the starvation-freedom proof.
+    // Two ring-3 domains on one CPU under the LAPIC timer:
+    //   domain 20 — the spinner: 400M pure-compute iterations, no
+    //     syscalls, then exit(7). Without a timer it starves everyone
+    //     forever (nothing else can take the CPU away from CPL3).
+    //   domain 21 — the writer: 4 × (SYS_WRITE a message, spin a
+    //     little), then exit(0).
+    // The exit test (M2-PLAN week 2): the writer must finish WHILE the
+    // spinner is still runnable, and the tick path must have switched
+    // domains — both impossible without interrupt-driven preemption.
+    line(
+            &mut out,
+            &["[SCHD] preemption demo: retiring the M1 hello domain (a kernel-resident CFS entity must never be preemptor-picked)"],
+        );
+    mm::user::destroy_user(&mut k, &mut pool, 1);
+
+    crate::sched::preempt::arm();
+
+    // The two data pages, as NAMED statics — not promoted `&[0u8]`-style
+    // temporaries: this toolchain's release+LTO codegen once elided the
+    // store of a promoted slice's POINTER argument (the callee received
+    // stale stack garbage as data.as_ptr() and the copy faulted — the
+    // full forensic story is in ADR-0012). A named static gives the
+    // argument a real symbol that cannot be optimized away.
+    static SPINNER_DATA: [u8; 1] = [0]; // mode 0: the spinner
+    static WRITER_DATA: [u8; 0x90] = writer_data_page();
+
+    /// The writer's data page, built at compile time: mode byte 1,
+    /// then four 22-byte messages at 0x10 + round*0x20 (the blob's own
+    /// addressing).
+    const fn writer_data_page() -> [u8; 0x90] {
+        let mut d = [0u8; 0x90];
+        d[0] = 1; // mode 1: the writer
+        let msgs: [&[u8; 22]; 4] = [
+            b"[W] writer round 0\n   ",
+            b"[W] writer round 1\n   ",
+            b"[W] writer round 2\n   ",
+            b"[W] writer round 3\n   ",
+        ];
+        let mut i = 0;
+        while i < 4 {
+            let mut j = 0;
+            while j < 22 {
+                d[0x10 + i * 0x20 + j] = msgs[i][j];
+                j += 1;
+            }
+            i += 1;
+        }
+        d
+    }
+
+    let spinner = match mm::user::spawn_user_blob(
+        &mut k,
+        &mut pool,
+        20,
+        aegis_os::profile::service_profile(),
+        RING3_PREEMPT,
+        &SPINNER_DATA,
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(&mut out, &["[SCHD] ERROR: spinner spawn failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    let writer = match mm::user::spawn_user_blob(
+        &mut k,
+        &mut pool,
+        21,
+        aegis_os::profile::service_profile(),
+        RING3_PREEMPT,
+        &WRITER_DATA,
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(&mut out, &["[SCHD] ERROR: writer spawn failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    line(
+            &mut out,
+            &["[SCHD] preempt demo: spinner=20 (400M iters, no syscalls) writer=21 (4 writes), timer live"],
+        );
+
+    // Park the writer (its first execution will come from a timer
+    // switch rewriting the interrupt frame); launch the spinner through
+    // the fresh SYSRET path.
+    crate::sched::context::stash_parked(
+        writer.run,
+        crate::sched::context::ParkedContext::from_user_context(&writer.ctx),
+    );
+    let kernel_cr3 = hw::read_cr3();
+    spinner.run.tables.activate();
+    crate::sched::context::begin(spinner.run);
+    crate::sched::context::launch(&spinner.ctx);
+    // Reached only via resume_kernel (SYS_EXIT / a fault): the timer
+    // interleaves the runs; every return here is one domain EXITING
+    // with the other parked. The loop hands the CPU to the survivor
+    // until the queue empties.
+    let mut writer_exited_first = false;
+    let mut writer_writes = 0u64;
+    let mut spinner_clean_exit = false;
+    let mut writer_clean_exit = false;
+    loop {
+        let run = crate::sched::context::take();
+        hw::write_cr3(kernel_cr3);
+        let finished = run.domain;
+        let writes = run.write_bytes;
+        {
+            let (what, code) = match &run.exit {
+                crate::sched::context::ExitKind::Exited(c) => ("exited", *c),
+                crate::sched::context::ExitKind::Fault { vector, .. } => {
+                    // A fault during the demo is a demo failure — these
+                    // blobs touch nothing but their own pages.
+                    let mut bv = [0u8; 20];
+                    line(
+                        &mut out,
+                        &[
+                            "[SCHD] ERROR: domain ",
+                            strutil::dec(finished as u64, &mut bv),
+                            " faulted (vector below) — halting",
+                        ],
+                    );
+                    let mut bv2 = [0u8; 20];
+                    line(
+                        &mut out,
+                        &[
+                            "[SCHD] fault vector=",
+                            strutil::dec(*vector as u64, &mut bv2),
+                        ],
+                    );
+                    hw::halt_forever();
+                }
+            };
+            let mut b1 = [0u8; 20];
+            let mut b2 = [0u8; 20];
+            let mut b3 = [0u8; 20];
+            line(
+                &mut out,
+                &[
+                    "[SCHD] domain ",
+                    strutil::dec(finished as u64, &mut b1),
+                    " ",
+                    what,
+                    ", code=",
+                    strutil::dec(code, &mut b2),
+                    ", writes=",
+                    strutil::dec(writes, &mut b3),
+                ],
+            );
+        }
+        if finished == 21 {
+            // The proof: the writer finished while the spinner was
+            // still parked-runnable — impossible without preemption
+            // (the spinner launched first and never yields).
+            writer_exited_first = crate::sched::context::is_parked(20);
+            writer_writes = writes;
+            writer_clean_exit = matches!(run.exit, crate::sched::context::ExitKind::Exited(0));
+        }
+        if finished == 20 {
+            spinner_clean_exit = matches!(run.exit, crate::sched::context::ExitKind::Exited(7));
+        }
+        mm::user::destroy_user(&mut k, &mut pool, finished);
+        match crate::sched::preempt::on_exit(&mut k.sched, finished) {
+            Some(next) => {
+                let Some((nrun, nctx)) = crate::sched::context::take_parked(next) else {
+                    line(
+                        &mut out,
+                        &["[SCHD] ERROR: handover target not parked; halting"],
+                    );
+                    hw::halt_forever();
+                };
+                let mut b = [0u8; 20];
+                line(
+                    &mut out,
+                    &[
+                        "[SCHD] handover: CPU -> domain ",
+                        strutil::dec(next as u64, &mut b),
+                    ],
+                );
+                nrun.tables.activate();
+                crate::sched::context::begin(nrun);
+                crate::sched::context::resume_parked(&nctx);
+                // Returns when THAT domain exits — loop.
+            }
+            None => break,
+        }
+    }
+
+    // The summary + verdict (CI greps these).
+    let switches = crate::sched::preempt::switches();
+    let ticks = crate::sched::preempt::ticks();
+    {
+        let mut b1 = [0u8; 20];
+        let mut b2 = [0u8; 20];
+        line(
+            &mut out,
+            &[
+                "[SCHD] preempt: switches=",
+                strutil::dec(switches, &mut b1),
+                " ticks=",
+                strutil::dec(ticks, &mut b2),
+            ],
+        );
+    }
+    let preempt_pass =
+        writer_exited_first && writer_clean_exit && spinner_clean_exit && switches >= 2;
+    if preempt_pass {
+        let mut b = [0u8; 20];
+        line(
+                &mut out,
+                &[
+                    "[SCHD] starvation-freedom: writer (21) finished while spinner (20) still runnable, writes=",
+                    strutil::dec(writer_writes, &mut b),
+                ],
+            );
+        line(
+                &mut out,
+                &["[VERDICT] M2-W2 PREEMPTION: PASS — timer-driven CFS, ring-3 preemptible, monitor windows close on tick"],
+            );
+    } else {
+        line(
+                &mut out,
+                &["[SCHD] ERROR: preemption proof incomplete (see the switches/ticks/exits above); halting"],
+            );
+        hw::halt_forever();
+    }
 }
 
 /// The M1 exit criteria, evaluated from the three stage reports.

@@ -10,6 +10,13 @@ publish = false
 name = "aegis-kernel"
 path = "src/main.rs"
 
+# ADR-0012: the timer-preemption boot demo (step 12 of kmain). OFF by
+# default pending the toolchain investigation in ADR-0012's open
+# issues; enable with: cargo build -p aegis-kernel --release \
+#   --target x86_64-unknown-none --features preempt-demo
+[features]
+preempt-demo = []
+
 # Path dependency on the policy core (package `aegis-os`, crate name
 # `aegis_os`): still zero external crates.
 [dependencies]
