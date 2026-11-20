@@ -88,6 +88,27 @@ pub fn driver_stack_step<const N: usize>(
                 ],
             );
             line(out, &["[IOMMU] dma-drivers=0 (fail-closed: no broker)"]);
+
+            // The q35-neg control lane: a placeholder broker whose
+            // verdict is Absent lets the driver steps run anyway —
+            // every claim refuses, and identity-mode drivers (the
+            // e1000 control for the device-DMA investigation) run
+            // their full flow against plain RAM.
+            // Drivers reach device MMIO through the 4th-GiB direct-
+            // map window; on the IOMMU lane vtd_step maps it — map it
+            // here too or every BAR read faults (measured: #PF at
+            // cr2=direct_map+0xfebc5400, the e1000's RAL).
+            crate::arch::vtd::map_mmio_window();
+            let broker = aegis_os::dma::DmaBroker::new(
+                crate::arch::vtd::Vtd::absent(),
+                aegis_os::dma::DmaQuotas {
+                    max_regions: 16,
+                    max_bytes: 64 * 1024,
+                },
+            );
+            let mut broker = broker;
+            let inv = pci_step(out, &aegis_os::dmar::Dmar::absent_stub(), &mut broker);
+            e1k_step(k, pool, out, &mut broker, &inv);
         }
         Discovery::Failed(err) => {
             line(
@@ -945,9 +966,15 @@ fn pci_step(
     }
 
     // Dump the context table as the hardware sees it (guest-side
-    // ground truth for the device-DMA investigation).
+    // ground truth for the device-DMA investigation). No-op without a
+    // real unit: the absent broker's root_pa is 0 (guarded — reading
+    // through the direct map at unmapped PAs panics by design).
     {
-        let root = crate::memops::read_u64(broker.prot().root_pa());
+        let root_pa = broker.prot().root_pa();
+        if root_pa == 0 {
+            return inv;
+        }
+        let root = crate::memops::read_u64(root_pa);
         if root & 1 != 0 {
             let ct = root & 0x000F_FFFF_FFFF_F000;
             let dfns: [u64; 6] = [0x10, 0x18, 0x20, 0x28, 0x30, 0xF8];
@@ -1120,6 +1147,9 @@ fn virtio_step<const N: usize>(
         line(out, &["[VBLK] vendor caps incomplete — refusing"]);
         return;
     };
+    // Bus master on (the cluster fix — see pci::enable_bus_master):
+    // the device's DMA must actually reach memory before any ring.
+    crate::pci::enable_bus_master(dev);
     let Some(mmio) = v::MmioVirtio::from_caps(&caps, dev) else {
         line(
             out,
@@ -1483,6 +1513,9 @@ fn net_step<const N: usize>(
         line(out, &["[VNET] vendor caps incomplete — refusing"]);
         return;
     };
+    // Bus master on (the cluster fix — see pci::enable_bus_master):
+    // the device's DMA must actually reach memory before any ring.
+    crate::pci::enable_bus_master(dev);
     let Some(mmio) = v::MmioVirtio::from_caps(&caps, dev) else {
         line(out, &["[VNET] register blocks unresolved — refusing"]);
         return;
@@ -2277,14 +2310,37 @@ fn e1k_step<const N: usize>(
             ],
         );
     }
-    if matches!(broker.verdict(), DmaVerdict::Absent { .. }) {
-        line(out, &["[E1K] broker verdict absent — refusing to drive"]);
-        return;
+    // The no-IOMMU control (ADR-0013 lane q35-neg): when there is no
+    // DMAR at all the device DMAs plain RAM — run the SAME TX→RX flow
+    // with unbrokered frames. If the round trip completes here, the
+    // driver is proven correct and the IOMMU-lane gap is QEMU-side.
+    let identity = matches!(broker.verdict(), DmaVerdict::Absent { .. });
+    if identity {
+        line(
+            out,
+            &["[E1K] identity mode: no IOMMU on this machine — same flow, unbrokered frames (the device-DMA control lane)"],
+        );
     }
     let Some(mmio) = crate::pci::mem_bar_base(dev, 0) else {
         line(out, &["[E1K] BAR0 unresolved — refusing"]);
         return;
     };
+    // Bus master on: the NIC's DMA must actually reach memory (the
+    // cluster fix — see pci::enable_bus_master). Read back — a CF8
+    // discipline bug here would silently park every DMA.
+    crate::pci::enable_bus_master(dev);
+    let cmd_back = crate::pci::read_cfg32(dev, 0x04);
+    if cmd_back & 0x6 != 0x6 {
+        let mut cb = [0u8; 18];
+        line(
+            out,
+            &[
+                "[E1K] PCI command readback=0x",
+                strutil::hex(u64::from(cmd_back), &mut cb),
+                " — BUS MASTER DID NOT STICK",
+            ],
+        );
+    }
     let r32 = |off: u64| crate::memops::read_u32(mmio + off);
     let w32 = |off: u64, v: u32| crate::memops::write_u32(mmio + off, v);
 
@@ -2333,19 +2389,21 @@ fn e1k_step<const N: usize>(
         }
     }
     let [rx_ring, tx_ring, rx_buf, tx_buf] = frames;
-    for &pa in frames.iter() {
-        if broker
-            .map_region(0, pa, 4096, DmaDir::Bidirectional)
-            .is_err()
-        {
-            line(out, &["[E1K] broker refused a frame — refusing"]);
-            return;
+    if !identity {
+        for &pa in frames.iter() {
+            if broker
+                .map_region(0, pa, 4096, DmaDir::Bidirectional)
+                .is_err()
+            {
+                line(out, &["[E1K] broker refused a frame — refusing"]);
+                return;
+            }
         }
+        line(
+            out,
+            &["[E1K] RX/TX rings + buffers mapped via broker (4 regions, IOMMU-enforced)"],
+        );
     }
-    line(
-        out,
-        &["[E1K] RX/TX rings + buffers mapped via broker (4 regions, IOMMU-enforced)"],
-    );
 
     // Program the rings. One RX descriptor posted (index 0), RDT=1.
     w32(E1K_RDBAL, rx_ring as u32);
@@ -2354,7 +2412,9 @@ fn e1k_step<const N: usize>(
     w32(E1K_RDH, 0);
     crate::memops::write_u64(rx_ring, rx_buf); // desc[0].buffer_addr
     w32(E1K_RDT, 1);
-    w32(E1K_RCTL, 0x8002); // EN | BAM (broadcast — the OFFER is broadcast)
+    w32(E1K_RCTL, 0x8002); // EN | BAM — BAM is bit 15 (0x8000) per
+                           // e1000x_regs.h; the broadcast OFFER needs
+                           // it or receive_filter drops it silently
 
     w32(E1K_TDBAL, tx_ring as u32);
     w32(E1K_TDBAL + 4, 0);
@@ -2371,7 +2431,9 @@ fn e1k_step<const N: usize>(
     put8(tx_ring + 11, 0x0B); // cmd: EOP | IFCS | RS
     w32(E1K_TDT, 1);
 
-    // Poll TX completion (status.DD at desc[0]+12).
+    // Poll TX completion: DD is bit 0 of the upper dword (+12) —
+    // E1000_TXD_STAT_DD=0x1 in QEMU's e1000x_regs.h, and the
+    // writeback pci_dma_write()s the dword at desc+12.
     let mut spins = 0u64;
     while crate::virtio::read_u8_pa(tx_ring + 12) & 1 == 0 && spins < 50_000_000 {
         spins += 1;
@@ -2386,18 +2448,29 @@ fn e1k_step<const N: usize>(
         // Teardown still runs with the live device attached.
         line(
             out,
-            &["[E1K] TX: DISCOVER built+rings armed, descriptor consumed (TDH 0→1) — no egress on this QEMU lane (open: device IOMMU attachment; see drivers.md)"],
+            &[if identity {
+                "[E1K] TX: DISCOVER built+rings armed — DD did NOT set even in identity mode (no IOMMU) — a DRIVER-side bug, see drivers.md"
+            } else {
+                "[E1K] TX: DISCOVER built+rings armed, descriptor consumed (TDH 0→1) — no egress on this QEMU lane (open: device IOMMU attachment; see drivers.md)"
+            }],
         );
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
-            out,
-            &[
-                "[E1K] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
-        );
+        if identity {
+            line(
+                out,
+                &["[E1K] teardown (identity): frames freed, no broker regions"],
+            );
+        } else {
+            let revoked = broker.revoke_all(0);
+            let mut nr = [0u8; 20];
+            line(
+                out,
+                &[
+                    "[E1K] teardown: revoke_all(0) → ",
+                    strutil::dec(revoked as u64, &mut nr),
+                    " region(s) unmapped; frames return scrubbed",
+                ],
+            );
+        }
         for &pa in frames.iter() {
             let _ = pool.free(&mut k.frames, pa, E1K_OWNER);
         }
@@ -2408,26 +2481,65 @@ fn e1k_step<const N: usize>(
         &["[E1K] TX: DHCP DISCOVER sent (290 bytes, xid=0xa6515151)"],
     );
 
-    // Poll RX for the OFFER.
+    // Poll RX for the OFFER. The budget must outlast QEMU's RCTL
+    // flush-queue timer: every RCTL write parks delivery for 1000 ms
+    // of the VIRTUAL clock (e1000.c set_rx_control — an untraced
+    // can_receive=false), so the OFFER sits queued for a full second
+    // before the NIC's first RX descriptor fetch. Measured: the OFFER
+    // arrives ~76 µs after the DISCOVER but only lands after the
+    // timer; a 200 M-spin poll exits first.
     let mut spins = 0u64;
-    while crate::virtio::read_u8_pa(rx_ring + 12) & 1 == 0 && spins < 200_000_000 {
+    while crate::virtio::read_u8_pa(rx_ring + 12) & 1 == 0 && spins < 3_000_000_000 {
         spins += 1;
     }
     if crate::virtio::read_u8_pa(rx_ring + 12) & 1 == 0 {
+        let rdh = r32(E1K_RDH);
+        let rdt = r32(E1K_RDT);
+        let rctl = r32(E1K_RCTL);
+        let mut rb = [0u8; 18];
+        let mut rc = [0u8; 18];
+        let mut re = [0u8; 18];
+        let mut rf = [0u8; 18];
+        let mut rg = [0u8; 18];
+        let mut rh = [0u8; 18];
+        line(
+            out,
+            &[
+                "[E1K] dbg rx: RDH=0x",
+                strutil::hex(u64::from(rdh), &mut rb),
+                " RDT=0x",
+                strutil::hex(u64::from(rdt), &mut rc),
+                " RCTL=0x",
+                strutil::hex(u64::from(rctl), &mut re),
+                " desc[0]=0x",
+                strutil::hex(crate::memops::read_u64(rx_ring), &mut rf),
+                "0x",
+                strutil::hex(crate::memops::read_u64(rx_ring + 8), &mut rg),
+                " buf[0..8]=0x",
+                strutil::hex(crate::memops::read_u64(rx_buf), &mut rh),
+            ],
+        );
         line(
             out,
             &["[E1K] RX: no packet arrived (poll budget exhausted)"],
         );
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
-            out,
-            &[
-                "[E1K] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
-        );
+        if identity {
+            line(
+                out,
+                &["[E1K] teardown (identity): frames freed, no broker regions"],
+            );
+        } else {
+            let revoked = broker.revoke_all(0);
+            let mut nr = [0u8; 20];
+            line(
+                out,
+                &[
+                    "[E1K] teardown: revoke_all(0) → ",
+                    strutil::dec(revoked as u64, &mut nr),
+                    " region(s) unmapped; frames return scrubbed",
+                ],
+            );
+        }
         for &pa in frames.iter() {
             let _ = pool.free(&mut k.frames, pa, E1K_OWNER);
         }
@@ -2484,7 +2596,11 @@ fn e1k_step<const N: usize>(
                 strutil::dec(u64::from(srv[2]), &mut s3),
                 ".",
                 strutil::dec(u64::from(srv[3]), &mut s4),
-                " ← FULL TX→slirp→RX round trip through the IOMMU",
+                if identity {
+                    " ← FULL TX→slirp→RX round trip (identity mode, no IOMMU on this machine)"
+                } else {
+                    " ← FULL TX→slirp→RX round trip through the IOMMU"
+                },
             ],
         );
     } else {
@@ -2495,16 +2611,23 @@ fn e1k_step<const N: usize>(
     }
 
     // Teardown: revoke + scrub, frames home.
-    let revoked = broker.revoke_all(0);
-    let mut nr = [0u8; 20];
-    line(
-        out,
-        &[
-            "[E1K] teardown: revoke_all(0) → ",
-            strutil::dec(revoked as u64, &mut nr),
-            " region(s) unmapped; frames return scrubbed",
-        ],
-    );
+    if identity {
+        line(
+            out,
+            &["[E1K] teardown (identity): frames freed, no broker regions"],
+        );
+    } else {
+        let revoked = broker.revoke_all(0);
+        let mut nr = [0u8; 20];
+        line(
+            out,
+            &[
+                "[E1K] teardown: revoke_all(0) → ",
+                strutil::dec(revoked as u64, &mut nr),
+                " region(s) unmapped; frames return scrubbed",
+            ],
+        );
+    }
     for &pa in frames.iter() {
         let _ = pool.free(&mut k.frames, pa, E1K_OWNER);
     }
@@ -2563,7 +2686,9 @@ fn nvme_poll(cq: u64, head: u16, phase: u16, budget: u64) -> Option<(u32, u32)> 
     let slot = cq + u64::from(head) * 16;
     let mut spins = 0u64;
     loop {
-        let pw = crate::memops::read_u32(slot + 12) >> 16; // cid | P+status
+        // DW3 (offset 12): status u16 at bytes 12-13, P at bit 0 —
+        // QEMU nvme.c:1517 writes cqe.status = (status << 1) | phase.
+        let pw = crate::memops::read_u32(slot + 12);
         if (pw & 1) == u32::from(phase) {
             return Some((crate::memops::read_u32(slot), (pw >> 1) & 0xFF));
         }
@@ -2599,6 +2724,8 @@ fn nvme_step<const N: usize>(
         line(out, &["[NVME] BAR0 unresolved — refusing"]);
         return;
     };
+    // Bus master on (the cluster fix).
+    crate::pci::enable_bus_master(dev);
     let cap = crate::memops::read_u64(mmio + NVME_CAP);
     let vs = crate::memops::read_u32(mmio + NVME_VS);
     let dstrd = ((cap >> 32) & 0xF) as u64;
@@ -2679,7 +2806,13 @@ fn nvme_step<const N: usize>(
         // as the e1000/virtio-net cluster (open; see drivers.md).
         line(
             out,
-            &["[NVME] Identify submitted — no completion on this lane (open: the device-DMA cluster; see drivers.md)"],
+            &[
+                "[NVME] dbg acq: dw0=0x",
+                strutil::hex(u64::from(crate::memops::read_u32(acq)), &mut [0u8; 18]),
+                " dw3=0x",
+                strutil::hex(u64::from(crate::memops::read_u32(acq + 12)), &mut [0u8; 18]),
+                " — Identify submitted, no completion (open item)",
+            ],
         );
         let revoked = broker.revoke_all(0);
         let mut nr = [0u8; 20];
@@ -2872,6 +3005,8 @@ fn ahci_step<const N: usize>(
         line(out, &["[AHCI] ABAR (BAR5) unresolved — refusing"]);
         return;
     };
+    // Bus master on (the cluster fix).
+    crate::pci::enable_bus_master(dev);
     let r32 = |off: u64| crate::memops::read_u32(abar + off);
     let w32 = |off: u64, v: u32| crate::memops::write_u32(abar + off, v);
     let ghc_ae = r32(0x04) & 0x8000_0000 != 0;
@@ -3028,6 +3163,8 @@ fn xhci_step<const N: usize>(
         line(out, &["[XHCI] BAR0 unresolved — refusing"]);
         return;
     };
+    // Bus master on (the cluster fix).
+    crate::pci::enable_bus_master(dev);
     let caplen = u64::from(crate::virtio::read_u8_pa(base));
     let ver = crate::memops::read_u16(base + 2);
     let hcs1 = crate::memops::read_u32(base + 4);
@@ -3605,7 +3742,7 @@ fn xhci_cmdring_step<const N: usize>(
     crate::memops::write_u64(op + 0x18, cmdring | 1); // CRCR + cycle
                                                       // Interrupter 0: ERSTSZ=1, ERSTBA, ERDP.
     let intr = base + rtsoff + 0x20;
-    crate::memops::write_u32(intr + 0x28, 1); // ERSTSZ... see note: IMAN/IMOD/ERSTSZ offsets
+    crate::memops::write_u32(intr + 0x08, 1); // ERSTSZ: IMAN+0,IMOD+4,ERSTSZ+8
     crate::memops::write_u64(intr + 0x10, erst); // ERSTBA
     crate::memops::write_u64(intr + 0x18, evring); // ERDP (segment 0)
     crate::memops::write_u32(op, 1); // RUN
@@ -3635,24 +3772,26 @@ fn xhci_cmdring_step<const N: usize>(
     let ev3 = crate::memops::read_u64(evring + 12);
     let ev_type = (crate::memops::read_u32(evring + 12) >> 10) & 0x3F;
     let _ = (ev0, ev3);
+    // Success signal: the EVENT RING, not CRCR — the controller never
+    // writes the dequeue pointer back into CRCR (it is load-bearing
+    // only at halt); the command-completion event TRB (type 33) in
+    // the event ring is the real proof the full TRB machinery ran:
+    // ring DMA → execution → event post.
+    let completed = ev_type == 33;
     let mut ha = [0u8; 20];
-    let mut hb = [0u8; 20];
-    let mut hc = [0u8; 20];
     line(
         out,
         &[
-            "[XTRB] No-Op command: doorbell 0 rung → CRCR advanced=",
-            if advanced { "yes" } else { "no" },
-            " (0x",
-            strutil::hex(crcr0, &mut [0u8; 18]),
-            " → 0x",
-            strutil::hex(crcr1, &mut [0u8; 18]),
-            "); event-ring slot0 type=",
+            "[XTRB] No-Op command: event-ring slot0 type=",
             strutil::dec(u64::from(ev_type), &mut ha),
-            " (33 = command completion)",
+            if completed {
+                " = COMMAND COMPLETION — the command ring executed end-to-end (DMA + doorbell + event post)"
+            } else {
+                " (expected 33 = command completion)"
+            },
         ],
     );
-    let _ = (hb, hc);
+    let _ = advanced;
     let revoked = broker.revoke_all(0);
     let mut nr = [0u8; 20];
     line(

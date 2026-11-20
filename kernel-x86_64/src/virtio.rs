@@ -243,17 +243,24 @@ pub fn used_entry_id(used_pa: u64, i: u16) -> u32 {
 
 // ── virtio-net additions (the second driver on this transport) ──
 
-/// The virtio-net header WITHOUT mergeable-rxbuf (we do not negotiate
-/// VIRTIO_NET_F_MRG_RXBUF): 10 bytes, all zero for a plain
-/// checksum-offload-free frame — flags=0, gso_type=NONE.
-pub const NET_HDR_LEN: u32 = 10;
+/// The virtio-net header the device exchanges with the driver.
+/// **12 bytes** with VIRTIO 1.0: QEMU's virtio_net_apply() sets
+/// guest_hdr_len = sizeof(virtio_net_hdr_mrg_rxbuf) UNCONDITIONALLY
+/// for version_1 (hw/net/virtio-net.c:646) — mergeable or not. We
+/// negotiated VERSION_1, so every buffer reserves 12: all zero for a
+/// plain frame (the extra 2 bytes are num_buffers, 0 on TX). Measured
+/// the 10-byte assumption: the device skipped 12, the wire frame came
+/// out shifted by 2 (dst read ffffffff5254, len 288 = 300-12).
+pub const NET_HDR_LEN: u32 = 12;
 
 /// Write the 10-byte virtio-net header at `pa` (plain frame: no
 /// offloads, no GSO — everything this driver sends is
 /// self-contained).
 pub fn write_net_header(pa: u64) {
     memops::write_u64(pa, 0);
-    write_u16_pa(pa + 8, 0);
+    memops::write_u64(pa + 8, 0);
+    // 12 bytes total (see NET_HDR_LEN): the first 10 are the v1
+    // header, the last 2 are num_buffers — zero on TX.
 }
 
 /// The Internet checksum (RFC 1071) over `len` bytes at `pa` —
@@ -475,7 +482,7 @@ mod tests {
         write_net_header(pa);
         assert_eq!(memops::read_u64(pa), 0);
         assert_eq!(read_u16_pa(pa + 8), 0);
-        assert_eq!(NET_HDR_LEN, 10);
+        assert_eq!(NET_HDR_LEN, 12);
     }
 
     /// The Internet checksum against the canonical worked example

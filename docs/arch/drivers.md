@@ -95,73 +95,88 @@ comments and tests:
 | virtio-gpu / e1000-data / NVMe-data | **blocked on the device-DMA cluster** (below) | |
 | Block layer + ext2 (item 8) | **first slice written, mount gated** | the image builder (scripts/mkext2.py: valid 1KiB-block rev-1 ext2 with hello.txt) + the full kernel parser (superblock → group descriptor → root inode → directory walk → file inode → data) are in the tree and run on the LIVE AHCI port; the mount is gated by the second-command no-op below — IDENTIFY (first command) completes with 512 bytes of DMA, ANY subsequent READ (0xC8 and 0x25 both tried, IS cleared, FRE live, identical headers/FIS/PRDT machinery) completes as TFD=0x50 with no PRDT transfer and no D2H FIS |
 
-### The AHCI second-command no-op (block-layer open item)
+### The device-DMA cluster: SOLVED — the missing PCI bus-master enable
 
-The first command on a freshly started AHCI port (IDENTIFY DEVICE)
-completes with full PRDT DMA. Every subsequent command — tried with
-READ DMA (0xC8) and READ DMA EXT (0x25), port interrupt-status
-cleared, FRE live, command headers/FIS/PRDT rewritten by the same
-code path — completes instantly as a no-op: TFD=0x50, no data
-transfer, no D2H FIS. This gates the ext2 first slice (the parser and
-the host-built image are done and in the tree).
+For three sessions the NICs (virtio-net, e1000) and xHCI "never
+DMA'd": zero translate events, zero faults, zero-filled descriptor
+reads (TDH advances on a zero command — no EOP, no RS writeback, no
+packet), while virtio-blk/NVMe/AHCI worked. The working set's secret:
+**SeaBIOS had enabled bus mastering on the devices it probes for
+boot.** Our kernel never wrote PCI COMMAND at all — the NICs sat with
+BM off, and QEMU parks a BM-less device's `bus_master_enable_region`
+disabled, so every device DMA dissolves into reads of nothing, never
+reaching the IOMMU. That signature masqueraded as a QEMU attach bug
+(see the retraction below).
 
-### The device-DMA cluster (root-caused to QEMU, guest side proven complete)
+The break came from a **control experiment**: a new identity mode for
+the e1000 on the no-IOMMU lane (`q35-neg` + `--verify-q35-noiommu`,
+`Vtd::absent()` + `Dmar::absent_stub()` placeholders so the driver
+steps run against a refusing broker). Same driver, plain RAM, no
+IOMMU — and TX still read zeros. A driver-side bug by elimination.
+`pci::enable_bus_master()` (COMMAND |= MEM|BM at config offset 0x04)
+now runs in every driver step before any ring is programmed.
 
-Three drivers — virtio-net, e1000, NVMe (data plane) — program
-identically to the working ones but their device DMA never happens.
-This session closed every guest-side hypothesis:
+Two follow-on bugs the now-working DMA exposed:
 
-1. **A real VT-d bug was found and fixed first**: the context entry's
-   high word carried the domain id in bits 0-15. QEMU 10 decodes the
-   walk depth as `2 + (hi & 7)` and the domain id as `(hi >> 8) & 0xffff`
-   (hw/i386/intel_iommu_internal.h). Our layout made QEMU read
-   AW = DID & 7 — a three-level walk over our four-level SLPT — the
-   measured `slpte permission error (iova=0x1187000, level=0x2,
-   slpte=0x0)` fault — and DID = 0, so every domain-selective IOTLB
-   invalidation matched nothing. Fixed: `context_entry_hi = (did << 8) | 2`.
-   After the fix the boot's `[CTX ] dump:` marker proves every
-   context entry reads `hi=0x102` (DID=1, AW=2), and the devices that
-   translate at all now translate correctly.
-2. **The context table is provably complete** (the `[CTX ] dump:`
-   marker dumps entries 0x10/0x18/0x20/0x28/0x30/0xF8 as the hardware
-   sees them) and every driver's frames are broker-mapped before use.
-3. **What remains is a QEMU device-class quirk, isolated by
-   experiment**: virtio-blk, NVMe (admin fetch) and AHCI always emit
-   `vtd_dmar_translate` events and their DMA lands; virtio-net, e1000
-   and xHCI never emit a single translate or fault event no matter
-   what — swapping the QEMU cmdline order moves the failures with the
-   *devices*, not the slots (e1000 failed as 00:04.0 and again as
-   00:02.0; virtio-blk worked in both places); detaching the e1000's
-   netdev changes nothing; the order-swap of kernel driver steps
-   changes nothing. A zero-filled DMA read explains the e1000's exact
-   symptom set (TDH advances, no DD writeback, no packet — a zero
-   command has no EOP and no RS; QEMU's e1000.c:640-727), and the
-   empty packet capture confirms no egress. The per-device
-   address-space attach inside this QEMU build is the remaining
-   suspect — beyond kernel control, fully documented.
+- **e1000 RX**: `RCTL` must be `0x8002` — BAM is **bit 15**
+  (E1000_RCTL_BAM 0x8000 in e1000x_regs.h), not bit 19; and the RX
+  poll must outlast QEMU's `flush_queue_timer`: `set_rx_control`
+  arms it for **1000 ms of the virtual clock on every RCTL write**
+  (e1000.c:424), so the OFFER (measured arriving 76 µs after the
+  DISCOVER) sits queued for a full second before the first RX
+  descriptor fetch. Budget 3 G spins.
+- **virtio-net header**: 12 bytes, not 10 — QEMU's
+  `virtio_net_apply()` sets `guest_hdr_len =
+  sizeof(virtio_net_hdr_mrg_rxbuf)` **unconditionally for VERSION_1**
+  (hw/net/virtio-net.c:646), mergeable-RX or not. Measured from the
+  packet capture: the device skipped 12, the wire frame came out
+  shifted by two (dst read ffffffff5254, len 288 = 300−12).
 
-### The AHCI second-command no-op (block-layer open item, sharpened)
+**Result**: both NICs now complete the full DHCP
+DISCOVER→slirp→OFFER round trip **through the IOMMU** on the main
+lane (`[VNET] RX: 602 bytes — DHCP OFFER yiaddr=10.0.2.15`, same for
+`[E1K] RX: 594 bytes`), and the e1000 also does it in identity mode
+on the no-IOMMU control lane. The e1000's TX DD poll reads desc+12
+bit 0 (E1000_TXD_STAT_DD=0x1; a +14 detour was wrong and is
+reverted — the writeback pci_dma_write()s the dword at +12).
 
-The first command on a fresh port (IDENTIFY DEVICE) completes with
-512 bytes of PRDT DMA. QEMU's own AHCI trace (`handle_cmd_fis_dump`)
-shows the second command's handle_cmd reading a **STALE FIS** — the
-IDENTIFY's `27 80 EC` bytes where the READ's `27 80 25 40` was
-written — and later CI writes vanish between the kernel and QEMU
-(7 issued, 2 logged). A TFD busy-wait before each issue (QEMU's
-busy-skip at ahci.c:1317) and port interrupt-status clearing were
-both added and did not change it; the FRE=0 rule for CLB/FB
-programming was found and fixed earlier. The cmd-table mapping under
-the IOMMU serves cached bytes in this build — the ext2 first slice
-(image builder + full parser in the tree) stays gated on it.
+### xHCI TRB: the No-Op command completes end-to-end
 
-### xHCI second slice: the TRB machinery (honest negative)
+`xhci_cmdring_step` re-brings the controller up, programs an event
+ring + ERST + interrupter 0, enqueues a No-Op command TRB and rings
+doorbell 0. After fixing the ERSTSZ offset (**interrupter +0x08** —
+IMAN+0, IMOD+4, ERSTSZ+8, ERSTBA+0x10, ERDP+0x18; +0x28 was
+interrupter 1's) the event ring receives **type 33 — command
+completion**: ring DMA, doorbell and event post all live. CRCR's
+dequeue pointer is NOT a success metric (the controller never writes
+it back); the marker now reports the event TRB type.
 
-`xhci_cmdring_step` re-brings the controller up with fresh frames,
-programs an event ring + ERST + interrupter 0, enqueues a No-Op
-command TRB and rings doorbell 0. The doorbell write lands; **CRCR
-does not advance and no event TRB appears** — the command-ring DMA
-never happens, the same never-translate signature as the NICs above.
-The register-level bring-up (previous slice) remains fully live.
+### Still open (with the evidence trail)
+
+- **NVMe Identify completion**: the CQE stays all-zero (the new
+  `[NVME] dbg acq:` marker dumps dw0/dw3). The admin queue pair is
+  live (CSTS.RDY=1) and the SQ doorbell is written at BAR+0x1000
+  (DSTRD=0), yet `enable=nvme*` traces show **no** controller
+  activity at submit time — the doorbell write appears not to reach
+  the device. Next step: trace the MMIO write arrival at the BAR.
+- **AHCI second command** (gates the ext2 first slice): the first
+  command on a fresh port (IDENTIFY) completes with 512 bytes of
+  PRDT DMA; QEMU's own `handle_cmd_fis_dump` then shows the second
+  command reading a **STALE FIS** — the IDENTIFY's `27 80 EC` bytes
+  where the READ's `27 80 25 40` was written — and later CI writes
+  vanish between the kernel and QEMU (7 issued, 2 logged). A TFD
+  busy-wait before each issue and port IS clearing were added and
+  did not change it.
+
+### Retraction
+
+The previous conclusion — "a QEMU device-class quirk that keeps NIC
+DMA from the IOMMU, proven by slot/order/netdev experiments" — is
+**retracted**. Those experiments were sound but the premise was
+wrong: the failures followed the devices because SeaBIOS's BM
+footprint followed the devices. The control lane falsified it in one
+boot. Kept here deliberately: the discipline of this checklist is
+that retracted conclusions stay visible.
 
 ### Gate integrity note (fixed this session)
 

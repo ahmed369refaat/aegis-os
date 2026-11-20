@@ -173,6 +173,23 @@ pub struct Dmar {
     pub structure_count: usize,
 }
 
+impl Dmar {
+    /// A placeholder for machines with **no DMAR** (the q35-neg
+    /// control lane): no units, no RMRR — the claim path's scope and
+    /// RMRR checks see an empty world, and the broker refuses anyway
+    /// (verdict Absent). Never produced by parsing.
+    #[must_use]
+    pub const fn absent_stub() -> Self {
+        Self {
+            haw_bits: 39,
+            intr_remap: false,
+            x2apic_opt_out: false,
+            structures: [DmarStruct::Unknown { kind: 0, len: 0 }; MAX_STRUCTS],
+            structure_count: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmarStruct {
     Drhd(Drhd),

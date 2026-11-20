@@ -486,6 +486,31 @@ pub fn read_cfg32(dev: &PciDev, off: u8) -> u32 {
     crate::hw::inl(CFG_DATA_PORT)
 }
 
+/// Write one config dword (0xCF8 select + 0xCFC write).
+#[cfg(not(test))]
+pub fn write_cfg32(dev: &PciDev, off: u8, v: u32) {
+    crate::hw::outl(CFG_ADDR_PORT, cfg_addr(dev.bus, dev.dev, dev.func, off));
+    crate::hw::outl(CFG_DATA_PORT, v);
+}
+
+/// Enable MEMORY-SPACE + BUS-MASTER in the command register (offset
+/// 0x04). THE cluster fix: without bit 2 QEMU parks the device's
+/// `bus_master_enable_region` disabled — every device DMA read
+/// returns zeros with **zero** IOMMU translate or fault events (the
+/// device's DMA never reaches the IOMMU at all), which masqueraded
+/// as a QEMU attach bug across virtio-net/e1000/xHCI. The "working"
+/// devices (virtio-blk/NVMe/AHCI) only worked because SeaBIOS had
+/// enabled bus mastering on the devices it probes for boot. A kernel
+/// that drives a device claims the bus-master duty itself.
+///
+/// Reads-modify-writes: I/O-space (bit 0) and INTx-disable (bit 10)
+/// keep whatever the BAR probe / firmware left there.
+#[cfg(not(test))]
+pub fn enable_bus_master(dev: &PciDev) {
+    let cmd = read_cfg32(dev, 0x04);
+    write_cfg32(dev, 0x04, cmd | 0x6); // MEM | BM
+}
+
 #[cfg(not(test))]
 mod ports {
     /// Latch the CF8 address (one dword write — see the module doc

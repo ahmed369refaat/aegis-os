@@ -46,7 +46,7 @@
 //! - Multi-DRHD machines: refused loudly (`UnsupportedMultiDrhd`) —
 //!   this machine class (QEMU q35) has exactly one unit (measured).
 
-use aegis_os::dma::{DmaDir, DmaError, DmaProt, DmaVerdict};
+use aegis_os::dma::{DmaAbsentReason, DmaDir, DmaError, DmaProt, DmaVerdict};
 use aegis_os::dmar::{Dmar, DmarStruct, Drhd};
 use aegis_os::memory::PAGE_SIZE;
 
@@ -282,9 +282,44 @@ pub struct Vtd {
     assigned: u32,
     mapped_pages: u64,
     unmapped_pages: u64,
+    /// True only for `Vtd::absent()` — a placeholder that exists so
+    /// the fail-closed arm can still hand the driver steps a broker
+    /// (whose every operation refuses; verdict Absent). Real units
+    /// are only constructed through `plan`.
+    disabled: bool,
 }
 
 impl Vtd {
+    /// The no-hardware placeholder for machines without a DMAR: the
+    /// driver steps can still run against a broker whose verdict is
+    /// `Absent` (the q35-neg control lane) — every operation refuses.
+    #[must_use]
+    pub const fn absent() -> Self {
+        Self {
+            reg_base: 0,
+            segment: 0,
+            haw_bits: 39,
+            levels: 4,
+            caps: Caps {
+                ver: 0,
+                cap: 0,
+                ecap: 0,
+                levels: 4,
+                coherent: false,
+            },
+            root_pa: 0,
+            iq_pa: 0,
+            iq_tail: 0,
+            tables: [0; TABLE_BUDGET],
+            table_cursor: 0,
+            dom_slpt: [None; MAX_VTD_DOMAINS],
+            assigned: 0,
+            mapped_pages: 0,
+            unmapped_pages: 0,
+            disabled: true,
+        }
+    }
+
     /// Pure planning: validate caps, consume the first two table
     /// frames (root table, invalidation queue). No MMIO — host tests
     /// construct units this way and drive the whole `DmaProt` surface
@@ -330,6 +365,7 @@ impl Vtd {
             root_pa: tables[0],
             iq_pa: tables[1],
             iq_tail: 0,
+            disabled: false,
             tables: *tables,
             table_cursor: 2,
             dom_slpt: [None; MAX_VTD_DOMAINS],
@@ -562,7 +598,14 @@ impl Vtd {
 impl DmaProt for Vtd {
     fn verdict(&self) -> DmaVerdict {
         // A Vtd only exists after caps validated + TE sequenced: the
-        // verdict is structural, never optimistic.
+        // verdict is structural, never optimistic. The one exception
+        // is the `absent()` placeholder (no DMAR in the firmware):
+        // every broker operation refuses against it.
+        if self.disabled {
+            return DmaVerdict::Absent {
+                reason: DmaAbsentReason::NoDmar,
+            };
+        }
         DmaVerdict::Available {
             haw_bits: self.haw_bits,
             queued_invalidation: true,

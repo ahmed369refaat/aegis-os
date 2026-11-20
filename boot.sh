@@ -93,9 +93,11 @@ case "${1:-}" in
       "[IOMMU] dmar: pa=0x"  # placeholder replaced below; see lane block
       "[VNET] alive: MAC="
       "[VNET] dbg q1 readback:"  # the device holds exactly the frames we mapped
-      "[VNET] TX: DISCOVER published+kicked"
+      "[VNET] TX: DHCP DISCOVER sent"
       "[E1K] alive:"  # registers live: MAC + link
-      "[E1K] TX: DISCOVER built+rings armed"  # honest split marker
+      "[E1K] TX: DHCP DISCOVER sent"  # the NIC egress works
+      "[E1K] RX: "  # the OFFER parsed: full round trip through the IOMMU
+      "[VNET] RX: "  # both NICs live
       "[NVME] admin qpair live"  # controller enable + queue pair
       "[NVME] teardown: revoke_all(0) → 6 region(s)"
       "[AHCI] ABAR live:"  # port + signature proven
@@ -117,8 +119,16 @@ case "${1:-}" in
     ;;
   --verify-q35-noiommu)
     MODE=verify
-    MACHINE_ARGS=(-machine q35 -cpu max -m 128M)
-    EXTRA_GREPS=()
+    MACHINE_ARGS=(-machine q35 -cpu max -m 128M
+                  -netdev user,id=n1
+                  -device e1000,netdev=n1
+                  -object filter-dump,id=f1,netdev=n1,file=/tmp/e1k-noiommu.pcap
+                  -d guest_errors -trace enable=e1000* -trace enable=e1000x*)
+    EXTRA_GREPS=(
+      "[E1K] identity mode:"  # the control lane: same driver, no IOMMU
+      "[E1K] TX: DHCP DISCOVER sent"
+      "[E1K] RX:"
+    )
     ;;
 esac
 
