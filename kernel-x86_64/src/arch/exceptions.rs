@@ -61,6 +61,19 @@ pub fn ist_tops() -> [u64; 5] {
 
 /// Set by `arm_and_trigger_de`: the *next* #DE is the selftest, not a bug.
 static SELFTEST_DE: AtomicBool = AtomicBool::new(false);
+/// N4 (ADR-0008): armed SMEP selftest — the next instruction-fetch #PF
+/// at exactly this user VA is the deliberate CPL0 jump into a user page
+/// (SMEP), not a bug.
+static ARMED_SMEP: AtomicBool = AtomicBool::new(false);
+static SMEP_VA: AtomicU64 = AtomicU64::new(0);
+/// The resume label's address, parked by the trigger before the fault
+/// (the NX_RESUME pattern: fetch faults report the target as RIP).
+static mut SMEP_RESUME: u64 = 0;
+/// N4 (ADR-0008): armed SMAP selftest — the next data #PF at exactly
+/// this user VA is the deliberate CPL0 read outside the STAC window
+/// (SMAP), not a bug.
+static ARMED_SMAP: AtomicBool = AtomicBool::new(false);
+static SMAP_VA: AtomicU64 = AtomicU64::new(0);
 /// Set by `arm_guard_write`: the next #PF at exactly this address is the
 /// (terminal) stack-guard selftest; 0 = unarmed.
 static GUARD_VA: AtomicU64 = AtomicU64::new(0);
@@ -194,6 +207,32 @@ fn dispatch(f: &mut ExceptionFrame) {
         f.rip = unsafe { core::ptr::addr_of!(NX_RESUME).read_volatile() };
         ARMED_NX.store(false, Ordering::SeqCst);
         serial::write_str("[EXC] NX selftest: exec of NX page faulted (I/D), rip advanced\n");
+        return;
+    }
+    if ARMED_SMEP.load(Ordering::SeqCst)
+        && f.vector == 14
+        && cr2 == SMEP_VA.load(Ordering::SeqCst)
+        && (f.error_code & PF_INSTRUCTION_FETCH) != 0
+    {
+        // SMEP: the fetch never retired; the saved RIP is the user
+        // target, so resume at the trigger's label (the NX pattern).
+        // SAFETY: written by arm_sme_call's trigger before the fault;
+        // single CPU, read exactly once here.
+        f.rip = unsafe { core::ptr::addr_of!(SMEP_RESUME).read_volatile() };
+        ARMED_SMEP.store(false, Ordering::SeqCst);
+        serial::write_str("[SEC ] SMEP selftest: kernel exec of user RX page faulted (I/D)\n");
+        return;
+    }
+    if ARMED_SMAP.load(Ordering::SeqCst)
+        && f.vector == 14
+        && cr2 == SMAP_VA.load(Ordering::SeqCst)
+    {
+        // SMAP: a CPL0 data access to a user page outside the STAC
+        // window. Data faults report the faulting instruction; advance
+        // past it (the guard-read pattern).
+        f.rip += MOV_LEN;
+        ARMED_SMAP.store(false, Ordering::SeqCst);
+        serial::write_str("[SEC ] SMAP selftest: kernel read of user page outside STAC faulted\n");
         return;
     }
     if ARMED_DG.load(Ordering::SeqCst)
@@ -387,6 +426,47 @@ pub fn call_user(va: u64) {
 /// PR-1.3: read through `va`, which must be a policy guard-gap page
 /// (absent PTE). The #PF is diagnosed, RIP advanced past the 3-byte
 /// `movq (%rax), %rax`, and execution resumes here.
+/// N4 (ADR-0008): jump into a *user* RX page from CPL0 — SMEP must
+/// fault the fetch. A JMP (not a call) so the fault leaves RSP exact
+/// (the arm_nx_call rationale).
+pub fn arm_sme_call(va: u64) {
+    ARMED_SMEP.store(true, Ordering::SeqCst);
+    SMEP_VA.store(va, Ordering::SeqCst);
+    // SAFETY: deliberately fetches an instruction from a user page at
+    // CPL0 → #PF under SMEP. Never completes when SMEP is active.
+    unsafe {
+        let slot = core::ptr::addr_of_mut!(SMEP_RESUME) as u64;
+        core::arch::asm!(
+            "lea 9f(%rip), %rcx",
+            "movq %rcx, (%rdx)",
+            "jmpq *%rax",
+            "9:",
+            in("rax") va,
+            in("rdx") slot,
+            out("rcx") _,
+            options(att_syntax),
+        );
+    }
+    ARMED_SMEP.store(false, Ordering::SeqCst);
+}
+
+/// N4 (ADR-0008): read a *user* page from CPL0 with no STAC window —
+/// SMAP must fault the access.
+pub fn arm_smap_read(va: u64) {
+    ARMED_SMAP.store(true, Ordering::SeqCst);
+    SMAP_VA.store(va, Ordering::SeqCst);
+    // SAFETY: deliberately loads from a user page at CPL0 outside the
+    // STAC window → #PF under SMAP.
+    unsafe {
+        core::arch::asm!(
+            "movq (%rax), %rax",
+            in("rax") va,
+            options(att_syntax, preserves_flags),
+        );
+    }
+    ARMED_SMAP.store(false, Ordering::SeqCst);
+}
+
 pub fn arm_guard_read(va: u64) {
     ARMED_DG.store(true, Ordering::SeqCst);
     DG_VA.store(va, Ordering::SeqCst);

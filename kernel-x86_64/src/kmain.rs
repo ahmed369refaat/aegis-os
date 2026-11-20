@@ -45,6 +45,10 @@ use crate::{hw, memops, mm, multiboot, serial, strutil};
 use aegis_os::memory::MemFlags;
 use aegis_os::Kernel;
 
+fn on_off(b: bool) -> &'static str {
+    if b { "on" } else { "off" }
+}
+
 fn line(out: &mut dyn FnMut(&str), parts: &[&str]) {
     for p in parts {
         out(p);
@@ -291,6 +295,30 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     line(&mut out, &["[ARCH] domain guard selftest: reading A's guard-gap page"]);
     arch::exceptions::arm_guard_read(GUARD_GAP_VA);
     line(&mut out, &["[MM ] per-domain tables: 2 domains, W^X + guards live"]);
+
+    // ── N4 (ADR-0008): SMEP/SMAP — enabled only after the selftests
+    // above (the RX selftest legitimately executes a user page from
+    // CPL0; the A/B reads legitimately touch user VAs). From here on,
+    // a kernel jump into a user page or a kernel access to user memory
+    // outside the STAC window is an MMU fault.
+    let leaf7 = hw::cpuid7_ebx();
+    let smep = arch::features::has_smep(leaf7);
+    let smap = arch::features::has_smap(leaf7);
+    hw::write_cr4(arch::features::cr4_image(hw::read_cr4(), smep, smap));
+    hw::set_smap_active(smap);
+    line(&mut out, &["[ARCH] smep=", on_off(smep), " smap=", on_off(smap)]);
+    if smep {
+        // A's tables are needed (RX_VA is mapped only there).
+        tables_a.activate();
+        line(&mut out, &["[ARCH] SMEP selftest: jumping into A's user RX page from CPL=0"]);
+        arch::exceptions::arm_sme_call(RX_VA);
+        line(&mut out, &["[SEC ] SMEP selftest: kernel jump into user page faulted, resumed"]);
+    }
+    if smap {
+        line(&mut out, &["[ARCH] SMAP selftest: reading A's user RW page from CPL=0, no STAC"]);
+        arch::exceptions::arm_smap_read(VA);
+        line(&mut out, &["[SEC ] SMAP selftest: kernel read outside the window faulted, resumed"]);
+    }
 
     // Back on the kernel's own tables for the remaining selftests.
     hw::write_cr3(kernel_cr3);

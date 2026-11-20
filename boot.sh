@@ -65,7 +65,7 @@ fi
 
 # -machine pc keeps the ACPI poweroff port (0x604) stable; -no-reboot
 # turns a triple fault into a clean QEMU exit instead of a loop.
-QEMU_ARGS=(-machine pc -cpu qemu64 -m 128M -kernel "$IMAGE" -display none -serial stdio -no-reboot)
+QEMU_ARGS=(-machine pc -cpu max -m 128M -kernel "$IMAGE" -display none -serial stdio -no-reboot)
 
 if [ "${1:-}" = "--verify" ]; then
   LOG=$(mktemp)
@@ -106,6 +106,9 @@ if [ "${1:-}" = "--verify" ]; then
     grep -qF "[SEC ] ring3 domain 10 quarantined by monitor" "$LOG" || { echo "VERIFY FAIL: N2 monitor-quarantine marker missing"; ok=0; }
     grep -qF "healthy domain still running: yes" "$LOG" || { echo "VERIFY FAIL: N2 healthy-witness marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 audit-only: verdicts logged, mask unchanged" "$LOG" || { echo "VERIFY FAIL: N2 audit-only marker missing"; ok=0; }
+    grep -qF "[ARCH] smep=on smap=on" "$LOG" || { echo "VERIFY FAIL: N4 SMEP/SMAP not both on (-cpu max required)"; ok=0; }
+    grep -qF "[SEC ] SMEP selftest: kernel jump into user page faulted, resumed" "$LOG" || { echo "VERIFY FAIL: N4 SMEP selftest marker missing"; ok=0; }
+    grep -qF "[SEC ] SMAP selftest: kernel read outside the window faulted, resumed" "$LOG" || { echo "VERIFY FAIL: N4 SMAP selftest marker missing"; ok=0; }
     grep -qF "[RING3] hello domain exited(0): message written from CPL=3" "$LOG" || { echo "VERIFY FAIL: ring-3 exit marker missing"; ok=0; }
     grep -qF "[SYSC] syscall round-trip: " "$LOG" || { echo "VERIFY FAIL: round-trip marker missing"; ok=0; }
     grep -qF "[RING3] user fault: domain terminated, kernel resumes" "$LOG" || { echo "VERIFY FAIL: user-fault resume marker missing"; ok=0; }

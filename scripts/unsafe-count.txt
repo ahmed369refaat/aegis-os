@@ -23,3 +23,7 @@
 #      sched/context.rs (set, map-deref, USER_RUN peek) — the same
 #      documented pattern as USER_RUN itself.
 66
+# 72 -> N4 review fix (ADR-0008): +6 — cpuid7_ebx (push/pop RBX dance),
+#      stac, clac (hw); the armed SMEP jump, the armed SMAP read, and
+#      the SMEP resume-slot read (arch/exceptions).
+72

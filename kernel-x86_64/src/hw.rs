@@ -80,6 +80,63 @@ pub fn read_cr2() -> u64 {
 /// N2 (ADR-0007 §2): the monitor's window clock (until a real timer
 /// exists). Raw RDTSC — only window *boundaries* matter, so ordering
 /// against speculation is irrelevant here.
+/// N4 (ADR-0008): CPUID leaf 7 sub-leaf 0's EBX — the SMEP/SMAP
+/// capability word. Decoding is pure (arch/features.rs).
+pub fn cpuid7_ebx() -> u64 {
+    let a: u32;
+    let b: u64;
+    let c: u32;
+    let d: u32;
+    // SAFETY: CPUID is unprivileged. RBX is reserved for LLVM's use as
+    // an asm operand, so the classic push/mov/pop dance moves EBX into
+    // an allocatable register (stack balanced by the push/pop pair).
+    unsafe {
+        core::arch::asm!(
+            "push %rbx",
+            "cpuid",
+            "movq %rbx, {b}",
+            "pop %rbx",
+            in("eax") 7u32,
+            in("ecx") 0u32,
+            lateout("eax") a,
+            lateout("ecx") c,
+            lateout("edx") d,
+            b = out(reg) b,
+            options(att_syntax),
+        );
+    }
+    let _ = (a, c, d);
+    b
+}
+
+/// N4 (ADR-0008): set once at boot when SMAP is enabled — the user-copy
+/// path wraps itself in STAC/CLAC only when the CPU supports it (STAC
+/// on a CPU without it is #UD).
+static SMAP_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_smap_active(on: bool) {
+    SMAP_ACTIVE.store(on, core::sync::atomic::Ordering::SeqCst);
+}
+
+#[must_use]
+pub fn smap_active() -> bool {
+    SMAP_ACTIVE.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// N4 (ADR-0008): open the SMAP window for the current instruction
+/// stream (allow supervisor access to user pages). Allowlisted.
+pub fn stac() {
+    // SAFETY: STAC is a privileged-ring-agnostic no-flags instruction;
+    // the caller owns the window's extent.
+    unsafe { core::arch::asm!("stac", options(nostack, preserves_flags)) };
+}
+
+/// N4 (ADR-0008): close the SMAP window.
+pub fn clac() {
+    // SAFETY: see stac().
+    unsafe { core::arch::asm!("clac", options(nostack, preserves_flags)) };
+}
+
 pub fn read_tsc() -> u64 {
     let lo: u32;
     let hi: u32;

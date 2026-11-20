@@ -12,6 +12,7 @@
 //! `exceptions`, `percpu`, the `load` fns) are target-only.
 
 pub mod fault_class;
+pub mod features;
 pub mod frame;
 pub mod gdt;
 pub mod idt;

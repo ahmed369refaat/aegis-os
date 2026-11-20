@@ -207,12 +207,21 @@ mod exec {
         // fault. IN_USER_COPY is armed so that if this invariant ever
         // breaks, the fault is named, not billed to the user.
         IN_USER_COPY.store(true, Ordering::SeqCst);
+        // N4 (ADR-0008): the single blessed SMAP window — the copy
+        // reads user pages from CPL0, so it runs under STAC/CLAC when
+        // (and only when) the CPU has SMAP.
+        if crate::hw::smap_active() {
+            crate::hw::stac();
+        }
         let written = crate::mm::user_range::copy_user_bytes(
             buf,
             len,
             &memops::read_u8_va,
             |b| serial::write_byte(b),
         );
+        if crate::hw::smap_active() {
+            crate::hw::clac();
+        }
         IN_USER_COPY.store(false, Ordering::SeqCst);
         run.write_bytes += written;
         written
