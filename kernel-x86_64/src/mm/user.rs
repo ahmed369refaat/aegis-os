@@ -62,7 +62,6 @@ pub struct UserSpawn {
 /// half), and the gate snapshot is taken from the profile's syscall
 /// mask — the same mask `create_domain` built the domain's live mask
 /// from.
-#[cfg(not(test))]
 pub fn spawn_user_blob<const N: usize>(
     k: &mut Kernel<N>,
     pool: &mut FramePool<N>,
@@ -86,13 +85,41 @@ pub fn spawn_user_blob<const N: usize>(
     // Lib identity first (audit/accounting; the frame owner tag below
     // matches this id so a destroy reclaims everything at once).
     k.create_domain(id, profile).map_err(|_| SpawnError::Domain)?;
-    // Gate snapshot: the live mask starts as the profile's mask, and a
-    // freshly created domain is never quarantined.
-    let mask = profile.syscalls;
-    let quarantined = false;
+    // N3: transactional from here on — the old code returned early on
+    // any failure (PML4 alloc, a region map, pool exhaustion), leaving
+    // the lib domain registered and frames owned by the id. Every
+    // failure now rolls back every frame AND the lib identity (which
+    // also clears the monitor state, F7) before returning.
+    match build_user_tables(k, pool, id, blob, data) {
+        Ok((tables, space)) => {
+            // Gate snapshot: the live mask starts as the profile's
+            // mask, and a freshly created domain is never quarantined.
+            let mask = profile.syscalls;
+            Ok(UserSpawn {
+                domain: id,
+                ctx: UserContext::new(layout::CODE_BASE, layout::STACK_TOP),
+                run: UserRun::new(tables, space, id, mask, false),
+            })
+        }
+        Err(e) => {
+            pool.free_all_owned(&mut k.frames, id);
+            let _ = k.destroy_domain(id);
+            Err(e)
+        }
+    }
+}
 
-    // Hardware side: fresh tables, kernel half shared in, layout mapped
-    // through the policy gate, blob/data copied in via the direct map.
+/// The hardware half of a spawn: fresh tables, kernel half shared in,
+/// layout mapped through the policy gate, blob/data copied in via the
+/// direct map. Every frame it takes is pool-owned by `id`, so a single
+/// `free_all_owned` (N3 rollback) reclaims it all.
+fn build_user_tables<const N: usize>(
+    k: &mut Kernel<N>,
+    pool: &mut FramePool<N>,
+    id: u32,
+    blob: &[u8],
+    data: &[u8],
+) -> Result<(PageTables, AddressSpace), SpawnError> {
     let mut src = PoolSource::new(pool, &mut k.frames, id);
     let mut tables = PageTables::new(&mut src)?;
     tables.install_kernel_entries();
@@ -120,12 +147,7 @@ pub fn spawn_user_blob<const N: usize>(
     )?;
     copy_into_frame(&tables, layout::CODE_BASE, blob);
     copy_into_frame(&tables, layout::DATA_BASE, data);
-
-    Ok(UserSpawn {
-        domain: id,
-        ctx: UserContext::new(layout::CODE_BASE, layout::STACK_TOP),
-        run: UserRun::new(tables, space, id, mask, quarantined),
-    })
+    Ok((tables, space))
 }
 
 /// Free every frame the domain owns (tables + pages; the pool scrubs
@@ -141,7 +163,6 @@ pub fn destroy_user<const N: usize>(k: &mut Kernel<N>, pool: &mut FramePool<N>, 
 /// at a time through the direct map). `base` must be a mapped region
 /// start; the caller only ever passes layout bases whose regions were
 /// just mapped.
-#[cfg(not(test))]
 fn copy_into_frame(tables: &PageTables, base: u64, bytes: &[u8]) {
     let pa = match tables.translate(base) {
         Some(p) => p,
@@ -166,5 +187,103 @@ mod tests {
         // The examples are a few dozen bytes of asm; one code page is
         // orders of magnitude more than enough.
         assert!(layout::CODE_PAGES * 4096 >= 128);
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use aegis_os::profile::service_profile;
+
+    /// N3: a real host buffer standing in for the pool's physical
+    /// memory (the runtime.rs FakePhys pattern): memops on the host is
+    /// the identity map, so pool PAs are Vec addresses.
+    struct Phys {
+        _mem: Vec<u64>,
+    }
+
+    const N: usize = 256;
+
+    fn setup() -> (Kernel<N>, FramePool<N>, Phys) {
+        // Page-align the backing buffer: the map path requires
+        // page-aligned physical frames, and a Vec is only 8-aligned.
+        let mut mem = vec![0u64; N * 512 + 1024];
+        let base = ((mem.as_ptr() as u64) + 4095) & !4095u64;
+        (
+            Kernel::new_over_arena(),
+            FramePool::new(base, memops::scrub_frame),
+            Phys { _mem: mem },
+        )
+    }
+
+    fn state<const M: usize>(k: &Kernel<M>, pool: &FramePool<M>) -> (usize, usize) {
+        (k.frames.frames_in_use(), pool.owned_count())
+    }
+
+    /// N3: a duplicate id fails before any allocation — the baseline
+    /// must be untouched.
+    #[test]
+    fn spawn_fails_cleanly_on_duplicate_id() {
+        let (mut k, mut pool, _p) = setup();
+        k.create_domain(7, service_profile()).unwrap();
+        let b = state(&k, &pool);
+        let r = spawn_user_blob(&mut k, &mut pool, 7, service_profile(), &[0u8; 16], &[0u8; 4]);
+        assert!(matches!(r, Err(SpawnError::Domain)));
+        assert_eq!(state(&k, &pool), b);
+    }
+
+    /// N3: an oversized blob is refused before anything is allocated.
+    #[test]
+    fn spawn_fails_cleanly_when_blob_too_large() {
+        let (mut k, mut pool, _p) = setup();
+        let b = state(&k, &pool);
+        let big = [0u8; layout::CODE_PAGES * 4096 + 1];
+        let r = spawn_user_blob(&mut k, &mut pool, 7, service_profile(), &big, &[0u8; 4]);
+        assert!(matches!(r, Err(SpawnError::BlobTooLarge { .. })));
+        assert_eq!(state(&k, &pool), b);
+        assert_eq!(k.domain_state(7), None);
+    }
+
+    /// N3: the heart of it — pool exhaustion at EVERY allocation point
+    /// (measured, not assumed: a successful spawn takes `needed`
+    /// frames; starving it by 1..=needed makes each successive
+    /// allocation the failing one). After each failure: frames, owners
+    /// and the domain table back to baseline, ballast fully recoverable.
+    #[test]
+    fn spawn_rolls_back_at_every_allocation_point() {
+        // Measure what a successful spawn costs.
+        let (mut k, mut pool, _p) = setup();
+        spawn_user_blob(&mut k, &mut pool, 7, service_profile(), &[0u8; 16], &[0u8; 4]).unwrap();
+        let needed = k.frames.frames_in_use();
+        assert!(needed >= 4, "sanity: tables + regions cost frames (got {needed})");
+        drop(k);
+
+        for deficit in 1..=needed {
+            let (mut k, mut pool, _p) = setup();
+            let ballast = N - (needed - deficit);
+            for _ in 0..ballast {
+                pool.alloc_for(&mut k.frames, 999).unwrap();
+            }
+            let r = spawn_user_blob(&mut k, &mut pool, 7, service_profile(), &[0u8; 16], &[0u8; 4]);
+            assert!(r.is_err(), "deficit {deficit}: the pool is short by exactly {deficit}");
+            assert_eq!(
+                k.frames.frames_in_use(),
+                ballast,
+                "deficit {deficit}: spawn leaked frames"
+            );
+            assert_eq!(
+                pool.owned_count(),
+                ballast,
+                "deficit {deficit}: spawn leaked owner tags"
+            );
+            assert_eq!(
+                k.domain_state(7),
+                None,
+                "deficit {deficit}: the lib domain leaked"
+            );
+            let freed = pool.free_all_owned(&mut k.frames, 999);
+            assert_eq!(freed, ballast, "deficit {deficit}: ballast recoverable");
+            assert_eq!(k.frames.frames_in_use(), 0);
+        }
     }
 }

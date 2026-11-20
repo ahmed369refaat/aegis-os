@@ -115,6 +115,13 @@ impl PageTables {
         }
     }
 
+    /// Host-build stand-in: there is no kernel half to share on the
+    /// host (no CR3, no stub tables), so the host spawn path (N3
+    /// transactional tests) installs nothing — the tests never launch
+    /// and only assert frame/owner/domain-table accounting.
+    #[cfg(test)]
+    pub fn install_kernel_entries(&mut self) {}
+
     /// The CR3 value for these tables (physical, no PCID).
     #[must_use]
     pub fn cr3(&self) -> u64 {
