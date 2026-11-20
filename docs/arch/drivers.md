@@ -93,7 +93,17 @@ comments and tests:
 | ACPI MADT/MCFG (item 14) | **parsed** | 1 LAPIC + 1 IOAPIC @0xFEC00000; ECAM base 0xB0000000 bus 0..255 |
 | USB enumeration / HID | **not started** | next xHCI slice: TRB rings, address device, interrupt-IN |
 | virtio-gpu / e1000-data / NVMe-data | **blocked on the device-DMA cluster** (below) | |
-| Block layer + ext2 (item 8) | **not started** | the BlockDevice trait unifying blk/ahci/nvme is the first slice |
+| Block layer + ext2 (item 8) | **first slice written, mount gated** | the image builder (scripts/mkext2.py: valid 1KiB-block rev-1 ext2 with hello.txt) + the full kernel parser (superblock → group descriptor → root inode → directory walk → file inode → data) are in the tree and run on the LIVE AHCI port; the mount is gated by the second-command no-op below — IDENTIFY (first command) completes with 512 bytes of DMA, ANY subsequent READ (0xC8 and 0x25 both tried, IS cleared, FRE live, identical headers/FIS/PRDT machinery) completes as TFD=0x50 with no PRDT transfer and no D2H FIS |
+
+### The AHCI second-command no-op (block-layer open item)
+
+The first command on a freshly started AHCI port (IDENTIFY DEVICE)
+completes with full PRDT DMA. Every subsequent command — tried with
+READ DMA (0xC8) and READ DMA EXT (0x25), port interrupt-status
+cleared, FRE live, command headers/FIS/PRDT rewritten by the same
+code path — completes instantly as a no-op: TFD=0x50, no data
+transfer, no D2H FIS. This gates the ext2 first slice (the parser and
+the host-built image are done and in the tree).
 
 ### The device-DMA cluster (the one open investigation)
 

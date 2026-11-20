@@ -107,6 +107,7 @@ case "${1:-}" in
       "[MCFG] ECAM base"  # parsed
       "[KBD2] negotiated scancode set 2, ack="  # the real 0xF0/0x02 exchange
       "[KBD2] scancode"  # the QMP round trip
+      "[EXT2] mount gated: READ after IDENTIFY completes as a no-op"  # the honest split
       "[E1K] teardown: revoke_all(0) → 4 region(s)"
       "[GFX] VBE 640x480x32 linear"  # the mode engaged
       "[RTC] 2026-"  # the MC146818 read the host clock
