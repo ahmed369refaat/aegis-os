@@ -1,6 +1,6 @@
 # AegisOS — Full Engineering Architecture
 
-> Reference design document. The reference implementation embodies every policy described here and backs it with tests — 219 total: 180 unit + 16 integration in the policy core, plus 23 host tests in the bootable kernel that run the M1 sequence logic itself. The kernel boots on QEMU and CI asserts its exit criteria on every push.
+> Reference design document. The reference implementation embodies every policy described here and backs it with tests — 320 total: 243 policy-core (225 unit + 18 integration/property) plus 77 kernel host tests that run the boot-sequence and arch-encoding logic itself (single source of truth for counts: `scripts/count-tests.sh`). The kernel boots on QEMU, runs ring-3 domains, and CI asserts its exit criteria on every push.
 
 ## 1. The foundation: what we take from Unix, and why
 
@@ -10,7 +10,7 @@
 | Processes and threads, efficient scheduling | The base unit is the **Domain**: a process + a full isolation envelope; threads inside a domain share its mask | Isolation enforced at the domain boundary, not the thread — cheaper and more precise |
 | `syscall` as a stable interface | 64 fixed syscall slots + a `u64` bit mask per domain | Membership test = one AND + one bit test: a deterministic O(1) path |
 | Drivers and structured I/O | A driver is a **driver domain** holding `IOCTL` only, no direct kernel access | Driver bugs and exploits stay outside the kernel |
-| Clarity and separation of concerns | Every core module has one testable contract in isolation | 196 core tests + 23 kernel host tests, all without special setup = provability |
+| Clarity and separation of concerns | Every core module has one testable contract in isolation | 243 core tests + 77 kernel host tests, all without special setup = provability |
 | POSIX process machinery | Pipes, signals, fd tables, dup2, nice levels, chroot — reimplemented under the mask | Familiar semantics, unfamiliar safety: every one of them is mask-gated |
 
 What we deliberately **drop** from Unix: default trust in processes (root/suid), signals as a control-plane mechanism (kept as delivery semantics only), and UID-based resource ownership — replaced by capabilities and attenuation. One Linux-ism is kept on purpose: uid 0 bypasses DAC checks (documented, and still confined by chroot).
@@ -30,6 +30,7 @@ aegis-os/
 │   ├── signal.rs                   signal sets: pending/blocked, unblockable KILL
 │   ├── sched.rs                    CFS: vruntime + Linux nice→weight table
 │   ├── net.rs                      brokered sockets + token-bucket rate limits
+│   ├── ipc.rs                      capability-endpoint IPC (ADR-0004, async half)
 │   ├── ringbuf.rs                  SPSC telemetry rings: power-of-two, non-blocking
 │   ├── profile.rs                  profiles: service/parser/driver/plugin/netd
 │   ├── domain.rs                   the isolation unit + deterministic fast path
@@ -53,7 +54,8 @@ aegis-os/
 │       ├── runtime.rs                the M1 sequence (host-tested, callback-driven)
 │       └── kmain.rs                  live boot: validate → claim pool → run → verdict
 ├── tests/integration.rs           # security scenarios (escalation, isolation)
-└── tests/linux_like.rs            # Linux-semantics scenarios (VFS/pipe/sched/net)
+├── tests/linux_like.rs            # Linux-semantics scenarios (VFS/pipe/sched/net)
+└── tests/property_tests.rs        # attenuation/derivation properties (seeded, deterministic)
 ```
 
 ### 2.1 The boot path (M1, x86_64 — implemented, two-stage)

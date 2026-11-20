@@ -14,11 +14,16 @@ documents.
   (on the booted kernel) real pool frames with per-frame ownership.
 - Domains never share ambient authority. Cooperation happens through
   IPC and derived capabilities only.
-- **M1 boundary, stated plainly:** domains are kernel-resident objects
-  whose region mappings pass the full memory policy and whose pages are
-  real, tracked, scrubbed frames. Per-domain page tables and ring-3
-  execution are M2 — the hardware user/kernel boundary is not yet in
-  place, and we do not claim it is.
+- **Hardware boundary, stated plainly (live since PR-1.3 + ADR-0010):**
+  user domains run at CPL=3 on per-domain page tables — every mapping
+  passes the full memory policy *and* becomes a real PTE (W^X/NX, guard
+  gaps as absent pages, U/S split), syscalls enter via SYSCALL/SYSRET
+  through the same policy `gate()` as kernel-resident domains, and
+  SMEP/SMAP plus kernel-image W^X are MMU-enforced. The seven-run
+  ring-3 sequence (hello / NX / kernel-VA / forged syscall / edge
+  writes / live-monitor quarantine / audit-only) is asserted by
+  `boot.sh --verify` in CI. Kernel-resident domains remain for bring-up
+  selftests and the M1 sequence only.
 
 ## 2. Attenuation-only privileges (the core invariant)
 
@@ -93,8 +98,10 @@ logging while instant quarantine still fires.
   allowlist (`arch/`, `boot/`, `hw.rs`, `memops.rs`, `sched/`), every
   item carrying a `SAFETY` note — enforced by `scripts/check_unsafe.sh`
   in CI, with the count ratcheted in `scripts/unsafe-count.txt`.
-- `no_std` throughout; the core also builds for bare-metal ARM
-  (thumbv7em) to prove no host assumptions leak in.
+- `no_std` throughout; the core builds for bare-metal ARM (thumbv7em)
+  **and, since ADR-0011, for `aarch64-unknown-none-softfloat` and
+  `riscv64imac-unknown-none-elf` in CI** — arch-agnosticism is enforced
+  by the compiler, not by intention.
 
 ## 6. Where each claim is proven
 

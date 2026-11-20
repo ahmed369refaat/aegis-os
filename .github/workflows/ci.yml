@@ -38,6 +38,22 @@ jobs:
       - name: Build the policy core for bare-metal ARM
         run: cargo build --target thumbv7em-none-eabihf --verbose
 
+  # ADR-0011: the policy core is architecture-agnostic BY COMPILER, not
+  # by intention. These builds catch any x86_64 assumption in src/ the
+  # moment it lands, instead of during a future aarch64/RISC-V port.
+  multi-arch:
+    name: Policy core cross-arch builds (aarch64 + riscv64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain  # reads rust-toolchain.toml (pinned)
+        with:
+          targets: aarch64-unknown-none-softfloat,riscv64imac-unknown-none-elf
+      - name: Build the policy core for aarch64 (bare-metal, soft-float)
+        run: cargo build --target aarch64-unknown-none-softfloat --verbose
+      - name: Build the policy core for RISC-V RV64IMAC (bare-metal)
+        run: cargo build --target riscv64imac-unknown-none-elf --verbose
+
   kernel-build:
     name: Boot image build (x86_64, two-stage)
     runs-on: ubuntu-latest

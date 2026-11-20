@@ -28,29 +28,40 @@ permissions; an audit trail for every sensitive syscall.
 
 **Execution plan:** stages 2–4 (plus full Ring-3 dispatch, ELF loader,
 demand paging/COW, configurable limits) are scheduled week-by-week in
-[`docs/M2-PLAN.md`](M2-PLAN.md) — gap analysis, adopter-usability
-mitigations, exit criteria and metrics live there.
+[`docs/M2-PLAN.md`](M2-PLAN.md); the **full-scope plan to production
+readiness (all seven areas, multi-architecture first-class) is
+[`docs/GAP-ANALYSIS-v2.md`](GAP-ANALYSIS-v2.md)**, and the architecture
+seam it depends on is designed in
+[`docs/adr/0011-multi-architecture-hal-bsp.md`](adr/0011-multi-architecture-hal-bsp.md).
 
 Mapping: Ring-3 → Stage 1 · IPC → Stage 2 · block+FS → Stage 3 ·
-preemption/SMP → Stage 4 · POSIX ABI → Stage 5 · drivers → Stage 6 ·
-hardening (ASLR/audit) → Stage 7 · compliance → Stage 8.
+preemption/SMP → Stage 4 (the *preemption half* of Stage 4 is pulled
+into M2-W2 — a starvable system cannot pass M2 exit criteria; SMP
+stays) · POSIX ABI → Stage 5 · drivers → Stage 6 · hardening
+(ASLR/audit) → Stage 7 · compliance → Stage 8.
 
-## Current state (v0.2.0, the honest baseline)
+## Current state (the honest baseline)
 
 **Done and CI-proven:** the full policy core (attenuation-only masks,
 capability generations, ten-check memory policy, in-memory VFS + Unix DAC
 + chroot, pipes, signals, fd tables, CFS, buddy allocator, rate-limited
-brokered sockets, behavior monitor with graduated response) — 196 tests;
-a bootable two-stage x86_64 kernel (ELF32 multiboot stub → ELF64 kernel)
-with a real 256-frame pool, scrub-on-free verified by read-back, kernel-
-resident domains, and a CI boot test asserting the M1 exit criteria — 23
-kernel host tests; 219 total, zero external dependencies, unsafe confined
-to the allowlist (arch/, boot/, hw.rs, memops.rs, sched/ — as defined in scripts/check_unsafe.sh).
+brokered sockets, capability-endpoint async IPC, behavior monitor with
+graduated response) — 243 tests; a bootable two-stage x86_64 kernel
+(ELF32 multiboot stub → ELF64 kernel) with a real 4096-frame pool,
+scrub-on-free verified by read-back, per-domain page tables, SMEP/SMAP,
+kernel-image W^X, SYSCALL/SYSRET ring-3 entry, and the seven-run ring-3
+sequence asserted by the CI boot test — 77 kernel host tests; 320 total,
+zero external dependencies, unsafe confined to the allowlist (arch/,
+boot/, hw.rs, memops.rs, sched/ — as defined in scripts/check_unsafe.sh,
+ratcheted at 78).
 
-**Not present at all (each gets its stage below):** Ring-3 isolation,
-per-domain page tables, interrupts/exceptions, timers, IPC, block devices,
-on-disk filesystems, preemption, SMP, a POSIX syscall ABI, drivers,
-ASLR/KASLR, audit trail, seccomp-style filtering, compliance suites.
+**Not present at all (each gets its stage below):** timer interrupts and
+preemption, SMP, demand paging/COW, the ELF loader, the full ring-3
+syscall surface, block devices, on-disk filesystems, real networking,
+the POSIX ABI surface, drivers, IOMMU, ASLR/KASLR, a seccomp-style
+filter layer, compliance suites, and the second architecture (the HAL
+seam of ADR-0011 — enforced in CI by cross-arch builds of the core —
+with aarch64 bring-up as its Phase 2).
 
 ---
 
