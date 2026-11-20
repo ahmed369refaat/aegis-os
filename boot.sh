@@ -76,6 +76,15 @@ case "${1:-}" in
                   -device virtio-blk-pci,disable-legacy=on,iommu_platform=on,drive=vd0
                   -netdev user,id=n0
                   -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on
+                  -netdev user,id=n1
+                  -device e1000,netdev=n1
+                  -drive id=nvme0,if=none,format=raw,file=target/nvme0.img
+                  -device nvme,drive=nvme0,serial=AEGISN1
+                  -drive id=sd0,if=none,format=raw,file=target/sdisk0.img
+                  -device ide-hd,drive=sd0,bus=ide.0
+                  -drive id=usb0,if=none,format=raw,file=target/usb0.img
+                  -device qemu-xhci
+                  -device usb-storage,drive=usb0
                   -vga std
                   -qmp unix:/tmp/qmp.sock,server,nowait
                   -drive id=vd0,if=none,format=raw,file=target/vdisk0.img)
@@ -85,8 +94,21 @@ case "${1:-}" in
       "[VNET] alive: MAC="
       "[VNET] dbg q1 readback:"  # the device holds exactly the frames we mapped
       "[VNET] TX: DISCOVER published+kicked"
+      "[E1K] alive:"  # registers live: MAC + link
+      "[E1K] TX: DISCOVER built+rings armed"  # honest split marker
+      "[NVME] admin qpair live"  # controller enable + queue pair
+      "[NVME] teardown: revoke_all(0) → 6 region(s)"
+      "[AHCI] ABAR live:"  # port + signature proven
+      "[AHCI] teardown: revoke_all(0) → 4 region(s)"
+      "[XHCI] "  # bring-up + port detection (register-only, fully live)
+      "[ACPI] directory walk"  # HPET/MADT/MCFG located
+      "[HPET] block @"  # the live counter
+      "[MADT] LAPIC entries="  # parsed
+      "[MCFG] ECAM base"  # parsed
+      "[KBD2] negotiated scancode set 2, ack="  # the real 0xF0/0x02 exchange
+      "[KBD2] scancode"  # the QMP round trip
+      "[E1K] teardown: revoke_all(0) → 4 region(s)"
       "[GFX] VBE 640x480x32 linear"  # the mode engaged
-      "[KBD] scancode 0x000000000000001e"  # QMP 'a' made it through the i8042
       "[RTC] 2026-"  # the MC146818 read the host clock
       "[VNET] teardown: revoke_all(0) → 8 region(s)"
     )
@@ -136,7 +158,7 @@ if [ "$MODE" = "verify" ]; then
   # timeout (the keyboard poll spins for the injected key).
   QEMU_TIMEOUT=60
   if [ "${1:-}" = "--verify-q35" ]; then
-    QEMU_TIMEOUT=130
+    QEMU_TIMEOUT=240
     rm -f /tmp/qmp.sock /tmp/screen.ppm
     touch "$LOG"
     (python3 "$(dirname "$0")/scripts/qmp_drive.py" "$LOG" >/tmp/qmp-drive.log 2>&1 &)
@@ -225,14 +247,20 @@ grep -qF "(virtio-blk) → dom 0 ok (broker assigned)" "$LOG" || { echo "VERIFY 
       grep -qF "[IOMMU] dma-drivers=0 (fail-closed: no broker)" "$LOG" || { echo "VERIFY FAIL: dma-drivers must be 0 on the negative lane"; ok=0; }
       ;;
   esac
-  if [ "$ok" = 1 ]; then
-    if [ "${1:-}" = "--verify-q35" ]; then
-      # Pixel-level proof of the GFX driver (must come AFTER ok=1 is
-      # final): what QMP captured has to match the pattern drawn.
-      if ! python3 "$(dirname "$0")/scripts/check_screen.py" /tmp/screen.ppm; then
-        ok=0
-      fi
+  # Lane-specific markers (EXTRA_GREPS from the lane block) — the
+  # loop was MISSING until now: the array had been dead code and the
+  # lane's own markers were never actually enforced. Integrity fix.
+  for g in "${EXTRA_GREPS[@]}"; do
+    grep -qF "$g" "$LOG" || { echo "VERIFY FAIL: missing lane marker: $g"; ok=0; }
+  done
+  if [ "${1:-}" = "--verify-q35" ] && [ "$ok" = 1 ]; then
+    # Pixel-level proof of the GFX driver: what QMP captured has to
+    # match the pattern drawn (weight it into the verdict honestly).
+    if ! python3 "$(dirname "$0")/scripts/check_screen.py" /tmp/screen.ppm; then
+      ok=0
     fi
+  fi
+  if [ "$ok" = 1 ]; then
     echo "BOOT VERIFY: PASS"
   else
     echo "BOOT VERIFY: FAIL"
