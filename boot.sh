@@ -101,13 +101,14 @@ case "${1:-}" in
       "[AHCI] ABAR live:"  # port + signature proven
       "[AHCI] teardown: revoke_all(0) → 4 region(s)"
       "[XHCI] "  # bring-up + port detection (register-only, fully live)
+      "[XTRB] No-Op command:"  # the TRB machinery (command ring + event ring)
       "[ACPI] directory walk"  # HPET/MADT/MCFG located
       "[HPET] block @"  # the live counter
       "[MADT] LAPIC entries="  # parsed
       "[MCFG] ECAM base"  # parsed
       "[KBD2] negotiated scancode set 2, ack="  # the real 0xF0/0x02 exchange
       "[KBD2] scancode"  # the QMP round trip
-      "[EXT2] mount gated: READ after IDENTIFY completes as a no-op"  # the honest split
+      "[EXT2] mount gated: the second AHCI command reads a STALE FIS"  # the honest split
       "[E1K] teardown: revoke_all(0) → 4 region(s)"
       "[GFX] VBE 640x480x32 linear"  # the mode engaged
       "[RTC] 2026-"  # the MC146818 read the host clock

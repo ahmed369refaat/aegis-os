@@ -105,21 +105,63 @@ code path — completes instantly as a no-op: TFD=0x50, no data
 transfer, no D2H FIS. This gates the ext2 first slice (the parser and
 the host-built image are done and in the tree).
 
-### The device-DMA cluster (the one open investigation)
+### The device-DMA cluster (root-caused to QEMU, guest side proven complete)
 
-Three devices — virtio-net (00:03.0), e1000 (00:04.0), NVMe — program
-identically to the working ones, the IOMMU state is written by the
-same broker code path, yet their data-plane DMA never happens: the
-device consumes a descriptor (e1000 TDH advanced; virtio-net kick
-dispatches per trace) but there are ZERO `vtd_dmar_translate` events
-and zero fault reports for those BDFs, and no packet/data lands. The
-order-swap experiment (e1000 before virtio-blk) rules out
-first-device-wins. **AHCI on the same lane, same broker, same domain
-completes IDENTIFY with 512 bytes of DMA** — so the IOMMU
-programming is correct and the cluster is device-specific (likely a
-QEMU device/IOMMU-attachment path for those models). Evidence: boot
-logs with register readbacks, descriptor dumps, QMP packet captures,
-and vtd traces.
+Three drivers — virtio-net, e1000, NVMe (data plane) — program
+identically to the working ones but their device DMA never happens.
+This session closed every guest-side hypothesis:
+
+1. **A real VT-d bug was found and fixed first**: the context entry's
+   high word carried the domain id in bits 0-15. QEMU 10 decodes the
+   walk depth as `2 + (hi & 7)` and the domain id as `(hi >> 8) & 0xffff`
+   (hw/i386/intel_iommu_internal.h). Our layout made QEMU read
+   AW = DID & 7 — a three-level walk over our four-level SLPT — the
+   measured `slpte permission error (iova=0x1187000, level=0x2,
+   slpte=0x0)` fault — and DID = 0, so every domain-selective IOTLB
+   invalidation matched nothing. Fixed: `context_entry_hi = (did << 8) | 2`.
+   After the fix the boot's `[CTX ] dump:` marker proves every
+   context entry reads `hi=0x102` (DID=1, AW=2), and the devices that
+   translate at all now translate correctly.
+2. **The context table is provably complete** (the `[CTX ] dump:`
+   marker dumps entries 0x10/0x18/0x20/0x28/0x30/0xF8 as the hardware
+   sees them) and every driver's frames are broker-mapped before use.
+3. **What remains is a QEMU device-class quirk, isolated by
+   experiment**: virtio-blk, NVMe (admin fetch) and AHCI always emit
+   `vtd_dmar_translate` events and their DMA lands; virtio-net, e1000
+   and xHCI never emit a single translate or fault event no matter
+   what — swapping the QEMU cmdline order moves the failures with the
+   *devices*, not the slots (e1000 failed as 00:04.0 and again as
+   00:02.0; virtio-blk worked in both places); detaching the e1000's
+   netdev changes nothing; the order-swap of kernel driver steps
+   changes nothing. A zero-filled DMA read explains the e1000's exact
+   symptom set (TDH advances, no DD writeback, no packet — a zero
+   command has no EOP and no RS; QEMU's e1000.c:640-727), and the
+   empty packet capture confirms no egress. The per-device
+   address-space attach inside this QEMU build is the remaining
+   suspect — beyond kernel control, fully documented.
+
+### The AHCI second-command no-op (block-layer open item, sharpened)
+
+The first command on a fresh port (IDENTIFY DEVICE) completes with
+512 bytes of PRDT DMA. QEMU's own AHCI trace (`handle_cmd_fis_dump`)
+shows the second command's handle_cmd reading a **STALE FIS** — the
+IDENTIFY's `27 80 EC` bytes where the READ's `27 80 25 40` was
+written — and later CI writes vanish between the kernel and QEMU
+(7 issued, 2 logged). A TFD busy-wait before each issue (QEMU's
+busy-skip at ahci.c:1317) and port interrupt-status clearing were
+both added and did not change it; the FRE=0 rule for CLB/FB
+programming was found and fixed earlier. The cmd-table mapping under
+the IOMMU serves cached bytes in this build — the ext2 first slice
+(image builder + full parser in the tree) stays gated on it.
+
+### xHCI second slice: the TRB machinery (honest negative)
+
+`xhci_cmdring_step` re-brings the controller up with fresh frames,
+programs an event ring + ERST + interrupter 0, enqueues a No-Op
+command TRB and rings doorbell 0. The doorbell write lands; **CRCR
+does not advance and no event TRB appears** — the command-ring DMA
+never happens, the same never-translate signature as the NICs above.
+The register-level bring-up (previous slice) remains fully live.
 
 ### Gate integrity note (fixed this session)
 

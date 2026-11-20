@@ -120,10 +120,19 @@ pub const fn context_entry(slpt_root_pa: u64, _did: u16) -> u64 {
     ENTRY_P | (0b10 << 2) | (slpt_root_pa & ADDR_MASK)
 }
 
-/// High word of a context entry: just the 16-bit domain id.
+/// High word of a context entry: DID at bits 8-23 and **AW = 2 at
+/// bits 0-2**. QEMU decodes the walk depth as `2 + (hi & 7)` (and
+/// DID as `(hi >> 8) & 0xffff`): with DID riding the low bits QEMU
+/// read AW = DID & 7 — a three-level walk over our four-level tree,
+/// the measured `slpte permission error (level=0x2, slpte=0x0)` on
+/// virtio-net/e1000/NVMe — while virtio-blk/AHCI survived on their
+/// context-cache entries from the init proof, whose hand-written
+/// context entry carried a correct AW. The mis-placed DID also made
+/// every domain-selective IOTLB invalidation match nothing (QEMU
+/// saw DID 0), so unmapped pages could stay cached. Both fixed here.
 #[must_use]
 pub const fn context_entry_hi(did: u16) -> u64 {
-    did as u64 & 0xFFFF
+    ((did as u64) << 8) | 2
 }
 
 /// Second-level leaf PTE for a 4 KiB page.
@@ -841,7 +850,11 @@ mod tests {
             0b10 << 2,
             "TT=0b10 (QEMU's 4-level walk selector)"
         );
-        assert_eq!(context_entry_hi(5), 5);
+        assert_eq!(
+            context_entry_hi(5),
+            (5 << 8) | 2,
+            "DID at bits 8-23, AW=2 (the 4-level walk) in the high word"
+        );
         // SLPT leaves: P, W per direction, frame address.
         assert_eq!(slpte_leaf(0x7000, false), 0x7001);
         assert_eq!(slpte_leaf(0x7000, true), 0x7003);
@@ -954,7 +967,12 @@ mod tests {
         let (lo, hi) = vtd.context_entry_of(0, (0x03, 0));
         assert_eq!(lo & 1, 1);
         assert_eq!(lo & ADDR_MASK, vtd.dom_slpt[0].unwrap());
-        assert_eq!(hi & 0xFFFF, 1, "DIDs are 1-based (dom 0 → DID 1)");
+        assert_eq!(
+            (hi >> 8) & 0xFFFF,
+            1,
+            "DIDs are 1-based (dom 0 → DID 1), at QEMU's bits 8-23"
+        );
+        assert_eq!(hi & 7, 2, "AW=2: QEMU walks 2+(hi&7)=4 levels");
         // The context table frame came from the budget.
         assert_eq!(vtd.tables_used(), 4, "root + IQ + ctx table + SLPT root");
         // Wrong segment: refused.

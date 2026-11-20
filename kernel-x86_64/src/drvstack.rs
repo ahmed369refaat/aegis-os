@@ -68,6 +68,7 @@ pub fn driver_stack_step<const N: usize>(
                 nvme_step(k, pool, out, &mut broker, &inv);
                 ahci_step(k, pool, out, &mut broker, &inv);
                 xhci_step(k, pool, out, &mut broker, &inv);
+                xhci_cmdring_step(k, pool, out, &mut broker, &inv);
                 acpi_hpet_step(out, dir_pa);
                 gfx_step(out, &inv);
                 ps2_step(out);
@@ -942,6 +943,46 @@ fn pci_step(
             }
         }
     }
+
+    // Dump the context table as the hardware sees it (guest-side
+    // ground truth for the device-DMA investigation).
+    {
+        let root = crate::memops::read_u64(broker.prot().root_pa());
+        if root & 1 != 0 {
+            let ct = root & 0x000F_FFFF_FFFF_F000;
+            let dfns: [u64; 6] = [0x10, 0x18, 0x20, 0x28, 0x30, 0xF8];
+            let v0 = crate::memops::read_u64(ct + dfns[0] * 16 + 8);
+            let v1 = crate::memops::read_u64(ct + dfns[1] * 16 + 8);
+            let v2 = crate::memops::read_u64(ct + dfns[2] * 16 + 8);
+            let v3 = crate::memops::read_u64(ct + dfns[3] * 16 + 8);
+            let v4 = crate::memops::read_u64(ct + dfns[4] * 16 + 8);
+            let v5 = crate::memops::read_u64(ct + dfns[5] * 16 + 8);
+            let mut b0 = [0u8; 18];
+            let mut b1 = [0u8; 18];
+            let mut b2 = [0u8; 18];
+            let mut b3 = [0u8; 18];
+            let mut b4 = [0u8; 18];
+            let mut b5 = [0u8; 18];
+            line(
+                out,
+                &[
+                    "[CTX ] dump: 0x10 hi=0x",
+                    strutil::hex(v0, &mut b0),
+                    " 0x18 hi=0x",
+                    strutil::hex(v1, &mut b1),
+                    " 0x20 hi=0x",
+                    strutil::hex(v2, &mut b2),
+                    " 0x28 hi=0x",
+                    strutil::hex(v3, &mut b3),
+                    " 0x30 hi=0x",
+                    strutil::hex(v4, &mut b4),
+                    " 0xF8 hi=0x",
+                    strutil::hex(v5, &mut b5),
+                ],
+            );
+        }
+    }
+
     inv
 }
 
@@ -3318,10 +3359,17 @@ fn ahci_read_dma(abar: u64, clb: u64, ctba: u64, buf: u64, lba: u64) -> bool {
     crate::memops::write_u64(ctba + 0x80, buf);
     crate::memops::write_u32(ctba + 0x88, 511);
     crate::memops::write_u32(ctba + 0x8C, 0);
-    // Clear the port's accumulated interrupt-status bits before
-    // issuing (Linux's ahci does this): an uncleared D2H-FIS-received
-    // bit gates QEMU's next command into a no-op (measured).
-    w32(0x100 + 0x10, 0xFFFF_FFFF);
+    // QEMU's handle_cmd silently SKIPS the command when the IDE
+    // engine still reports BSY/DRQ (the tail of the previous PIO
+    // command — measured: CI stays set, no FIS, no data; ahci.c:1317
+    // "Engine currently busy, try again later"). Wait TFD clean first.
+    let mut spins = 0u64;
+    while r32(0x100 + 0x20) & 0x88 != 0 && spins < 8_000_000 {
+        spins += 1;
+    }
+    if r32(0x100 + 0x20) & 0x88 != 0 {
+        return false; // engine stuck busy — honest failure
+    }
     w32(0x100 + 0x38, 1); // CI bit 0
     let mut spins = 0u64;
     while r32(0x100 + 0x38) & 1 != 0 && spins < 10_000_000 {
@@ -3357,7 +3405,7 @@ fn ext2_over_ahci(out: &mut dyn FnMut(&str), abar: u64, clb: u64, ctba: u64, fis
         line(
             out,
             &[
-                "[EXT2] mount gated: READ after IDENTIFY completes as a no-op on this QEMU build (TFD=0x50, no PRDT transfer, no D2H FIS — the second-command open item, drivers.md)",
+                "[EXT2] mount gated: the second AHCI command reads a STALE FIS (QEMU trace: handle_cmd dumps the IDENTIFY FIS 27-80-EC where the READ FIS 27-80-25-40 was written) and later CI writes vanish; the cmd-table mapping under the IOMMU serves cached bytes — the second-command open item, drivers.md",
             ],
         );
         line(
@@ -3478,4 +3526,144 @@ fn ext2_over_ahci(out: &mut dyn FnMut(&str), abar: u64, clb: u64, ctba: u64, fis
         ],
     );
     let _ = hs;
+}
+
+// ── xHCI TRB machinery (item 12, second slice): event ring + the
+// No-Op command — the command-ring doorbell, CRCR advance, and the
+// completion event are exactly what device enumeration rides on ──
+
+/// Issue a No-Op command TRB on the command ring + doorbell 0, then
+/// read back CRCR (the dequeue pointer advances only if the
+/// controller DMAs the TRB) and the event-ring head.
+#[cfg(not(test))]
+fn xhci_cmdring_step<const N: usize>(
+    k: &mut aegis_os::Kernel<N>,
+    pool: &mut FramePool<N>,
+    out: &mut dyn FnMut(&str),
+    broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
+    inv: &crate::pci::Inventory,
+) {
+    use aegis_os::dma::{DmaDir, DmaVerdict};
+
+    let Some(dev) = inv.find_by(0x1B36, 0x0C) else {
+        line(out, &["[XTRB] no xHCI — skipping"]);
+        return;
+    };
+    if matches!(broker.verdict(), DmaVerdict::Absent { .. }) {
+        line(out, &["[XTRB] broker verdict absent — refusing"]);
+        return;
+    }
+    let Some(base) = crate::pci::mem_bar_base(dev, 0) else {
+        line(out, &["[XTRB] BAR0 unresolved — refusing"]);
+        return;
+    };
+    let caplen = u64::from(crate::virtio::read_u8_pa(base));
+    let op = base + caplen;
+    // The xHCI bring-up slice (xhci_step) already ran: RUN is on,
+    // DCBAAP/CRCR point at ITS frames — which were freed+scrubbed at
+    // its teardown! Re-bring-up with fresh frames here.
+    crate::memops::write_u32(op, 0); // !RUN
+    let mut spins = 0u64;
+    while crate::memops::read_u32(op + 4) & 1 == 0 && spins < 4_000_000 {
+        spins += 1;
+    }
+    crate::memops::write_u32(op, 2); // HCRST
+    let mut spins = 0u64;
+    while crate::memops::read_u32(op + 4) & (1 << 11) != 0 && spins < 8_000_000 {
+        spins += 1;
+    }
+    let dboff = u64::from(crate::memops::read_u32(base + 0x14) & 0xFFFF);
+    let rtsoff = u64::from(crate::memops::read_u32(base + 0x18));
+
+    // Frames: DCBAA, command ring, event ring, ERST (segment table).
+    let mut frames = [0u64; 4];
+    for slot in frames.iter_mut() {
+        match pool.alloc_for(&mut k.frames, XHCI_OWNER) {
+            Ok(pa) => *slot = pa,
+            Err(_) => {
+                line(out, &["[XTRB] pool exhausted — refusing"]);
+                return;
+            }
+        }
+    }
+    let [dcbaa, cmdring, evring, erst] = frames;
+    for &pa in frames.iter() {
+        if broker
+            .map_region(0, pa, 4096, DmaDir::Bidirectional)
+            .is_err()
+        {
+            line(out, &["[XTRB] broker refused a frame — refusing"]);
+            return;
+        }
+    }
+    // ERST entry 0: the event-ring segment (64 TRBs).
+    crate::memops::write_u64(erst, evring);
+    crate::memops::write_u64(erst + 8, 64);
+
+    crate::memops::write_u64(op + 0x30, dcbaa); // DCBAAP
+    crate::memops::write_u32(op + 0x38, 1); // MaxSlotsEn (one slot is plenty)
+    crate::memops::write_u64(op + 0x18, cmdring | 1); // CRCR + cycle
+                                                      // Interrupter 0: ERSTSZ=1, ERSTBA, ERDP.
+    let intr = base + rtsoff + 0x20;
+    crate::memops::write_u32(intr + 0x28, 1); // ERSTSZ... see note: IMAN/IMOD/ERSTSZ offsets
+    crate::memops::write_u64(intr + 0x10, erst); // ERSTBA
+    crate::memops::write_u64(intr + 0x18, evring); // ERDP (segment 0)
+    crate::memops::write_u32(op, 1); // RUN
+    let mut spins = 0u64;
+    while crate::memops::read_u32(op + 4) & 1 != 0 && spins < 8_000_000 {
+        spins += 1;
+    }
+    let crcr0 = crate::memops::read_u64(op + 0x18) & 0xFFFF_FFF0;
+
+    // No-Op command TRB at slot 0: type=8 (bits 10-15 of dword 3),
+    // cycle bit set to match CRCR's RCS=1.
+    crate::memops::write_u64(cmdring, 0);
+    crate::memops::write_u64(cmdring + 8, 0);
+    crate::memops::write_u64(cmdring + 16, 0);
+    crate::memops::write_u32(cmdring + 12, (8u32 << 10) | 1);
+    crate::memops::write_u32(base + dboff, 0); // doorbell 0 = command ring
+
+    let mut spins = 0u64;
+    let mut crcr1 = crate::memops::read_u64(op + 0x18) & 0xFFFF_FFF0;
+    while crcr1 == crcr0 && spins < 10_000_000 {
+        crcr1 = crate::memops::read_u64(op + 0x18) & 0xFFFF_FFF0;
+        spins += 1;
+    }
+    let advanced = crcr1 != crcr0;
+    // Event ring: a command-completion event TRB (type=33) at slot 0?
+    let ev0 = crate::memops::read_u64(evring);
+    let ev3 = crate::memops::read_u64(evring + 12);
+    let ev_type = (crate::memops::read_u32(evring + 12) >> 10) & 0x3F;
+    let _ = (ev0, ev3);
+    let mut ha = [0u8; 20];
+    let mut hb = [0u8; 20];
+    let mut hc = [0u8; 20];
+    line(
+        out,
+        &[
+            "[XTRB] No-Op command: doorbell 0 rung → CRCR advanced=",
+            if advanced { "yes" } else { "no" },
+            " (0x",
+            strutil::hex(crcr0, &mut [0u8; 18]),
+            " → 0x",
+            strutil::hex(crcr1, &mut [0u8; 18]),
+            "); event-ring slot0 type=",
+            strutil::dec(u64::from(ev_type), &mut ha),
+            " (33 = command completion)",
+        ],
+    );
+    let _ = (hb, hc);
+    let revoked = broker.revoke_all(0);
+    let mut nr = [0u8; 20];
+    line(
+        out,
+        &[
+            "[XTRB] teardown: revoke_all(0) → ",
+            strutil::dec(revoked as u64, &mut nr),
+            " region(s) unmapped; frames return scrubbed",
+        ],
+    );
+    for &pa in frames.iter() {
+        let _ = pool.free(&mut k.frames, pa, XHCI_OWNER);
+    }
 }
