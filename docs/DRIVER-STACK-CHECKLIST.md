@@ -42,7 +42,7 @@ no IPC = drain + clean exit); syscall surface never exceeds
 
 | # | Item | Phase | Done means (proof form) | Status |
 |---|---|---|---|---|
-| 1 | IOMMU/VT-d | 0 | ADR-0013 accepted; DMAR walker + DRHD init + map/unmap + QI round-trip proven by host tests + q35-lane markers; **enforcement proof (unmapped DMA faults) deferred to the first real DMA device (Phase 2 virtio-blk) — recorded as an honest split, not silently claimed** | ADR-0013 proposed (Phase-0 GO 2026-11-20); code = PRs 0.2–0.5 |
+| 1 | IOMMU/VT-d | 0 | ADR-0013 accepted; DMAR walker + DRHD init + map/unmap + QI round-trip proven by host tests + q35-lane markers; **enforcement proof (unmapped DMA faults) deferred to the first real DMA device (Phase 2 virtio-blk) — recorded as an honest split, not silently claimed** | PR 0.1 + 0.2 landed: ADR-0013 proposed (GO 2026-11-20); `src/dmar.rs` parser + `src/dma.rs` DmaProt/broker host-proven (49 tests, QEMU layout pinned, fuzz + truncation properties, unsafe Δ 0); walker wiring into the kernel + markers = PRs 0.3–0.5 |
 | 2 | PCI/PCIe enumeration | 1 | CF8/CFC type-0/1 walks + ECAM via MCFG (MCFG verified present on q35); capability walk; BAR sizing with overflow checks; boot marker prints the tree; fuzz on config headers | not started |
 | 3 | Interrupt broker | 1 | Kernel-owned vector table above 0x30 (existing 32..=47 + 48 wiring reused, not rebuilt); IOAPIC routing design (IOAPIC 0xFEC00000 inside the LAPIC window GiB); MSI/MSI-X allocation as capabilities; own ADR (owns the IRTE decision — lane runs intremap=off until then, per ADR-0013) | not started |
 | 4 | Driver model | 1 | DriverDomain lifecycle probe→claim (Device capability, GRANT-gated)→start→degrade→teardown; monitor telemetry feeds (incl. broker faults); markers for each transition | not started |
@@ -65,11 +65,12 @@ capacity self-test.
 
 ## Verified baseline facts this plan stands on (2026-11-20, a915e60)
 
-- Tests: `cargo test` 251 passed (233 lib + 6/10/2 integration);
-  `cargo test -p aegis-kernel` 88 passed; `cargo fmt --check` clean;
+- Tests at Phase-0 PR 0.2: `cargo test` 300 passed (282 lib — incl.
+  49 IOMMU-policy tests — + 6/10/2 integration); `cargo test -p
+  aegis-kernel` 88 passed; `cargo fmt --check` clean;
   `scripts/check_unsafe.sh` PASS **89/89** — the pin at a915e60 is 89
   (ADR-0012 moved it 78→89; the growth-needs-an-ADR invariant is
-  intact).
+  intact, and PR 0.2 held the ratchet at 89 with zero unsafe).
 - `boot.sh --verify`: PASS on pc (QEMU 10.0.13, TCG, 48 s, clean
   poweroff). The unmodified kernel also boots `-M q35 -device
   intel-iommu` to the full M1 PASS and powers off (~22 s) — the

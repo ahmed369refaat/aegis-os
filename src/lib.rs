@@ -41,6 +41,8 @@
 
 pub mod buddy;
 pub mod capability;
+pub mod dma;
+pub mod dmar;
 pub mod domain;
 pub mod fd;
 pub mod ipc;
@@ -677,6 +679,10 @@ pub mod prelude {
     pub use crate::capability::{
         CapError, CapHandle, Capability, CapabilityTable, Resource, Rights, MAX_CAPABILITIES,
     };
+    pub use crate::dma::{
+        DmaBroker, DmaDir, DmaError, DmaProt, DmaQuotas, DmaVerdict, MAX_DMA_REGIONS,
+    };
+    pub use crate::dmar::{Dmar, DmarError, Drhd, MAX_TABLE_BYTES};
     pub use crate::domain::{Decision, Domain, DomainState};
     pub use crate::fd::{FdEntry, FdError, FdTable, FdTarget, MAX_FDS};
     pub use crate::net::{
