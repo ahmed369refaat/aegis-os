@@ -469,7 +469,10 @@ fn parse_scope(s: &[u8], so: usize, slen: usize) -> Result<(DeviceScope, usize),
         return Err(DmarError::BadScopeLen(0));
     }
     let scope_len = s[so + 1] as usize;
-    if scope_len < 8 || scope_len % 2 != 0 || so.checked_add(scope_len).map_or(true, |e| e > slen) {
+    if scope_len < 8
+        || !scope_len.is_multiple_of(2)
+        || so.checked_add(scope_len).is_none_or(|e| e > slen)
+    {
         return Err(DmarError::BadScopeLen(s[so + 1]));
     }
     let hops = (scope_len - 6) / 2;
@@ -477,9 +480,9 @@ fn parse_scope(s: &[u8], so: usize, slen: usize) -> Result<(DeviceScope, usize),
         return Err(DmarError::BadPathLen(s[so + 1]));
     }
     let mut path = [(0u8, 0u8); MAX_SCOPE_PATH];
-    for h in 0..hops {
+    for (h, slot) in path.iter_mut().enumerate().take(hops) {
         let off = so + 6 + h * 2;
-        path[h] = (s[off], s[off + 1]);
+        *slot = (s[off], s[off + 1]);
     }
     Ok((
         DeviceScope {
@@ -1236,7 +1239,7 @@ mod tests {
 
     #[test]
     fn rsdp_truncation_prefixes_never_parse() {
-        let mut r = vec![0u8; 20];
+        let mut r = [0u8; 20];
         r[..8].copy_from_slice(b"RSD PTR ");
         r[9..15].copy_from_slice(b"BOCHS ");
         r[16..20].copy_from_slice(&0x07FE_23C9u32.to_le_bytes());

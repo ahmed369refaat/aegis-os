@@ -223,7 +223,6 @@ pub struct Caps {
 }
 
 /// Validate the raw register reads against the D4/D3 requirements.
-#[must_use]
 pub fn validate_caps(ver: u32, cap: u64, ecap: u64, haw_bits: u8) -> Result<Caps, VtdError> {
     if ver == 0 {
         return Err(VtdError::BadVer(ver));
@@ -324,7 +323,6 @@ impl Vtd {
     /// frames (root table, invalidation queue). No MMIO — host tests
     /// construct units this way and drive the whole `DmaProt` surface
     /// over plain buffers.
-    #[must_use]
     pub fn plan(
         dmar: &Dmar,
         ver: u32,

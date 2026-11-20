@@ -45,8 +45,6 @@ use aegis_os::dma::DmaVerdict;
 pub const MAX_PCI_DEVICES: usize = 32;
 /// Capability-list entries recorded per device (bounded walk).
 pub const MAX_CAPS: usize = 8;
-/// The dword count we look at per function (the first 64 bytes:
-/// header + BARs + the capability pointer).
 
 /// The I/O ports (fixed by the PCI spec).
 pub const CFG_ADDR_PORT: u16 = 0xCF8;
@@ -141,7 +139,7 @@ pub fn bar_size_from_mem64_mask(mask: u64) -> Option<u64> {
         return None;
     }
     let addr = mask & 0xFFFF_FFFF_FFFF_FFF0; // type/prefetch bits
-    Some(addr & addr.wrapping_neg()) // lowest set bit
+    Some(addr.isolate_lowest_one()) // lowest set bit
 }
 
 /// 32-bit memory-BAR size from a probe mask, same lowest-set-bit
@@ -153,7 +151,7 @@ pub fn bar_size_from_mem32_mask(mask: u32) -> Option<u64> {
         return None;
     }
     let addr = mask & 0xFFFF_FFF0; // type/prefetch bits
-    Some(u64::from(addr & addr.wrapping_neg()))
+    Some(u64::from(addr.isolate_lowest_one()))
 }
 
 /// I/O BAR size from a probe mask (16-bit port space, lowest-set-bit
@@ -167,7 +165,7 @@ pub fn bar_size_from_io_mask(mask: u32) -> Option<u64> {
     if addr == 0 {
         return None;
     }
-    Some(u64::from(addr & addr.wrapping_neg()))
+    Some(u64::from(addr.isolate_lowest_one()))
 }
 
 // ── the device record ──
@@ -201,7 +199,6 @@ pub enum ClaimError {
     RmrrCovered,
 }
 
-#[must_use]
 pub fn check_claim(
     dev: &PciDev,
     verdict: DmaVerdict,

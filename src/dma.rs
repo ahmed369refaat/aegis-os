@@ -278,10 +278,10 @@ impl<P: DmaProt> DmaBroker<P> {
             DmaVerdict::Available { haw_bits, .. } => haw_bits,
             DmaVerdict::Absent { .. } => return Err(DmaError::Absent),
         };
-        if len == 0 || len % DMA_PAGE != 0 {
+        if len == 0 || !len.is_multiple_of(DMA_PAGE) {
             return Err(DmaError::BadLength(len));
         }
-        if base % DMA_PAGE != 0 {
+        if !base.is_multiple_of(DMA_PAGE) {
             return Err(DmaError::NotAligned(base));
         }
         // The run must fit inside the host address width. u64 math
@@ -938,7 +938,7 @@ mod tests {
     fn fuzz_decode_random_bytes_never_panic() {
         // Seeded LCG: any 64 bytes decode to a message or a typed
         // error — and a decoding message re-encodes identically.
-        let mut state = 0xAD5_0DEAD_13u64;
+        let mut state = 0xAD_50_DE_AD_13u64;
         let mut next = move || {
             state = state
                 .wrapping_mul(6364136223846793005)

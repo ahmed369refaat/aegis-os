@@ -178,8 +178,7 @@ fn print_found(
             if dmar.intr_remap { "on" } else { "off" },
         ],
     );
-    let mut idx = 0usize;
-    for s in &dmar.structures[..dmar.structure_count] {
+    for (idx, s) in dmar.structures[..dmar.structure_count].iter().enumerate() {
         let mut hb = [0u8; 18];
         let mut hl = [0u8; 18];
         let mut nb = [0u8; 20];
@@ -232,7 +231,6 @@ fn print_found(
                 );
             }
         }
-        idx += 1;
     }
 }
 
@@ -417,15 +415,12 @@ fn proof_step<const N: usize>(
             " → dom 0",
         ],
     );
-    match unit.assign_device(0, 0, bus, (dev, func)) {
-        Err(e) => {
-            line(
-                out,
-                &["[IOMMU] vtd: hw-proof: assign refused (", hw_code(&e), ")"],
-            );
-            return;
-        }
-        Ok(()) => {}
+    if let Err(e) = unit.assign_device(0, 0, bus, (dev, func)) {
+        line(
+            out,
+            &["[IOMMU] vtd: hw-proof: assign refused (", hw_code(&e), ")"],
+        );
+        return;
     }
     let (lo, hi) = unit.context_entry_of(bus, (dev, func));
     let mut h1 = [0u8; 18];
@@ -1053,6 +1048,12 @@ pub const VBLK_OWNER: u32 = 43;
 
 /// One virtqueue ring set + the request control page, all mapped
 /// through the broker BEFORE the device sees any address.
+//
+// `notify_off` and `cookies` are the per-queue bookkeeping the
+// per-region teardown + used-ring validation rework (driver-stack
+// phases 3/4) consumes; today's teardown goes through revoke_all,
+// which does not read them.
+#[allow(dead_code)]
 struct VblkQueue {
     qsize: u16,
     notify_off: u16,
@@ -1101,7 +1102,7 @@ fn poll_used(q: &VblkQueue, want: u16) -> Option<u32> {
         let used = v::used_idx(q.used_pa);
         if used == want {
             let id = v::used_entry_id(q.used_pa, want.wrapping_sub(1) % q.qsize);
-            return Some(id as u32);
+            return Some(id);
         }
         if spins >= budget {
             return None;
@@ -1126,7 +1127,7 @@ fn virtio_step<const N: usize>(
     inv: &crate::pci::Inventory,
 ) {
     use crate::virtio as v;
-    use aegis_os::dma::{DmaDir, DmaProt, DmaVerdict};
+    use aegis_os::dma::{DmaDir, DmaVerdict};
 
     let Some(dev) = inv
         .find_by(0x1AF4, 0x01)
@@ -1283,15 +1284,12 @@ fn virtio_step<const N: usize>(
     // ── read sector 0 (device WRITES the data page through the IOMMU) ──
     let want = submit(&queue, data_pa, 0, v::BLK_T_IN);
     mmio.notify(0, notify_off);
-    match poll_used(&queue, want) {
-        None => {
-            line(
-                out,
-                &["[VBLK] read sector 0: DID NOT COMPLETE — refusing to continue"],
-            );
-            return;
-        }
-        Some(_) => {}
+    if poll_used(&queue, want).is_none() {
+        line(
+            out,
+            &["[VBLK] read sector 0: DID NOT COMPLETE — refusing to continue"],
+        );
+        return;
     }
     let st = v::read_u8_pa(ctrl_pa + 512);
     let data0 = crate::memops::read_u64(data_pa);
@@ -1427,6 +1425,11 @@ pub const VNET_OWNER: u32 = 44;
 
 /// One queue's ring set, broker-mapped before the device ever sees
 /// an address (the same discipline as virtio-blk).
+//
+// `notify_off` and `desc_pa` are the per-queue bookkeeping the
+// per-region teardown rework (driver-stack phases 3/4) consumes;
+// today's teardown goes through revoke_all, which does not read them.
+#[allow(dead_code)]
 struct NetQueue {
     qsize: u16,
     notify_off: u16,
@@ -1787,7 +1790,6 @@ fn net_step<const N: usize>(
         let mut h2 = [0u8; 18];
         let mut h3 = [0u8; 18];
         let mut h4 = [0u8; 18];
-        let mut h8 = [0u8; 18];
         let d0 = crate::memops::read_u64(tx_desc);
         let d1 = crate::memops::read_u64(tx_desc + 8);
         line(
@@ -1977,11 +1979,11 @@ fn gfx_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
     for y in 0..64u64 {
         for x in 0..640u64 {
             let rgb = if x < 213 {
-                0xFF_0000
+                0xFF0000
             } else if x < 427 {
-                0x00_FF00
+                0x00FF00
             } else {
-                0x0000_FF
+                0x0000FF
             };
             put(x, y, rgb);
         }
@@ -2166,7 +2168,7 @@ fn rtc_step(out: &mut dyn FnMut(&str)) {
     let (day, mon) = (bcd(r(0x07)), bcd(r(0x08)));
     let (year, cent) = (bcd(r(0x09)), bcd(r(0x32)));
     let (mut hs, mut ms, mut ss) = ([0u8; 20], [0u8; 20], [0u8; 20]);
-    let (mut ds, mut mos, mut ys, mut cs) = ([0u8; 20], [0u8; 20], [0u8; 20], [0u8; 20]);
+    let (mut ds, mut mos, mut cs) = ([0u8; 20], [0u8; 20], [0u8; 20]);
     line(
         out,
         &[
@@ -2196,7 +2198,6 @@ fn rtc_step(out: &mut dyn FnMut(&str)) {
 pub const E1K_OWNER: u32 = 45;
 
 // e1000 MMIO register offsets (8254x; QEMU's e1000 implements these).
-const E1K_CTRL: u64 = 0x0000;
 const E1K_STATUS: u64 = 0x0008;
 const E1K_RCTL: u64 = 0x0100;
 const E1K_TCTL: u64 = 0x0400;
@@ -2379,7 +2380,7 @@ fn e1k_step<const N: usize>(
     // Frames: RX ring, TX ring, one buffer each (e1000 is 32-bit
     // DMA — pool frames below 4 GiB satisfy it).
     let mut frames = [0u64; 4];
-    for (i, slot) in frames.iter_mut().enumerate() {
+    for slot in frames.iter_mut() {
         match pool.alloc_for(&mut k.frames, E1K_OWNER) {
             Ok(pa) => *slot = pa,
             Err(_) => {
@@ -2651,13 +2652,10 @@ const NVME_ASQ: u64 = 0x28;
 const NVME_ACQ: u64 = 0x30;
 const NVME_DBA: u64 = 0x1000;
 
-/// One admin/I-O submission-queue entry (64 bytes; the fields this
-/// driver uses).
+/// The command-specific half of an SQE (the fields this driver fills;
+/// the submit path zeroes the rest).
 #[cfg(not(test))]
-fn nvme_submit(
-    sq: u64,
-    tail: &mut u16,
-    db_pa: u64,
+struct NvmeCmd {
     cid: u32,
     opcode: u32,
     nsid: u32,
@@ -2665,18 +2663,23 @@ fn nvme_submit(
     cdw10: u32,
     cdw11: u32,
     cdw12: u32,
-) {
+}
+
+/// One admin/I-O submission-queue entry (64 bytes; the fields this
+/// driver uses).
+#[cfg(not(test))]
+fn nvme_submit(sq: u64, tail: &mut u16, db_pa: u64, cmd: &NvmeCmd) {
     let e = sq + u64::from(*tail) * 64;
     crate::memops::write_u64(e, 0);
-    crate::memops::write_u32(e, opcode | (cid << 16)); // cdw0
-    crate::memops::write_u32(e + 4, nsid);
+    crate::memops::write_u32(e, cmd.opcode | (cmd.cid << 16)); // cdw0
+    crate::memops::write_u32(e + 4, cmd.nsid);
     // NOTE: prp1 as split u32 halves made no difference — the 8-byte
     // store is not the cause (see the prp1 anomaly note in drivers.md).
-    crate::memops::write_u64(e + 16, prp1);
+    crate::memops::write_u64(e + 16, cmd.prp1);
     crate::memops::write_u64(e + 24, 0);
-    crate::memops::write_u32(e + 40, cdw10);
-    crate::memops::write_u32(e + 44, cdw11);
-    crate::memops::write_u32(e + 48, cdw12);
+    crate::memops::write_u32(e + 40, cmd.cdw10);
+    crate::memops::write_u32(e + 44, cmd.cdw11);
+    crate::memops::write_u32(e + 48, cmd.cdw12);
     *tail = tail.wrapping_add(1) & 15;
     crate::memops::write_u32(db_pa, u32::from(*tail));
 }
@@ -2733,7 +2736,7 @@ fn nvme_step<const N: usize>(
     crate::pci::enable_bus_master(dev);
     let cap = crate::memops::read_u64(mmio + NVME_CAP);
     let vs = crate::memops::read_u32(mmio + NVME_VS);
-    let dstrd = ((cap >> 32) & 0xF) as u64;
+    let dstrd = (cap >> 32) & 0xF;
     let stride = 4u64 << dstrd;
     let mut h = [0u8; 20];
     let mut h2 = [0u8; 20];
@@ -2741,7 +2744,7 @@ fn nvme_step<const N: usize>(
         out,
         &[
             "[NVME] CAP: MQES=",
-            strutil::dec((cap & 0xFFFF) as u64 + 1, &mut h),
+            strutil::dec((cap & 0xFFFF) + 1, &mut h),
             " DSTRD=",
             strutil::dec(dstrd, &mut h2),
         ],
@@ -2761,7 +2764,7 @@ fn nvme_step<const N: usize>(
 
     // Frames: admin SQ/CQ, I/O SQ/CQ, two data pages.
     let mut frames = [0u64; 6];
-    for (i, slot) in frames.iter_mut().enumerate() {
+    for slot in frames.iter_mut() {
         match pool.alloc_for(&mut k.frames, NVME_OWNER) {
             Ok(pa) => *slot = pa,
             Err(_) => {
@@ -2835,7 +2838,20 @@ fn nvme_step<const N: usize>(
 
     // IDENTIFY CONTROLLER: cdw10=1, PRP1=data1.
     cid += 1;
-    nvme_submit(asq, &mut a_tail, admin_sq_db, cid, 0x06, 0, data1, 1, 0, 0);
+    nvme_submit(
+        asq,
+        &mut a_tail,
+        admin_sq_db,
+        &NvmeCmd {
+            cid,
+            opcode: 0x06,
+            nsid: 0,
+            prp1: data1,
+            cdw10: 1,
+            cdw11: 0,
+            cdw12: 0,
+        },
+    );
     {
         let mut e0 = [0u8; 18];
         let mut e2 = [0u8; 18];
@@ -2966,13 +2982,15 @@ fn nvme_step<const N: usize>(
         asq,
         &mut a_tail,
         admin_sq_db,
-        cid,
-        0x05,
-        0,
-        iocq,
-        (15 << 16) | 1,
-        1,
-        0,
+        &NvmeCmd {
+            cid,
+            opcode: 0x05,
+            nsid: 0,
+            prp1: iocq,
+            cdw10: (15 << 16) | 1,
+            cdw11: 1,
+            cdw12: 0,
+        },
     );
     let Some((_, st)) = nvme_poll(acq, a_head, 1, 10_000_000) else {
         // Dump the first four CQE dw3 words (phase+status): where
@@ -3047,13 +3065,15 @@ fn nvme_step<const N: usize>(
         asq,
         &mut a_tail,
         admin_sq_db,
-        cid,
-        0x01,
-        0,
-        iosq,
-        (15 << 16) | 1,
-        1 | (1 << 16),
-        0,
+        &NvmeCmd {
+            cid,
+            opcode: 0x01,
+            nsid: 0,
+            prp1: iosq,
+            cdw10: (15 << 16) | 1,
+            cdw11: 1 | (1 << 16),
+            cdw12: 0,
+        },
     );
     let Some((_, st)) = nvme_poll(acq, a_head, 1, 10_000_000) else {
         line(out, &["[NVME] CreateIoSq did not complete — refusing"]);
@@ -3103,9 +3123,21 @@ fn nvme_step<const N: usize>(
 
     // READ LBA 0 of namespace 1 (1 sector) into data2.
     let io_sq_db = mmio + NVME_DBA + 2 * stride;
-    let io_cq_db = mmio + NVME_DBA + 3 * stride;
     let mut io_tail = 0u16;
-    nvme_submit(iosq, &mut io_tail, io_sq_db, 1, 0x02, 1, data2, 0, 0, 0);
+    nvme_submit(
+        iosq,
+        &mut io_tail,
+        io_sq_db,
+        &NvmeCmd {
+            cid: 1,
+            opcode: 0x02,
+            nsid: 1,
+            prp1: data2,
+            cdw10: 0,
+            cdw11: 0,
+            cdw12: 0,
+        },
+    );
     let Some((_, st)) = nvme_poll(iocq, 0, 1, 100_000_000) else {
         line(out, &["[NVME] read LBA0 did not complete — refusing"]);
         let revoked = broker.revoke_all(0);
@@ -3212,7 +3244,6 @@ fn ahci_step<const N: usize>(
     let w32 = |off: u64, v: u32| crate::memops::write_u32(abar + off, v);
     let ghc_ae = r32(0x04) & 0x8000_0000 != 0;
     let pi = r32(0x0C);
-    let port = abar + 0x100; // port 0
     let sig = r32(0x100 + 0x24);
     let mut h = [0u8; 18];
     let mut h2 = [0u8; 18];
@@ -3265,7 +3296,7 @@ fn ahci_step<const N: usize>(
     while r32(0x100 + 0x20) & 0x88 != 0 && spins < 4_000_000 {
         spins += 1;
     } // TFD.BSY|DRQ
-    w32(0x100 + 0x00, clb as u32);
+    w32(0x100, clb as u32);
     w32(0x100 + 0x04, 0);
     w32(0x100 + 0x08, fis as u32);
     w32(0x100 + 0x0C, 0);
@@ -3616,11 +3647,7 @@ fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) {
         if space == 0 && block != 0 {
             let caps = crate::memops::read_u64(block);
             let period = caps >> 32; // femtoseconds
-            let freq = if period > 0 {
-                1_000_000_000_000_000u64 / period
-            } else {
-                0
-            };
+            let freq = 1_000_000_000_000_000u64.checked_div(period).unwrap_or(0);
             // Enable the main counter, read it twice.
             let cfg = crate::memops::read_u64(block + 0x10);
             crate::memops::write_u64(block + 0x10, cfg | 1);
@@ -3667,7 +3694,6 @@ pub const EXT2_OWNER: u32 = 49;
 /// the command never completes.
 #[cfg(not(test))]
 fn ahci_read_dma(abar: u64, clb: u64, ctba: u64, buf: u64, lba: u64) -> bool {
-    let port = abar + 0x100;
     let r32 = |off: u64| crate::memops::read_u32(abar + off);
     let w32 = |off: u64, v: u32| crate::memops::write_u32(abar + off, v);
     // Header 0: CFL=5, PRDTL=1, table at ctba.
@@ -3762,7 +3788,6 @@ fn ext2_over_ahci(out: &mut dyn FnMut(&str), abar: u64, clb: u64, ctba: u64, fis
         );
         return;
     }
-    let mut hs = [0u8; 18];
     line(
         out,
         &[
@@ -3844,7 +3869,7 @@ fn ext2_over_ahci(out: &mut dyn FnMut(&str), abar: u64, clb: u64, ctba: u64, fis
         line(out, &["[EXT2] file-data read failed — refusing"]);
         return;
     }
-    let n = u64::from(fsize).min(24) as u64;
+    let n = u64::from(fsize).min(24);
     let mut content = [0u8; 24];
     for i in 0..n {
         let b = crate::virtio::read_u8_pa(data + i);
@@ -3863,7 +3888,6 @@ fn ext2_over_ahci(out: &mut dyn FnMut(&str), abar: u64, clb: u64, ctba: u64, fis
             "\" ← read-only ext2 over AHCI",
         ],
     );
-    let _ = hs;
 }
 
 // ── xHCI TRB machinery (item 12, second slice): event ring + the

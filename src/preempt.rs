@@ -88,6 +88,13 @@ impl Preemptor {
 }
 
 #[cfg(test)]
+impl Preemptor {
+    fn slice_ticks_dbg(&self) -> u64 {
+        self.slice_ticks
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -97,7 +104,7 @@ mod tests {
     /// so the very next pick is the other domain.
     #[test]
     fn a_spinning_domain_cannot_starve_a_second() {
-        let mut p = Preemptor::new(1);
+        let p = Preemptor::new(1);
         let mut s = Scheduler::new();
         s.register(1, 0).unwrap(); // the spinner
         s.register(2, 0).unwrap(); // the well-behaved domain
@@ -134,7 +141,7 @@ mod tests {
 
     #[test]
     fn a_solo_domain_is_never_switched() {
-        let mut p = Preemptor::new(1);
+        let p = Preemptor::new(1);
         let mut s = Scheduler::new();
         s.register(7, 0).unwrap();
         for _ in 0..50 {
@@ -144,7 +151,7 @@ mod tests {
 
     #[test]
     fn equal_nice_domains_alternate_exactly() {
-        let mut p = Preemptor::new(1);
+        let p = Preemptor::new(1);
         let mut s = Scheduler::new();
         s.register(20, 0).unwrap();
         s.register(21, 0).unwrap();
@@ -164,7 +171,7 @@ mod tests {
 
     #[test]
     fn exit_hands_over_to_the_survivor_then_reports_empty() {
-        let mut p = Preemptor::new(1);
+        let p = Preemptor::new(1);
         let mut s = Scheduler::new();
         s.register(20, 0).unwrap();
         s.register(21, 0).unwrap();
@@ -179,7 +186,7 @@ mod tests {
 
     #[test]
     fn nicer_domain_earns_proportionally_more_slices() {
-        let mut p = Preemptor::new(1);
+        let p = Preemptor::new(1);
         let mut s = Scheduler::new();
         s.register(1, -5).unwrap(); // weight 3121
         s.register(2, 5).unwrap(); // weight 335
@@ -205,7 +212,7 @@ mod tests {
     /// and the unregistered current is never charged.
     #[test]
     fn unregistered_current_falls_back_to_the_pick_without_charging() {
-        let mut p = Preemptor::new(4);
+        let p = Preemptor::new(4);
         let mut s = Scheduler::new();
         s.register(5, 0).unwrap();
         // Domain 9 was never registered (it just exited / a bookkeeping
@@ -227,7 +234,7 @@ mod tests {
     /// preemptor.
     #[test]
     fn heavy_domain_progress_guarantee_survives_the_preemptor() {
-        let mut p = Preemptor::new(1);
+        let p = Preemptor::new(1);
         let mut s = Scheduler::new();
         s.register(1, 19).unwrap(); // weight 15 — the heaviest nice
         s.register(2, 19).unwrap();
@@ -242,12 +249,5 @@ mod tests {
             }
         }
         assert!(ran_2, "the heaviest-nice pair must still rotate");
-    }
-}
-
-#[cfg(test)]
-impl Preemptor {
-    fn slice_ticks_dbg(&self) -> u64 {
-        self.slice_ticks
     }
 }

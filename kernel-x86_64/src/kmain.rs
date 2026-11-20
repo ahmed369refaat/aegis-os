@@ -29,11 +29,11 @@
 //! 10. (was the terminal act; now step 13) —
 //! 11. telemetry drain (the supervisor stand-in, M2-W2),
 //! 12. the M2-W2 preemption proof (ADR-0012): the LAPIC timer goes live
-//!    and two ring-3 domains — a pure spinner that never calls a
-//!    syscall and a writer — run interleaved under interrupt-driven
-//!    CFS; the writer must finish while the spinner is still runnable,
+//!     and two ring-3 domains — a pure spinner that never calls a
+//!     syscall and a writer — run interleaved under interrupt-driven
+//!     CFS; the writer must finish while the spinner is still runnable,
 //! 13. the terminal act: write through a fresh stack's guard page — the
-//!    #PF is diagnosed, the marker printed, and QEMU powers off.
+//!     #PF is diagnosed, the marker printed, and QEMU powers off.
 //!
 //! No allocation: log lines are `&str` fragments plus stack-buffer numbers.
 
@@ -48,7 +48,9 @@ static RING3_ROGUE: &[u8] = include_bytes!("../blob/ring3-rogue.bin");
 /// page-crossing write that must return -EFAULT (ADR-0007 §1).
 static RING3_EDGE: &[u8] = include_bytes!("../blob/ring3-edge.bin");
 /// The M2-W2 preemption blob: the spinner (mode 0) and the writer
-/// (mode 1) of the starvation-freedom proof (ADR-0012).
+/// (mode 1) of the starvation-freedom proof (ADR-0012). Only the
+/// `preempt-demo` build reads it (see preempt_demo below).
+#[cfg(feature = "preempt-demo")]
 static RING3_PREEMPT: &[u8] = include_bytes!("../blob/ring3-preempt.bin");
 /// The exact message the hello blob writes from ring-3 (its length is
 /// baked into the blob's `mov edx, 26`).

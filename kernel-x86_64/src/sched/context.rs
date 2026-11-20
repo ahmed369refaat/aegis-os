@@ -530,8 +530,8 @@ mod entry {
             rsp: 0,
             ss: 0,
         };
-        for i in 0..15 {
-            ctx.gprs[i] = super::gpr_at(frame, i);
+        for (i, gpr) in ctx.gprs.iter_mut().enumerate() {
+            *gpr = super::gpr_at(frame, i);
         }
         // SAFETY: the frame is CPL3 (the tick asserted it before
         // calling): the CPU physically pushed the user rsp/ss two and
@@ -549,8 +549,8 @@ mod entry {
     /// returning to the interrupted one. The frame rewrite IS the
     /// context switch; CR3 and USER_RUN are the caller's half.
     pub fn unpark_into_frame(frame: &mut ExceptionFrame, ctx: &ParkedContext) {
-        for i in 0..15 {
-            super::set_gpr_at(frame, i, ctx.gprs[i]);
+        for (i, gpr) in ctx.gprs.iter().enumerate() {
+            super::set_gpr_at(frame, i, *gpr);
         }
         frame.rip = ctx.rip;
         frame.cs = ctx.cs;

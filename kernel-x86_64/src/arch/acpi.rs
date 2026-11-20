@@ -51,6 +51,13 @@ pub const RSDP_SIG: &[u8; 8] = b"RSD PTR ";
 
 /// What the discovery walk concluded. `Copy` end to end so callers can
 /// log it without borrowing the scratch buffer.
+//
+// The Found variant dwarfs the others (it carries the parsed RSDP and
+// DMAR). The kernel has no allocator, so boxing the payload is not an
+// option; the enum is returned exactly once per boot into a known
+// stack slot and copied out for logging, so the padding cost is paid
+// once and deliberately.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Discovery {
     /// Full success: RSDP + directory + a parsed DMAR.
@@ -269,7 +276,7 @@ pub fn discover_boot(buf: &mut [u8]) -> Discovery {
     let ebda = ebda_base(EBDA_SEG_PTR);
     // A zero/garbage BDA word means "no EBDA to scan": the ROM window
     // is the standard fallback and SeaBIOS q35 keeps the RSDP there.
-    let ebda_window = if ebda >= 0x400 && ebda < 0xA_0000 {
+    let ebda_window = if (0x400..0xA_0000).contains(&ebda) {
         Some((ebda, EBDA_SCAN_LEN))
     } else {
         None

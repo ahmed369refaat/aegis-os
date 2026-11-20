@@ -178,14 +178,14 @@ pub fn parse_virtio_caps(read_cfg: &mut dyn FnMut(u8) -> u32) -> Option<VirtioCa
 /// Read the u16 at `pa` (must be 2-aligned).
 #[must_use]
 pub fn read_u16_pa(pa: u64) -> u16 {
-    debug_assert!(pa % 2 == 0);
+    debug_assert!(pa.is_multiple_of(2));
     let w = memops::read_u32(pa & !3);
     ((w >> (8 * (pa & 2))) & 0xFFFF) as u16
 }
 
 /// Write the u16 at `pa` (must be 2-aligned) via u32 read-modify-write.
 pub fn write_u16_pa(pa: u64, v: u16) {
-    debug_assert!(pa % 2 == 0);
+    debug_assert!(pa.is_multiple_of(2));
     let base = pa & !3;
     let shift = 8 * (pa & 2);
     let w = memops::read_u32(base);
