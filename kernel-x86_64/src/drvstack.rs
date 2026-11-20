@@ -2670,6 +2670,8 @@ fn nvme_submit(
     crate::memops::write_u64(e, 0);
     crate::memops::write_u32(e, opcode | (cid << 16)); // cdw0
     crate::memops::write_u32(e + 4, nsid);
+    // NOTE: prp1 as split u32 halves made no difference — the 8-byte
+    // store is not the cause (see the prp1 anomaly note in drivers.md).
     crate::memops::write_u64(e + 16, prp1);
     crate::memops::write_u64(e + 24, 0);
     crate::memops::write_u32(e + 40, cdw10);
@@ -2686,9 +2688,12 @@ fn nvme_poll(cq: u64, head: u16, phase: u16, budget: u64) -> Option<(u32, u32)> 
     let slot = cq + u64::from(head) * 16;
     let mut spins = 0u64;
     loop {
-        // DW3 (offset 12): status u16 at bytes 12-13, P at bit 0 —
-        // QEMU nvme.c:1517 writes cqe.status = (status << 1) | phase.
-        let pw = crate::memops::read_u32(slot + 12);
+        // DW3 (offset 12) = [SQHD(15:0) | P+SF(31:16)] — the phase
+        // lives at bit 16 (byte 14), NOT bit 0: QEMU nvme.c:1517
+        // writes cqe.status = (status << 1) | phase as the le16 at
+        // bytes 14-15. Reading bit 0 mistakes SQHD's LSB for the
+        // phase (it matched slot 0 by accident: SQHD=1).
+        let pw = crate::memops::read_u32(slot + 12) >> 16;
         if (pw & 1) == u32::from(phase) {
             return Some((crate::memops::read_u32(slot), (pw >> 1) & 0xFF));
         }
@@ -2776,11 +2781,42 @@ fn nvme_step<const N: usize>(
         }
     }
 
-    // Enable the controller with the admin queue pair (16 entries).
+    // Full reset cycle. SeaBIOS drives the NVMe boot disk BEFORE us
+    // and leaves the controller ENABLED with ITS admin queue state
+    // (its own tail/head, its own CQ phase). A driver that wants
+    // slot-0 queues disables first (NVMe 1.4 §3.1.5: queue registers
+    // are writable only while CC.EN=0/CSTS.RDY=0), reprograms, then
+    // enables with the entry-size bits set. Without the cycle our
+    // doorbell(1) goes BACKWARDS from SeaBIOS's tail and the CQEs
+    // post to stale slots — measured: the Identify data page stayed
+    // zero while the pci_nvme trace showed completions.
+    crate::memops::write_u32(mmio + NVME_CC, 0); // EN=0 → reset
+    let mut spins = 0u64;
+    while crate::memops::read_u32(mmio + NVME_CSTS) & 1 != 0 && spins < 50_000_000 {
+        spins += 1;
+    }
+    if crate::memops::read_u32(mmio + NVME_CSTS) & 1 != 0 {
+        line(
+            out,
+            &["[NVME] controller did not disable (CSTS.RDY stuck) — refusing"],
+        );
+        let revoked = broker.revoke_all(0);
+        let _ = revoked;
+        for &pa in frames.iter() {
+            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
+        }
+        return;
+    }
+    // Admin queue pair (16 entries) + CC: EN | MPS=0 (4 KiB pages) |
+    // IOSQES=6 (64 B SQ entries, bits 20-23) | IOCQES=4 (16 B CQ
+    // entries, bits 16-19). 0x460001 had the two nibbles SWAPPED
+    // (IOSQES=4/IOCQES=6) and every executed command read prp1=0 —
+    // the data writes landed at PA 0 (measured: the serial bytes
+    // AEGI at PA 0).
     crate::memops::write_u32(mmio + NVME_AQA, (15 << 16) | 15);
     crate::memops::write_u64(mmio + NVME_ASQ, asq);
     crate::memops::write_u64(mmio + NVME_ACQ, acq);
-    crate::memops::write_u32(mmio + NVME_CC, 1); // EN
+    crate::memops::write_u32(mmio + NVME_CC, 0x0064_0001);
     let mut spins = 0u64;
     while crate::memops::read_u32(mmio + NVME_CSTS) & 1 == 0 && spins < 50_000_000 {
         spins += 1;
@@ -2800,18 +2836,63 @@ fn nvme_step<const N: usize>(
     // IDENTIFY CONTROLLER: cdw10=1, PRP1=data1.
     cid += 1;
     nvme_submit(asq, &mut a_tail, admin_sq_db, cid, 0x06, 0, data1, 1, 0, 0);
+    {
+        let mut e0 = [0u8; 18];
+        let mut e2 = [0u8; 18];
+        let mut qa = [0u8; 18];
+        let mut rb = [0u8; 18];
+        line(
+            out,
+            &[
+                "[NVME] dbg entry: asq=0x",
+                strutil::hex(asq, &mut e0),
+                " entry[0](cdw0|prp1)=0x",
+                strutil::hex(
+                    (u64::from(crate::memops::read_u32(asq)) << 32)
+                        | crate::memops::read_u64(asq + 16),
+                    &mut e2,
+                ),
+                " asq_reg=0x",
+                strutil::hex(crate::memops::read_u64(mmio + NVME_ASQ), &mut qa),
+                " aqa_reg=0x",
+                strutil::hex(u64::from(crate::memops::read_u32(mmio + NVME_AQA)), &mut rb),
+            ],
+        );
+    }
     let Some((_, st)) = nvme_poll(acq, a_head, 1, 10_000_000) else {
         // Registers + queue pair proven above; the completion needs
         // the controller's DMA — the same no-translation signature
         // as the e1000/virtio-net cluster (open; see drivers.md).
+        // Give the post bottom-half a long second window, then dump
+        // everything: the queue registers as the device sees them, the
+        // identify data page (did the 4 KiB PRP write land?), and the
+        // CQE's first two dwords.
+        let mut spins2 = 0u64;
+        while crate::memops::read_u32(acq + 12) == 0 && spins2 < 5_000_000 {
+            spins2 += 1;
+        }
         line(
             out,
             &[
-                "[NVME] dbg acq: dw0=0x",
+                "[NVME] dbg: asq_reg=0x",
+                strutil::hex(crate::memops::read_u64(mmio + NVME_ASQ), &mut [0u8; 18]),
+                " (mine 0x",
+                strutil::hex(asq, &mut [0u8; 18]),
+                ") acq_reg=0x",
+                strutil::hex(crate::memops::read_u64(mmio + NVME_ACQ), &mut [0u8; 18]),
+                " (mine 0x",
+                strutil::hex(acq, &mut [0u8; 18]),
+                ") data1[0..8]=0x",
+                strutil::hex(crate::memops::read_u64(data1), &mut [0u8; 18]),
+                " cqe0=0x",
                 strutil::hex(u64::from(crate::memops::read_u32(acq)), &mut [0u8; 18]),
-                " dw3=0x",
+                " cqe3=0x",
                 strutil::hex(u64::from(crate::memops::read_u32(acq + 12)), &mut [0u8; 18]),
-                " — Identify submitted, no completion (open item)",
+                (if crate::memops::read_u64(data1) != 0 {
+                    " — data ARRIVED; completion timing open"
+                } else {
+                    " — no data either"
+                }),
             ],
         );
         let revoked = broker.revoke_all(0);
@@ -2851,6 +2932,20 @@ fn nvme_step<const N: usize>(
         snb[i as usize] = if (0x20..0x7F).contains(&b) { b } else { b' ' };
     }
     let nn = crate::memops::read_u32(data1 + 516);
+    let mut dp = [0u8; 18];
+    let mut d0 = [0u8; 18];
+    let mut z0 = [0u8; 18];
+    line(
+        out,
+        &[
+            "[NVME] dbg identify: data1_pa=0x",
+            strutil::hex(data1, &mut dp),
+            " data1[0..8]=0x",
+            strutil::hex(crate::memops::read_u64(data1), &mut d0),
+            " PA0[0..8]=0x",
+            strutil::hex(crate::memops::read_u64(0x0), &mut z0),
+        ],
+    );
     line(
         out,
         &[
@@ -2863,6 +2958,10 @@ fn nvme_step<const N: usize>(
 
     // Create I/O CQ (QID 1, 16 entries) then I/O SQ (QID 1 → CQ 1).
     cid += 1;
+    // cdw11 = PC (bit 0: physically-contiguous single page) | IV=0
+    // (interrupt vector lives at bits 16+, and interrupts stay off —
+    // the old 1<<17 was read as IV=2 and the device rejected the
+    // queue: err_invalid_create_cq_vector).
     nvme_submit(
         asq,
         &mut a_tail,
@@ -2872,11 +2971,47 @@ fn nvme_step<const N: usize>(
         0,
         iocq,
         (15 << 16) | 1,
-        1 << 17,
+        1,
         0,
     );
     let Some((_, st)) = nvme_poll(acq, a_head, 1, 10_000_000) else {
+        // Dump the first four CQE dw3 words (phase+status): where
+        // did the completion actually land?
+        let mut b0 = [0u8; 18];
+        let mut b1 = [0u8; 18];
+        let mut b2 = [0u8; 18];
+        let mut b3 = [0u8; 18];
+        let s0 = strutil::hex(u64::from(crate::memops::read_u32(acq + 12)), &mut b0);
+        let s1 = strutil::hex(u64::from(crate::memops::read_u32(acq + 28)), &mut b1);
+        let s2 = strutil::hex(u64::from(crate::memops::read_u32(acq + 44)), &mut b2);
+        let s3 = strutil::hex(u64::from(crate::memops::read_u32(acq + 60)), &mut b3);
+        line(
+            out,
+            &[
+                "[NVME] dbg acq dw3: s0=0x",
+                s0,
+                " s1=0x",
+                s1,
+                " s2=0x",
+                s2,
+                " s3=0x",
+                s3,
+            ],
+        );
         line(out, &["[NVME] CreateIoCq did not complete — refusing"]);
+        let revoked = broker.revoke_all(0);
+        let mut nr = [0u8; 20];
+        line(
+            out,
+            &[
+                "[NVME] teardown: revoke_all(0) → ",
+                strutil::dec(revoked as u64, &mut nr),
+                " region(s) unmapped; frames return scrubbed",
+            ],
+        );
+        for &pa in frames.iter() {
+            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
+        }
         return;
     };
     a_head = a_head.wrapping_add(1) & 15;
@@ -2891,9 +3026,23 @@ fn nvme_step<const N: usize>(
                 " — refusing",
             ],
         );
+        let revoked = broker.revoke_all(0);
+        let mut nr = [0u8; 20];
+        line(
+            out,
+            &[
+                "[NVME] teardown: revoke_all(0) → ",
+                strutil::dec(revoked as u64, &mut nr),
+                " region(s) unmapped; frames return scrubbed",
+            ],
+        );
+        for &pa in frames.iter() {
+            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
+        }
         return;
     }
     cid += 1;
+    // cdw11 = PC (bit 0) | CQID=1 (bits 16+: the SQ routes to CQ 1).
     nvme_submit(
         asq,
         &mut a_tail,
@@ -2903,11 +3052,24 @@ fn nvme_step<const N: usize>(
         0,
         iosq,
         (15 << 16) | 1,
-        (1 << 17) | (1 << 16),
+        1 | (1 << 16),
         0,
     );
     let Some((_, st)) = nvme_poll(acq, a_head, 1, 10_000_000) else {
         line(out, &["[NVME] CreateIoSq did not complete — refusing"]);
+        let revoked = broker.revoke_all(0);
+        let mut nr = [0u8; 20];
+        line(
+            out,
+            &[
+                "[NVME] teardown: revoke_all(0) → ",
+                strutil::dec(revoked as u64, &mut nr),
+                " region(s) unmapped; frames return scrubbed",
+            ],
+        );
+        for &pa in frames.iter() {
+            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
+        }
         return;
     };
     a_head = a_head.wrapping_add(1) & 15;
@@ -2922,6 +3084,19 @@ fn nvme_step<const N: usize>(
                 " — refusing",
             ],
         );
+        let revoked = broker.revoke_all(0);
+        let mut nr = [0u8; 20];
+        line(
+            out,
+            &[
+                "[NVME] teardown: revoke_all(0) → ",
+                strutil::dec(revoked as u64, &mut nr),
+                " region(s) unmapped; frames return scrubbed",
+            ],
+        );
+        for &pa in frames.iter() {
+            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
+        }
         return;
     }
     line(out, &["[NVME] I/O qpair QID1 created (CQ+SQ)"]);
@@ -2933,6 +3108,19 @@ fn nvme_step<const N: usize>(
     nvme_submit(iosq, &mut io_tail, io_sq_db, 1, 0x02, 1, data2, 0, 0, 0);
     let Some((_, st)) = nvme_poll(iocq, 0, 1, 100_000_000) else {
         line(out, &["[NVME] read LBA0 did not complete — refusing"]);
+        let revoked = broker.revoke_all(0);
+        let mut nr = [0u8; 20];
+        line(
+            out,
+            &[
+                "[NVME] teardown: revoke_all(0) → ",
+                strutil::dec(revoked as u64, &mut nr),
+                " region(s) unmapped; frames return scrubbed",
+            ],
+        );
+        for &pa in frames.iter() {
+            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
+        }
         return;
     };
     if st != 0 {
@@ -2945,6 +3133,19 @@ fn nvme_step<const N: usize>(
                 " — refusing",
             ],
         );
+        let revoked = broker.revoke_all(0);
+        let mut nr = [0u8; 20];
+        line(
+            out,
+            &[
+                "[NVME] teardown: revoke_all(0) → ",
+                strutil::dec(revoked as u64, &mut nr),
+                " region(s) unmapped; frames return scrubbed",
+            ],
+        );
+        for &pa in frames.iter() {
+            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
+        }
         return;
     }
     let d0 = crate::memops::read_u64(data2);

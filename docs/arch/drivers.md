@@ -153,20 +153,62 @@ it back); the marker now reports the event TRB type.
 
 ### Still open (with the evidence trail)
 
-- **NVMe Identify completion**: the CQE stays all-zero (the new
-  `[NVME] dbg acq:` marker dumps dw0/dw3). The admin queue pair is
-  live (CSTS.RDY=1) and the SQ doorbell is written at BAR+0x1000
-  (DSTRD=0), yet `enable=nvme*` traces show **no** controller
-  activity at submit time — the doorbell write appears not to reach
-  the device. Next step: trace the MMIO write arrival at the BAR.
+- **NVMe — one precisely-bounded anomaly: the device reads prp1 as 0**.
+
+  The 2026-11-20 session took the NVMe from "no completion" to a
+  nearly-complete admin flow. Four driver bugs fixed, each verified
+  against QEMU source:
+
+  1. **No reset cycle** — SeaBIOS drives the NVMe boot disk before us
+     and leaves the controller ENABLED with its own queue state. Our
+     old CC=1 write had no disable phase (queue registers are
+     writable only at CC.EN=0, NVMe 1.4 §3.1.5) and no entry-size
+     bits. Now: CC=0 → CSTS.RDY=0 → AQA/ASQ/ACQ → CC=0x0064_0001
+     (EN | IOSQES=6 | IOCQES=4 — note 0x46_0001 has the nibbles
+     swapped and behaves differently downstream).
+  2. **cdw11 bit layouts** for Create I/O CQ/SQ — IV lives at bits
+     16+ (our 1<<17 was read as IV=2 → err_invalid_create_cq_vector),
+     PC is bit 0, CQID (SQ) bits 16+. Corrected: cdw11 = 1 (CQ) and
+     1 | (1<<16) (SQ).
+  3. **The CQE phase bit is bit 16** (byte 14, the P/SF u16 — QEMU
+     nvme.c:1517 `cqe.status = (status << 1) | phase`), NOT bit 0 of
+     the dword at +12: that byte is SQHD, whose LSB matched our
+     phase==1 check **by accident** on slot 0. Fixed poll.
+  4. **The nvme-ns device** — the lane's `-device nvme,drive=` is the
+     pre-QEMU-8 form: the controller comes up with **zero
+     namespaces** (NN=0 in the identify). Now `-device nvme-ns`.
+
+  What works now: full reset cycle, Identify executes (cdw0/nsid/
+  cdw10 all arrive), CreateIoCq/CreateIoSq execute, the CQE poll
+  machinery is correct, and refusal paths tear down (revoke + scrub
+  + free, the lane greps are count-agnostic).
+
+  The remaining anomaly, with the evidence: **every executed command
+  reads prp1 (SQ entry bytes 16-23) as 0** — the Identify's 4 KiB
+  data write lands at **PA 0** (proven: the serial bytes "AEGI…"
+  from serial=AEGISN1 read back at PA 0), and the CreateIoCq now
+  refuses with SC=2 (invalid field — a CQ at address 0). Meanwhile
+  bytes 0-7 and 40-43 of the SAME entry arrive correctly, our
+  kernel's same-PA readback shows the written prp1, the vtd trace
+  shows the SQ fetch translating iova 0x1189000 → gpa 0x1189000
+  (identity), and the split-32-bit-store experiment made no
+  difference. Eliminated: entry layout/size (NVME_SQES=6), doorbell
+  offsets, register values (ASQ/AQA read back correct), u64 stores,
+  the phase poll. Next experiment: the no-IOMMU control (an NVMe on
+  the q35-neg lane pattern) to isolate the vtd pass-through fast
+  path (`vtd_pt_enable_fast_path` fires at our doorbell).
 - **AHCI second command** (gates the ext2 first slice): the first
   command on a fresh port (IDENTIFY) completes with 512 bytes of
-  PRDT DMA; QEMU's own `handle_cmd_fis_dump` then shows the second
-  command reading a **STALE FIS** — the IDENTIFY's `27 80 EC` bytes
-  where the READ's `27 80 25 40` was written — and later CI writes
-  vanish between the kernel and QEMU (7 issued, 2 logged). A TFD
-  busy-wait before each issue and port IS clearing were added and
-  did not change it.
+  PRDT DMA; the second command reads a **STALE FIS** — the
+  IDENTIFY's `27 80 EC` bytes where the READ's `27 80 25 40` was
+  written — and later CI writes vanish between the kernel and QEMU
+  (7 issued, 2 logged). A TFD busy-wait before each issue and port
+  IS clearing were added and did not change it. **Retested after the
+  bus-master/context-entry fixes: the signature is unchanged.** The
+  NVMe prp1 anomaly (same session) shows devices can read SOME
+  fields of a guest-written structure and not others — the AHCI
+  stale-FIS has the same shape and should be re-examined with the
+  same trace-driven method.
 
 ### Retraction
 
