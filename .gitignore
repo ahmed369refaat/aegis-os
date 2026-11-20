@@ -3,3 +3,13 @@ Cargo.lock.bak
 *.swp
 .idea/
 .vscode/
+
+# Core dumps never belong in a repo: an ELF core embeds the crashing
+# process's memory, which includes its environment block — any credential
+# that was exported at crash time ships with it (see
+# docs/incident-core-dump.md and scripts/check-no-binaries.sh, which
+# enforces this mechanically).
+core
+core.*
+*.core
+vgcore.*
