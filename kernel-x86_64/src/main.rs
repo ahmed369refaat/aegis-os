@@ -70,6 +70,7 @@ pub mod sched;
 pub mod strutil;
 #[cfg(not(test))]
 pub mod syscall;
+pub mod virtio;
 
 /// Boot-path panic handler: print what we can over serial and halt.
 /// Panics after serial init produce a visible message; panics before it

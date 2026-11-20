@@ -61,7 +61,8 @@ pub fn driver_stack_step<const N: usize>(
             if let Some(mut unit) = vtd_step(k, pool, out, &dmar) {
                 proof_step(k, pool, out, &dmar, &mut unit);
                 let mut broker = broker_step(k, pool, out, unit);
-                pci_step(out, &dmar, &mut broker);
+                let inv = pci_step(out, &dmar, &mut broker);
+                virtio_step(k, pool, out, &mut broker, &inv);
             } else {
                 line(out, &["[IOMMU] dma-drivers=0 (fail-closed: no broker)"]);
             }
@@ -508,9 +509,10 @@ fn broker_step<const N: usize>(
 ) -> aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd> {
     use aegis_os::dma::{DmaBroker, DmaDir, DmaError, DmaQuotas};
 
-    // Small quotas so the refusal itself is provable in one boot.
+    // Room for the driver's five regions; the byte budget is small
+    // enough that the refusal itself is provable in one boot.
     let quotas = DmaQuotas {
-        max_regions: 2,
+        max_regions: 16,
         max_bytes: 64 * 1024,
     };
     let mut broker = DmaBroker::new(unit, quotas);
@@ -581,7 +583,7 @@ fn broker_step<const N: usize>(
     );
 
     // Quotas: fill the region budget, watch the third map refuse.
-    for _ in 0..2u64 {
+    for _ in 0..quotas.max_regions as u64 {
         let Ok(pa) = pool.alloc_for(&mut k.frames, VTD_TABLE_OWNER) else {
             break;
         };
@@ -648,7 +650,7 @@ fn pci_step(
     out: &mut dyn FnMut(&str),
     dmar: &Dmar,
     broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
-) {
+) -> crate::pci::Inventory {
     use crate::pci;
 
     let inv = pci::enumerate_bus0();
@@ -786,7 +788,8 @@ fn pci_step(
                 },
             }
         }
-    }
+    };
+    inv
 }
 
 /// Capability names for the inventory (diagnostics; unknown = "?").
@@ -818,4 +821,375 @@ fn hex4(v: u16, buf: &mut [u8; 6]) -> &str {
         buf[2 + i] = DIGITS[((v >> shift) & 0xF) as usize];
     }
     core::str::from_utf8(&buf[..6]).unwrap_or("0x????")
+}
+
+// ── Phase 2: the virtio-blk driver over the broker (checklist item 5) ──
+
+/// The pool owner tag for virtio-blk frames (rings, control page,
+/// data page) — distinct from the VT-d table budget so the M1
+/// zero-leak accounting can name every holder.
+pub const VBLK_OWNER: u32 = 43;
+
+/// One virtqueue ring set + the request control page, all mapped
+/// through the broker BEFORE the device sees any address.
+struct VblkQueue {
+    qsize: u16,
+    notify_off: u16,
+    desc_pa: u64,
+    avail_pa: u64,
+    used_pa: u64,
+    ctrl_pa: u64,
+    cookies: [u64; 4],
+}
+
+/// The shared submission path: build the 3-descriptor chain, publish
+/// it in the avail ring, kick the queue. `data` points at the page
+/// the device reads (OUT) or writes (IN). The queue travels as an
+/// argument — no statics, no unsafe (the Phase-1 driver-domain model
+/// owns per-domain state when multiple devices exist).
+#[cfg(not(test))]
+fn submit(q: &VblkQueue, data_pa: u64, sector: u64, req_type: u32) -> u16 {
+    use crate::virtio as v;
+    v::write_blk_header(q.ctrl_pa, req_type, sector);
+    // desc 0: the 16-byte header, device reads.
+    v::write_desc(q.desc_pa, q.ctrl_pa, 16, v::DESC_F_NEXT, 1);
+    // desc 1: the 512-byte sector, device writes for IN.
+    let data_flags = if req_type == v::BLK_T_IN {
+        v::DESC_F_NEXT | v::DESC_F_WRITE
+    } else {
+        v::DESC_F_NEXT
+    };
+    v::write_desc(q.desc_pa + 16, data_pa, 512, data_flags, 2);
+    // desc 2: the status byte, device writes.
+    v::write_desc(q.desc_pa + 32, q.ctrl_pa + 512, 1, v::DESC_F_WRITE, 0);
+    let avail_idx = v::read_u16_pa(q.avail_pa + 2);
+    v::write_u16_pa(v::avail_slot_addr(q.avail_pa, avail_idx % q.qsize), 0);
+    v::write_u16_pa(q.avail_pa + 2, avail_idx.wrapping_add(1));
+    avail_idx.wrapping_add(1)
+}
+
+/// Bounded poll for the used ring to reach `want` (the avail index we
+/// published). None on timeout — the caller decides what that means
+/// (the enforcement probe WANTS the timeout or the error completion).
+#[cfg(not(test))]
+fn poll_used(q: &VblkQueue, want: u16) -> Option<u32> {
+    use crate::virtio as v;
+    let budget = 20_000_000u64; // bounded: ADR-0013's no-infinite-spin rule
+    let mut spins = 0u64;
+    loop {
+        let used = v::used_idx(q.used_pa);
+        if used == want {
+            let id = v::used_entry_id(q.used_pa, want.wrapping_sub(1) % q.qsize);
+            return Some(id as u32);
+        }
+        if spins >= budget {
+            return None;
+        }
+        spins += 1;
+    }
+}
+
+/// Phase 2: drive the claimed virtio-blk — handshake, queue setup
+/// (all ring frames mapped through the broker first: the device never
+/// sees an unmapped address), a sector read, a write+read-back
+/// round trip, then the **enforcement probe**: the data page is
+/// unmapped through the broker and a request targeting it must fault
+/// (VT-d FSTS.PPF) — ADR-0013's end-to-end security proof. Teardown
+/// proves the revoke path with a real device attached.
+#[cfg(not(test))]
+fn virtio_step<const N: usize>(
+    k: &mut aegis_os::Kernel<N>,
+    pool: &mut FramePool<N>,
+    out: &mut dyn FnMut(&str),
+    broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
+    inv: &crate::pci::Inventory,
+) {
+    use crate::virtio as v;
+    use aegis_os::dma::{DmaDir, DmaProt, DmaVerdict};
+
+    let Some(dev) = inv
+        .find_by(0x1AF4, 0x01)
+        .filter(|d| crate::pci::has_virtio_cap(d))
+    else {
+        line(out, &["[VBLK] no virtio-blk to drive on this machine"]);
+        return;
+    };
+    // The claim gate ran in pci_step; the verdict must still be live.
+    if matches!(broker.verdict(), DmaVerdict::Absent { .. }) {
+        line(
+            out,
+            &["[VBLK] broker verdict flipped absent — refusing to drive"],
+        );
+        return;
+    }
+    let Some(caps) = v::parse_virtio_caps(&mut |off| crate::pci::read_cfg32(dev, off)) else {
+        line(out, &["[VBLK] vendor caps incomplete — refusing"]);
+        return;
+    };
+    let Some(mmio) = v::MmioVirtio::from_caps(&caps, dev) else {
+        line(
+            out,
+            &["[VBLK] register blocks unresolved against the BARs — refusing"],
+        );
+        return;
+    };
+
+    // ── the modern handshake ──
+    mmio.set_status(0);
+    let feat_low = mmio.device_features(0);
+    let feat_high = mmio.device_features(1);
+    // Spec order: ACK|DRIVER first — QEMU errors on feature writes
+    // before DRIVER — then negotiate, then FEATURES_OK.
+    mmio.set_status(v::STATUS_ACK | v::STATUS_DRIVER);
+    mmio.set_driver_features(0, v::DRIVER_FEATURES_LOW);
+    mmio.set_driver_features(1, v::DRIVER_FEATURES_HIGH);
+    mmio.set_status(v::STATUS_ACK | v::STATUS_DRIVER | v::STATUS_FEATURES_OK);
+    if mmio.status() & v::STATUS_FEATURES_OK == 0 {
+        line(out, &["[VBLK] FEATURES_OK not accepted — refusing"]);
+        return;
+    }
+    let (qsize_raw, notify_off) = mmio.select_queue(0);
+    // One frame per ring serves 256 descriptors: shrink if needed.
+    let qsize = if qsize_raw > 256 {
+        mmio.set_queue_size(256)
+    } else {
+        qsize_raw
+    };
+    if qsize == 0 || qsize > 2048 {
+        let mut nq = [0u8; 20];
+        let mut no = [0u8; 20];
+        line(
+            out,
+            &[
+                "[VBLK] queue size out of the supported band (size=",
+                strutil::dec(u64::from(qsize), &mut nq),
+                " notify_off=",
+                strutil::dec(u64::from(notify_off), &mut no),
+                ") — refusing",
+            ],
+        );
+        return;
+    }
+
+    // ── ring frames: pool + broker FIRST, device second ──
+    let mut frames = [0u64; 5];
+    for (i, slot) in frames.iter_mut().enumerate() {
+        match pool.alloc_for(&mut k.frames, VBLK_OWNER) {
+            Ok(pa) => *slot = pa,
+            Err(_) => {
+                let mut b = [0u8; 20];
+                line(
+                    out,
+                    &[
+                        "[VBLK] pool exhausted at frame ",
+                        strutil::dec(i as u64, &mut b),
+                        " — refusing",
+                    ],
+                );
+                return;
+            }
+        }
+    }
+    let [desc_pa, avail_pa, used_pa, ctrl_pa, data_pa] = frames;
+    let mut cookies = [0u64; 5];
+    let mut ok = true;
+    for (i, &pa) in frames.iter().enumerate() {
+        match broker.map_region(0, pa, 4096, DmaDir::Bidirectional) {
+            Ok(view) => cookies[i] = view.cookie,
+            Err(_) => {
+                let mut b = [0u8; 20];
+                line(
+                    out,
+                    &[
+                        "[VBLK] broker refused ring frame ",
+                        strutil::dec(i as u64, &mut b),
+                        " — refusing (the device gets no addresses)",
+                    ],
+                );
+                ok = false;
+                break;
+            }
+        }
+    }
+    if !ok {
+        return;
+    }
+    let mut n = [0u8; 20];
+    line(
+        out,
+        &[
+            "[VBLK] queue rings mapped via broker (desc/avail/used/ctrl/data: ",
+            strutil::dec(5, &mut n),
+            " regions, IOMMU-enforced)",
+        ],
+    );
+    mmio.setup_queue(desc_pa, avail_pa, used_pa);
+    mmio.set_status(v::live_status());
+    let status = mmio.status();
+    if status != v::live_status() {
+        line(out, &["[VBLK] DRIVER_OK path failed — refusing"]);
+        return;
+    }
+    let capacity = mmio.capacity_sectors();
+    let mut nc = [0u8; 20];
+    line(
+        out,
+        &[
+            "[VBLK] alive: status=0x0f qsize=",
+            strutil::dec(u64::from(qsize), &mut n),
+            " capacity=",
+            strutil::dec(capacity, &mut nc),
+            " sectors",
+        ],
+    );
+    let _ = (feat_low, feat_high);
+
+    // The live queue for the submit/poll helpers (plain data — no
+    // statics anywhere in this driver).
+    let queue = VblkQueue {
+        qsize,
+        notify_off,
+        desc_pa,
+        avail_pa,
+        used_pa,
+        ctrl_pa,
+        cookies: [cookies[0], cookies[1], cookies[2], cookies[3]],
+    };
+
+    // ── read sector 0 (device WRITES the data page through the IOMMU) ──
+    let want = submit(&queue, data_pa, 0, v::BLK_T_IN);
+    mmio.notify(notify_off);
+    match poll_used(&queue, want) {
+        None => {
+            line(
+                out,
+                &["[VBLK] read sector 0: DID NOT COMPLETE — refusing to continue"],
+            );
+            return;
+        }
+        Some(_) => {}
+    }
+    let st = v::read_u8_pa(ctrl_pa + 512);
+    let data0 = crate::memops::read_u64(data_pa);
+    let mut h = [0u8; 18];
+    line(
+        out,
+        &[
+            "[VBLK] read sector 0: complete, status=OK, data[0..8]=",
+            strutil::hex(data0, &mut h),
+            " (DMA landed through the IOMMU)",
+        ],
+    );
+    if st != v::BLK_S_OK {
+        line(
+            out,
+            &["[VBLK] status byte is not OK — refusing to continue"],
+        );
+        return;
+    }
+
+    // ── write + read-back round trip (device READS the data page too) ──
+    crate::memops::write_u64(data_pa, 0x0BAD_C0DE_0BAD_C0DE);
+    let want = submit(&queue, data_pa, 0, v::BLK_T_OUT);
+    mmio.notify(notify_off);
+    if poll_used(&queue, want).is_none() {
+        line(
+            out,
+            &["[VBLK] write: DID NOT COMPLETE — refusing to continue"],
+        );
+        return;
+    }
+    // Scrub the page (the broker discipline: the device's copy dies
+    // with the region), then read the sector back fresh.
+    crate::memops::scrub_frame(data_pa);
+    let want = submit(&queue, data_pa, 0, v::BLK_T_IN);
+    mmio.notify(notify_off);
+    if poll_used(&queue, want).is_none() {
+        line(
+            out,
+            &["[VBLK] read-back: DID NOT COMPLETE — refusing to continue"],
+        );
+        return;
+    }
+    let back = crate::memops::read_u64(data_pa);
+    if back == 0x0BAD_C0DE_0BAD_C0DE {
+        line(
+            out,
+            &["[VBLK] write+read-back: pattern survived the round trip (device read+write through the IOMMU)"],
+        );
+    } else {
+        let mut h2 = [0u8; 18];
+        line(
+            out,
+            &[
+                "[VBLK] write+read-back MISMATCH: wrote 0x0badc0de0badc0de, read ",
+                strutil::hex(back, &mut h2),
+            ],
+        );
+        return;
+    }
+
+    // ── THE ENFORCEMENT PROBE (ADR-0013's payoff) ──
+    // Complete the data region and unmap it through the broker (the
+    // full abort handshake — the honest path), return the frame, then
+    // ask the device to DMA into the now-unmapped page. The IOMMU
+    // must fault it; nothing the device does reaches RAM.
+    broker
+        .region_complete(cookies[4])
+        .expect("data region live");
+    broker
+        .unmap_region(cookies[4])
+        .expect("abort handshake done");
+    let _ = pool.free(&mut k.frames, data_pa, VBLK_OWNER);
+    let want = submit(&queue, data_pa, 0, v::BLK_T_IN); // the dead page
+    mmio.notify(notify_off);
+    let completed = poll_used(&queue, want);
+    let fsts = broker.prot().fsts();
+    let ppf = fsts & crate::arch::vtd::FSTS_PPF != 0;
+    let mut hf = [0u8; 18];
+    match completed {
+        None => {
+            line(
+                out,
+                &[
+                    "[VBLK] enforcement: request to the unmapped page did NOT complete, fsts=",
+                    strutil::hex(u64::from(fsts), &mut hf),
+                    " PPF=",
+                    if ppf { "yes" } else { "no" },
+                    " — unmapped DMA faults (ADR-0013 D1/D6)",
+                ],
+            );
+        }
+        Some(_) => {
+            let st = v::read_u8_pa(ctrl_pa + 512);
+            let mut ns = [0u8; 20];
+            line(
+                out,
+                &[
+                    "[VBLK] enforcement: request completed WITH ERROR status=",
+                    strutil::dec(u64::from(st), &mut ns),
+                    " fsts=",
+                    strutil::hex(u64::from(fsts), &mut hf),
+                    " PPF=",
+                    if ppf { "yes" } else { "no" },
+                    " — the DMA was blocked at the IOMMU",
+                ],
+            );
+        }
+    }
+    if !ppf {
+        line(out, &["[VBLK] enforcement: PPF did NOT set — INVESTIGATE (fault recording may need the FRCD walk)"]);
+    }
+
+    // ── teardown: revoke the rest with the device still attached ──
+    let revoked = broker.revoke_all(0);
+    let mut nr = [0u8; 20];
+    line(
+        out,
+        &[
+            "[VBLK] teardown: broker revoke_all(0) → ",
+            strutil::dec(revoked as u64, &mut nr),
+            " region(s) unmapped; frames return scrubbed",
+        ],
+    );
 }

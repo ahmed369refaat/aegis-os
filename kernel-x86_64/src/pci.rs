@@ -113,6 +113,10 @@ pub fn describe(vendor: u16, device: u16) -> &'static str {
 /// A sized BAR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bar {
+    /// The BAR number this register pair lives at (0..=5); a 64-bit
+    /// BAR reports its LOW slot. Virtio capabilities name BARs by
+    /// this index.
+    pub slot: u8,
     pub kind: BarKind,
     pub base: u64,
     pub size: u64,
@@ -351,6 +355,7 @@ fn size_bars(
             write(0, dev, func, bar_off(i), lo_orig);
             if let Some(size) = bar_size_from_io_mask(mask) {
                 let bar = Bar {
+                    slot: i as u8,
                     kind: BarKind::Io,
                     base: u64::from(lo_orig & 0xFFFF_FFFC),
                     size,
@@ -379,6 +384,7 @@ fn size_bars(
                 let mask = (u64::from(lo_m) & 0xFFFF_F000) | (u64::from(hi_m) << 32);
                 if let Some(size) = bar_size_from_mem64_mask(mask) {
                     let bar = Bar {
+                        slot: i as u8,
                         kind: BarKind::Mem64,
                         base: (u64::from(lo_orig) & 0xFFFF_F000) | (u64::from(hi_orig) << 32),
                         size,
@@ -394,6 +400,7 @@ fn size_bars(
                 write(0, dev, func, bar_off(i), lo_orig);
                 if let Some(size) = bar_size_from_mem32_mask(mask) {
                     let bar = Bar {
+                        slot: i as u8,
                         kind: BarKind::Mem32,
                         base: u64::from(lo_orig & 0xFFFF_F000),
                         size,
@@ -424,8 +431,13 @@ fn walk_caps(
     if !(0x40..=0xFC).contains(&cap_ptr) {
         return;
     }
+    // NOTE: capability lists are NOT sorted — QEMU's virtio devices
+    // walk DOWN (msix @ 0x98 → virtio caps @ 0x40, measured). Loop
+    // protection comes from a visited set, not pointer monotonicity.
+    let mut seen: [u8; 16] = [0; 16];
+    let mut seen_count = 0usize;
     let mut ptr = cap_ptr;
-    let mut guard = 0u8; // the list is bounded by construction anyway
+    let mut guard = 0u8;
     while ptr != 0 && d.cap_count < MAX_CAPS && guard < 48 {
         let word = read(0, dev, func, ptr);
         let id = (word & 0xFF) as u8;
@@ -433,8 +445,12 @@ fn walk_caps(
         d.cap_ids[d.cap_count] = id;
         d.cap_ptrs[d.cap_count] = ptr;
         d.cap_count += 1;
-        if next <= ptr {
-            break; // no forward progress: malformed, stop walking
+        if seen[..seen_count].contains(&ptr) {
+            break; // a real loop: stop walking
+        }
+        if seen_count < seen.len() {
+            seen[seen_count] = ptr;
+            seen_count += 1;
         }
         ptr = next;
         guard += 1;
@@ -447,7 +463,28 @@ pub fn has_virtio_cap(dev: &PciDev) -> bool {
     dev.cap_ids[..dev.cap_count].contains(&0x09)
 }
 
+/// The physical base of memory BAR number `slot` (virtio capabilities
+/// name their register blocks this way). None for absent/IO BARs.
+#[must_use]
+pub fn mem_bar_base(dev: &PciDev, slot: u8) -> Option<u64> {
+    dev.bars[..dev.bar_count]
+        .iter()
+        .flatten()
+        .find(|b| b.slot == slot && b.kind != BarKind::Io)
+        .map(|b| b.base)
+}
+
 // ── the kernel-side port accessors (target-only) ──
+
+/// Read one config dword (the virtio cap parser and the virtio driver
+/// need raw config reads at arbitrary dword offsets).
+#[cfg(not(test))]
+pub fn read_cfg32(dev: &PciDev, off: u8) -> u32 {
+    // 0xCF8 dword select + 0xCFC dword read (see the module doc for
+    // why this width is load-bearing).
+    crate::hw::outl(CFG_ADDR_PORT, cfg_addr(dev.bus, dev.dev, dev.func, off));
+    crate::hw::inl(CFG_DATA_PORT)
+}
 
 #[cfg(not(test))]
 mod ports {
@@ -696,10 +733,12 @@ mod tests {
             &h,
             &mut d,
         );
-        assert_eq!(d.cap_count, 1);
+        // The same word forever: the visited-set protection records
+        // the entry once more on its second visit, then stops.
+        assert!(d.cap_count <= 2, "looping list must not spin");
         assert_eq!(d.cap_ids[0], 0x09);
         assert!(has_virtio_cap(&d));
-        assert!(reads <= 2, "no-forward-progress list must not spin");
+        assert!(reads <= 3, "looping list must not spin");
     }
 
     #[test]

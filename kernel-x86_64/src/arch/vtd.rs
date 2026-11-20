@@ -563,8 +563,11 @@ impl DmaProt for Vtd {
         // entry was never cached; see qi_desc_context for the replace
         // path).
         let devfn_idx = ((devfn.0 as u64) << 3) | (devfn.1 as u64);
-        crate::memops::write_u64(ctx_table + devfn_idx * 16, context_entry(slpt, dom as u16));
-        crate::memops::write_u64(ctx_table + devfn_idx * 16 + 8, context_entry_hi(dom as u16));
+        // Domain ids are 1-based in the hardware: DID 0 reads as the
+        // "no domain" pattern (QEMU rejects hi=0 entries, measured).
+        let did = (dom + 1) as u16;
+        crate::memops::write_u64(ctx_table + devfn_idx * 16, context_entry(slpt, did));
+        crate::memops::write_u64(ctx_table + devfn_idx * 16 + 8, context_entry_hi(did));
         self.assigned += 1;
         Ok(())
     }
@@ -613,7 +616,7 @@ impl DmaProt for Vtd {
         }
         // Real hardware caches translations: one domain-wide IOTLB
         // invalidation per unmap, drained and error-checked.
-        let desc = qi_desc_iotlb_domain(dom as u16);
+        let desc = qi_desc_iotlb_domain((dom + 1) as u16);
         self.qi_enqueue(&desc);
         self.qi_kick_and_drain()
             .map_err(|_| DmaError::Hardware(4))?;
@@ -906,7 +909,7 @@ mod tests {
         let (lo, hi) = vtd.context_entry_of(0, (0x03, 0));
         assert_eq!(lo & 1, 1);
         assert_eq!(lo & ADDR_MASK, vtd.dom_slpt[0].unwrap());
-        assert_eq!(hi & 0xFFFF, 0);
+        assert_eq!(hi & 0xFFFF, 1, "DIDs are 1-based (dom 0 → DID 1)");
         // The context table frame came from the budget.
         assert_eq!(vtd.tables_used(), 4, "root + IQ + ctx table + SLPT root");
         // Wrong segment: refused.
@@ -968,15 +971,20 @@ mod tests {
         assert_eq!(vtd.slpte_of(slpt, pa), None, "leaf cleared");
         assert_eq!(vtd.slpte_of(slpt, pa + 4096), None);
         assert_eq!(vtd.unmapped_pages(), 2);
-        // The invalidation descriptor landed in the IQ frame, slot 0.
+        // The invalidation descriptor landed in the IQ frame, slot 0
+        // (DID 1: domains are 1-based in the hardware).
         let qw0 = arena.read(vtd.iq_pa());
-        assert_eq!(qw0, 0x2 | (0b10 << 4), "IOTLB domain-wide, did=0");
+        assert_eq!(
+            qw0,
+            0x2 | (0b10 << 4) | (1 << 16),
+            "IOTLB domain-wide, did=1"
+        );
         // Unmapping again is benign idempotence (no page counted twice).
         vtd.unmap_run(0, pa, 8192).unwrap();
         assert_eq!(vtd.unmapped_pages(), 2);
         assert_eq!(
             arena.read(vtd.iq_pa() + 16),
-            0x2 | (0b10 << 4),
+            0x2 | (0b10 << 4) | (1 << 16),
             "second desc at slot 1"
         );
     }
