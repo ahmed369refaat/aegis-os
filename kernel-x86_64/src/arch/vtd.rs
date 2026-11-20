@@ -105,11 +105,19 @@ pub const fn root_entry(ctx_table_pa: u64) -> u64 {
 }
 
 /// Context entry for a device: present, translation-type 0 (multi-
-/// level), the domain's second-level root. (DID rides the high word —
+/// level), **AW = 2** (the 4-level/48-bit page walk — bits 11:8;
+/// Linux's `context_set_address_width(ctx, agaw)`. Without it the
+/// walk runs TWO levels and reads PML4 slots at the wrong shift:
+/// measured "slpte permission error level=2" on the first device
+/// DMA), the domain's second-level root. (DID rides the high word —
 /// `context_entry_hi`.)
 #[must_use]
 pub const fn context_entry(slpt_root_pa: u64, _did: u16) -> u64 {
-    ENTRY_P | (slpt_root_pa & ADDR_MASK)
+    // TT bits 3:2 = 0b10: QEMU decodes the walk depth as 2+TT (TT=00
+    // walks two levels and mis-reads my 4-level tables — measured
+    // "slpte permission error level=2" on the first device DMA; bits
+    // 11:8 are reserved and rejected outright).
+    ENTRY_P | (0b10 << 2) | (slpt_root_pa & ADDR_MASK)
 }
 
 /// High word of a context entry: just the 16-bit domain id.
@@ -495,6 +503,28 @@ impl Vtd {
         (leaf & ENTRY_P != 0).then_some(leaf)
     }
 
+    /// Diagnostics: the four walk entries for `iova` (PML4, PDPT,
+    /// PD, PT) from this domain's root — the boot proof prints them
+    /// when the device faults and we need to see which link is dead.
+    #[must_use]
+    pub fn walk_entries(&self, dom: u32, iova: u64) -> [u64; 4] {
+        let Some(&Some(root)) = self.dom_slpt.get(dom as usize) else {
+            return [0; 4];
+        };
+        let mut out = [0u64; 4];
+        let mut table = root;
+        for (i, level) in (2..=4u8).rev().enumerate() {
+            let entry = crate::memops::read_u64(table + slpt_index(iova, level) * 8);
+            out[i] = entry;
+            if entry & ENTRY_P == 0 {
+                return out;
+            }
+            table = entry & ADDR_MASK;
+        }
+        out[3] = crate::memops::read_u64(table + slpt_index(iova, 1) * 8);
+        out
+    }
+
     /// The domain's SLPT root (boot-proof + tests). None until the
     /// domain has a device assigned.
     #[must_use]
@@ -666,17 +696,28 @@ impl Vtd {
     /// validated; the MMIO window already mapped by the caller).
     /// Reports the iteration counts for the boot log.
     pub fn program_and_enable(&mut self) -> Result<(u64, u64, u64), VtdError> {
+        // GCMD discipline (Linux's pattern): the register is written
+        // as one ACCUMULATED word. QEMU interprets a missing enabled
+        // bit as a DISABLE command — measured on this lane: writing
+        // TE alone silently disabled the just-enabled invalidation
+        // queue ("improper state when disable QI", head=tail=0), every
+        // IQT write was then ignored, and the device's first ring DMA
+        // hit an untranslated IOVA.
+        let mut gcmd: u32 = 0; // bring-up: nothing enabled yet
         // Root table: legacy RTT (bit 0 clear), 4 KiB-aligned address.
         crate::memops::write_u64(self.reg_base + REG_RTADDR, self.root_pa & ADDR_MASK);
-        self.write32(REG_GCMD, GCMD_SRTP);
+        gcmd |= GCMD_SRTP;
+        self.write32(REG_GCMD, gcmd);
         let srtp_spins = self.spin_gsts(GSTS_RTPS)?;
         // Invalidation queue: address + QS order, then enable.
         crate::memops::write_u64(self.reg_base + REG_IQA, (self.iq_pa & ADDR_MASK) | IQ_QS);
-        self.write32(REG_GCMD, GCMD_QIE);
+        gcmd |= GCMD_QIE;
+        self.write32(REG_GCMD, gcmd);
         let qie_spins = self.spin_gsts(GSTS_QIES)?;
         // Translation enable: from here every unclaimed device DMA
         // faults (the fail-closed world ADR-0013 is about).
-        self.write32(REG_GCMD, GCMD_TE);
+        gcmd |= GCMD_TE;
+        self.write32(REG_GCMD, gcmd);
         let te_spins = self.spin_gsts(GSTS_TES)?;
         Ok((srtp_spins, qie_spins, te_spins))
     }
@@ -791,9 +832,9 @@ mod tests {
             1,
             "present, address low bits masked"
         );
-        // Context: present, TT=0, SLPTPTR; DID rides the high word.
+        // Context: present, TT=0, AW=2 (4-level), SLPTPTR; DID high.
         let lo = context_entry(0x2000, 5);
-        assert_eq!(lo & 0xFFF, 1);
+        assert_eq!(lo & 0xFFF, 0x9, "P | TT=0b10 (the 4-level walk)");
         assert_eq!(lo & ADDR_MASK, 0x2000);
         assert_eq!(lo & (3 << 2), 0, "translation-type 0");
         assert_eq!(context_entry_hi(5), 5);
