@@ -363,6 +363,14 @@ pub fn wait_for_delivery_spin(budget_tsc: u64) -> Option<u8> {
 mod tests {
     use super::*;
 
+    /// The SLOTS table is a process-wide static and cargo runs tests
+    /// in parallel: every test in this module (and any other test that
+    /// reaches alloc/release) must hold this lock for its whole body,
+    /// or a sibling's reset() releases the slots mid-assert. The race
+    /// was latent until ADR-0022 grew the Kernel struct enough to
+    /// shift thread scheduling — pinned here for good.
+    static SLOTS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Reset every slot so tests are order-independent.
     fn reset() {
         for s in SLOTS.iter() {
@@ -391,6 +399,7 @@ mod tests {
 
     #[test]
     fn alloc_hands_out_the_range_in_order_and_refuses_duplicates() {
+        let _g = SLOTS_TEST_LOCK.lock().unwrap();
         reset();
         let v = alloc(0xAAA, 3, 1).expect("first alloc");
         assert_eq!(v, DEVICE_VECTOR_BASE);
@@ -414,6 +423,7 @@ mod tests {
 
     #[test]
     fn alloc_exhausts_loudly_at_the_slot_count() {
+        let _g = SLOTS_TEST_LOCK.lock().unwrap();
         reset();
         for i in 0..VEC_SLOTS as u32 {
             assert_eq!(
@@ -431,6 +441,7 @@ mod tests {
 
     #[test]
     fn mailbox_counts_saturate_and_report_losses_loudly() {
+        let _g = SLOTS_TEST_LOCK.lock().unwrap();
         reset();
         let _ = alloc(0xAAA, 3, 1);
         let slot = &SLOTS[0];
@@ -460,6 +471,7 @@ mod tests {
 
     #[test]
     fn unknown_devices_drain_and_count_as_absent() {
+        let _g = SLOTS_TEST_LOCK.lock().unwrap();
         reset();
         assert_eq!(drain(0xDEAD), None);
         assert_eq!(counts(0xDEAD), None);
@@ -469,6 +481,7 @@ mod tests {
 
     #[test]
     fn msi_sources_cannot_collide_with_gsis() {
+        let _g = SLOTS_TEST_LOCK.lock().unwrap();
         // The namespaces are disjoint by construction: a GSI fits in
         // 16 bits on any bootable machine; MSI entries ride above
         // 0x8000_0000.
