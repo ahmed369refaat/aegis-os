@@ -1,5 +1,11 @@
 //! xHCI: the operational + runtime registers, port detection, the command ring.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use crate::frames::FramePool;
 use crate::mmio::{BarMmio, MmioBus};
 use crate::strutil;
@@ -11,6 +17,21 @@ pub const XHCI_OWNER: u32 = 48;
 /// The port-scan cap: the register window must cover this many port
 /// status registers before the scan trusts `max_ports` at all.
 const PORT_SCAN_CAP: u64 = 16;
+
+/// Build the No-Op command TRB at `pa`: type=8 (bits 10-15 of dword
+/// 3) with the cycle bit set to match CRCR's RCS=1. Pure PA writes.
+fn build_noop_trb(pa: u64) {
+    crate::memops::write_u64(pa, 0);
+    crate::memops::write_u64(pa + 8, 0);
+    crate::memops::write_u64(pa + 16, 0);
+    crate::memops::write_u32(pa + 12, (8u32 << 10) | 1);
+}
+
+/// The event TRB's type at `pa` (bits 10-15 of dword 3); 33 = command
+/// completion. Hostile dword values can only yield 0..=63.
+fn event_trb_type(pa: u64) -> u32 {
+    (crate::memops::read_u32(pa + 12) >> 10) & 0x3F
+}
 
 #[cfg(not(test))]
 pub(crate) fn xhci_step<const N: usize>(
@@ -378,12 +399,8 @@ pub(crate) fn xhci_cmdring_step<const N: usize>(
     }
     let crcr0 = bus.read64(op + 0x18).unwrap_or(0) & 0xFFFF_FFF0;
 
-    // No-Op command TRB at slot 0: type=8 (bits 10-15 of dword 3),
-    // cycle bit set to match CRCR's RCS=1.
-    crate::memops::write_u64(cmdring, 0);
-    crate::memops::write_u64(cmdring + 8, 0);
-    crate::memops::write_u64(cmdring + 16, 0);
-    crate::memops::write_u32(cmdring + 12, (8u32 << 10) | 1);
+    // No-Op command TRB at slot 0 (type 8, cycle bit set).
+    build_noop_trb(cmdring);
     if !bus.write32(dboff, 0) {
         // doorbell 0 = command ring
         line(
@@ -404,7 +421,7 @@ pub(crate) fn xhci_cmdring_step<const N: usize>(
     // Event ring: a command-completion event TRB (type=33) at slot 0?
     let ev0 = crate::memops::read_u64(evring);
     let ev3 = crate::memops::read_u64(evring + 12);
-    let ev_type = (crate::memops::read_u32(evring + 12) >> 10) & 0x3F;
+    let ev_type = event_trb_type(evring);
     let _ = (ev0, ev3);
     // Success signal: the EVENT RING, not CRCR — the controller never
     // writes the dequeue pointer back into CRCR (it is load-bearing
@@ -427,4 +444,40 @@ pub(crate) fn xhci_cmdring_step<const N: usize>(
     );
     let _ = advanced;
     session.close(out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noop_trb_is_type_8_with_the_cycle_bit() {
+        let phys = crate::drvstack::testharness::FakePhys::new(1);
+        let pa = phys.pa(0);
+        build_noop_trb(pa);
+        assert_eq!(crate::memops::read_u64(pa), 0);
+        // dword 3 (at +12) carries type+cycle; dword 2 (+8) stays 0 —
+        // the u32 write overlaps the u64's high half, faithful to the
+        // driver's TRB layout
+        assert_eq!(crate::memops::read_u32(pa + 8), 0);
+        assert_eq!(crate::memops::read_u32(pa + 12), (8u32 << 10) | 1);
+    }
+
+    /// The event-type extraction: hostile dwords can only produce
+    /// 0..=63; type 33 is command completion.
+    #[test]
+    fn event_trb_type_is_bounded_under_garbage() {
+        let phys = crate::drvstack::testharness::FakePhys::new(1);
+        let pa = phys.pa(0);
+        let mut rng = crate::drvstack::testharness::XorShift(0xBEEF);
+        for _ in 0..1000 {
+            let dw3 = rng.next() as u32;
+            crate::memops::write_u32(pa + 12, dw3);
+            let ty = event_trb_type(pa);
+            assert!(ty <= 0x3F, "the type field is 6 bits, always");
+            assert_eq!(ty, (dw3 >> 10) & 0x3F);
+        }
+        crate::memops::write_u32(pa + 12, (33u32 << 10) | 1);
+        assert_eq!(event_trb_type(pa), 33);
+    }
 }

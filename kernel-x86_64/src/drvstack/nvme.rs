@@ -1,5 +1,11 @@
 //! NVMe: controller reset, admin queue pair, Identify/CreateIoCq.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use crate::frames::FramePool;
 use crate::mmio::{BarMmio, MmioBus};
 use crate::strutil;
@@ -22,7 +28,6 @@ const NVME_DBA: u64 = 0x1000;
 
 /// The command-specific half of an SQE (the fields this driver fills;
 /// the submit path zeroes the rest).
-#[cfg(not(test))]
 struct NvmeCmd {
     cid: u32,
     opcode: u32,
@@ -39,8 +44,13 @@ struct NvmeCmd {
 /// cooked address — the device-derived stride stays inside the window
 /// the enumeration measured. Returns false if the window refused the
 /// doorbell (the caller tears down).
-#[cfg(not(test))]
-fn nvme_submit(bus: &BarMmio, db_off: u64, sq: u64, tail: &mut u16, cmd: &NvmeCmd) -> bool {
+fn nvme_submit(
+    bus: &dyn crate::mmio::MmioBus,
+    db_off: u64,
+    sq: u64,
+    tail: &mut u16,
+    cmd: &NvmeCmd,
+) -> bool {
     let e = sq + u64::from(*tail) * 64;
     crate::memops::write_u64(e, 0);
     crate::memops::write_u32(e, cmd.opcode | (cmd.cid << 16)); // cdw0
@@ -64,7 +74,6 @@ fn nvme_submit(bus: &BarMmio, db_off: u64, sq: u64, tail: &mut u16, cmd: &NvmeCm
 
 /// Poll the completion-queue slot at `head` for `phase`; returns
 /// (result dword, status) — status 0 is success.
-#[cfg(not(test))]
 fn nvme_poll(cq: u64, head: u16, phase: u16, budget: u64) -> Option<(u32, u32)> {
     let slot = cq + u64::from(head) * 16;
     let mut spins = 0u64;
@@ -623,4 +632,134 @@ pub(crate) fn nvme_step<const N: usize>(
 
     // Teardown with the device live.
     session.close(out);
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drvstack::testharness::{FakeBus, FakePhys, RegScript, XorShift};
+    use crate::mmio::MmioBus;
+
+    /// Hostile-device tests for the SQE encoder + CQE poll (round 5,
+    /// Phase B): the REAL functions (memops is identity on host),
+    /// driven through the fake register bank and host-"physical"
+    /// buffers. A lying device must never panic the driver, never
+    /// hang a poll, and every accepted completion must satisfy its
+    /// documented bounds.
+    #[test]
+    fn submit_encodes_the_spec_fields_and_rings_the_doorbell() {
+        let phys = FakePhys::new(2);
+        let sq = phys.pa(0);
+        let mut bus = FakeBus::new(0x1000, 0x4000);
+        let mut tail = 0u16;
+        let cmd = NvmeCmd {
+            cid: 7,
+            opcode: 0x06,
+            nsid: 1,
+            prp1: 0x1234_0000,
+            cdw10: 42,
+            cdw11: 3,
+            cdw12: 9,
+        };
+        assert!(nvme_submit(&bus, 0x1000, sq, &mut tail, &cmd));
+        // tail advanced modulo the queue size
+        assert_eq!(tail, 1);
+        // the doorbell got the new tail
+        assert_eq!(bus.write_log.borrow().get(&0x1000), Some(&1));
+        // cdw0 = opcode | cid<<16
+        assert_eq!(crate::memops::read_u32(sq), 0x06 | (7 << 16));
+        assert_eq!(crate::memops::read_u32(sq + 4), 1); // nsid
+                                                        // F11 pin: the data pointer sits at BOTH +16 (spec PRP1) and
+                                                        // +24 (where this QEMU reads it)
+        assert_eq!(crate::memops::read_u64(sq + 16), 0x1234_0000);
+        assert_eq!(crate::memops::read_u64(sq + 24), 0x1234_0000);
+        assert_eq!(crate::memops::read_u32(sq + 40), 42); // cdw10
+        assert_eq!(crate::memops::read_u32(sq + 44), 3); // cdw11
+        assert_eq!(crate::memops::read_u32(sq + 48), 9); // cdw12
+                                                         // tail wraps modulo 16
+        let mut t15 = 15u16;
+        assert!(nvme_submit(&bus, 0x1000, sq, &mut t15, &cmd));
+        assert_eq!(t15, 0, "the queue is 16 entries: 15 -> 0");
+    }
+
+    #[test]
+    fn submit_refuses_when_the_doorbell_is_out_of_window() {
+        let phys = FakePhys::new(1);
+        let mut bus = FakeBus::new(0x1000, 0x100); // window ends before the DBA
+        let mut tail = 0u16;
+        let cmd = NvmeCmd {
+            cid: 1,
+            opcode: 2,
+            nsid: 0,
+            prp1: 0,
+            cdw10: 0,
+            cdw11: 0,
+            cdw12: 0,
+        };
+        assert!(!nvme_submit(&bus, 0x1000, phys.pa(0), &mut tail, &cmd));
+        // the entry was still written (the device just never learns)
+        assert_eq!(crate::memops::read_u32(phys.pa(0)), 2 | (1 << 16));
+    }
+
+    #[test]
+    fn poll_reads_the_phase_at_bit16_and_the_status_above_it() {
+        let phys = FakePhys::new(1);
+        let cq = phys.pa(0);
+        // F11's lesson, pinned: DW3 = [SQHD(15:0) | P(16) | SF(17..)] —
+        // phase at bit 16, NOT bit 0 (SQHD's LSB once matched by
+        // accident). status = (dw3 >> 17) & 0xFF.
+        crate::memops::write_u32(cq, 0xDEAD_BEEF); // result dword
+        crate::memops::write_u32(cq + 12, (1u32 << 16) | (0x23 << 17) | 0x00AB);
+        let (res, st) = nvme_poll(cq, 0, 1, 100).expect("phase matches");
+        assert_eq!(res, 0xDEAD_BEEF);
+        assert_eq!(st, 0x23);
+    }
+
+    #[test]
+    fn poll_never_hangs_on_a_device_that_never_completes() {
+        let phys = FakePhys::new(1);
+        let cq = phys.pa(0);
+        // the CQE stays zero (phase 0) while we poll for phase 1: the
+        // budget MUST bound the loop — this test fails by hanging if
+        // it does not.
+        assert_eq!(nvme_poll(cq, 0, 1, 10_000), None);
+    }
+
+    #[test]
+    fn poll_survives_a_lying_device_without_panicking() {
+        let phys = FakePhys::new(1);
+        let cq = phys.pa(0);
+        // garbage CQE dwords: whatever comes back must satisfy the
+        // documented bounds (status <= 0xFF) or be refused by phase.
+        let mut rng = XorShift(0xA11CE);
+        for _ in 0..1000 {
+            let dw0 = rng.next() as u32;
+            let dw3 = rng.next() as u32;
+            crate::memops::write_u32(cq, dw0);
+            crate::memops::write_u32(cq + 12, dw3);
+            let phase = (rng.next() & 1) as u16;
+            if let Some((res, st)) = nvme_poll(cq, 0, phase, 4) {
+                assert_eq!(res, dw0);
+                assert_eq!(st, (dw3 >> 17) & 0xFF);
+                assert!(st <= 0xFF, "every accepted status is within bounds");
+                assert_eq!((dw3 >> 16) & 1, u32::from(phase));
+            }
+        }
+    }
+
+    #[test]
+    fn the_fake_bus_scripts_what_the_device_lies_about() {
+        // the harness itself: Sequence/Refused/Garbage behave as
+        // documented (the driver tests above rely on this).
+        let mut bus = FakeBus::new(0, 0x100);
+        bus.set(0x10, RegScript::Sequence(vec![1, 2, 3]));
+        bus.set(0x30, RegScript::Garbage(7));
+        assert_eq!(bus.read32(0x10), Some(1));
+        assert_eq!(bus.read32(0x10), Some(2));
+        assert_eq!(bus.read32(0x10), Some(3));
+        assert_eq!(bus.read32(0x10), Some(1), "the sequence cycles");
+        let g1 = bus.read32(0x30).unwrap();
+        let g2 = bus.read32(0x30).unwrap();
+        assert_ne!(g1, g2, "garbage flips between reads (deterministic)");
+        assert_eq!(bus.reads(), 6);
+    }
 }

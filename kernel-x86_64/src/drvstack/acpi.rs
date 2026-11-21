@@ -1,5 +1,11 @@
 //! ACPI table directory walk: HPET/MADT/MCFG discovery markers.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use crate::strutil;
 use crate::strutil::line;
 

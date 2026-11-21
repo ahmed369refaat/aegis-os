@@ -1,6 +1,11 @@
 //! AHCI: ABAR/port bring-up, IDENTIFY, DMA reads + the ext2 mount entry.
 
-use super::ext2::ext2_over_ahci;
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use crate::frames::FramePool;
 use crate::strutil;
 use crate::strutil::line;
@@ -13,6 +18,68 @@ use crate::strutil::line;
 /// The pool owner tag for AHCI frames (cmd list, cmd table, FIS rx,
 /// data page).
 pub const AHCI_OWNER: u32 = 47;
+
+/// Build header 0 + the READ DMA EXT (0x25) command table — the
+/// ADR-0014 layout QEMU actually parses: FIS bytes 4-6 LBA 0-23,
+/// byte 7 device, bytes 8-10 LBA 24-47, byte 12 the sector count, and
+/// the PRDT's byte count in the entry's LAST dword (+0x8C). Every
+/// field offset here was once wrong (the "stale FIS" was three
+/// driver bugs) — the tests pin them. Pure PA writes.
+fn build_read_dma_cmdtable(clb: u64, ctba: u64, buf: u64, lba: u64) {
+    // Header 0: CFL=5, PRDTL=1, table at ctba.
+    crate::memops::write_u32(clb, 5 | (1 << 16));
+    crate::memops::write_u32(clb + 4, 0);
+    crate::memops::write_u32(clb + 8, ctba as u32);
+    crate::memops::write_u32(clb + 12, 0);
+    // H2D FIS: READ DMA EXT (0x25, 48-bit LBA).
+    crate::memops::write_u32(ctba, 0x27 | (0x80 << 8) | (0x25 << 16));
+    // dword 1 (bytes 4-7): LBA low 24 bits, device 0x40 (LBA select).
+    crate::memops::write_u32(
+        ctba + 4,
+        ((lba & 0xFF) as u32)
+            | ((((lba >> 8) & 0xFF) as u32) << 8)
+            | ((((lba >> 16) & 0xFF) as u32) << 16)
+            | (0x40u32 << 24),
+    );
+    // dword 2 (bytes 8-11): LBA bits 24-47, feature 15:8 = 0.
+    crate::memops::write_u32(
+        ctba + 8,
+        (((lba >> 24) & 0xFF) as u32)
+            | ((((lba >> 32) & 0xFF) as u32) << 8)
+            | ((((lba >> 40) & 0xFF) as u32) << 16),
+    );
+    // dword 3 (bytes 12-15): sector count 7:0 = 1 at byte 12.
+    crate::memops::write_u32(ctba + 12, 1);
+    crate::memops::write_u64(ctba + 16, 0);
+    crate::memops::write_u64(ctba + 24, 0);
+    crate::memops::write_u64(ctba + 32, 0);
+    // PRDT: buf at +0x80, byte count in the LAST dword (+0x8C).
+    crate::memops::write_u64(ctba + 0x80, buf);
+    crate::memops::write_u32(ctba + 0x88, 0);
+    crate::memops::write_u32(ctba + 0x8C, 511);
+}
+
+/// Build header 0 + the IDENTIFY DEVICE (0xEC) command table.
+fn build_identify_cmdtable(clb: u64, ctba: u64, data: u64) {
+    crate::memops::write_u32(clb, 5 | (1 << 16));
+    crate::memops::write_u32(clb + 4, 0);
+    crate::memops::write_u32(clb + 8, ctba as u32);
+    crate::memops::write_u32(clb + 12, 0);
+    // H2D FIS: 0x27 | C | 0xEC (IDENTIFY DEVICE) | dev 0xE0.
+    crate::memops::write_u64(ctba, 0x27 | (0x80 << 8) | (0xEC << 16) | (0xE0 << 24));
+    crate::memops::write_u64(ctba + 8, 0);
+    crate::memops::write_u64(ctba + 16, 0);
+    crate::memops::write_u64(ctba + 24, 0);
+    crate::memops::write_u64(ctba + 32, 0);
+    crate::memops::write_u64(ctba + 40, 0);
+    crate::memops::write_u64(ctba + 48, 0);
+    crate::memops::write_u64(ctba + 56, 0);
+    // PRDT entry 0 at ctba+0x80: data page; byte count in the LAST
+    // dword (+0x8C, zero-based DBC).
+    crate::memops::write_u64(ctba + 0x80, data);
+    crate::memops::write_u32(ctba + 0x88, 0);
+    crate::memops::write_u32(ctba + 0x8C, 511);
+}
 
 #[cfg(not(test))]
 pub(crate) fn ahci_step<const N: usize>(
@@ -188,22 +255,7 @@ pub(crate) fn ahci_step<const N: usize>(
     // Command header 0: CFL=5, PRDTL=1; table at ctba.
     crate::memops::write_u32(clb, 5 | (1 << 16));
     crate::memops::write_u32(clb + 4, 0); // PRDBC
-    crate::memops::write_u32(clb + 8, ctba as u32);
-    crate::memops::write_u32(clb + 12, 0);
-    // H2D FIS: 0x27 | C | 0xEC (IDENTIFY DEVICE) | dev 0xE0.
-    crate::memops::write_u64(ctba, 0x27 | (0x80 << 8) | (0xEC << 16) | (0xE0 << 24));
-    crate::memops::write_u64(ctba + 8, 0);
-    crate::memops::write_u64(ctba + 16, 0);
-    crate::memops::write_u64(ctba + 24, 0);
-    crate::memops::write_u64(ctba + 32, 0);
-    crate::memops::write_u64(ctba + 40, 0);
-    crate::memops::write_u64(ctba + 48, 0);
-    crate::memops::write_u64(ctba + 56, 0);
-    // PRDT entry 0 at ctba+0x80: data page; byte count in the LAST
-    // dword (+0x8C, zero-based DBC — see ahci_read_dma's note).
-    crate::memops::write_u64(ctba + 0x80, data);
-    crate::memops::write_u32(ctba + 0x88, 0);
-    crate::memops::write_u32(ctba + 0x8C, 511);
+    build_identify_cmdtable(clb, ctba, data);
 
     // Issue and poll CI bit 0.
     if !bus.write32(0x100 + 0x38, 1) {
@@ -240,7 +292,7 @@ pub(crate) fn ahci_step<const N: usize>(
         );
         // The block layer's first slice rides the LIVE port: read-only
         // ext2 (superblock → root dir → hello.txt) via READ DMA.
-        ext2_over_ahci(out, &bus, clb, ctba, fis, data);
+        super::ext2::ext2_over_ahci(out, &bus, clb, ctba, fis, data);
     } else {
         line(
             out,
@@ -269,51 +321,7 @@ pub(crate) fn ahci_read_dma(
     lba: u64,
 ) -> bool {
     use crate::mmio::MmioBus;
-    // Header 0: CFL=5, PRDTL=1, table at ctba.
-    crate::memops::write_u32(clb, 5 | (1 << 16));
-    crate::memops::write_u32(clb + 4, 0);
-    crate::memops::write_u32(clb + 8, ctba as u32);
-    crate::memops::write_u32(clb + 12, 0);
-    // H2D FIS: READ DMA EXT (0x25, 48-bit LBA) — the modern AHCI
-    // path Linux uses; the 28-bit 0xC8 completed as a no-op on this
-    // QEMU build (measured: TFD=0x50, no data, no D2H FIS).
-    // ADR-0014 step 5, the layout QEMU actually parses (ahci.c
-    // handle_reg_h2d_fis): bytes 4-6 LBA 0-23, byte 7 device, bytes
-    // 8-10 LBA 24-47, bytes 12-13 sector count. The original code put
-    // the LBA at bytes 9-11 and NEVER wrote byte 12 (0 = 65536
-    // sectors, measured as prepare_buf limit=32 MiB, so LBA 2 read as
-    // LBA 2<<24 — off the image): the "stale FIS" was this driver
-    // bug, not QEMU's FIS cache — the cmd-table read-back showed the
-    // driver's bytes present in RAM all along.
-    crate::memops::write_u32(ctba, 0x27 | (0x80 << 8) | (0x25 << 16));
-    // dword 1 (bytes 4-7): LBA low 24 bits, device 0x40 (LBA select).
-    crate::memops::write_u32(
-        ctba + 4,
-        ((lba & 0xFF) as u32)
-            | ((((lba >> 8) & 0xFF) as u32) << 8)
-            | ((((lba >> 16) & 0xFF) as u32) << 16)
-            | (0x40u32 << 24),
-    );
-    // dword 2 (bytes 8-11): LBA bits 24-47, feature 15:8 = 0.
-    crate::memops::write_u32(
-        ctba + 8,
-        (((lba >> 24) & 0xFF) as u32)
-            | ((((lba >> 32) & 0xFF) as u32) << 8)
-            | ((((lba >> 40) & 0xFF) as u32) << 16),
-    );
-    // dword 3 (bytes 12-15): sector count 7:0 = 1 at byte 12; count
-    // 15:8 and control zero.
-    crate::memops::write_u32(ctba + 12, 1);
-    crate::memops::write_u64(ctba + 16, 0);
-    crate::memops::write_u64(ctba + 24, 0);
-    crate::memops::write_u64(ctba + 32, 0);
-    // PRDT: buf at +0x80; the byte count lives in the entry's LAST
-    // dword (+0x8C — QEMU's AHCI_SG { addr, reserved, flags_size },
-    // zero-based DBC at bits 21:0, I at bit 31). Writing it at +0x88
-    // (the reserved dword) made every entry "1 byte" (measured:
-    // prepare_buf prepared=1, no DMA transfer).
-    crate::memops::write_u64(ctba + 0x80, buf);
-    crate::memops::write_u32(ctba + 0x88, 0);
+    build_read_dma_cmdtable(clb, ctba, buf, lba);
     crate::memops::write_u32(ctba + 0x8C, 511);
     // QEMU's handle_cmd silently SKIPS the command when the IDE
     // engine still reports BSY/DRQ (the tail of the previous PIO
@@ -335,4 +343,98 @@ pub(crate) fn ahci_read_dma(
     }
     bus.read32(0x100 + 0x38).is_some_and(|v| v & 1 == 0)
         && bus.read32(0x100 + 0x20).is_some_and(|v| v & 0x88 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ADR-0014 offsets, pinned: every field offset here was once
+    /// wrong and cost a session of debugging ("the stale FIS").
+    #[test]
+    fn read_dma_cmdtable_pins_the_fis_and_prdt_layout() {
+        let phys = crate::drvstack::testharness::FakePhys::new(4);
+        let clb = phys.pa(0);
+        let ctba = phys.pa(4096);
+        let buf = phys.pa(8192);
+        let lba: u64 = 0x01_2345_6789_AB;
+        build_read_dma_cmdtable(clb, ctba, buf, lba);
+        // header: CFL=5, PRDTL=1, table address
+        assert_eq!(crate::memops::read_u32(clb), 5 | (1 << 16));
+        // CTBA is a 32-bit field (the AHCI command-table address)
+        assert_eq!(crate::memops::read_u32(clb + 8), ctba as u32);
+        // FIS: H2D | C | READ DMA EXT
+        assert_eq!(
+            crate::memops::read_u32(ctba),
+            0x27 | (0x80 << 8) | (0x25 << 16)
+        );
+        // LBA bytes 4-6 (low 24), device 0x40 at byte 7 (byte-level)
+        // LBA 0x0123456789AB: LSB-first bytes AB 89 67 | 45 23 01
+        assert_eq!(crate::virtio::read_u8_pa(ctba + 4), 0xAB);
+        assert_eq!(crate::virtio::read_u8_pa(ctba + 5), 0x89);
+        assert_eq!(crate::virtio::read_u8_pa(ctba + 6), 0x67);
+        assert_eq!(
+            crate::virtio::read_u8_pa(ctba + 7),
+            0x40,
+            "device = LBA select"
+        );
+        // LBA bytes 8-10 (bits 24-47)
+        assert_eq!(crate::virtio::read_u8_pa(ctba + 8), 0x45);
+        assert_eq!(crate::virtio::read_u8_pa(ctba + 9), 0x23);
+        assert_eq!(crate::virtio::read_u8_pa(ctba + 10), 0x01);
+        // sector count at byte 12 (the never-written-byte-12 bug)
+        assert_eq!(crate::virtio::read_u8_pa(ctba + 12), 1);
+        // PRDT: buffer at +0x80, byte count in the LAST dword (+0x8C)
+        assert_eq!(crate::memops::read_u64(ctba + 0x80), buf);
+        assert_eq!(
+            crate::memops::read_u32(ctba + 0x88),
+            0,
+            "the reserved dword stays 0"
+        );
+        assert_eq!(
+            crate::memops::read_u32(ctba + 0x8C),
+            511,
+            "zero-based DBC in the last dword"
+        );
+    }
+
+    #[test]
+    fn read_dma_survives_hostile_lbas_without_panicking() {
+        let phys = crate::drvstack::testharness::FakePhys::new(4);
+        let clb = phys.pa(0);
+        let ctba = phys.pa(4096);
+        let mut rng = crate::drvstack::testharness::XorShift(0xFEED);
+        for _ in 0..1000 {
+            let lba = rng.next();
+            build_read_dma_cmdtable(clb, ctba, phys.pa(8192), lba);
+            // every FIS byte lands in its documented field: the low 48
+            // bits distribute across bytes 4-6 and 8-10, count stays 1.
+            let b4 = crate::virtio::read_u8_pa(ctba + 4) as u64;
+            let b5 = crate::virtio::read_u8_pa(ctba + 5) as u64;
+            let b6 = crate::virtio::read_u8_pa(ctba + 6) as u64;
+            let b8 = crate::virtio::read_u8_pa(ctba + 8) as u64;
+            let b9 = crate::virtio::read_u8_pa(ctba + 9) as u64;
+            let b10 = crate::virtio::read_u8_pa(ctba + 10) as u64;
+            let rebuilt = b4 | (b5 << 8) | (b6 << 16) | (b8 << 24) | (b9 << 32) | (b10 << 40);
+            assert_eq!(
+                rebuilt,
+                lba & ((1 << 48) - 1),
+                "the 48-bit LBA survives the roundtrip"
+            );
+        }
+    }
+
+    #[test]
+    fn identify_cmdtable_pins_the_ec_fis() {
+        let phys = crate::drvstack::testharness::FakePhys::new(4);
+        let clb = phys.pa(0);
+        let ctba = phys.pa(4096);
+        let data = phys.pa(8192);
+        build_identify_cmdtable(clb, ctba, data);
+        assert_eq!(
+            crate::memops::read_u64(ctba),
+            0x27 | (0x80 << 8) | (0xEC << 16) | (0xE0u64 << 24)
+        );
+        assert_eq!(crate::memops::read_u32(ctba + 0x8C), 511);
+    }
 }

@@ -4,6 +4,48 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Changed — review round 5, Phase B: hostile-device tests for every driver
+
+The drvstack tree compiled OUT of test builds entirely
+(`#[cfg(not(test))] mod drvstack`) — every driver module had ZERO
+tests and nothing exercised a lying device. Phase B opens the tree to
+host builds (the step functions stay cfg'd; the pure logic does not)
+and drives the REAL driver code — memops is identity on host, so the
+actual submit/encode/parse functions run against the new fakes:
+
+- **`drvstack/testharness.rs`**: one shared, deterministic harness —
+  a scriptable fake `MmioBus` (constant / cycling-sequence /
+  flipping-garbage registers, a write log), a budget-capped fake
+  `DmaProt`, the host-"physical" `FakePhys` buffer pattern, and the
+  repo's xorshift. The harness has its own self-test (which caught a
+  real mixing bug: xorshift's three shifts do not propagate low-bit
+  differences into the high half — folded with a finalizer).
+- **Per-module hostile tests** (19 in drvstack, every driver module
+  covered): nvme's SQE encoder + CQE poll (the F11 pin: the data
+  pointer at BOTH +16/+24, the phase bit at 16; a never-completing
+  device cannot hang the poll — budget-bounded by test; 1000-garbage
+  CQEs, every accepted status within bounds); e1k's TX descriptor +
+  the RX DD bit (garbage in neighboring fields cannot flip it); ahci's
+  READ-DMA-EXT command table (every ADR-0014 offset pinned — each was
+  once wrong; a 1000-LBA fuzz roundtrips the 48-bit field); xhci's
+  No-Op TRB + event-type extraction (bounded to 6 bits under garbage);
+  netutil's DHCP DISCOVER (checksum VERIFIES over the built packet;
+  1000 hostile MACs all build checksum-valid frames); vblk's
+  3-descriptor chain (IN/OUT flag polarity, avail publish + wrap
+  semantics); vnet's avail publish; legacy's BCD decode (hostile
+  nibbles decode to face value, never panic).
+- **Extractions** (the trait-seam move the round asked for):
+  e1k::build_tx_desc/rx_desc_done, xhci::build_noop_trb/
+  event_trb_type, ahci::build_read_dma_cmdtable/
+  build_identify_cmdtable (module-scope, host-testable; the boot steps
+  call them — single source of truth), netutil un-cfg'd, vblk::submit
+  and vnet::net_publish un-cfg'd, legacy::bcd_decode extracted.
+- The step-orchestration modules without their own #[test]
+  (drvstack/pci.rs, vtd.rs, broker.rs, ext2.rs, acpi.rs) are thin
+  sequencing over layers that ARE tested (crate pci.rs, arch/vtd.rs,
+  arch/acpi.rs, the ext2 policy core) — noted in the report.
+- Boot markers byte-identical (all three lanes PASS unchanged).
+
 ### Changed — review round 5, Phase A (ADR-0018): one IOMMU domain per device
 
 The main remaining isolation gap: every device sat in IOMMU domain 0

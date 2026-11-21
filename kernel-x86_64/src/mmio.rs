@@ -13,6 +13,11 @@
 //! test fake replaces it today and ADR-0017's `IpcMmio` replaces it
 //! from ring 3, so the *same driver code* runs in both worlds.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only users (driver steps and their helpers), so items only
+// they use look dead there — they are used by the boot build.
+#![cfg_attr(test, allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 use crate::memops;
 
 /// A validated physical-address window: `base .. base+len`, `len > 0`,

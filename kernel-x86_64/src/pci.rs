@@ -39,6 +39,11 @@
 //!   class keeps bus 0 flat; a bridge scan arrives with a machine
 //!   that has one.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only users (driver steps and their helpers), so items only
+// they use look dead there — they are used by the boot build.
+#![cfg_attr(test, allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 use aegis_os::dma::DmaVerdict;
 
 /// Devices the fixed inventory holds (fail-loud exhaustion).
@@ -726,8 +731,6 @@ mod tests {
             "MEM stays until unquiesce"
         );
     }
-
-    use super::*;
 
     /// A fake PCI bus: one 64-byte config image per (dev, fn) plus
     /// BAR-probe semantics — an all-ones write arms the probe, the

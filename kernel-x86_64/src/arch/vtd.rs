@@ -46,6 +46,11 @@
 //! - Multi-DRHD machines: refused loudly (`UnsupportedMultiDrhd`) —
 //!   this machine class (QEMU q35) has exactly one unit (measured).
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only users (driver steps and their helpers), so items only
+// they use look dead there — they are used by the boot build.
+#![cfg_attr(test, allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 use aegis_os::dma::{DmaAbsentReason, DmaDir, DmaError, DmaProt, DmaVerdict};
 use aegis_os::dmar::{Dmar, DmarStruct, Drhd};
 use aegis_os::memory::PAGE_SIZE;

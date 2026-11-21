@@ -1,6 +1,11 @@
 //! Read-only ext2 over AHCI (ADR-0014): superblock -> dirent -> file data.
 
-use super::ahci::ahci_read_dma;
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use crate::strutil;
 use crate::strutil::line;
 
@@ -43,7 +48,7 @@ pub(crate) fn ext2_over_ahci(
     // into a stack buffer the parser can slice.
     let mut sec = [0u8; 512];
     let load = |lba: u64, sec: &mut [u8; 512]| -> bool {
-        if !ahci_read_dma(bus, clb, ctba, data, lba) {
+        if !super::ahci::ahci_read_dma(bus, clb, ctba, data, lba) {
             return false;
         }
         for (i, b) in sec.iter_mut().enumerate() {

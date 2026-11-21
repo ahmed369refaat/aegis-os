@@ -2,6 +2,10 @@
 //! the shared teardown discipline, and the step sequencing. The
 //! per-subsystem steps live in the sibling modules.
 
+// Host-test builds compile this module without its boot-only step
+// functions; their imports stay (used by the boot build).
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use crate::arch;
 use crate::arch::acpi::Discovery;
 use crate::frames::FramePool;
@@ -11,6 +15,9 @@ use aegis_os::dmar::{self, Dmar, DmarStruct};
 
 // ADR-0016: one module per subsystem — the split is a pure move; the
 // step sequencing below is the only thing that knows them all.
+#[cfg(test)]
+mod testharness;
+
 mod acpi;
 mod ahci;
 mod broker;
@@ -64,6 +71,7 @@ pub const VTD_TABLE_OWNER: u32 = 42;
 /// set, and — when a DMAR exists — bring the real VT-d unit up
 /// (PR 0.4). Absence and failure are verdicts, not crashes: the boot
 /// continues and later claim paths fail closed on them.
+#[cfg(not(test))]
 pub fn driver_stack_step<const N: usize>(
     k: &mut aegis_os::Kernel<N>,
     pool: &mut FramePool<N>,

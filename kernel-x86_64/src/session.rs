@@ -16,6 +16,12 @@
 //! frames while the device could still DMA them — a real window on
 //! the no-IOMMU lane), then frees.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only users (the driver steps), so items only they use (the
+// enforcement-probe helpers) look dead there — they are used by the
+// boot build.
+#![cfg_attr(test, allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 use crate::frames::FramePool;
 use crate::pci::PciDev;
 use crate::strutil;
@@ -31,6 +37,7 @@ use aegis_os::dma::DmaProt;
 /// goes through here, so no driver can hand a device-reachable page
 /// back to the allocator.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(test, allow(unused_variables))]
 pub(crate) fn revoke_or_quarantine<const N: usize, P: DmaProt>(
     k: &mut aegis_os::Kernel<N>,
     pool: &mut FramePool<N>,

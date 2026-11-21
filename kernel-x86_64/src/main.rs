@@ -51,7 +51,10 @@
 pub mod arch;
 #[cfg(not(test))]
 pub mod boot;
-#[cfg(not(test))]
+// Round 5, Phase B: the drvstack tree compiles in TEST builds too —
+// the per-driver pure logic (SQE/CQE, descriptors, FIS, DHCP, TRBs)
+// runs on the host against the testharness fakes; the boot-only step
+// functions stay #[cfg(not(test))] inside their modules.
 pub mod drvstack;
 #[cfg(not(test))]
 pub mod kmain;

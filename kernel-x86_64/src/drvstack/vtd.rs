@@ -1,5 +1,11 @@
 //! VT-d bring-up + the hardware proofs + the broker demo (PR 0.4/0.5).
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use super::hw_code;
 use super::line;
 use super::VTD_TABLE_OWNER;
@@ -12,6 +18,7 @@ use aegis_os::dmar::{self, Dmar, DmarStruct};
 /// SRTP/QIE/TE sequenced with bounded spins. Every refusal is a
 /// marker + verdict line, never a halting guess. Returns the live
 /// unit for the hardware proofs and the broker (PR 0.5) to sit on.
+#[cfg(not(test))]
 pub(crate) fn vtd_step<const N: usize>(
     k: &mut aegis_os::Kernel<N>,
     pool: &mut FramePool<N>,
@@ -132,6 +139,7 @@ pub(crate) fn vtd_step<const N: usize>(
 /// `DmaProt` surface the broker (PR 0.5) will sit on. The device
 /// comes from the DRHD's own scopes; the real claim path arrives with
 /// Phase 1's PCI model (the marker says so).
+#[cfg(not(test))]
 pub(crate) fn proof_step<const N: usize>(
     k: &mut aegis_os::Kernel<N>,
     pool: &mut FramePool<N>,
