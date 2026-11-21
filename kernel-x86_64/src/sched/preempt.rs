@@ -37,8 +37,30 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// One timer tick in TSC cycles (TSC-deadline mode): ~10 ms at a
 /// 2.5 GHz reference TSC. Only cadence — never correctness — depends
-/// on this; the monitor windows carry their own clock.
+/// on this; the monitor windows carry their own clock. This is the
+/// FALLBACK used until the HPET calibration (ADR-0019's platform
+/// slice) replaces it with the measured value.
 pub const TICK_INTERVAL_TSC: u64 = 25_000_000;
+
+/// The live tick interval: the measured value after calibration, or
+/// the [`TICK_INTERVAL_TSC`] fallback. Atomic so the boot-time
+/// calibration can store it while everything else keeps reading it —
+/// no unsafe to hold it.
+static TICK_INTERVAL: AtomicU64 = AtomicU64::new(TICK_INTERVAL_TSC);
+
+/// Store the calibrated tick interval (HPET-measured TSC frequency;
+/// refuses a zero — a zero cadence would starve the preemptor).
+pub fn set_tick_interval(cycles: u64) {
+    if cycles > 0 {
+        TICK_INTERVAL.store(cycles, Ordering::SeqCst);
+    }
+}
+
+/// The live tick interval in TSC cycles.
+#[must_use]
+pub fn tick_interval() -> u64 {
+    TICK_INTERVAL.load(Ordering::SeqCst)
+}
 
 /// The one preemptor: slice_ticks = 1 (one tick = one CFS slice
 /// charge). Stateless over the real scheduler (`Kernel::sched`), so a
@@ -62,7 +84,7 @@ pub fn arm() {
     let tsc_deadline = lapic::init();
     TSC_DEADLINE.store(tsc_deadline, Ordering::SeqCst);
     if tsc_deadline {
-        lapic::arm_deadline(hw::read_tsc() + TICK_INTERVAL_TSC);
+        lapic::arm_deadline(hw::read_tsc() + tick_interval());
         serial::write_str("[ARCH] lapic timer armed: mode=tsc-deadline vector=48\n");
     } else {
         // The fallback line is different ON PURPOSE: the periodic mode
@@ -82,7 +104,7 @@ pub fn on_timer_tick(frame: &mut ExceptionFrame) {
     // worst case is prompt back-to-back ticks, bounded by handler cost.
     lapic::eoi();
     if TSC_DEADLINE.load(Ordering::SeqCst) {
-        lapic::arm_deadline(hw::read_tsc() + TICK_INTERVAL_TSC);
+        lapic::arm_deadline(hw::read_tsc() + tick_interval());
     }
 
     // A tick can only interrupt CPL3: the kernel runs IF=0 (SYSCALL
@@ -171,4 +193,26 @@ pub fn switches() -> u64 {
 /// next runnable domain, if any (kmain's handover path).
 pub fn on_exit(sched: &mut aegis_os::sched::Scheduler, exited: u32) -> Option<u32> {
     PREEMPTOR.on_exit(sched, exited)
+}
+
+/// Pause the timer (mask the LVT entry): ADR-0019's bounded delivery
+/// window opens IF inside the kernel for microseconds, and a tick
+/// through THAT window would be a CPL0 preemption — a frame shape the
+/// tick path deliberately does not model (see the guard in
+/// `on_timer_tick`). Pause first, window second.
+pub fn pause_ticks() {
+    lapic::mask_timer();
+}
+
+/// Resume the timer after the window: unmask and re-arm a FULL
+/// interval (TSC-deadline) or reload the count (periodic) — a partial
+/// interval through the window would fire a prompt back-to-back tick.
+pub fn resume_ticks() {
+    if TSC_DEADLINE.load(Ordering::SeqCst) {
+        lapic::unmask_timer();
+        lapic::arm_deadline(hw::read_tsc() + tick_interval());
+    } else {
+        lapic::reload_periodic();
+        lapic::unmask_timer();
+    }
 }

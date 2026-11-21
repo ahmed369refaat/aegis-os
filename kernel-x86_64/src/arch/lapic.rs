@@ -71,6 +71,48 @@ pub const fn svr_value() -> u32 {
 /// SVR bit 8: software enable.
 pub const SVR_ENABLE: u32 = 1 << 8;
 
+// ── x2APIC (ADR-0019) ──────────────────────────────────────────────────
+// CPUID.01H:ECX bit 21 offers the MSR-mapped APIC ("x2APIC"). When
+// present we switch (IA32_APIC_BASE bit 10) and every register
+// access — including the EOI — routes through MSR 0x800+off instead
+// of the MMIO window. The register FILE offsets (ID 0x02, VER 0x03,
+// ..., DIVIDE 0x3E) map straight onto 0x800+off; the one merge is
+// ICR (xAPIC's 0x300/0x310 pair becomes the single 64-bit 0x830 —
+// unused until SMP's IPIs).
+
+/// IA32_APIC_BASE bit 10: x2APIC enable (only settable alongside bit
+/// 11; not clearable once set without disabling the APIC entirely).
+pub const APIC_BASE_X2APIC: u64 = 1 << 10;
+/// The x2APIC MSR file base: register `off` → MSR 0x800 + off.
+pub const MSR_X2APIC_BASE: u32 = 0x800;
+/// CPUID.01H:ECX bit 21: the CPU offers x2APIC.
+pub const CPUID_ECX_X2APIC: u64 = 1 << 21;
+
+/// The x2APIC EOI MSR (0x80B).
+pub const MSR_X2APIC_EOI: u32 = 0x80B;
+
+/// Mode: set once at `init` (before any interrupt can fire — IF=0 at
+/// bring-up), read by every accessor. Static atomic, no unsafe.
+static X2APIC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Is the APIC in x2APIC mode? (False = classic xAPIC MMIO.)
+#[must_use]
+pub fn x2apic_active() -> bool {
+    X2APIC.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// The x2APIC MSR index for a register-file offset (pure — host
+/// tests pin the mapping, including the EOI and the LVT timer). The
+/// xAPIC MMIO offsets are 16-byte spaced (0x020, 0x030, 0x0B0, ...);
+/// the x2APIC MSRs are PACKED — the mapping is 0x800 + (off >> 4):
+/// ID 0x020→0x802, VER 0x030→0x803, EOI 0x0B0→0x80B, SVR 0x0F0→0x80F,
+/// LVT-timer 0x320→0x832, and ICR's 0x300/0x310 pair merges into the
+/// single 64-bit 0x830.
+#[must_use]
+pub const fn x2apic_msr(off: u64) -> u32 {
+    MSR_X2APIC_BASE + (off >> 4) as u32
+}
+
 /// LVT timer encodings. The mask bit (16) must stay CLEAR for the
 /// timer to fire; the mode field is bits 18:17.
 pub const LVT_MASKED: u32 = 1 << 16;
@@ -122,15 +164,24 @@ pub fn reg(offset: u64) -> u64 {
 
 #[cfg(not(test))]
 fn read32(offset: u64) -> u32 {
-    // memops takes the PHYSICAL address and translates through the
-    // direct map (the window mapping is what makes this PA reachable).
-    // 4-byte accesses: the LAPIC's natural MMIO width.
-    memops::read_u32(DEFAULT_MMIO_BASE + offset)
+    // x2APIC: the same register file, one MSR read instead of an MMIO
+    // window. memops takes the PHYSICAL address and translates
+    // through the direct map (the window mapping is what makes this
+    // PA reachable); 4-byte accesses: the xAPIC natural MMIO width.
+    if x2apic_active() {
+        hw::rdmsr(x2apic_msr(offset)) as u32
+    } else {
+        memops::read_u32(DEFAULT_MMIO_BASE + offset)
+    }
 }
 
 #[cfg(not(test))]
 fn write32(offset: u64, v: u32) {
-    memops::write_u32(DEFAULT_MMIO_BASE + offset, v);
+    if x2apic_active() {
+        hw::wrmsr(x2apic_msr(offset), u64::from(v));
+    } else {
+        memops::write_u32(DEFAULT_MMIO_BASE + offset, v);
+    }
 }
 
 /// Map the LAPIC's MMIO window into the kernel's direct map: the
@@ -174,7 +225,9 @@ pub fn init() -> bool {
     }
 
     // IA32_APIC_BASE: keep the firmware base (assert the default), set
-    // the global-enable bit.
+    // the global-enable bit; x2APIC mode when the CPU offers it
+    // (ADR-0019) — the register file stays, every access after this
+    // point routes through MSR 0x800+off.
     let base = hw::rdmsr(MSR_IA32_APIC_BASE);
     if base & !0xFFF_u64 & !APIC_BASE_ENABLE != DEFAULT_MMIO_BASE {
         // A relocated APIC: the window mapping above used the default.
@@ -183,7 +236,16 @@ pub fn init() -> bool {
         crate::serial::write_str("[ARCH] lapic: unexpected APIC base MSR — halting\n");
         hw::halt_forever();
     }
-    hw::wrmsr(MSR_IA32_APIC_BASE, base | APIC_BASE_ENABLE);
+    let x2 = crate::arch::features::has_x2apic(hw::cpuid1_ecx());
+    let enable = if x2 {
+        hw::wrmsr(MSR_IA32_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_X2APIC);
+        X2APIC.store(true, core::sync::atomic::Ordering::SeqCst);
+        base | APIC_BASE_ENABLE | APIC_BASE_X2APIC
+    } else {
+        hw::wrmsr(MSR_IA32_APIC_BASE, base | APIC_BASE_ENABLE);
+        base | APIC_BASE_ENABLE
+    };
+    let _ = enable;
 
     // Task priority: accept everything (the IDT gates decide).
     write32(REG_TPR, 0);
@@ -215,10 +277,36 @@ pub fn arm_deadline(deadline_tsc: u64) {
 }
 
 /// Acknowledge the current interrupt: without an EOI the LAPIC never
-/// delivers the next one.
+/// delivers the next one. Mode-aware: an MMIO write in xAPIC, the
+/// 0x80B MSR in x2APIC (ADR-0019 — the broker's `deliver` calls this
+/// FIRST, before any bookkeeping).
 #[cfg(not(test))]
 pub fn eoi() {
     write32(REG_EOI, 0);
+}
+
+/// Mask the timer's LVT entry (pause ticks) — used by ADR-0019's
+/// bounded delivery window so a preempt tick cannot land mid-window
+/// in CPL0 (the tick path models CPL3 frames only).
+#[cfg(not(test))]
+pub fn mask_timer() {
+    let lvt = read32(REG_LVT_TIMER);
+    write32(REG_LVT_TIMER, lvt | LVT_MASKED);
+}
+
+/// Unmask the timer's LVT entry (resume ticks after the window).
+#[cfg(not(test))]
+pub fn unmask_timer() {
+    let lvt = read32(REG_LVT_TIMER);
+    write32(REG_LVT_TIMER, lvt & !LVT_MASKED);
+}
+
+/// Reload the periodic-mode initial count (a fresh full interval).
+/// TSC-deadline mode ignores this and re-arms via `arm_deadline`.
+#[cfg(not(test))]
+pub fn reload_periodic() {
+    write32(REG_TIMER_DIVIDE, DIVIDE_BY_16);
+    write32(REG_TIMER_INIT_COUNT, PERIODIC_FALLBACK_COUNT);
 }
 
 #[cfg(test)]
@@ -317,5 +405,42 @@ mod tests {
     #[test]
     fn divide_by_16_is_the_sdm_encoding() {
         assert_eq!(DIVIDE_BY_16, 0x3);
+    }
+
+    /// The x2APIC MSR map (ADR-0019): the register file maps onto
+    /// 0x800+off — the EOI, the LVT timer, and the version register
+    /// pinned so a wrong offset writes a NEIGHBORING MSR (the exact
+    /// bug class worth pinning).
+    #[test]
+    fn x2apic_msr_map_is_pinned() {
+        assert_eq!(x2apic_msr(REG_EOI), 0x80B);
+        assert_eq!(x2apic_msr(REG_LVT_TIMER), 0x832);
+        assert_eq!(x2apic_msr(REG_VERSION), 0x803);
+        assert_eq!(x2apic_msr(REG_ID), 0x802);
+        assert_eq!(x2apic_msr(REG_SVR), 0x80F);
+        assert_eq!(x2apic_msr(REG_TPR), 0x808);
+        assert_eq!(x2apic_msr(REG_TIMER_INIT_COUNT), 0x838);
+        assert_eq!(x2apic_msr(REG_TIMER_DIVIDE), 0x83E);
+        // The map is a pure shift of the file: distinct offsets stay
+        // distinct MSRs (no aliasing).
+        for a in [REG_ID, REG_EOI, REG_SVR, REG_LVT_TIMER] {
+            for b in [REG_VERSION, REG_TPR, REG_TIMER_DIVIDE] {
+                assert_ne!(x2apic_msr(a), x2apic_msr(b));
+            }
+        }
+    }
+
+    /// The x2APIC enable bit and its CPUID feature bit, pinned:
+    /// APIC_BASE bit 10 (x2APIC), CPUID.01H:ECX bit 21.
+    #[test]
+    fn x2apic_bits_are_pinned() {
+        assert_eq!(APIC_BASE_X2APIC, 1 << 10);
+        assert_eq!(CPUID_ECX_X2APIC, 1 << 21);
+        // Distinct from the global-enable bit (11) and from every
+        // other flag the base MSR carries.
+        assert_ne!(APIC_BASE_X2APIC, APIC_BASE_ENABLE);
+        assert!(crate::arch::features::has_x2apic(CPUID_ECX_X2APIC));
+        assert!(!crate::arch::features::has_x2apic(0));
+        assert!(!crate::arch::features::has_x2apic(1 << 20), "neighbor bit must not decode");
     }
 }

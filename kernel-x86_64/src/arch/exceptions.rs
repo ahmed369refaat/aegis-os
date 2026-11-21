@@ -156,6 +156,20 @@ fn dispatch(f: &mut ExceptionFrame) {
         return;
     }
 
+    // ── broker-owned device vectors (ADR-0019): route to the
+    // interrupt broker BEFORE the fault classification. The frame may
+    // be CPL3 — a device IRQ that interrupted user code is NOT the
+    // domain's death — and it may be CPL0 (the deliberate delivery
+    // window); either way the broker owns it: EOI first, then the
+    // device's mailbox. An unowned vector is a NAMED halt inside the
+    // broker (nothing arms a vector it did not hand out).
+    if (crate::irq::DEVICE_VECTOR_BASE..=crate::irq::DEVICE_VECTOR_MAX)
+        .contains(&(f.vector as u8))
+    {
+        crate::irq::deliver(f.vector as u8);
+        return;
+    }
+
     let mut bv = [0u8; 20];
     let mut brip = [0u8; 18];
     let mut bcs = [0u8; 18];
@@ -342,8 +356,10 @@ fn dispatch(f: &mut ExceptionFrame) {
         ARMED_GUARD.store(false, Ordering::SeqCst);
         serial::write_str("[EXC] guard selftest: stack guard #PF ok\n");
         // Terminal by design: the last act of the boot, so the proof ends
-        // the run cleanly (mirrors the PR-1.1 pattern).
-        hw::shutdown_qemu()
+        // the run cleanly (mirrors the PR-1.1 pattern). The power-off is
+        // FADT-sourced when the ACPI step installed one (arch::pwr),
+        // the legacy constants otherwise.
+        crate::arch::pwr::power_off()
     }
 
     // ── a stray device IRQ: named, loud, terminal ────────────────────

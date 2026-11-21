@@ -68,9 +68,12 @@ pub mod session;
 pub mod frames;
 #[cfg(not(test))]
 pub mod hw;
+pub mod irq;
 pub mod memops;
 pub mod multiboot;
+pub mod msi;
 pub mod pci;
+pub mod rng;
 pub mod runtime;
 pub mod sched;
 pub mod strutil;

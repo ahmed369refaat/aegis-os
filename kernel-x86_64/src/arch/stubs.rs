@@ -83,6 +83,74 @@ vector_stub!(irq47, 47, noerr);
 // 48: the LAPIC timer (ADR-0012) — the preemption entry. No CPU error
 // code; the dispatch routes it to the tick before anything else.
 vector_stub!(irq48, 48, noerr);
+// 49..=112: broker-owned device vectors (ADR-0019). No CPU error code. These land in the dispatch's broker route
+// (ADR-0019): an owned vector delivers to its device's mailbox, an
+// unowned one is a NAMED halt — the ADR-0010 discipline extended
+// from the legacy 8259 range to the device range.
+vector_stub!(irq49, 49, noerr);
+vector_stub!(irq50, 50, noerr);
+vector_stub!(irq51, 51, noerr);
+vector_stub!(irq52, 52, noerr);
+vector_stub!(irq53, 53, noerr);
+vector_stub!(irq54, 54, noerr);
+vector_stub!(irq55, 55, noerr);
+vector_stub!(irq56, 56, noerr);
+vector_stub!(irq57, 57, noerr);
+vector_stub!(irq58, 58, noerr);
+vector_stub!(irq59, 59, noerr);
+vector_stub!(irq60, 60, noerr);
+vector_stub!(irq61, 61, noerr);
+vector_stub!(irq62, 62, noerr);
+vector_stub!(irq63, 63, noerr);
+vector_stub!(irq64, 64, noerr);
+vector_stub!(irq65, 65, noerr);
+vector_stub!(irq66, 66, noerr);
+vector_stub!(irq67, 67, noerr);
+vector_stub!(irq68, 68, noerr);
+vector_stub!(irq69, 69, noerr);
+vector_stub!(irq70, 70, noerr);
+vector_stub!(irq71, 71, noerr);
+vector_stub!(irq72, 72, noerr);
+vector_stub!(irq73, 73, noerr);
+vector_stub!(irq74, 74, noerr);
+vector_stub!(irq75, 75, noerr);
+vector_stub!(irq76, 76, noerr);
+vector_stub!(irq77, 77, noerr);
+vector_stub!(irq78, 78, noerr);
+vector_stub!(irq79, 79, noerr);
+vector_stub!(irq80, 80, noerr);
+vector_stub!(irq81, 81, noerr);
+vector_stub!(irq82, 82, noerr);
+vector_stub!(irq83, 83, noerr);
+vector_stub!(irq84, 84, noerr);
+vector_stub!(irq85, 85, noerr);
+vector_stub!(irq86, 86, noerr);
+vector_stub!(irq87, 87, noerr);
+vector_stub!(irq88, 88, noerr);
+vector_stub!(irq89, 89, noerr);
+vector_stub!(irq90, 90, noerr);
+vector_stub!(irq91, 91, noerr);
+vector_stub!(irq92, 92, noerr);
+vector_stub!(irq93, 93, noerr);
+vector_stub!(irq94, 94, noerr);
+vector_stub!(irq95, 95, noerr);
+vector_stub!(irq96, 96, noerr);
+vector_stub!(irq97, 97, noerr);
+vector_stub!(irq98, 98, noerr);
+vector_stub!(irq99, 99, noerr);
+vector_stub!(irq100, 100, noerr);
+vector_stub!(irq101, 101, noerr);
+vector_stub!(irq102, 102, noerr);
+vector_stub!(irq103, 103, noerr);
+vector_stub!(irq104, 104, noerr);
+vector_stub!(irq105, 105, noerr);
+vector_stub!(irq106, 106, noerr);
+vector_stub!(irq107, 107, noerr);
+vector_stub!(irq108, 108, noerr);
+vector_stub!(irq109, 109, noerr);
+vector_stub!(irq110, 110, noerr);
+vector_stub!(irq111, 111, noerr);
+vector_stub!(irq112, 112, noerr);
 // 255: the LAPIC spurious vector (from SVR). Wired so a spurious
 // delivery is a named no-op in the dispatch instead of an absent-gate
 // #GP — the ADR-0010 lesson (absent gates turn surprises into
@@ -171,10 +239,33 @@ pub extern "C" fn exception_common() {
     );
 }
 
+/// The broker-owned device-vector stubs (49..=112, ADR-0019) in
+/// vector order — the IDT wiring and the broker's slot arithmetic
+/// both index this table.
+const DEVICE_STUBS: [extern "C" fn(); 64] = [
+    irq49, irq50, irq51, irq52,
+    irq53, irq54, irq55, irq56,
+    irq57, irq58, irq59, irq60,
+    irq61, irq62, irq63, irq64,
+    irq65, irq66, irq67, irq68,
+    irq69, irq70, irq71, irq72,
+    irq73, irq74, irq75, irq76,
+    irq77, irq78, irq79, irq80,
+    irq81, irq82, irq83, irq84,
+    irq85, irq86, irq87, irq88,
+    irq89, irq90, irq91, irq92,
+    irq93, irq94, irq95, irq96,
+    irq97, irq98, irq99, irq100,
+    irq101, irq102, irq103, irq104,
+    irq105, irq106, irq107, irq108,
+    irq109, irq110, irq111, irq112,
+];
+
 /// The registry the IDT is filled from: (stub address, IST index) for
 /// a wired vector. Valid for the exceptions (0..=31), the legacy IRQ
-/// catch-alls (32..=47), the LAPIC timer (48) and the LAPIC spurious
-/// vector (255) — see `idt::load` for the wiring policy.
+/// catch-alls (32..=47), the LAPIC timer (48), the broker-owned
+/// device vectors (49..=112) and the LAPIC spurious vector (255) —
+/// see `idt::load` for the wiring policy.
 pub fn vector_handler(vector: u8) -> (u64, u8) {
     let stub: extern "C" fn() = match vector {
         0 => v00,
@@ -226,6 +317,8 @@ pub fn vector_handler(vector: u8) -> (u64, u8) {
         46 => irq46,
         47 => irq47,
         48 => irq48,
+        // 49..=112: the broker-owned device vectors (ADR-0019).
+        49..=112 => DEVICE_STUBS[(vector - 49) as usize],
         255 => v255,
         _ => panic!("vector_handler: not a wired vector (0..=48, 255)"),
     };

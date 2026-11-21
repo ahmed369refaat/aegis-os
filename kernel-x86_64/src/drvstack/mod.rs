@@ -23,12 +23,14 @@ mod ahci;
 mod broker;
 mod e1k;
 mod ext2;
+mod irq;
 mod legacy;
 mod netutil;
 mod nvme;
 mod pci;
 mod vblk;
 mod vnet;
+mod vrng;
 mod vtd;
 mod xhci;
 
@@ -104,11 +106,18 @@ pub fn driver_stack_step<const N: usize>(
             );
             if let Some(mut unit) = vtd::vtd_step(k, pool, out, &dmar) {
                 vtd::proof_step(k, pool, out, &dmar, &mut unit);
+                // ADR-0019: IR comes up between the DMA engine and the
+                // broker — the broker owns every IRTE from here on.
+                irq::ir_setup_step(k, pool, out, &mut unit, &dmar);
                 let mut broker = broker::broker_step(k, pool, out, unit);
                 // ADR-0018: kernel-allocated, one IOMMU domain per
                 // device (domain 0 stays the kernel's own).
                 let mut domains = crate::session::DomainIds::new();
-                let inv = pci::pci_step(out, &dmar, &mut broker, &mut domains);
+                let inv = pci::pci_step(out, dir_pa, &dmar, &mut broker, &mut domains);
+                // ADR-0019 + the platform slice: entropy sources before
+                // storage drivers — the pool needs no device at all,
+                // the bus source rides the broker.
+                vrng::rng_step(k, pool, out, &mut broker, &inv);
                 vblk::virtio_step(k, pool, out, &mut broker, &inv);
                 vnet::net_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_step(k, pool, out, &mut broker, &inv);
@@ -117,7 +126,8 @@ pub fn driver_stack_step<const N: usize>(
                 ahci::ahci_step(k, pool, out, &mut broker, &inv);
                 xhci::xhci_step(k, pool, out, &mut broker, &inv);
                 xhci::xhci_cmdring_step(k, pool, out, &mut broker, &inv);
-                acpi::acpi_hpet_step(out, dir_pa);
+                let madt_view = acpi::acpi_hpet_step(out, dir_pa);
+                irq::irq_step(out, madt_view.as_ref());
                 legacy::gfx_step(out, &inv);
                 legacy::ps2_step(out);
                 legacy::rtc_step(out);
@@ -158,6 +168,7 @@ pub fn driver_stack_step<const N: usize>(
             let mut domains = crate::session::DomainIds::new();
             let inv = pci::pci_step(
                 out,
+                0, // no ACPI directory on this arm: the legacy port pair
                 &aegis_os::dmar::Dmar::absent_stub(),
                 &mut broker,
                 &mut domains,
