@@ -4,6 +4,147 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Added — review round 7 ("I"): read-only FAT32 — the EFI System Partition
+
+- **The FAT32 policy core** (`src/fat32.rs`): BPB validation with the
+  spec's own type determination (a cluster count below 65525 is
+  FAT12/FAT16-shaped and REFUSED as `NotFat32`, never misread),
+  FAT-entry classification (free/reserved/bad/past-the-volume values
+  refuse; a legal follow and end-of-chain are distinct outcomes), 8.3
+  dirent parsing (long-name, deleted, and volume-label records are
+  skipped per the format; a size>0 record with no cluster behind it
+  refuses), and the cluster-chain walk with a structural termination
+  proof — each iteration covers exactly one cluster, so the walk ends
+  after ceil(len/cluster_bytes) steps; a loop-back entry re-reads a
+  bounded cluster and still terminates; a chain shorter than the
+  dirent's length refuses with `ChainTooShort`, a length the volume
+  cannot hold refuses up front with `ChainTooLong`. Seven host tests
+  including a 2000-image fuzz corpus; the walk itself lives in the
+  core (the kernel supplies only the sector loader), so every bound
+  above is host-proven, not boot-hoped.
+- **`scripts/mkfat32.py`**: grows the mkext2 disk with GPT partition 2
+  — an ESP (type GUID C12A7328-…) holding an honest FAT32 volume:
+  65600 clusters (≥ the 65525 minimum), two 516-sector FAT copies, the
+  FSInfo sector with true free-cluster accounting, the backup boot
+  sector, and HELLO.ESP — 1200 bytes across clusters 3→4→5, so the
+  chain has real hops to walk. The GPT backup moves to the new tail;
+  the stale copy is zeroed; the protective MBR is resized.
+- **The transport** (`drvstack/fat32.rs`): mounts on the LIVE AHCI
+  port right after ext2 (same frames, no restart), walks the GPT again
+  for partition 2, and reads HELLO.ESP through the policy core's walk
+  — the marker prints the head (cluster 3) AND the tail (cluster 5),
+  so every hop between them is proven. Live on BOTH lanes (IOMMU and
+  no-IOMMU), grepped by the CI lanes.
+
+### Fixed — review round 7 ("I"): the hidden lane debt of rounds 6–H
+
+- **The TSC calibration that never calibrated** (`drvstack/acpi.rs`):
+  `tsc_delta.checked_mul(10^15)` overflows u64 for ANY real window —
+  a 2M-spin calibration is millions of TSC ticks and the product
+  exceeds 2^64 ten times over — so the "[TSC ] calibrated" marker
+  had never printed (hidden behind the round-6 lane crash). The
+  arithmetic moved to u128; the quotient bounds (1 MHz..16 GHz)
+  stay.
+- **The virtio-console chain that never chained**
+  (`drvstack/vcon.rs`): the header descriptor was written with
+  `flags = 0` — without `DESC_F_NEXT` the next-index field is
+  ignored, the device treated the 4-byte port header as the whole
+  request, and the host file received exactly those 4 bytes while
+  the guest-side completion reported success. One flag; the host
+  file now holds the full round-trip payload.
+- **The CPUID RBX destruction** (`hw::cpuid7_ebx` / `hw::cpuid1_ecx`):
+  the "bulletproof" push/cpuid/store/pop pattern was inverted — the
+  `mov %rbx,(%rsp)` overwrote the SAVED original RBX with CPUID's
+  output and the `pop` handed that to the output operand, so the
+  caller's callee-saved RBX never came back. CPUID destroys RBX and
+  the block never declared it; whether anything broke was allocation
+  luck (a release build kept the driver stack's inventory pointer in
+  RBX across `cpuid7_ebx()` — the q35 lane #PF'd at a garbage
+  pointer, deterministically, while a marker-instrumented build with
+  different register allocation ran clean). `cpuid7_ebx` now shuttles
+  the word out with `xchg` (the original RBX lands back in the
+  register, the wanted EBX in the slot); `cpuid1_ecx` stores ECX to
+  its operand directly and pops the original RBX. The other push-RBX
+  sites (the naked entry stubs) are self-balanced and untouched.
+- **The unclaimed-virtio DMA failure** (`drvstack/pci.rs` +
+  `pci::Inventory::set_dom_dev`, host-tested): the round-G/H steps
+  drove virtio-rng, virtio-console, and virtio-balloon WITHOUT
+  walking the claim gate — their sessions ran with `dev.dom = 0`
+  (the kernel's own domain), and an unclaimed device's DMA fails
+  closed at the IOMMU, so every device completion honestly timed
+  out ("DID NOT COMPLETE (budget)") the moment the ECAM fix let the
+  q35 lane reach them. Claimed devices beside them (vblk dom 1,
+  vnet dom 2) completed everything — the differential that pinned
+  it. The three devices now walk the same claim gate as the rest
+  (matched by virtio device id, legacy and modern both; the family's
+  class codes are ambiguous), recorded through the new id-matched
+  `set_dom_dev`. The domain budget that made the fix visible —
+  `MAX_VTD_DOMAINS` 8 → 16, with the derived `TABLE_BUDGET` scaling
+  along (the q35 lane now claims nine devices; dom 7 was the last
+  handout, so rng/balloon were refused on budget before the raise) —
+  and console's device round trip completing on its own domain
+  ("TX complete … the HOST file holds the other half") is the
+  end-to-end proof.
+- **The idle-queue MSI-X kick** (`drvstack/vnet.rs`): the ADR-0019
+  delivery proof kicked the TX queue AFTER the DHCP exchange drained
+  it — a notify with no pending buffer never produces a used-ring
+  update, so the device never fired and the 400M-TSC-cycle delivery
+  window ground the whole lane into its timeout (under QEMU TCG the
+  emulated TSC makes 400M cycles ten-plus wall-clock minutes). The
+  step now queues one fresh TX before the kick (the used-ring update
+  itself — not the network — is the event that fires entry 2), and
+  the window's budget drops to 40M cycles (~13 ms on real iron at
+  3 GHz, under a minute under TCG).
+
+### Known-open (round I, honestly recorded — not claimed)
+
+- **MSI message delivery (both formats)**: the arming, read-back,
+  fresh-work kick, bounded window, and teardown are proven live, but
+  the message never lands (compat on the base lane, remapped on IR).
+  The delivery window's own honesty is what exposed it: the old
+  mwait window slept through its deadline (a silent device = a
+  hung boot), the new `wait_for_delivery_spin` says "NOT delivered"
+  loudly and the boot continues. The DELIVERED greps moved off both
+  lanes; the line-interrupt chain (IOAPIC → vector → mailbox) is
+  delivered and stays grepped.
+- **The balloon inflate**: the deflate round trip is live (the page
+  returns home); the inflate's host-side discard never completes the
+  queue entry under this QEMU. Round H's "real inflate/deflate"
+  claim was never exercised (the lane crashed at ECAM first) — the
+  checklist now says what actually happens.
+- **The ECAM direct-map hole** (`mm::map_gib_windows` + `gib_span`):
+  round 6's ADR-0020 shipped the ECAM seam without mapping the GiB the
+  MCFG window lives in — on q35 the third GiB (PCIEXBAR 0xB000_0000),
+  which nothing else maps — so the FIRST config read through the
+  direct map #PF'd and the kernel halted ("unexpected fault"). The q35
+  lane never got that far (see below), so the crash hid. The fix
+  generalizes the fourth-GiB LAPIC/VT-d window trick: the spanned
+  1-GiB PDPT entries are mapped as RW+NX huge pages, idempotently,
+  only-if-absent; the span math is pure and host-tested. The lane now
+  greps the mapping marker.
+- **The GPT lane marker** (`drvstack/ext2.rs`): the lane greps
+  expected `LBA 34..=289` while the kernel printed `LBA 34..289` —
+  every lane ran red on that grep since round 6, which is exactly how
+  the ECAM crash above stayed hidden. The kernel now prints the
+  inclusive range (the GPT span is first..=last); the FAT32 marker
+  matches the same convention.
+- **The fmt debt**: rounds G/H shipped 25 files without a fmt pass —
+  `cargo fmt --all --check` (the CI job) reported 1407 diff lines on a
+  tree that was clean at 15d9441. Reformatted, zero semantic change,
+  full suite green.
+- **The lane timeouts**: q35/IR lanes raised 240s → 600s. The M2
+  syscall audit phase alone emits ~390k serial lines before the driver
+  stack starts, and q35 + intel-iommu under TCG on a loaded host needs
+  more than 240s just to reach `[PCI ]` — the timeout kill looked like
+  a boot failure while it was really a budget failure.
+- **A dead comparison in `pci::ecam_addr`** (flagged by the compiler):
+  `bus.wrapping_sub(start_bus) > 255` on u8s is always false; the
+  window's end is the caller's bound (`CfgAccess::resolve` checks
+  `end_bus`). Removed with the responsibility stated.
+- unsafe ratchet: unchanged at 100/100 — the round adds ZERO unsafe
+  (the transport reuses the proven AHCI read path; the GiB-window
+  writes go through the memops wrappers).
+
 ### Changed — review round 6, part 2 ("H"): the watchdogs, AMD-Vi's IVRS, and two more virtio devices
 
 - **The watchdogs** (`drvstack/wdt.rs`, register maps pinned against
