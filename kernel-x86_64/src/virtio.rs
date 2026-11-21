@@ -398,6 +398,13 @@ pub fn write_u16_pa(pa: u64, v: u16) {
     memops::write_u32(base, cleared | ((v as u32) << shift));
 }
 
+/// Write the u32 at `pa` (must be 4-aligned): a plain word store —
+/// the virtio-serial port-id header and similar 4-byte structures.
+pub fn write_u32_pa(pa: u64, v: u32) {
+    debug_assert!(pa.is_multiple_of(4));
+    memops::write_u32(pa, v);
+}
+
 /// Read the u8 at `pa` via its containing u32 word.
 #[must_use]
 pub fn read_u8_pa(pa: u64) -> u8 {

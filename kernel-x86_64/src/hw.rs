@@ -55,6 +55,19 @@ pub fn inb(port: u16) -> u8 {
     val
 }
 
+/// Read one word from an I/O port — the natural width of the ICH9
+/// TCO watchdog's registers (16-bit I/O at PMBASE+0x60; byte pairs
+/// would depend on the region's per-byte decode, and dword reads
+/// would smear the neighboring register into the value).
+///
+/// SAFETY: as `inb`.
+pub fn inw(port: u16) -> u16 {
+    let val: u16;
+    // SAFETY: ring-0 CPL; a pure device read.
+    unsafe { asm!("in ax, dx", out("ax") val, in("dx") port, options(nostack, preserves_flags)) }
+    val
+}
+
 /// Read one dword from an I/O port — the natural width of the PCI
 /// config data register (0xCFC).
 ///

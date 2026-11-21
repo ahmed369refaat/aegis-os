@@ -314,6 +314,7 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
     let mut madt_pa: u64 = 0;
     let mut mcfg_pa: u64 = 0;
     let mut facp_pa: u64 = 0;
+    let mut ivrs_pa: u64 = 0;
     let mut sig = [0u8; 8];
     for i in 0..n.min(64) {
         let entry_pa = if xsdt {
@@ -330,6 +331,7 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
             b"APIC" => madt_pa = entry_pa,
             b"MCFG" => mcfg_pa = entry_pa,
             b"FACP" => facp_pa = entry_pa,
+            b"IVRS" => ivrs_pa = entry_pa,
             _ => {}
         }
     }
@@ -479,6 +481,47 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
         } else {
             line(out, &["[FADT] power fields malformed — power paths stay on the legacy constants"]);
         }
+    }
+
+    // IVRS: AMD-Vi's firmware description. Absent on every QEMU
+    // machine (no AMD-Vi emulation) — the honest absence marker; on
+    // real AMD servers this parses the IVHD blocks (the IOMMU bases
+    // + the device-entry topology) the AMD engine slice will consume.
+    if ivrs_pa != 0 {
+        match crate::arch::acpi::table_ok(ivrs_pa, b"IVRS", &mut scratch) {
+            Some(len) => {
+                let n = (len as usize).min(scratch.len());
+                crate::arch::acpi::read_bytes(ivrs_pa, &mut scratch[..n]);
+                match aegis_os::ivrs::parse_ivrs(&scratch[..n]) {
+                    Ok(v) => {
+                        let mut b1 = [0u8; 20];
+                        let mut b2 = [0u8; 20];
+                        let mut b3 = [0u8; 18];
+                        let i = v.ivhds[0];
+                        line(
+                            out,
+                            &[
+                                "[IVRS] AMD-Vi: pa_bits=",
+                                strutil::dec(u64::from(v.phys_addr_bits), &mut b1),
+                                " ivhd=",
+                                strutil::dec(v.ivhd_count as u64, &mut b2),
+                                " base=0x",
+                                strutil::hex(i.map(|x| x.base_address).unwrap_or(0), &mut b3),
+                                " (parse slice; the engine follows)",
+                            ],
+                        );
+                    }
+                    Err(_) => {
+                        line(out, &["[IVRS] table present but malformed — refusing"]);
+                    }
+                }
+            }
+            None => {
+                line(out, &["[IVRS] table failed validation — refusing"]);
+            }
+        }
+    } else {
+        line(out, &["[IVRS] absent (no AMD-Vi on this machine — QEMU does not emulate it)"]);
     }
 
     // HPET: table +44 = the block's base address (space at +40).

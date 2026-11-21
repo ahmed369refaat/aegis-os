@@ -29,9 +29,12 @@ mod netutil;
 mod nvme;
 mod pci;
 mod vblk;
+mod vballoon;
+mod vcon;
 mod vnet;
 mod vrng;
 mod vtd;
+mod wdt;
 mod xhci;
 
 // The pool owner tags stay reachable at `crate::drvstack::*` (their
@@ -118,6 +121,8 @@ pub fn driver_stack_step<const N: usize>(
                 // storage drivers — the pool needs no device at all,
                 // the bus source rides the broker.
                 vrng::rng_step(k, pool, out, &mut broker, &inv);
+                vcon::console_step(k, pool, out, &mut broker, &inv);
+                vballoon::balloon_step(k, pool, out, &mut broker, &inv);
                 vblk::virtio_step(k, pool, out, &mut broker, &inv);
                 vnet::net_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_step(k, pool, out, &mut broker, &inv);
@@ -128,6 +133,7 @@ pub fn driver_stack_step<const N: usize>(
                 xhci::xhci_cmdring_step(k, pool, out, &mut broker, &inv);
                 let madt_view = acpi::acpi_hpet_step(out, dir_pa);
                 irq::irq_step(out, madt_view.as_ref());
+                wdt::wdt_step(out, &inv);
                 legacy::gfx_step(out, &inv);
                 legacy::ps2_step(out);
                 legacy::rtc_step(out);

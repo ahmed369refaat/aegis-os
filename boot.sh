@@ -91,7 +91,12 @@ case "${1:-}" in
                   -drive id=vd0,if=none,format=raw,file=target/vdisk0.img
                   -device pcie-root-port,id=rp0,bus=pcie.0
                   -drive id=vd1,if=none,format=raw,file=target/vdisk1.img
-                  -device virtio-blk-pci,bus=rp0,disable-legacy=on,drive=vd1)
+                  -device virtio-blk-pci,bus=rp0,disable-legacy=on,drive=vd1
+                  -device i6300esb
+                  -chardev file,id=vc0,path=target/console.out
+                  -device virtio-serial-pci,disable-legacy=on,iommu_platform=on
+                  -device virtconsole,chardev=vc0
+                  -device virtio-balloon-pci,disable-legacy=on,iommu_platform=on)
     EXTRA_GREPS=(
       "[IOMMU] dmar: pa="
       "[IOMMU] dmar: pa=0x"  # placeholder replaced below; see lane block
@@ -106,6 +111,14 @@ case "${1:-}" in
       "[PWR ] FADT: PM1a control @"  # the power paths read the firmware's own addresses
       "[IDLE] mwait woke on the delivery store"  # C0 idle: MONITOR/MWAIT, woken by the real IRQ
       "[GPT ] partition 1 'aegis-root' LBA 34..=289"  # the partition layer under the ext2 mount
+      "[WDT ] iTCO live: PMBASE 0x"  # the ICH9 TCO watchdog: registers live, NO_REBOOT gate read
+      "[WDT ] iTCO: programmed 10s → read-back"  # the write path, proven by read-back under NO_REBOOT
+      "[WDT ] i6300esb driven: unlock×3"  # the PCI watchdog: unlock/preload/ping sequence, reboot masked
+      "[VCON] virtio-console alive: tx qsize="  # port 0's transmit queue through the broker
+      "[VCON] TX complete: "  # the guest half of the round trip (the host file is the other half)
+      "[VBAL] virtio-balloon alive: config num_pages="  # the memory device's config layout
+      "[VBAL] cycle done: inflated=yes deflated=yes"  # a REAL one-page inflate/deflate, actual returns home
+      "[IVRS] absent (no AMD-Vi on this machine"  # the honest AMD-Vi absence (QEMU does not emulate it)
       "[VNET] alive: MAC="
       "[VNET] dbg q1 readback:"  # the device holds exactly the frames we mapped
       "[VNET] TX: DHCP DISCOVER sent"
@@ -365,6 +378,15 @@ grep -qF "(virtio-blk) → dom" "$LOG" || { echo "VERIFY FAIL: the virtio-blk cl
   for g in "${EXTRA_GREPS[@]}"; do
     grep -qF "$g" "$LOG" || { echo "VERIFY FAIL: missing lane marker: $g"; ok=0; }
   done
+  # ADR-0017's transport made audible: the virtio-console round trip's
+  # HOST half — the guest marker above proves the driver, the file
+  # below proves the bytes actually LEFT the machine.
+  if [ "${1:-}" = "--verify-q35" ]; then
+    if [ ! -s target/console.out ] || ! grep -q "AEGIS-VIRTIO-CONSOLE-ROUNDTRIP" target/console.out; then
+      echo "VERIFY FAIL: the console round trip never reached the host file"
+      ok=0
+    fi
+  fi
   if [ "${1:-}" = "--verify-q35" ] && [ "$ok" = 1 ]; then
     # Pixel-level proof of the GFX driver: what QMP captured has to
     # match the pattern drawn (weight it into the verdict honestly).
