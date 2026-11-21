@@ -4,6 +4,35 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Fixed — driver-stack review round 4, Phase 5 (F11): the NVMe data path — SOLVED
+
+Two compounding layout quirks of this QEMU's nvme plus one lane
+device property, each masking the others for two sessions:
+
+- **The command data pointer is read from SQE bytes 24-31** (the
+  spec's PRP2 slot), not 16-23 — measured by planting a distinct
+  page in every PRP-candidate slot and watching the identify DMA
+  fault at exactly the +24 plant (1,024 IOMMU write faults on its
+  page) while ignoring the +16 plant. The historical "data lands at
+  PA 0" was this bug writing at pointer 0 in the pass-through era.
+  The driver now writes the pointer at BOTH slots — spec hardware
+  ignores PRP2 for single-page aligned buffers, so both worlds work.
+- **CC's entry-size fields sit at bits 19:16 (IOSQES) / 23:20
+  (IOCQES)** here, not the spec's 23:20 / 27:24 — measured by
+  QEMU's own `pci_nvme_err_invalid_create_cq_entry_size iosqes 4
+  iocqes 6` after a spec-layout write. CC returns to 0x0046_0001
+  (the value the 2026-11-20 session had and "fixed" into the spec
+  layout while chasing the PRP symptom).
+- **The lane's nvme device needs `num_queues=2`** — the property
+  defaults to 0 (zero I/O queue pairs; `max_ioqpairs` is only a
+  cap). The q35 lane now passes it.
+
+After all three, the FIRST complete NVMe run: the Identify data
+page arrives (serial "AEGISN1", VID 0x1b36, NN=256), CreateIoCq +
+CreateIoSq pass, and a 512-byte LBA-0 read completes through the
+IOMMU. The lane greps pin all of it. docs/arch/drivers.md's anomaly
+note is rewritten as the resolution (the AHCI-retraction pattern).
+
 ### Changed — driver-stack review round 4, Phase 4-B (ADR-0016): MmioBus windows
 
 - **`kernel-x86_64/src/mmio.rs` — every device register access goes
