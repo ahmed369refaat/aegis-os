@@ -46,14 +46,20 @@ the earlier baseline. Proven the same way this document demands
   (MONITOR/MWAIT) wakes on a real delivery; and the storage stack
   reads a real partition table (protective MBR + GPT, both CRC-32s
   enforced, typed hostile refusals — ext2 rides the partition base).
+- **Round 6 part 2 ("H") closed more of the same rows:** the
+  watchdogs are live (iTCO with the NO_REBOOT-gated write path +
+  i6300esb with its masked-reboot sequence), AMD-Vi's IVRS is parsed
+  (the engine slice follows on real AMD hardware), and the virtio
+  family grew by two (console with a guest↔host file round trip, and
+  the balloon with a real one-page inflate/deflate).
 - **Still open from the rows below (honest):** UEFI boot/GOP,
   Secure Boot, USB enumeration beyond xHCI bring-up, ext4 write +
-  FAT32 (the ESP), dm-verity/encryption, TPM 2.0, SMP, the
-  watchdogs, kvmclock, AMD-Vi (IVRS), TCP/IP + TLS, the remaining
-  virtio devices (scsi/balloon/console/vsock/input/gpu), the cloud
-  NICs (ENA/gVNIC/Hyper-V), and the ring-3 delivery of interrupts
-  into driver domains (the mailbox + domain record are the landing
-  pad; the transport slice follows ADR-0017).
+  FAT32 (the ESP), dm-verity/encryption, TPM 2.0, SMP, kvmclock,
+  the AMD-Vi register engine, TCP/IP + TLS, the remaining virtio
+  devices (scsi/vsock/input/gpu), the cloud NICs (ENA/gVNIC/
+  Hyper-V), and the ring-3 delivery of interrupts into driver
+  domains (the mailbox + domain record are the landing pad; the
+  transport slice follows ADR-0017).
 
 ---
 
