@@ -119,78 +119,69 @@ pub fn read_cr2() -> u64 {
 /// N4 (ADR-0008): CPUID leaf 7 sub-leaf 0's EBX — the SMEP/SMAP
 /// capability word. Decoding is pure (arch/features.rs).
 pub fn cpuid7_ebx() -> u64 {
-    let a: u32;
-    let b: u64;
-    let c: u32;
-    let d: u32;
-    // SAFETY: CPUID is unprivileged. RBX cannot be an asm operand
-    // (LLVM reserves it), and an `out(reg)` temporary is allocation
-    // luck — if the allocator picks RBX itself, the restore-pop
-    // clobbers the result (observed: SMEP/SMAP read as off in one
-    // build, on in another). Round I: the previous shape ("push /
-    // cpuid / mov %rbx,(%rsp) / pop {b}") ALSO destroyed the caller's
-    // callee-saved RBX — the mov overwrote the saved original with
-    // CPUID's EBX and the pop handed that to the output, so the
-    // original never came back (the release build faulted on it: the
-    // driver stack's inventory pointer lived in RBX across this
-    // call). The XCHG fixes both: it swaps CPUID's EBX into the slot
-    // and the ORIGINAL RBX back into the register; the pop then
-    // feeds the output with the wanted word. No intermediate
-    // register, no allocation luck, RBX preserved.
+    let b: u32;
+    // SAFETY: CPUID is unprivileged. Round K tightened ADR-0008 from
+    // "the value must travel the pushed stack slot" to "no allocation
+    // luck at all": every operand is a FIXED register. The original
+    // RBX is parked in fixed RSI, CPUID fills EBX with the wanted
+    // word, and the 64-bit XCHG swaps them — RBX leaves the block
+    // byte-identical to how it entered, RSI carries the wanted EBX
+    // (CPUID zero-extends EBX, so the upper half is clean), and
+    // `out("esi")` exports it. The previous push/xchg/pop shape was
+    // SOUND (audit in this round: with the xchg the slot and the
+    // register always end with the right values, whichever register
+    // the allocator picked for `out(reg)`), but the push/pop window
+    // depended on that audit holding; the fixed-register shape makes
+    // the wrong allocation impossible instead of merely harmless.
     unsafe {
         core::arch::asm!(
-            "push %rbx",
+            "movq %rbx, %rsi",
             "cpuid",
-            "xchgq %rbx, (%rsp)",
-            "pop {b}",
+            "xchgq %rbx, %rsi",
             in("eax") 7u32,
             in("ecx") 0u32,
-            lateout("eax") a,
-            lateout("ecx") c,
-            lateout("edx") d,
-            b = out(reg) b,
-            options(att_syntax),
+            lateout("eax") _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            out("esi") b,
+            options(att_syntax, nostack),
         );
     }
-    let _ = (a, c, d);
-    b
+    u64::from(b)
 }
 
 /// CPUID leaf 1's ECX — the feature word carrying TSC-deadline (bit 24;
-/// decoded in arch/features) and RDRAND (bit 30). Same ADR-0008
-/// bulletproof pattern as `cpuid7_ebx`: RBX cannot be an asm operand
-/// (LLVM reserves it), so the wanted value travels through the pushed
-/// stack slot, never a temporary register the allocator might recycle.
+/// decoded in arch/features) and RDRAND (bit 30). Round K shape: the
+/// ADR-0008 fixed-register discipline — no push/pop window and no
+/// `out(reg)` template operand anywhere near CPUID. The original RBX
+/// (CPUID destroys it) is parked in fixed RSI and restored from it;
+/// ECX's result is exported straight from the fixed `inout("ecx")`
+/// operand. The previous shape ("push / mov %rcx,{c} / pop %rbx" with
+/// `c = out(reg)`) was a TRUE allocation-luck bug: rustc 1.100.0 CAN
+/// allocate RBX to an `out(reg)` (verified with 15 simultaneous
+/// `out(reg)` operands it picks ... r11 rbx last), and then the
+/// restore-pop overwrote the stored result with the original RBX —
+/// the feature word would read as garbage, silently.
 pub fn cpuid1_ecx() -> u64 {
-    let a: u32;
-    let c: u64;
-    let d: u32;
-    // SAFETY: CPUID is unprivileged. The sequence saves RBX (CPUID
-    // destroys it), stores the wanted ECX into the output operand,
-    // and pops the ORIGINAL RBX back — round I: the previous
-    // "push / mov %rcx,(%rsp) / pop" shape overwrote the SAVED RBX
-    // with the result and popped that, silently destroying the
-    // caller's callee-saved RBX (the release build kept a driver-
-    // stack inventory pointer there; the q35 lane faulted on it the
-    // moment a step crossed a CPUID call). ECX's own output is dead
-    // here (the mov already saved it), hence no throwaway operand.
+    let c: u32;
+    // SAFETY: CPUID is unprivileged. RSI is declared clobbered
+    // (`out("rsi") _`) so the compiler keeps nothing live there across
+    // the block; it only ever holds the parked RBX between the mov and
+    // the mov back. `nostack` — the sequence touches no memory.
     unsafe {
         core::arch::asm!(
-            "push %rbx",
+            "movq %rbx, %rsi",
             "cpuid",
-            "movq %rcx, {c}",
-            "pop %rbx",
+            "movq %rsi, %rbx",
             in("eax") 1u32,
-            in("ecx") 0u32,
-            lateout("eax") a,
-            lateout("ecx") _,
-            lateout("edx") d,
-            c = out(reg) c,
-            options(att_syntax),
+            inout("ecx") 0u32 => c,
+            lateout("eax") _,
+            lateout("edx") _,
+            out("rsi") _,
+            options(att_syntax, nostack),
         );
     }
-    let _ = (a, d);
-    c
+    u64::from(c)
 }
 
 /// N4 (ADR-0008): set once at boot when SMAP is enabled — the user-copy
