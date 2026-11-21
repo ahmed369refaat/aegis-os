@@ -55,6 +55,8 @@ _ring3_start:
     je 12f                            /* mode 6: the mmap proof */
     cmp al, 7
     je 13f                            /* mode 7: the fork/CoW proof */
+    cmp al, 8
+    je 14f                            /* mode 8: the IPC pair */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -171,7 +173,7 @@ _ring3_start:
     call next_instr
 next_instr:
     pop rsi
-    add rsi, 0x232                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
+    add rsi, 0x347                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
     mov rdx, 0x0040C000               /* the kernel's trampoline page */
     syscall
     test rax, rax
@@ -340,6 +342,99 @@ fork_child:
     xor edi, edi                      /* 0: child verified */
     syscall
 
+14: /* ── mode 8: the IPC pair (ADR-0025) ──────────────────────── */
+    /* data[1]: 0 = sender, 1 = receiver. data[2..10]: channel A,
+       [10..18]: channel B, [18..26]: channel C (LE u64s). Both roles
+       POLL with bounded retries: the tick may run either party at any
+       point, so exact interleavings are the scheduler's business —
+       the proof is the CONTRACT (bounded queues, caps, lengths). */
+    movzx eax, byte ptr [0x00403001]
+    mov rbx, qword ptr [0x00403002]    /* channel A */
+    test eax, eax
+    jnz ipc_receiver
+
+    /* ── the sender: fill A until -EAGAIN, fill B until -EAGAIN,
+       prove the no-cap channel refuses -EPERM, then YIELD (the
+       nested dispatcher runs the parked receivers to completion) ── */
+    mov r12d, 0                         /* delivered to A */
+ipc_tx_a:
+    mov eax, 7
+    mov rdi, rbx
+    mov rsi, 7
+    syscall
+    cmp rax, -11                        /* EAGAIN: the queue is full */
+    je ipc_tx_a_done
+    cmp rax, 0
+    jl 133f                             /* any other refusal: a bug */
+    inc r12
+    cmp r12, 64
+    jb ipc_tx_a                         /* drain-and-refill is fine */
+ipc_tx_a_done:
+    test r12, r12
+    jz 133f                             /* zero delivered: a bug */
+    mov rbx, qword ptr [0x0040300A]     /* channel B */
+    mov r13d, 0
+ipc_tx_b:
+    mov eax, 7
+    mov rdi, rbx
+    mov rsi, 7
+    syscall
+    cmp rax, -11
+    je ipc_tx_b_done
+    cmp rax, 0
+    jl 133f
+    inc r13
+    cmp r13, 64
+    jb ipc_tx_b
+ipc_tx_b_done:
+    test r13, r13
+    jz 133f
+    /* the no-cap probe: channel C exists, never granted */
+    mov rbx, qword ptr [0x00403012]
+    mov eax, 7
+    mov rdi, rbx
+    mov rsi, 7
+    syscall
+    cmp rax, -1                         /* -EPERM: the gate refused */
+    jne 136f
+    /* hand the CPU to the receivers (the nested dispatcher); this
+       code resumes only after both have exited, then exits clean */
+    mov eax, 24
+    syscall
+    mov eax, 63
+    xor edi, edi
+    syscall
+
+ipc_receiver:
+    /* ── the receiver: drain until >= 4 AND the queue reads empty
+       (-EAGAIN), yielding between empty polls (the sender is still
+       filling); a wrong length or an unexpected errno exits nonzero ── */
+    mov r12d, 0                         /* drained */
+    mov r14d, 0                         /* empty polls */
+ipc_rx_loop:
+    mov eax, 8
+    mov rdi, rbx
+    syscall
+    cmp rax, -11                        /* empty NOW */
+    je ipc_rx_empty
+    cmp rax, 7                          /* the fixed length */
+    jne 135f
+    inc r12
+    jmp ipc_rx_loop
+ipc_rx_empty:
+    cmp r12, 4
+    jae ipc_rx_done                     /* >= 4 drained: the EAGAIN counts */
+    inc r14
+    cmp r14, 64
+    jae 139f                            /* starved: a bug */
+    mov eax, 24                         /* yield: let the sender fill */
+    syscall
+    jmp ipc_rx_loop
+ipc_rx_done:
+    mov eax, 63
+    xor edi, edi
+    syscall
+
 sig_handler:                          /* SIGUSR1: set the flag, ret */
     mov rax, 0x51515151
     mov qword ptr [0x00403060], rax
@@ -395,6 +490,27 @@ sig_handler:                          /* SIGUSR1: set the flag, ret */
     syscall
 123: mov eax, 63
     mov edi, 123                      /* the post-fork yield failed */
+    syscall
+133: mov eax, 63
+    mov edi, 133                      /* a send refused before the count */
+    syscall
+134: mov eax, 63
+    mov edi, 134                      /* the full-queue EAGAIN missing */
+    syscall
+135: mov eax, 63
+    mov edi, 135                      /* the receiver's count short */
+    syscall
+136: mov eax, 63
+    mov edi, 136                      /* the no-cap send NOT refused */
+    syscall
+137: mov eax, 63
+    mov edi, 137                      /* the empty-queue EAGAIN missing */
+    syscall
+138: mov eax, 63
+    mov edi, 138                      /* the sender's fill ran away */
+    syscall
+139: mov eax, 63
+    mov edi, 139                      /* the receiver starved */
     syscall
 "#,
 );

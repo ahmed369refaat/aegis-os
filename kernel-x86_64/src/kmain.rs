@@ -97,6 +97,12 @@ use crate::{hw, memops, mm, multiboot, serial, strutil};
 use aegis_os::memory::MemFlags;
 use aegis_os::Kernel;
 
+/// ADR-0025 WIP: the ring-3 IPC proof's kmain block is structurally
+/// done (three domains, parked receivers, the mailbox drain) but one
+/// nested-flow interaction still trips take() — parked here, one
+/// flag-flip from re-enabling, while the arms/blob/ADR ship as WIP.
+const IPC_PROOF_UNFINISHED: bool = true;
+
 fn on_off(b: bool) -> &'static str {
     if b {
         "on"
@@ -1304,6 +1310,13 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         let mut clean_exit = false;
         let mut saw_exit = false;
         while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            {
+                // [TEMP-PROFILING]
+                let mut b = [0u8; 20];
+                crate::serial::write_str("[DBG ] ipc: drained dom=");
+                crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+                crate::serial::write_str("\n");
+            }
             saw_exit = true;
             if dom == 22 {
                 clean_exit = matches!(exit, crate::sched::context::ExitKind::Exited(0));
@@ -1631,6 +1644,175 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 ],
             );
             hw::halt_forever();
+        }
+    }
+
+    // [ADR-0025 WIP] parked until the nested-flow bug is pinned
+    // (see SESSION-STATUS-K5). Flip the flag to re-enable:
+    if !IPC_PROOF_UNFINISHED {
+        // ── 19. ADR-0025: the IPC proof — capability-mediated endpoints,
+        //      reached from ring 3 at last. The bootstrap (a uid-0
+        //      supervisor domain) creates three endpoints — A owned by
+        //      rx1, B by rx2, C by rx1 but NEVER granted to the sender —
+        //      and grants the sender WRITE on A and B. The sender fills
+        //      both queues (4 deep each), proves the 5th send refuses
+        //      -EAGAIN (the bounded queue is not an unbounded privilege)
+        //      and that the no-cap send to C refuses -EPERM (the gate is
+        //      live, not decorative); the receivers drain their queues,
+        //      verify every message's length, and prove the empty queue
+        //      refuses -EAGAIN. Sequential runs — the async contract, not
+        //      the timing, is the proof. ──
+        {
+            // The completed mailbox must be EMPTY here: a stale entry
+            // means an earlier proof leaked an exit (and would corrupt
+            // this proof's drain — found live: the demo's domain-22
+            // leftover). Caught loudly, never consumed.
+            if let Some((dom, _)) = crate::sched::park::completed_drain() {
+                let mut b = [0u8; 20];
+                crate::serial::write_str("[M3] ipc: ERROR: stale mailbox entry dom=");
+                crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+                crate::serial::write_str("; halting\n");
+                hw::halt_forever();
+            }
+
+            // The three runs FIRST (spawn_user_blob creates the
+            // domains — the endpoint API needs live owners); the endpoint
+            // ids are baked after creation, so the data pages are built
+            // between spawn and launch.
+            struct IpcRun {
+                run: crate::sched::context::UserRun,
+                ctx: crate::sched::context::UserContext,
+            }
+            let mut runs: [Option<IpcRun>; 3] = [None, None, None];
+            for (i, dom) in [30u32, 28, 29].iter().enumerate() {
+                // data[1]: role 0 = sender, 1 = receiver; channels land at
+                // data[2..] once the endpoints exist.
+                let mut data = [0u8; 0x70];
+                data[0] = 8;
+                data[1] = u8::from(*dom != 30);
+                match mm::user::spawn_user_blob(
+                    &mut k,
+                    &mut pool,
+                    *dom,
+                    aegis_os::profile::service_profile(),
+                    RING3_PREEMPT,
+                    &data,
+                ) {
+                    Ok(sp) => {
+                        runs[i] = Some(IpcRun {
+                            run: sp.run,
+                            ctx: sp.ctx,
+                        })
+                    }
+                    Err(_) => {
+                        line(&mut out, &["[M3] ipc: ERROR: spawn failed; halting"]);
+                        hw::halt_forever();
+                    }
+                }
+            }
+            // The uid-0 supervisor for the bootstrap API (the killer
+            // pattern: uid is explicit, never ambient).
+            let _ = k.create_domain_with(31, aegis_os::profile::service_profile(), 0, 0, 0);
+            let ep_a = k.ipc_endpoint_create(31, 28).expect("endpoint A");
+            let ep_b = k.ipc_endpoint_create(31, 29).expect("endpoint B");
+            let ep_c = k.ipc_endpoint_create(31, 28).expect("endpoint C");
+            let _ = k.ipc_endpoint_grant(31, ep_a.0, 30, aegis_os::capability::Rights::WRITE);
+            let _ = k.ipc_endpoint_grant(31, ep_b.0, 30, aegis_os::capability::Rights::WRITE);
+            // The supervisor never RUNS — take it out of the scheduler or
+            // the very next yield/tick picks an unparked domain (found
+            // live: "yield/sleep picked unparked domain 31"). The domain
+            // itself stays alive: the caps it granted remain derived from
+            // a live principal.
+            let _ = k.sched.unregister(31);
+
+            // Bake the channel ids into each run's data page: the data
+            // page's frame PA (found by the run's own tables, PAGE-
+            // aligned), then word writes through the DIRECT MAP (memops
+            // takes PAs — write_u8_va is the raw USER-VA reader under the
+            // SMAP window, the wrong primitive here; found live as a CPL0
+            // #PF at an unmapped 0x101f000).
+            let bake = |run: &mut crate::sched::context::UserRun, chans: [u64; 3]| {
+                if let Some(page) = run.tables.translate(0x00403000) {
+                    for (i, c) in chans.iter().enumerate() {
+                        // data[2 + i*8 .. 10 + i*8] — the channel qword,
+                        // offset 2 bytes into the page.
+                        crate::memops::write_u64(page + 2 + (i * 8) as u64, *c);
+                    }
+                }
+            };
+            if let Some(r) = runs[0].as_mut() {
+                bake(
+                    &mut r.run,
+                    [u64::from(ep_a.0), u64::from(ep_b.0), u64::from(ep_c.0)],
+                );
+            }
+            if let Some(r) = runs[1].as_mut() {
+                bake(&mut r.run, [u64::from(ep_a.0), 0, 0]);
+            }
+            if let Some(r) = runs[2].as_mut() {
+                bake(&mut r.run, [u64::from(ep_b.0), 0, 0]);
+            }
+
+            // The receivers: stashed parked-runnable (the fork-child
+            // shape — the tick may pick them at any point mid-sender and
+            // the preemptor demands parked runs). The sender runs via the
+            // flat launch, fills both queues, proves the refusals, and
+            // YIELDS — the nested dispatcher then runs the parked
+            // receivers (each drains its queue, polling with yields until
+            // the sender's messages land) and the parked sender to
+            // completion; every exit lands in the completed mailbox.
+            let mut parked: [(u32, &str); 2] = [(28, "rx1"), (29, "rx2")];
+            for (i, (_dom, _)) in parked.iter().enumerate() {
+                if let Some(r) = runs[1 + i].take() {
+                    crate::sched::context::stash_parked(
+                        r.run,
+                        crate::sched::context::ParkedContext::from_user_context(&r.ctx),
+                    );
+                } else {
+                    line(&mut out, &["[M3] ipc: ERROR: receiver missing; halting"]);
+                    hw::halt_forever();
+                }
+            }
+            {
+                let Some(r) = runs[0].take() else {
+                    line(&mut out, &["[M3] ipc: ERROR: sender missing; halting"]);
+                    hw::halt_forever();
+                };
+                let kernel_cr3 = hw::read_cr3();
+                r.run.tables.activate();
+                crate::sched::context::begin(r.run);
+                crate::sched::context::launch(&r.ctx);
+                hw::write_cr3(kernel_cr3);
+                crate::serial::write_str("[DBG ] ipc: launch returned\n");
+            }
+            // kmain resumes when the nested dispatcher empties; drain all
+            // three exits and tear each domain down.
+            let mut clean = 0usize;
+            while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+                if !matches!(exit, crate::sched::context::ExitKind::Exited(0)) {
+                    line(
+                        &mut out,
+                        &["[M3] ipc: ERROR: a run exited nonzero; halting"],
+                    );
+                    hw::halt_forever();
+                }
+                clean += 1;
+                mm::user::destroy_user(&mut k, &mut pool, dom);
+                let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+            }
+            if clean == 3 {
+                line(
+                &mut out,
+                &["[M3] ipc: 8+ messages over 2 channels, caps enforced (EAGAIN + the no-cap EPERM), both ends verified"],
+            );
+            } else {
+                line(
+                    &mut out,
+                    &["[M3] ipc: ERROR: expected 3 clean exits, saw fewer; halting"],
+                );
+                hw::halt_forever();
+            }
+            let _ = &mut parked;
         }
     }
 

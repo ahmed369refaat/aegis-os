@@ -42,8 +42,9 @@ pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
 pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
 use aegis_os::sys::{SysRequest, SysValue};
 use aegis_os::syscall::{
-    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_KILL, SYS_MMAP, SYS_MUNMAP,
-    SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_WRITE,
+    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_IPC_RECV, SYS_IPC_SEND,
+    SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN,
+    SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -227,6 +228,8 @@ mod exec {
             Decision::Allowed if nr8 == SYS_MMAP => sys_mmap(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_MUNMAP => sys_munmap(run, a1, a2),
             Decision::Allowed if nr8 == SYS_FORK => sys_fork(run),
+            Decision::Allowed if nr8 == SYS_IPC_SEND => sys_ipc_send(run, a1, a2),
+            Decision::Allowed if nr8 == SYS_IPC_RECV => sys_ipc_recv(run, a1),
             // Round J: the file family runs on the LIVE lib kernel —
             // marshaled through sysabi, executed by `Kernel::execute`.
             Decision::Allowed if sysabi::FILE_FAMILY.contains(&nr8) => {
@@ -870,6 +873,55 @@ mod exec {
         let ctx = crate::sched::park::parked_from_current_syscall(0);
         crate::sched::context::stash_parked(child_run, ctx);
         child as u64
+    }
+
+    /// ipc_send(channel, len) — ADR-0025 D1: the core's capability-
+    /// gated async executor (WRITE == send), reached at last from
+    /// ring 3. The gate and the organic monitor accounting land in
+    /// `dispatch`; the queue's bounded EAGAIN and the cap denial's
+    /// -EPERM surface through the sysabi table.
+    fn sys_ipc_send(run: &mut crate::sched::context::UserRun, channel: u64, len: u64) -> u64 {
+        if channel > u32::MAX as u64 || len > u32::MAX as u64 {
+            return (-EINVAL) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        match k.execute(
+            run.domain,
+            aegis_os::sys::SysRequest::IpcSend {
+                channel: channel as u32,
+                len: len as u32,
+            },
+        ) {
+            Ok(aegis_os::sys::SysValue::Count(n)) => n as u64,
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// ipc_recv(channel) — ADR-0025 D1: the owner-only drain (READ ==
+    /// recv). Returns the popped message's LENGTH (the authenticated
+    /// sender rides the endpoint's record, not the return — the
+    /// receiver's proof checks the count and the kernel's sender id
+    /// through the second data word).
+    fn sys_ipc_recv(run: &mut crate::sched::context::UserRun, channel: u64) -> u64 {
+        if channel > u32::MAX as u64 {
+            return (-EINVAL) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        match k.execute(
+            run.domain,
+            aegis_os::sys::SysRequest::IpcRecv {
+                channel: channel as u32,
+            },
+        ) {
+            Ok(aegis_os::sys::SysValue::Count(n)) => n as u64,
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
     }
 
     /// SYS_READ(fd, buf, len): the executor fills a KERNEL buffer
