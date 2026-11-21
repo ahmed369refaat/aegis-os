@@ -214,6 +214,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // 4096 frames (16 MiB) since PR-1.3: per-domain page tables need
     // the room (every domain carries PML4+PDPT+PD+PTs plus its pages).
     let mut pool = FramePool::<KERNEL_POOL_FRAMES>::new(POOL_BASE, memops::scrub_frame);
+    // ADR-0024 D1: the mmap/munmap dispatch paths reach the pool
+    // through the context slot (same lifetime discipline as the
+    // kernel pointer).
+    crate::sched::context::set_pool(core::ptr::addr_of_mut!(pool));
     for f in 0..(KERNEL_POOL_LEN / FRAME_SIZE) {
         memops::scrub_frame(POOL_BASE + f * FRAME_SIZE);
     }
@@ -1489,6 +1493,67 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             );
             hw::halt_forever();
         }
+    }
+
+    // ── 17. ADR-0024 D1: the mmap proof — ring-3 memory of its own.
+    //      The blob maps TWO windows (page A and page B, guard-gapped
+    //      by construction), writes and reads back patterns through
+    //      both, munmaps B, re-verifies A survived the unmap, and then
+    //      DELIBERATELY reads B: the #PF that kills the run is the
+    //      proof the unmap was real (cr2 lands at the freed window's
+    //      address — at/above the trampoline, where nothing but an
+    //      mmap window ever lives). ──
+    {
+        static MMAP_DATA: [u8; 0x70] = {
+            let mut d = [0u8; 0x70];
+            d[0] = 6; // mode 6: the mmap proof
+            d
+        };
+        let mapper = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            26,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &MMAP_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(
+                    &mut out,
+                    &["[M3] mmap: ERROR: mapper spawn failed; halting"],
+                );
+                hw::halt_forever();
+            }
+        };
+        let kernel_cr3 = hw::read_cr3();
+        mapper.run.tables.activate();
+        crate::sched::context::begin(mapper.run);
+        crate::sched::context::launch(&mapper.ctx);
+        let run = crate::sched::context::take();
+        hw::write_cr3(kernel_cr3);
+        let cr2 = match run.exit {
+            crate::sched::context::ExitKind::Fault {
+                vector: 14, cr2, ..
+            } if cr2 >= crate::mm::user_layout::TRAMPOLINE_BASE + 4096 => cr2,
+            _ => {
+                line(
+                    &mut out,
+                    &["[M3] mmap: ERROR: exit was not the expected freed-page fault; halting"],
+                );
+                hw::halt_forever();
+            }
+        };
+        mm::user::destroy_user(&mut k, &mut pool, 26);
+        let _ = crate::sched::preempt::on_exit(&mut k.sched, 26);
+        let mut h = [0u8; 18];
+        line(
+            &mut out,
+            &[
+                "[M3] mmap: 2 windows mapped+verified, munmap freed, the freed read faulted at cr2=",
+                strutil::hex(cr2, &mut h),
+            ],
+        );
     }
 
     // ── 13. the terminal guard-page proof: the write must #PF, the

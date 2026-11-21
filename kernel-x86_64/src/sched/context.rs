@@ -491,6 +491,30 @@ mod entry {
         }
     }
 
+    /// ADR-0024 D1: kmain's frame pool, installed once beside the
+    /// kernel — the mmap/munmap syscall paths need it at dispatch
+    /// time, where no kmain frame is on the stack. The buddy arena
+    /// rides inside the Kernel (`k.frames`) and needs no slot.
+    static mut POOL: Option<*mut crate::frames::FramePool<{ crate::frames::KERNEL_POOL_FRAMES }>> =
+        None;
+
+    /// Install the pool pointer (kmain, once, right after creation).
+    pub fn set_pool(p: *mut crate::frames::FramePool<{ crate::frames::KERNEL_POOL_FRAMES }>) {
+        // SAFETY: single CPU, bring-up phase, before any ring-3 launch.
+        unsafe {
+            POOL = Some(p);
+        }
+    }
+
+    /// The live pool, when installed (host tests never install one).
+    pub fn pool_mut(
+    ) -> Option<&'static mut crate::frames::FramePool<{ crate::frames::KERNEL_POOL_FRAMES }>> {
+        // SAFETY: the pointer was set once from a live `&mut FramePool`
+        // that outlives every ring-3 run (kmain owns it for the whole
+        // boot); single CPU, no concurrent access.
+        unsafe { POOL.map(|p| &mut *p) }
+    }
+
     /// N2: the live kernel, when installed (host tests never install
     /// one — callers fall back to the snapshot).
     pub fn kernel_mut(
@@ -890,7 +914,7 @@ mod entry {
 /// point around its resume_parked calls). Boot-only like the module
 /// it re-exports.
 #[cfg(not(test))]
-pub use entry::{restore_resume_chain, save_resume_chain, ResumeChain};
+pub use entry::{pool_mut, restore_resume_chain, save_resume_chain, set_pool, ResumeChain};
 
 #[cfg(not(test))]
 pub use entry::{

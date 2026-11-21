@@ -90,4 +90,8 @@
 #      the SAVED_CHAIN static borrows (the shared-stack lesson: state
 #      that must survive excursions lives in .bss, and static-mut
 #      access is an unsafe act), and the unpark-delivery page walk.
-114
+
+# 116 -> ADR-0024 D1: +2 — the POOL context slot (set_pool/pool_mut,
+#      the KERNEL-pointer pattern mirrored for the frame pool; the
+#      mmap/munmap dispatch paths reach it at syscall time).
+116

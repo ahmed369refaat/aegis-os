@@ -364,6 +364,9 @@ if [ "$MODE" = "verify" ]; then
   # ADR-0023 D8: the signal-frame proof (delivery + sigreturn + the
   # forged-frame refusal).
   grep -qF "[M3] signal: handler ran, sigreturn resumed, forged frame refused" "$LOG" || { echo "VERIFY FAIL: M3 signal marker missing"; ok=0; }
+  # ADR-0024 D1: the mmap proof (two windows, a real munmap, the
+  # freed read faulting).
+  grep -qF "[M3] mmap: 2 windows mapped+verified" "$LOG" || { echo "VERIFY FAIL: M3 mmap marker missing"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the

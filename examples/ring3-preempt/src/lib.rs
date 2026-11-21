@@ -51,6 +51,8 @@ _ring3_start:
     je 10f                            /* mode 4: the killer */
     cmp al, 5
     je 11f                            /* mode 5: the forger */
+    cmp al, 6
+    je 12f                            /* mode 6: the mmap proof */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -167,7 +169,7 @@ _ring3_start:
     call next_instr
 next_instr:
     pop rsi
-    add rsi, 0xDE                     /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
+    add rsi, 0x1A5                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
     mov rdx, 0x0040C000               /* the kernel's trampoline page */
     syscall
     test rax, rax
@@ -234,6 +236,57 @@ killer_spin:
     xor edi, edi                      /* refused (nonzero): the proof */
     syscall
 
+12: /* ── mode 6: the mmap proof (ADR-0024 D1) ──────────────────── */
+    /* mmap(NULL, 4096, PROT_READ|PROT_WRITE) — the INTERNAL nr 4
+       (the Linux nr 9 collides with the round-J internal NET_SEND;
+       the full renumbering is Phase 5's ABI-VERSION table) */
+    mov eax, 4
+    xor edi, edi
+    mov rsi, 4096
+    mov edx, 3
+    syscall
+    mov r12, rax                      /* window A (survives syscalls) */
+    cmp rax, 0x0040D000
+    jb 110f                           /* below the trampoline floor */
+    /* write + read back a pattern through A */
+    mov rax, 0x600DF00D
+    mov [r12], rax
+    mov rbx, [r12]                    /* rbx: stub-restored, safe */
+    cmp rbx, rax
+    jne 111f
+    /* a SECOND window — strictly above A (the allocator's guard gaps) */
+    mov eax, 4
+    xor edi, edi
+    mov rsi, 4096
+    mov edx, 3
+    syscall
+    mov r13, rax                      /* window B */
+    cmp rax, r12
+    jbe 112f
+    mov rax, 0xFACEB00C
+    mov [r13], rax
+    mov rbx, [r13]
+    cmp rbx, rax
+    jne 113f
+    /* munmap window B — the INTERNAL nr 5 */
+    mov eax, 5
+    mov rdi, r13
+    mov rsi, 4096
+    syscall
+    test rax, rax
+    jnz 114f
+    /* A survived B's unmap, pattern intact */
+    mov rbx, [r12]
+    cmp rbx, 0x600DF00D
+    jne 115f
+    /* the flag: every step verified; the next read is deliberate */
+    mov rax, 0x7A7A7A7A
+    mov qword ptr [0x00403060], rax
+    /* the deliberate read of the FREED page: #PF ends this run, and
+       the kernel's proof reads cr2 */
+    mov rax, [r13]
+    jmp 116f                          /* unreachable; the fault wins */
+
 sig_handler:                          /* SIGUSR1: set the flag, ret */
     mov rax, 0x51515151
     mov qword ptr [0x00403060], rax
@@ -256,6 +309,27 @@ sig_handler:                          /* SIGUSR1: set the flag, ret */
     syscall
 108: mov eax, 63
     mov edi, 108                      /* the post-sleep yield failed */
+    syscall
+110: mov eax, 63
+    mov edi, 110                      /* window A below the floor */
+    syscall
+111: mov eax, 63
+    mov edi, 111                      /* A's pattern round-trip failed */
+    syscall
+112: mov eax, 63
+    mov edi, 112                      /* window B not above A */
+    syscall
+113: mov eax, 63
+    mov edi, 113                      /* B's pattern round-trip failed */
+    syscall
+114: mov eax, 63
+    mov edi, 114                      /* munmap refused */
+    syscall
+115: mov eax, 63
+    mov edi, 115                      /* A damaged by B's unmap */
+    syscall
+116: mov eax, 63
+    mov edi, 116                      /* the freed read did NOT fault */
     syscall
 "#,
 );

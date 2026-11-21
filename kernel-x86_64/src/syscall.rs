@@ -42,8 +42,8 @@ pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
 pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
 use aegis_os::sys::{SysRequest, SysValue};
 use aegis_os::syscall::{
-    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_KILL, SYS_NANOSLEEP, SYS_SCHED_YIELD,
-    SYS_SIGACTION, SYS_SIGRETURN, SYS_WRITE,
+    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_KILL, SYS_MMAP, SYS_MUNMAP,
+    SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -53,6 +53,9 @@ pub const EFAULT: i64 = 14;
 pub const EINVAL: i64 = 22;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
+/// ADR-0024: the frame source or the address space refused — out of
+/// memory (budget, pool, or window).
+pub const ENOMEM: i64 = 12;
 
 /// Longest SYS_WRITE the kernel will service in one call (bounds the
 /// copy loop; user code wanting more loops itself).
@@ -220,6 +223,8 @@ mod exec {
             Decision::Allowed if nr8 == SYS_CLOCK_GETTIME => sys_clock_gettime(run, a1, a2),
             Decision::Allowed if nr8 == SYS_SIGACTION => sys_sigaction(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_KILL => sys_kill(run, a1, a2),
+            Decision::Allowed if nr8 == SYS_MMAP => sys_mmap(run, a1, a2, a3),
+            Decision::Allowed if nr8 == SYS_MUNMAP => sys_munmap(run, a1, a2),
             // Round J: the file family runs on the LIVE lib kernel —
             // marshaled through sysabi, executed by `Kernel::execute`.
             Decision::Allowed if sysabi::FILE_FAMILY.contains(&nr8) => {
@@ -703,6 +708,103 @@ mod exec {
         }
         IN_USER_COPY.store(false, Ordering::SeqCst);
         0
+    }
+
+    /// mmap(addr, len, prot) — ADR-0024 D1: the gate ran (the used-bit
+    /// and monitor accounting land in `dispatch`); the EXECUTION makes
+    /// the mapping REAL — the same ten-check policy and the same
+    /// rollback-on-failure mapper spawn uses, over the RUN's own
+    /// tables and space, every frame pool-allocated with
+    /// `owner = run.domain` (exit reclaims through `free_all_owned`).
+    /// ANON only. `addr == 0` picks the lowest policy-acceptable
+    /// window at/above the trampoline; a nonzero hint is honored or
+    /// refused (never relocated — no MAP_FIXED guessing).
+    fn sys_mmap(run: &mut crate::sched::context::UserRun, addr: u64, len: u64, prot: u64) -> u64 {
+        use crate::mm::page_table::{MapError, PoolSource};
+        use crate::mm::user_layout;
+        use aegis_os::memory::MemFlags;
+
+        const WINDOW_FLOOR: u64 = user_layout::TRAMPOLINE_BASE + 4096;
+        /// The per-call ceiling (matches the policy's own quota scale;
+        /// a bigger ask is a program error, not an OOM).
+        const MAX_MMAP: u64 = 16 << 20;
+
+        if len == 0 || len > MAX_MMAP {
+            return (-EINVAL) as u64;
+        }
+        // Linux PROT bits only: READ=1 WRITE=2 EXEC=4.
+        if prot & !0b111 != 0 {
+            return (-EINVAL) as u64;
+        }
+        let mut flags = MemFlags(0);
+        if prot & 1 != 0 {
+            flags = MemFlags(flags.0 | MemFlags::READ.0);
+        }
+        if prot & 2 != 0 {
+            flags = MemFlags(flags.0 | MemFlags::WRITE.0);
+        }
+        if prot & 4 != 0 {
+            flags = MemFlags(flags.0 | MemFlags::EXEC.0);
+        }
+        // Round the length up to the page (Linux behavior; the policy
+        // is page-granular anyway).
+        let len_r = ((len as usize) + 4095) & !4095;
+        let base = if addr == 0 {
+            match run.space.find_free_window(len_r, WINDOW_FLOOR as usize) {
+                Some(b) => b as u64,
+                None => return (-ENOMEM) as u64,
+            }
+        } else {
+            if !addr.is_multiple_of(4096) || addr < WINDOW_FLOOR {
+                return (-EINVAL) as u64;
+            }
+            addr
+        };
+        let (Some(pool), Some(k)) = (context::pool_mut(), context::kernel_mut()) else {
+            return (-ENOMEM) as u64;
+        };
+        let mut src = PoolSource::new(pool, &mut k.frames, run.domain);
+        match run
+            .tables
+            .map_region(&mut run.space, base, len_r, flags, &mut src)
+        {
+            Ok(_) => base,
+            Err(MapError::Policy(aegis_os::memory::MemError::QuotaExceeded)) => (-ENOMEM) as u64,
+            Err(MapError::Policy(_)) => (-EINVAL) as u64,
+            Err(_) => (-ENOMEM) as u64,
+        }
+    }
+
+    /// munmap(addr, len) — ADR-0024 D1: WHOLE-REGION semantics (the
+    /// addr must name a region's exact base and len its exact length;
+    /// splitting is Phase 5+). The spawn-time layout is below the
+    /// window floor and refuses here — it is freed by teardown, not by
+    /// the ABI. Frames return through the pool (owner-scoped, scrubbed
+    /// on free).
+    fn sys_munmap(run: &mut crate::sched::context::UserRun, addr: u64, len: u64) -> u64 {
+        use crate::mm::page_table::PoolSource;
+        use crate::mm::user_layout;
+        const WINDOW_FLOOR: u64 = user_layout::TRAMPOLINE_BASE + 4096;
+
+        if !addr.is_multiple_of(4096) || addr < WINDOW_FLOOR || len == 0 {
+            return (-EINVAL) as u64;
+        }
+        // Whole-region: exact base AND exact length.
+        let exact = run
+            .space
+            .regions()
+            .any(|r| r.base == addr as usize && r.len == len as usize);
+        if !exact {
+            return (-EINVAL) as u64;
+        }
+        let (Some(pool), Some(k)) = (context::pool_mut(), context::kernel_mut()) else {
+            return (-ENOMEM) as u64;
+        };
+        let mut src = PoolSource::new(pool, &mut k.frames, run.domain);
+        match run.tables.unmap_region(&mut run.space, addr, &mut src) {
+            Ok(_) => 0,
+            Err(_) => (-EINVAL) as u64,
+        }
     }
 
     /// SYS_READ(fd, buf, len): the executor fills a KERNEL buffer
