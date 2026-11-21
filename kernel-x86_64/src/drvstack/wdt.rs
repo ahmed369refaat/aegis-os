@@ -170,18 +170,23 @@ fn itco_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
     use crate::hw;
     // The LPC bridge: class 06/01 (ISA bridge) — the one device the
     // walk always finds on bus 0.
-    let Some(lpc) = inv
-        .devices[..inv.count]
+    let Some(lpc) = inv.devices[..inv.count]
         .iter()
         .find(|d| d.class >> 8 == 0x06 && d.class & 0xFF == 0x01)
         .copied()
     else {
-        line(out, &["[WDT ] iTCO: no ISA bridge on this machine — skipped"]);
+        line(
+            out,
+            &["[WDT ] iTCO: no ISA bridge on this machine — skipped"],
+        );
         return;
     };
     let word = crate::pci::read_cfg32(&lpc, LPC_PMBASE_CFG);
     let Some(pmbase) = pmbase_from_dword(word) else {
-        line(out, &["[WDT ] iTCO: PMBASE runtime-disabled (RTE clear) — skipped"]);
+        line(
+            out,
+            &["[WDT ] iTCO: PMBASE runtime-disabled (RTE clear) — skipped"],
+        );
         return;
     };
     // The register ports, bounds-checked before any I/O.
@@ -252,11 +257,17 @@ fn itco_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
         return;
     }
     if cnt1 & TCO_LOCK != 0 {
-        line(out, &["[WDT ] iTCO: TCO_LOCK set by firmware — the timer is frozen (probe-only)"]);
+        line(
+            out,
+            &["[WDT ] iTCO: TCO_LOCK set by firmware — the timer is frozen (probe-only)"],
+        );
         return;
     }
     if cnt1 & TCO_TMR_HLT != 0 {
-        line(out, &["[WDT ] iTCO: timer halted by firmware (TMR_HLT) — leaving it halted"]);
+        line(
+            out,
+            &["[WDT ] iTCO: timer halted by firmware (TMR_HLT) — leaving it halted"],
+        );
         return;
     }
     // Program a short, visible timeout and reload: under NO_REBOOT
@@ -272,7 +283,11 @@ fn itco_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
         &[
             "[WDT ] iTCO: programmed 10s → read-back ",
             strutil::dec(u64::from(tmr_back), &mut t1),
-            if tmr_back == 0x0A { "s (ok), ticks=" } else { "s (MISMATCH?!), ticks=" },
+            if tmr_back == 0x0A {
+                "s (ok), ticks="
+            } else {
+                "s (MISMATCH?!), ticks="
+            },
             strutil::dec(u64::from(rld_back), &mut t2),
             " — inert under NO_REBOOT, proven by read-back",
         ],
@@ -289,13 +304,15 @@ fn itco_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
 /// stage at the 1 kHz scale).
 #[cfg(not(test))]
 fn esb_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
-    let Some(dev) = inv
-        .devices[..inv.count]
+    let Some(dev) = inv.devices[..inv.count]
         .iter()
         .find(|d| d.vendor == ESB_VENDOR && d.device == ESB_DEVICE)
         .copied()
     else {
-        line(out, &["[WDT ] i6300esb: card absent on this machine — skipped"]);
+        line(
+            out,
+            &["[WDT ] i6300esb: card absent on this machine — skipped"],
+        );
         return;
     };
     let Some(bar) = crate::pci::mem_bar(&dev, 0) else {
@@ -337,7 +354,10 @@ fn esb_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
             "[WDT ] i6300esb driven: unlock×3, timer1/2=0x",
             strutil::hex(u64::from(ESB_MAX_PRELOAD), &mut b1),
             " (max preload ≈ a quarter hour), pinged, reboot-on-timeout MASKED (cfg 0x",
-            strutil::hex(u64::from(crate::pci::read_cfg32(&dev, ESB_CONFIG_REG) & 0xFFFF), &mut b2),
+            strutil::hex(
+                u64::from(crate::pci::read_cfg32(&dev, ESB_CONFIG_REG) & 0xFFFF),
+                &mut b2,
+            ),
             ") — the registers are write-only on this device, so the sequence order is the proof",
         ],
     );
@@ -351,7 +371,11 @@ mod tests {
     /// bits 15:7 — pinned against QEMU's ICH9_LPC_PMBASE defines.
     #[test]
     fn pmbase_decodes_enabled_and_masked() {
-        assert_eq!(pmbase_from_dword(0x0601), Some(0x600), "q35 SeaBIOS PMBASE 0x600");
+        assert_eq!(
+            pmbase_from_dword(0x0601),
+            Some(0x600),
+            "q35 SeaBIOS PMBASE 0x600"
+        );
         assert_eq!(pmbase_from_dword(0x0401), Some(0x400));
         // Disabled (RTE clear): refuse even with a base present.
         assert_eq!(pmbase_from_dword(0x0600), None);
@@ -379,7 +403,11 @@ mod tests {
         assert_eq!(tco_port(0, TCO_RLD), None);
         // The window must not overlap 0xCF8/0xCFC.
         assert_eq!(tco_port(0x0C98, TCO_RLD), None, "RLD would land on 0xCF8");
-        assert_eq!(tco_port(0x0CA8, TCO_RLD), Some(0xD08), "past the pair, fine");
+        assert_eq!(
+            tco_port(0x0CA8, TCO_RLD),
+            Some(0xD08),
+            "past the pair, fine"
+        );
     }
 
     /// The TCO bit encodings, pinned against ich9_tco.h.

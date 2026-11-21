@@ -1081,10 +1081,7 @@ impl Vtd {
         if self.disabled {
             return Err(VtdError::SpinTimeout("IR on a disabled unit"));
         }
-        crate::memops::write_u64(
-            self.reg_base + REG_IRTA,
-            irta_value(irte_pa, eime, 7),
-        );
+        crate::memops::write_u64(self.reg_base + REG_IRTA, irta_value(irte_pa, eime, 7));
         let mut gcmd: u32 = GCMD_SRTP | GCMD_QIE | GCMD_TE | GCMD_SIRTP;
         self.write32(REG_GCMD, gcmd);
         let sirtp_spins = self.spin_gsts(GSTS_SIRTPS)?;
@@ -1942,7 +1939,11 @@ mod ir_tests {
 
         // Non-zero dest: EIME off rides dest_id bits 15:8.
         let [lo2, _] = irte_remapped(0x41, 2, false);
-        assert_eq!((lo2 >> 40) & 0xFF, 2, "dest_apic_id at dest_id 15:8 (QEMU's non-EIM mask)");
+        assert_eq!(
+            (lo2 >> 40) & 0xFF,
+            2,
+            "dest_apic_id at dest_id 15:8 (QEMU's non-EIM mask)"
+        );
         // EIME on: the dest is the low 32 bits of dest_id.
         let [lo3, _] = irte_remapped(0x41, 2, true);
         assert_eq!((lo3 >> 32) & 0xFFFF_FFFF, 2);
@@ -1956,7 +1957,10 @@ mod ir_tests {
         assert_eq!(irta_value(base, false, 7), 0x40_B007);
         assert_eq!(irta_value(base, true, 7), 0x40_B007 | IRTA_EIME);
         // The base's low 12 bits are stripped, never written.
-        assert_eq!(irta_value(0xFFFF_FFFF_FFFF_FFFF, false, 0), 0xFFFF_FFFF_FFFF_F000);
+        assert_eq!(
+            irta_value(0xFFFF_FFFF_FFFF_FFFF, false, 0),
+            0xFFFF_FFFF_FFFF_F000
+        );
         assert_eq!(irta_value(base, false, 0xF), 0x40_B00F);
         // A size order wider than the 4-bit field is masked.
         assert_eq!(irta_value(base, false, 0x1F), irta_value(base, false, 0xF));

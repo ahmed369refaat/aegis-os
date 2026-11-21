@@ -147,9 +147,9 @@ pub fn release(dev_tag: u32) -> bool {
 
 /// The slot index (not the vector) serving `dev_tag`, if any.
 fn vector_for(dev_tag: u32) -> Option<usize> {
-    SLOTS.iter().position(|s| {
-        s.taken.load(Ordering::SeqCst) && s.dev_tag.load(Ordering::SeqCst) == dev_tag
-    })
+    SLOTS
+        .iter()
+        .position(|s| s.taken.load(Ordering::SeqCst) && s.dev_tag.load(Ordering::SeqCst) == dev_tag)
 }
 
 /// The vector serving `dev_tag`, if any (marker printing, drain paths).
@@ -294,14 +294,18 @@ pub fn wait_for_delivery(budget_tsc: u64) -> Option<u8> {
             // already happened (the timer is masked; nothing else
             // wakes it). Stores after the arming wake the line.
             if LAST_DELIVERED.load(Ordering::SeqCst) != 0 {
-                crate::serial::write_str("[IDLE] mwait armed late — the delivery raced it (caught)\n");
+                crate::serial::write_str(
+                    "[IDLE] mwait armed late — the delivery raced it (caught)\n",
+                );
                 break;
             }
             hw::mwait(0, 0);
             // Woke: either the store landed (the loop re-checks) or a
             // spurious wake (the loop re-arms).
             if LAST_DELIVERED.load(Ordering::SeqCst) != 0 {
-                crate::serial::write_str("[IDLE] mwait woke on the delivery store (C0 idle, live)\n");
+                crate::serial::write_str(
+                    "[IDLE] mwait woke on the delivery store (C0 idle, live)\n",
+                );
                 break;
             }
         }

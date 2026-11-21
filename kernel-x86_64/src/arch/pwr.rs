@@ -15,7 +15,7 @@
 // paths (they need `hw`); the parse is the pure, host-tested half.
 #![cfg_attr(test, allow(dead_code, unused_imports, unused_variables))]
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 /// FADT offset: PM1a Control Block (32-bit I/O or memory address).
 pub const OFF_PM1A_CNT: usize = 0x40;
@@ -50,9 +50,14 @@ pub fn parse_gas(b: &[u8]) -> Option<Gas> {
     if space > 1 {
         return None; // PCI-config/Embedded-controller spaces: out of scope
     }
-    let address = u64::from(b[4]) | (u64::from(b[5]) << 8) | (u64::from(b[6]) << 16)
-        | (u64::from(b[7]) << 24) | (u64::from(b[8]) << 32) | (u64::from(b[9]) << 40)
-        | (u64::from(b[10]) << 48) | (u64::from(b[11]) << 56);
+    let address = u64::from(b[4])
+        | (u64::from(b[5]) << 8)
+        | (u64::from(b[6]) << 16)
+        | (u64::from(b[7]) << 24)
+        | (u64::from(b[8]) << 32)
+        | (u64::from(b[9]) << 40)
+        | (u64::from(b[10]) << 48)
+        | (u64::from(b[11]) << 56);
     Some(Gas { space, address })
 }
 
@@ -77,7 +82,8 @@ pub fn parse_fadt_power(b: &[u8]) -> Option<FadtPower> {
     if b.len() < OFF_PM1A_CNT + 4 {
         return None;
     }
-    let pm1a = u32::from(b[OFF_PM1A_CNT]) | (u32::from(b[OFF_PM1A_CNT + 1]) << 8)
+    let pm1a = u32::from(b[OFF_PM1A_CNT])
+        | (u32::from(b[OFF_PM1A_CNT + 1]) << 8)
         | (u32::from(b[OFF_PM1A_CNT + 2]) << 16)
         | (u32::from(b[OFF_PM1A_CNT + 3]) << 24);
     if b.len() < MIN_LEN_FOR_RESET {
@@ -88,7 +94,8 @@ pub fn parse_fadt_power(b: &[u8]) -> Option<FadtPower> {
             reset_value: 0,
         });
     }
-    let flags = u32::from(b[OFF_FLAGS]) | (u32::from(b[OFF_FLAGS + 1]) << 8)
+    let flags = u32::from(b[OFF_FLAGS])
+        | (u32::from(b[OFF_FLAGS + 1]) << 8)
         | (u32::from(b[OFF_FLAGS + 2]) << 16)
         | (u32::from(b[OFF_FLAGS + 3]) << 24);
     let reset_reg = if flags & FLAGS_RESET_REGISTER != 0 {
@@ -208,7 +215,13 @@ mod tests {
     fn the_q35_picture_parses() {
         let p = parse_fadt_power(&fixture(0x604, true)).expect("parses");
         assert_eq!(p.pm1a_cnt, 0x604);
-        assert_eq!(p.reset_reg, Some(Gas { space: 1, address: 0xCF9 }));
+        assert_eq!(
+            p.reset_reg,
+            Some(Gas {
+                space: 1,
+                address: 0xCF9
+            })
+        );
         assert_eq!(p.reset_value, 6);
     }
 
@@ -242,12 +255,24 @@ mod tests {
         let mut b = [0u8; 12];
         b[0] = 0;
         b[4..12].copy_from_slice(&0xFED0_0000u64.to_le_bytes());
-        assert_eq!(parse_gas(&b), Some(Gas { space: 0, address: 0xFED0_0000 }));
+        assert_eq!(
+            parse_gas(&b),
+            Some(Gas {
+                space: 0,
+                address: 0xFED0_0000
+            })
+        );
         // I/O space (1) is valid.
         let mut c = [0u8; 12];
         c[0] = 1;
         c[4..12].copy_from_slice(&0xCF9u64.to_le_bytes());
-        assert_eq!(parse_gas(&c), Some(Gas { space: 1, address: 0xCF9 }));
+        assert_eq!(
+            parse_gas(&c),
+            Some(Gas {
+                space: 1,
+                address: 0xCF9
+            })
+        );
         // PCI config space (2): out of scope → refuse.
         let mut d = [0u8; 12];
         d[0] = 2;

@@ -53,7 +53,10 @@ impl MadtIrq {
     /// The first IOAPIC's MMIO base (the machine this stack boots has
     /// exactly one; more is future work).
     pub(crate) fn primary_ioapic(&self) -> Option<u64> {
-        self.ioapics.get(0).filter(|(_, g)| *g == 0).map(|(a, _)| *a)
+        self.ioapics
+            .get(0)
+            .filter(|(_, g)| *g == 0)
+            .map(|(a, _)| *a)
     }
 
     /// Map an ISA IRQ to its GSI through the overrides (the PIT's
@@ -88,7 +91,8 @@ pub(crate) fn parse_madt_irq(bytes: &[u8]) -> MadtIrq {
             break; // truncated entry: stop, keep what parsed
         }
         let rd32 = |o: usize| -> u32 {
-            u32::from(bytes[o]) | (u32::from(bytes[o + 1]) << 8)
+            u32::from(bytes[o])
+                | (u32::from(bytes[o + 1]) << 8)
                 | (u32::from(bytes[o + 2]) << 16)
                 | (u32::from(bytes[o + 3]) << 24)
         };
@@ -112,8 +116,7 @@ pub(crate) fn parse_madt_irq(bytes: &[u8]) -> MadtIrq {
                 }
             }
             5 if el >= 12 => {
-                m.lapic_addr_override = u64::from(rd32(off + 4))
-                    | (u64::from(rd32(off + 8)) << 32);
+                m.lapic_addr_override = u64::from(rd32(off + 4)) | (u64::from(rd32(off + 8)) << 32);
             }
             _ => {} // unknown or short entry: skip it, keep walking
         }
@@ -222,7 +225,11 @@ mod madt_tests {
         assert_eq!(m.override_count, MAX_OVERRIDES);
         // And the mapping only sees recorded overrides.
         assert_eq!(m.gsi_of_isa_irq(0), 16);
-        assert_eq!(m.gsi_of_isa_irq(19), 19, "the 17th override was not recorded");
+        assert_eq!(
+            m.gsi_of_isa_irq(19),
+            19,
+            "the 17th override was not recorded"
+        );
     }
 
     #[test]
@@ -448,7 +455,10 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
         match crate::arch::acpi::table_ok(facp_pa, b"FACP", &mut scratch) {
             Some(len) => facp_len = (len as usize).min(scratch.len()),
             None => {
-                line(out, &["[FADT] table failed validation — power paths stay on the legacy constants"]);
+                line(
+                    out,
+                    &["[FADT] table failed validation — power paths stay on the legacy constants"],
+                );
                 facp_pa = 0;
             }
         }
@@ -479,7 +489,10 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
                 ],
             );
         } else {
-            line(out, &["[FADT] power fields malformed — power paths stay on the legacy constants"]);
+            line(
+                out,
+                &["[FADT] power fields malformed — power paths stay on the legacy constants"],
+            );
         }
     }
 
@@ -521,7 +534,10 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
             }
         }
     } else {
-        line(out, &["[IVRS] absent (no AMD-Vi on this machine — QEMU does not emulate it)"]);
+        line(
+            out,
+            &["[IVRS] absent (no AMD-Vi on this machine — QEMU does not emulate it)"],
+        );
     }
 
     // HPET: table +44 = the block's base address (space at +40).

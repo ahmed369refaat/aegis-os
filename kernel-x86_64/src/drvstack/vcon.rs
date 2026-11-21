@@ -50,8 +50,7 @@ pub(crate) fn console_step<const N: usize>(
     use crate::virtio as v;
     use aegis_os::dma::DmaVerdict;
 
-    let Some(dev) = inv
-        .devices[..inv.count]
+    let Some(dev) = inv.devices[..inv.count]
         .iter()
         .find(|d| d.vendor == 0x1AF4 && is_virtio_console(d.device))
         .copied()
@@ -71,7 +70,14 @@ pub(crate) fn console_step<const N: usize>(
     let resolved = match caps.resolve(&dev) {
         Ok(r) => r,
         Err(e) => {
-            line(out, &["[VCON] capability regions refused (", e.describe(), ") — refusing"]);
+            line(
+                out,
+                &[
+                    "[VCON] capability regions refused (",
+                    e.describe(),
+                    ") — refusing",
+                ],
+            );
             return;
         }
     };
@@ -86,7 +92,10 @@ pub(crate) fn console_step<const N: usize>(
     let negotiated = match v::negotiate_features(feat_low, feat_high) {
         Ok(n) => n,
         Err(why) => {
-            line(out, &["[VCON] feature negotiation refused: ", why, " — refusing"]);
+            line(
+                out,
+                &["[VCON] feature negotiation refused: ", why, " — refusing"],
+            );
             return;
         }
     };
@@ -107,7 +116,10 @@ pub(crate) fn console_step<const N: usize>(
         qs_raw
     };
     if qsize == 0 || qsize > 2048 {
-        line(out, &["[VCON] queue size out of the supported band — refusing"]);
+        line(
+            out,
+            &["[VCON] queue size out of the supported band — refusing"],
+        );
         return;
     }
 
@@ -145,7 +157,10 @@ pub(crate) fn console_step<const N: usize>(
     let [desc_pa, avail_pa, used_pa, data_pa] = frames;
     for &pa in frames.iter() {
         if session.map(pa).is_none() {
-            line(out, &["[VCON] broker refused a ring frame — refusing (the device gets no addresses)"]);
+            line(
+                out,
+                &["[VCON] broker refused a ring frame — refusing (the device gets no addresses)"],
+            );
             return;
         }
     }
@@ -180,7 +195,10 @@ pub(crate) fn console_step<const N: usize>(
     v::write_u16_pa(v::avail_slot_addr(avail_pa, avail_idx % qsize), 0);
     v::write_u16_pa(avail_pa + 2, avail_idx.wrapping_add(1));
     if !mmio.notify(1, notify_off) {
-        line(out, &["[VCON] notify slot outside the notify region — refusing (F5)"]);
+        line(
+            out,
+            &["[VCON] notify slot outside the notify region — refusing (F5)"],
+        );
         return;
     }
     // Bounded poll + F7 validation: the completion's length must be
@@ -199,7 +217,10 @@ pub(crate) fn console_step<const N: usize>(
             break;
         }
         if spins >= budget {
-            line(out, &["[VCON] transmit DID NOT COMPLETE (budget) — refusing"]);
+            line(
+                out,
+                &["[VCON] transmit DID NOT COMPLETE (budget) — refusing"],
+            );
             return;
         }
         spins += 1;
@@ -207,7 +228,10 @@ pub(crate) fn console_step<const N: usize>(
     let slot = want.wrapping_sub(1) % qsize;
     let chain_len = 4 + PROOF.len() as u32;
     if let Err(why) = v::validate_used(used_pa, slot, qsize, 0, chain_len) {
-        line(out, &["[VCON] used-ring validation refused: ", why, " — refusing"]);
+        line(
+            out,
+            &["[VCON] used-ring validation refused: ", why, " — refusing"],
+        );
         return;
     }
     let mut nb = [0u8; 20];

@@ -64,8 +64,16 @@ pub(crate) fn rng_step<const N: usize>(
         out,
         &[
             "[RNG ] rdrand: ",
-            if has_rdrand { "" } else { "absent (CPUID.01H:ECX bit 30 clear)" },
-            if has_rdrand { strutil::dec(ok, &mut b) } else { "" },
+            if has_rdrand {
+                ""
+            } else {
+                "absent (CPUID.01H:ECX bit 30 clear)"
+            },
+            if has_rdrand {
+                strutil::dec(ok, &mut b)
+            } else {
+                ""
+            },
             if has_rdrand { "/10 samples mixed" } else { "" },
         ],
     );
@@ -94,18 +102,23 @@ pub(crate) fn rng_step<const N: usize>(
     }
 
     // ── the device half ──
-    let Some(dev) = inv
-        .devices[..inv.count]
+    let Some(dev) = inv.devices[..inv.count]
         .iter()
         .find(|d| d.vendor == 0x1AF4 && is_virtio_rng(d.device))
         .copied()
     else {
-        line(out, &["[RNG ] virtio-rng: absent on this machine (CPU sources stand)"]);
+        line(
+            out,
+            &["[RNG ] virtio-rng: absent on this machine (CPU sources stand)"],
+        );
         rng_summary(out);
         return;
     };
     if matches!(broker.verdict(), DmaVerdict::Absent { .. }) {
-        line(out, &["[RNG ] broker verdict absent — refusing to drive the device"]);
+        line(
+            out,
+            &["[RNG ] broker verdict absent — refusing to drive the device"],
+        );
         rng_summary(out);
         return;
     }
@@ -120,7 +133,11 @@ pub(crate) fn rng_step<const N: usize>(
         Err(e) => {
             line(
                 out,
-                &["[RNG ] capability regions refused (", e.describe(), ") — refusing"],
+                &[
+                    "[RNG ] capability regions refused (",
+                    e.describe(),
+                    ") — refusing",
+                ],
             );
             rng_summary(out);
             return;
@@ -136,7 +153,10 @@ pub(crate) fn rng_step<const N: usize>(
     let negotiated = match v::negotiate_features(feat_low, feat_high) {
         Ok(n) => n,
         Err(why) => {
-            line(out, &["[RNG ] feature negotiation refused: ", why, " — refusing"]);
+            line(
+                out,
+                &["[RNG ] feature negotiation refused: ", why, " — refusing"],
+            );
             rng_summary(out);
             return;
         }
@@ -156,7 +176,10 @@ pub(crate) fn rng_step<const N: usize>(
         qsize_raw
     };
     if qsize == 0 || qsize > 2048 {
-        line(out, &["[RNG ] queue size out of the supported band — refusing"]);
+        line(
+            out,
+            &["[RNG ] queue size out of the supported band — refusing"],
+        );
         rng_summary(out);
         return;
     }
@@ -195,7 +218,10 @@ pub(crate) fn rng_step<const N: usize>(
     let [desc_pa, avail_pa, used_pa, data_pa] = frames;
     for &pa in frames.iter() {
         if session.map(pa).is_none() {
-            line(out, &["[RNG ] broker refused a ring frame — refusing (the device gets no addresses)"]);
+            line(
+                out,
+                &["[RNG ] broker refused a ring frame — refusing (the device gets no addresses)"],
+            );
             return;
         }
     }
@@ -222,7 +248,10 @@ pub(crate) fn rng_step<const N: usize>(
     v::write_u16_pa(v::avail_slot_addr(avail_pa, avail_idx % qsize), 0);
     v::write_u16_pa(avail_pa + 2, avail_idx.wrapping_add(1));
     if !mmio.notify(0, notify_off) {
-        line(out, &["[RNG ] notify slot outside the notify region — refusing (F5)"]);
+        line(
+            out,
+            &["[RNG ] notify slot outside the notify region — refusing (F5)"],
+        );
         return;
     }
     // Bounded poll (ADR-0013's no-infinite-spin rule).
@@ -240,7 +269,10 @@ pub(crate) fn rng_step<const N: usize>(
             break;
         }
         if spins >= budget {
-            line(out, &["[RNG ] entropy request DID NOT COMPLETE (budget) — CPU sources stand"]);
+            line(
+                out,
+                &["[RNG ] entropy request DID NOT COMPLETE (budget) — CPU sources stand"],
+            );
             rng_summary(out);
             return;
         }
@@ -249,7 +281,10 @@ pub(crate) fn rng_step<const N: usize>(
     // F7: validate the completion against the submission.
     let slot = want.wrapping_sub(1) % qsize;
     if let Err(why) = v::validate_used(used_pa, slot, qsize, 0, 16) {
-        line(out, &["[RNG ] used-ring validation refused: ", why, " — refusing"]);
+        line(
+            out,
+            &["[RNG ] used-ring validation refused: ", why, " — refusing"],
+        );
         return;
     }
     // Harvest: two words into the pool.

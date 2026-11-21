@@ -163,8 +163,7 @@ fn dispatch(f: &mut ExceptionFrame) {
     // window); either way the broker owns it: EOI first, then the
     // device's mailbox. An unowned vector is a NAMED halt inside the
     // broker (nothing arms a vector it did not hand out).
-    if (crate::irq::DEVICE_VECTOR_BASE..=crate::irq::DEVICE_VECTOR_MAX)
-        .contains(&(f.vector as u8))
+    if (crate::irq::DEVICE_VECTOR_BASE..=crate::irq::DEVICE_VECTOR_MAX).contains(&(f.vector as u8))
     {
         crate::irq::deliver(f.vector as u8);
         return;

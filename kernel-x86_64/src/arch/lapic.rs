@@ -238,7 +238,10 @@ pub fn init() -> bool {
     }
     let x2 = crate::arch::features::has_x2apic(hw::cpuid1_ecx());
     let enable = if x2 {
-        hw::wrmsr(MSR_IA32_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_X2APIC);
+        hw::wrmsr(
+            MSR_IA32_APIC_BASE,
+            base | APIC_BASE_ENABLE | APIC_BASE_X2APIC,
+        );
         X2APIC.store(true, core::sync::atomic::Ordering::SeqCst);
         base | APIC_BASE_ENABLE | APIC_BASE_X2APIC
     } else {
@@ -441,6 +444,9 @@ mod tests {
         assert_ne!(APIC_BASE_X2APIC, APIC_BASE_ENABLE);
         assert!(crate::arch::features::has_x2apic(CPUID_ECX_X2APIC));
         assert!(!crate::arch::features::has_x2apic(0));
-        assert!(!crate::arch::features::has_x2apic(1 << 20), "neighbor bit must not decode");
+        assert!(
+            !crate::arch::features::has_x2apic(1 << 20),
+            "neighbor bit must not decode"
+        );
     }
 }

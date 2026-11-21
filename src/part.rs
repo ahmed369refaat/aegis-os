@@ -19,7 +19,11 @@ const fn crc_table() -> [u32; 256] {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[i] = c;
@@ -84,9 +88,7 @@ pub struct MbrPartition {
 /// Is the sector a valid MBR (signature in place)?
 #[must_use]
 pub fn mbr_signature_ok(sector: &[u8]) -> bool {
-    sector.len() >= SECTOR
-        && sector[510] == 0x55
-        && sector[511] == 0xAA
+    sector.len() >= SECTOR && sector[510] == 0x55 && sector[511] == 0xAA
 }
 
 /// Is it a PROTECTIVE MBR — the GPT handoff? (Signature + an 0xEE
@@ -114,15 +116,24 @@ pub fn parse_mbr(sector: &[u8]) -> Result<[Option<MbrPartition>; 4], PartError> 
         if type_ == 0 {
             continue; // unused
         }
-        let start = u32::from_le_bytes([sector[e + 8], sector[e + 9], sector[e + 10], sector[e + 11]]);
-        let sectors =
-            u32::from_le_bytes([sector[e + 12], sector[e + 13], sector[e + 14], sector[e + 15]]);
+        let start =
+            u32::from_le_bytes([sector[e + 8], sector[e + 9], sector[e + 10], sector[e + 11]]);
+        let sectors = u32::from_le_bytes([
+            sector[e + 12],
+            sector[e + 13],
+            sector[e + 14],
+            sector[e + 15],
+        ]);
         // start + sectors must not wrap: the partition ends inside
         // the 32-bit LBA space.
         if start.checked_add(sectors).is_none() {
             return Err(PartError::BadGeometry);
         }
-        *slot = Some(MbrPartition { type_, start_lba: start, sectors });
+        *slot = Some(MbrPartition {
+            type_,
+            start_lba: start,
+            sectors,
+        });
     }
     Ok(out)
 }
@@ -297,7 +308,12 @@ pub fn parse_gpt_entries(
         if count == MAX_PARTS {
             return Err(PartError::TooManyEntries(count as u32));
         }
-        parts[count] = Some(GptPartition { first_lba, last_lba, name, name_len });
+        parts[count] = Some(GptPartition {
+            first_lba,
+            last_lba,
+            name,
+            name_len,
+        });
         count += 1;
     }
     // Overlap: no two partitions may share an LBA.
@@ -310,7 +326,11 @@ pub fn parse_gpt_entries(
             }
         }
     }
-    Ok(Gpt { header: *header, parts, count })
+    Ok(Gpt {
+        header: *header,
+        parts,
+        count,
+    })
 }
 
 #[cfg(test)]
@@ -349,7 +369,11 @@ mod tests {
         let parts = parse_mbr(&m).expect("valid MBR");
         assert_eq!(
             parts[0],
-            Some(MbrPartition { type_: 0xEE, start_lba: 1, sectors: 289 })
+            Some(MbrPartition {
+                type_: 0xEE,
+                start_lba: 1,
+                sectors: 289
+            })
         );
         assert_eq!(parts[1], None);
         // No signature: refuse.
@@ -382,7 +406,7 @@ mod tests {
         h[72..80].copy_from_slice(&2u64.to_le_bytes()); // entries LBA
         h[80..84].copy_from_slice(&4u32.to_le_bytes()); // 4 entries
         h[84..88].copy_from_slice(&128u32.to_le_bytes()); // entry size
-        // Entries: one partition.
+                                                          // Entries: one partition.
         let mut e = [0u8; 512];
         e[0..16].copy_from_slice(&[
             0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47,
@@ -456,7 +480,10 @@ mod tests {
         hc[84..88].copy_from_slice(&64u32.to_le_bytes());
         bad[84..88].copy_from_slice(&64u32.to_le_bytes());
         bad[16..20].copy_from_slice(&crc32(&hc).to_le_bytes());
-        assert!(matches!(parse_gpt_header(&bad), Err(PartError::BadEntrySize(_))));
+        assert!(matches!(
+            parse_gpt_header(&bad),
+            Err(PartError::BadEntrySize(_))
+        ));
         // Too many entries for one sector.
         let mut bad = h;
         let mut hc = [0u8; 92];

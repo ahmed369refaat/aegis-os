@@ -51,10 +51,17 @@ pub(crate) fn pci_step(
                     " (MCFG)",
                 ],
             );
-            pci::CfgAccess::Ecam { base, start_bus: sb, end_bus: eb }
+            pci::CfgAccess::Ecam {
+                base,
+                start_bus: sb,
+                end_bus: eb,
+            }
         }
         _ => {
-            line(out, &["[PCI ] config access: legacy CF8/CFC (no usable MCFG window)"]);
+            line(
+                out,
+                &["[PCI ] config access: legacy CF8/CFC (no usable MCFG window)"],
+            );
             pci::CfgAccess::LegacyPorts
         }
     };

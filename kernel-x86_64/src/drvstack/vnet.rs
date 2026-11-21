@@ -568,11 +568,17 @@ fn msix_irq_step<const N: usize>(
     // The broker vector this device's messages land on (domain: the
     // ADR-0018 domain the claim assigned — dev.dom).
     let Some(vector) = irq::alloc(VNET_OWNER, dev.dom, irq::MSI_SOURCE_BASE) else {
-        line(out, &["[MSIX] broker refused the NIC (table full or duplicate)"]);
+        line(
+            out,
+            &["[MSIX] broker refused the NIC (table full or duplicate)"],
+        );
         return;
     };
     let Some(info) = msi::read_msix(dev) else {
-        line(out, &["[MSIX] virtio-net carries no usable MSI-X cap — refusing closed"]);
+        line(
+            out,
+            &["[MSIX] virtio-net carries no usable MSI-X cap — refusing closed"],
+        );
         irq::release(VNET_OWNER);
         return;
     };
@@ -582,9 +588,8 @@ fn msix_irq_step<const N: usize>(
     // otherwise.
     let (addr, data) = if session.with_prot(|p| p.ir_active()) {
         let handle = u32::from(vector - irq::DEVICE_VECTOR_BASE);
-        let wrote = session.with_prot(|p| {
-            p.irte_write(handle, crate::arch::vtd::irte_remapped(vector, 0, false))
-        });
+        let wrote = session
+            .with_prot(|p| p.irte_write(handle, crate::arch::vtd::irte_remapped(vector, 0, false)));
         if !wrote {
             line(out, &["[MSIX] IRTE write refused — refusing closed"]);
             irq::release(VNET_OWNER);
@@ -599,16 +604,25 @@ fn msix_irq_step<const N: usize>(
                 " (the IOMMU routes this message)",
             ],
         );
-        (crate::arch::vtd::msi_remap_addr(handle), crate::arch::vtd::MSI_REMAP_DATA)
+        (
+            crate::arch::vtd::msi_remap_addr(handle),
+            crate::arch::vtd::MSI_REMAP_DATA,
+        )
     } else {
-        line(out, &["[MSIX] format: compat (no interrupt remapping on this unit)"]);
+        line(
+            out,
+            &["[MSIX] format: compat (no interrupt remapping on this unit)"],
+        );
         (msi::msi_addr(0), msi::msi_data(vector))
     };
     // Program every entry (config + both queues — bounded by the
     // table size, which read_msix already proved fits the BAR).
     for i in 0..info.table_size {
         if !msi::program_entry(dev, &info, i, addr, data) {
-            line(out, &["[MSIX] entry programming refused (bounds) — refusing closed"]);
+            line(
+                out,
+                &["[MSIX] entry programming refused (bounds) — refusing closed"],
+            );
             msi::set_enable(dev, &info, false);
             irq::release(VNET_OWNER);
             return;
@@ -620,7 +634,10 @@ fn msix_irq_step<const N: usize>(
     // firing" bug — pinned here instead).
     let mc = msi::message_control(dev, &info);
     if mc & msi::MSIX_ENABLE == 0 || mc & msi::MSIX_FUNC_MASK != 0 {
-        line(out, &["[MSIX] enable write did not stick — refusing closed"]);
+        line(
+            out,
+            &["[MSIX] enable write did not stick — refusing closed"],
+        );
         irq::release(VNET_OWNER);
         return;
     }
@@ -669,7 +686,10 @@ fn msix_irq_step<const N: usize>(
             );
         }
         None => {
-            line(out, &["[MSIX] message NOT delivered within the window — LOUD (proof failed)"]);
+            line(
+                out,
+                &["[MSIX] message NOT delivered within the window — LOUD (proof failed)"],
+            );
         }
     }
 

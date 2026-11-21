@@ -74,8 +74,7 @@ pub(crate) fn balloon_step<const N: usize>(
     use crate::virtio as v;
     use aegis_os::dma::DmaVerdict;
 
-    let Some(dev) = inv
-        .devices[..inv.count]
+    let Some(dev) = inv.devices[..inv.count]
         .iter()
         .find(|d| d.vendor == 0x1AF4 && is_virtio_balloon(d.device))
         .copied()
@@ -95,7 +94,14 @@ pub(crate) fn balloon_step<const N: usize>(
     let resolved = match caps.resolve(&dev) {
         Ok(r) => r,
         Err(e) => {
-            line(out, &["[VBAL] capability regions refused (", e.describe(), ") — refusing"]);
+            line(
+                out,
+                &[
+                    "[VBAL] capability regions refused (",
+                    e.describe(),
+                    ") — refusing",
+                ],
+            );
             return;
         }
     };
@@ -110,7 +116,10 @@ pub(crate) fn balloon_step<const N: usize>(
     let negotiated = match v::negotiate_features(feat_low, feat_high) {
         Ok(n) => n,
         Err(why) => {
-            line(out, &["[VBAL] feature negotiation refused: ", why, " — refusing"]);
+            line(
+                out,
+                &["[VBAL] feature negotiation refused: ", why, " — refusing"],
+            );
             return;
         }
     };
@@ -156,7 +165,10 @@ pub(crate) fn balloon_step<const N: usize>(
     let [i_desc, i_avail, i_used, d_desc, d_avail, d_used, page] = frames;
     for &pa in frames.iter() {
         if session.map(pa).is_none() {
-            line(out, &["[VBAL] broker refused a ring frame — refusing (the device gets no addresses)"]);
+            line(
+                out,
+                &["[VBAL] broker refused a ring frame — refusing (the device gets no addresses)"],
+            );
             return;
         }
     }
@@ -220,12 +232,18 @@ pub(crate) fn balloon_step<const N: usize>(
     v::write_u16_pa(v::avail_slot_addr(i_avail, avail_idx % i_qsize), 0);
     v::write_u16_pa(i_avail + 2, avail_idx.wrapping_add(1));
     if !mmio.notify(0, i_notify) {
-        line(out, &["[VBAL] notify slot outside the notify region — refusing (F5)"]);
+        line(
+            out,
+            &["[VBAL] notify slot outside the notify region — refusing (F5)"],
+        );
         return;
     }
     // The new target: actual + 1 page (checked).
     let Some(target) = inflate_target(actual0, 1) else {
-        line(out, &["[VBAL] the +1-page target would overflow — refusing"]);
+        line(
+            out,
+            &["[VBAL] the +1-page target would overflow — refusing"],
+        );
         return;
     };
     crate::memops::write_u32(dcfg + CFG_NUM_PAGES, target);
@@ -239,8 +257,8 @@ pub(crate) fn balloon_step<const N: usize>(
     {
         spins += 1;
     }
-    let inflated = v::used_idx(i_used) == want
-        && crate::memops::read_u32(dcfg + CFG_ACTUAL) == target;
+    let inflated =
+        v::used_idx(i_used) == want && crate::memops::read_u32(dcfg + CFG_ACTUAL) == target;
 
     // ── the deflate: the SAME page on queue 1, the target back to
     // the original count — the host restores the page's backing and
@@ -250,7 +268,10 @@ pub(crate) fn balloon_step<const N: usize>(
     v::write_u16_pa(v::avail_slot_addr(d_avail, d_idx % d_qsize), 0);
     v::write_u16_pa(d_avail + 2, d_idx.wrapping_add(1));
     if !mmio.notify(1, d_notify) {
-        line(out, &["[VBAL] deflate notify refused — the page returns via the session close"]);
+        line(
+            out,
+            &["[VBAL] deflate notify refused — the page returns via the session close"],
+        );
         return;
     }
     crate::memops::write_u32(dcfg + CFG_NUM_PAGES, deflate_target(actual0));
@@ -261,8 +282,8 @@ pub(crate) fn balloon_step<const N: usize>(
     {
         spins2 += 1;
     }
-    let deflated = v::used_idx(d_used) == d_want
-        && crate::memops::read_u32(dcfg + CFG_ACTUAL) == actual0;
+    let deflated =
+        v::used_idx(d_used) == d_want && crate::memops::read_u32(dcfg + CFG_ACTUAL) == actual0;
 
     let mut c1 = [0u8; 20];
     let mut c2 = [0u8; 20];
@@ -274,7 +295,10 @@ pub(crate) fn balloon_step<const N: usize>(
             " deflated=",
             if deflated { "yes" } else { "NO (budget)" },
             " actual=",
-            strutil::dec(u64::from(crate::memops::read_u32(dcfg + CFG_ACTUAL)), &mut c1),
+            strutil::dec(
+                u64::from(crate::memops::read_u32(dcfg + CFG_ACTUAL)),
+                &mut c1,
+            ),
             " (started ",
             strutil::dec(u64::from(actual0), &mut c2),
             ") — the page returns to the pool",

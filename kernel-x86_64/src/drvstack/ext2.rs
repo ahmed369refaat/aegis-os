@@ -86,9 +86,7 @@ pub(crate) fn ext2_over_ahci(
         if load(1, &mut hsec) {
             match aegis_os::part::parse_gpt_header(&hsec) {
                 Ok(hdr) => {
-                    let stored_crc = u32::from_le_bytes([
-                        hsec[88], hsec[89], hsec[90], hsec[91],
-                    ]);
+                    let stored_crc = u32::from_le_bytes([hsec[88], hsec[89], hsec[90], hsec[91]]);
                     if load(hdr.entries_lba, &mut sec) {
                         match aegis_os::part::parse_gpt_entries(&sec, &hdr, stored_crc) {
                             Ok(gpt) if gpt.count >= 1 => {
@@ -113,22 +111,45 @@ pub(crate) fn ext2_over_ahci(
                                 line(out, &["[GPT ] table valid but empty — ext2 at LBA 0 (raw fallback)"]);
                             }
                             Err(e) => {
-                                line(out, &["[GPT ] entries refused (hostile table): ", part_err_name(&e), " — ext2 at LBA 0 (raw fallback)"]);
+                                line(
+                                    out,
+                                    &[
+                                        "[GPT ] entries refused (hostile table): ",
+                                        part_err_name(&e),
+                                        " — ext2 at LBA 0 (raw fallback)",
+                                    ],
+                                );
                             }
                         }
                     } else {
-                        line(out, &["[GPT ] entries sector did not read — ext2 at LBA 0 (raw fallback)"]);
+                        line(
+                            out,
+                            &["[GPT ] entries sector did not read — ext2 at LBA 0 (raw fallback)"],
+                        );
                     }
                 }
                 Err(e) => {
-                    line(out, &["[GPT ] header refused: ", part_err_name(&e), " — ext2 at LBA 0 (raw fallback)"]);
+                    line(
+                        out,
+                        &[
+                            "[GPT ] header refused: ",
+                            part_err_name(&e),
+                            " — ext2 at LBA 0 (raw fallback)",
+                        ],
+                    );
                 }
             }
         } else {
-            line(out, &["[GPT ] header sector did not read — ext2 at LBA 0 (raw fallback)"]);
+            line(
+                out,
+                &["[GPT ] header sector did not read — ext2 at LBA 0 (raw fallback)"],
+            );
         }
     } else {
-        line(out, &["[GPT ] no GPT on this disk — ext2 at LBA 0 (raw fallback)"]);
+        line(
+            out,
+            &["[GPT ] no GPT on this disk — ext2 at LBA 0 (raw fallback)"],
+        );
     }
 
     // Superblock: LBA 2 within the filesystem (byte 1024, 1KiB
