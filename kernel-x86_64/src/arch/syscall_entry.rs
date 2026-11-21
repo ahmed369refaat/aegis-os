@@ -94,9 +94,35 @@ pub fn syscall_frame_addr() -> u64 {
     SYSCALL_FRAME.load(Ordering::Relaxed)
 }
 
+/// Read one word of the in-flight frame at an OFF_* offset (ADR-0023:
+/// the signal paths rebuild/rewrite the user image through the SAME
+/// table the stub's own loads use — the struct is mirror-imaged and
+/// must never be cast onto the base pointer).
+///
+/// SAFETY: the entry published the address; single CPU, IF=0.
+pub fn frame_word(off: u64) -> u64 {
+    let base = SYSCALL_FRAME.load(Ordering::Relaxed);
+    unsafe { *((base + off) as *const u64) }
+}
+
+/// Write one word of the in-flight frame at an OFF_* offset.
+///
+/// SAFETY: the entry published the address; single CPU, IF=0; the
+/// write is 8-byte aligned inside the frame.
+pub fn write_frame_word(off: u64, val: u64) {
+    let base = SYSCALL_FRAME.load(Ordering::Relaxed);
+    unsafe { *((base + off) as *mut u64) = val };
+}
+
 /// Round J's parked user RSP, read by the park paths.
 pub fn user_rsp_save() -> u64 {
     USER_RSP_SAVE.load(Ordering::Relaxed)
+}
+
+/// ADR-0023 D8: rewrite the in-flight user RSP (the signal delivery
+/// paths: the frame push moves the stack; sigreturn restores it).
+pub fn set_user_rsp_save(rsp: u64) {
+    USER_RSP_SAVE.store(rsp, Ordering::Relaxed);
 }
 
 fn percpu_kstack_top() -> u64 {

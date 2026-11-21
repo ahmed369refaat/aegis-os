@@ -163,9 +163,19 @@ pub fn completed_drain() -> Option<(u32, crate::sched::context::ExitKind)> {
     None
 }
 
+/// ADR-0023: the saved outer resume chain. A STATIC, deliberately:
+/// the kernel stack is SHARED (the stub reloads SYSCALL_RSP on every
+/// syscall), so every run the nested dispatcher resumes reuses the
+/// stack top — a frame-local chain would be overwritten mid-excursion
+/// (found live: the pair proof crashed jumping through a chain whose
+/// words were packed domain ids from the reused stack). The .bss slot
+/// is nobody's scratch.
+#[cfg(not(test))]
+static mut SAVED_CHAIN: [Option<crate::sched::context::ResumeChain>; 1] = [const { None }; 1];
+
 #[cfg(not(test))]
 mod boot {
-    use super::{live_callee_saved, parked_from_syscall, record_completed, SyscallImage};
+    use super::{live_callee_saved, parked_from_syscall, record_completed, SAVED_CHAIN, SyscallImage};
     use crate::arch::syscall_entry;
     use crate::arch::syscall_frame::{
         OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
@@ -222,6 +232,92 @@ mod boot {
         dispatch_next()
     }
 
+    /// ADR-0023 D8: deliver one pending caught signal to a run being
+    /// resumed from parked — the twin of the syscall-path delivery in
+    /// syscall.rs, rewriting the ParkedContext instead of the stub
+    /// frame. The interrupted image comes from the parked context;
+    /// the frame lands on ITS user stack (the caller activated the
+    /// target's tables first — the byte writes need its CR3).
+    fn deliver_to_parked(
+        run: &mut crate::sched::context::UserRun,
+        ctx: &mut crate::sched::context::ParkedContext,
+    ) {
+        use crate::mm::user_range::copy_out_bytes;
+        use aegis_os::sigframe::{self, InterruptedImage};
+
+        // ParkedContext gprs order: r15,r14,r13,r12,r11,r10,r9,r8,
+        // rbp,rdi,rsi,rdx,rcx,rbx,rax — indices 9..11,5..7,13,14.
+        let new_rsp = (ctx.rsp.saturating_sub(136)) & !0xF;
+        // The stack span must be a present user page in THIS run's
+        // tables (page-walk validation, CR3-independent).
+        let stack_ok = {
+            let page = new_rsp & !(crate::mm::pte::PAGE_SIZE_U64 - 1);
+            let end_page = ((new_rsp + sigframe::SIGFRAME_BYTES as u64 - 1)
+                & !(crate::mm::pte::PAGE_SIZE_U64 - 1));
+            let mut ok = true;
+            let mut p = page;
+            while p <= end_page {
+                ok = ok
+                    && matches!(run.tables.pte_of(p),
+                        Some(e) if e & crate::mm::pte::PTE_U != 0 && e & crate::mm::pte::PTE_P != 0);
+                p += crate::mm::pte::PAGE_SIZE_U64;
+            }
+            ok
+        };
+        if !stack_ok {
+            return;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return;
+        };
+        let Some((sig, handler, restorer)) = k.pop_catchable_signal(run.domain) else {
+            return;
+        };
+        let img = InterruptedImage {
+            rip: ctx.rip,
+            cs: ctx.cs,
+            rflags: ctx.rflags,
+            rsp: ctx.rsp,
+            ss: ctx.ss,
+            gprs: [
+                ctx.gprs[14], // rax
+                ctx.gprs[9],  // rdi
+                ctx.gprs[10], // rsi
+                ctx.gprs[11], // rdx
+                ctx.gprs[5],  // r10
+                ctx.gprs[7],  // r8
+                ctx.gprs[6],  // r9
+                ctx.gprs[13], // rbx
+            ],
+        };
+        let t = hw::read_tsc();
+        let cookie = t ^ (t.rotate_left(32)) ^ (u64::from(run.domain) << 48) ^ u64::from(sig);
+        let mut frame = [0u8; sigframe::SIGFRAME_BYTES];
+        sigframe::build(sig, cookie, restorer, &img, &mut frame);
+        crate::syscall::IN_USER_COPY.store(true, core::sync::atomic::Ordering::SeqCst);
+        if hw::smap_active() {
+            hw::stac();
+        }
+        let _ = copy_out_bytes(new_rsp, &frame, &|va, b| crate::memops::write_u8_va(va, b));
+        if hw::smap_active() {
+            hw::clac();
+        }
+        crate::syscall::IN_USER_COPY.store(false, core::sync::atomic::Ordering::SeqCst);
+        // Rewrite the parked image: the resume enters the handler with
+        // RDI = signum; the interrupted image lives on in the frame.
+        ctx.rip = handler;
+        ctx.gprs[9] = u64::from(sig); // rdi
+        ctx.gprs[14] = 0;             // rax (undefined at entry)
+        ctx.rsp = new_rsp;
+        // The delivery record rides the run (sigreturn matches the
+        // cookie and the exact frame address against it).
+        run.delivered = Some(crate::sched::context::Delivered {
+            sig,
+            cookie,
+            frame_rsp: new_rsp,
+        });
+    }
+
     /// Hand the CPU to the next runnable domain — or idle until one
     /// is — until the run set empties, then UNWIND to the outer
     /// launch point (kmain). The shape mirrors kmain's own handover
@@ -235,16 +331,27 @@ mod boot {
     /// kmain-only boot has, one nesting level deeper.
     fn dispatch_next() -> ! {
         // kmain's launch point, before any resume_parked of ours
-        // overwrites the eight slots.
-        let chain = context::save_resume_chain();
+        // overwrites the eight slots — in a .bss STATIC (see
+        // SAVED_CHAIN's doc: the shared stack is not ours to keep
+        // locals alive across excursions).
+        // SAFETY: single CPU, IF=0; the one slot is this module's.
+        unsafe {
+            *core::ptr::addr_of_mut!(SAVED_CHAIN[0]) = Some(context::save_resume_chain());
+        }
         loop {
             let now = hw::read_tsc();
             if let Some(k) = context::kernel_mut() {
                 k.tick(now);
                 if let Some(next) = k.sched.pick_next() {
                     match context::take_parked(next) {
-                        Some((run, ctx)) => {
+                        Some((mut run, mut ctx)) => {
                             run.tables.activate();
+                            // ADR-0023 D8: a signal may have arrived
+                            // while this run was parked — deliver it
+                            // by rewriting the parked image (the
+                            // target's CR3 is active, so the user-stack
+                            // write lands in ITS tables).
+                            deliver_to_parked(&mut run, &mut ctx);
                             context::begin(run);
                             context::resume_parked(&ctx);
                             // Returned: the resumed run EXITED; USER_RUN
@@ -287,8 +394,16 @@ mod boot {
             }
             // Nothing runnable, nothing sleeping: the run set is empty
             // — unwind to the outer launch point.
-            context::restore_resume_chain(&chain);
-            context::resume_kernel();
+            if let Some(chain) = {
+                // SAFETY: see the save site.
+                unsafe { *core::ptr::addr_of!(SAVED_CHAIN[0]) }
+            } {
+                context::restore_resume_chain(&chain);
+                context::resume_kernel();
+            }
+            // No chain saved (a bookkeeping bug): loud, never silent.
+            serial::write_str("[SCHD] KERNEL BUG: unwind with no saved chain\n");
+            hw::halt_forever();
         }
     }
 }

@@ -1291,6 +1291,8 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // empties (the sleeper exited; its exit sits in the completed
         // mailbox — teardown stays the spawner's contract).
         hw::write_cr3(kernel_cr3);
+        crate::serial::write_str("[DBG ] kmain back after the sleeper pair
+");
         let mut clean_exit = false;
         let mut saw_exit = false;
         while let Some((dom, exit)) = crate::sched::park::completed_drain() {
@@ -1332,6 +1334,148 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 },
             ],
         );
+    }
+
+    // ── 16. ADR-0023 D8: the signal proof — the first ring-3 signal
+    //      frames in the system's history. The VICTIM (23) installs a
+    //      SIGUSR1 handler (rt_sigaction with the trampoline
+    //      restorer), announces itself, and sleeps 200 ms; the KILLER
+    //      (24) strikes mid-sleep (kill(23, SIGUSR1)) and exits. On
+    //      the victim's wake the kernel delivers the signal ON THE
+    //      UNPARK PATH (the parked image is rewritten into the
+    //      handler; the interrupted image rides the pushed frame);
+    //      the handler sets its flag, `ret`s into the kernel's
+    //      trampoline, rt_sigreturn validates every user-supplied
+    //      field against the kernel's delivery record and resumes the
+    //      interrupted code — which verifies the flag and exits 0.
+    //      Then the FORGER (25) calls rt_sigreturn with a garbage
+    //      stack and NO delivery in flight: it must be refused
+    //      (its exit 0 certifies the refusal; exit 107 would mean a
+    //      forged frame was accepted). ──
+    {
+        static VICTIM_DATA: [u8; 0x70] = {
+            let mut d = [0u8; 0x70];
+            d[0] = 3; // mode 3: the victim
+            let msg: &[u8; 13] = b"victim armed\n";
+            let mut i = 0;
+            while i < 13 {
+                d[0x10 + i] = msg[i];
+                i += 1;
+            }
+            d
+        };
+        static KILLER_DATA: [u8; 1] = [4]; // mode 4: the killer
+        let victim = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            23,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &VICTIM_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(&mut out, &["[M3] signal: ERROR: victim spawn failed; halting"]);
+                hw::halt_forever();
+            }
+        };
+        let killer = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            24,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &KILLER_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(&mut out, &["[M3] signal: ERROR: killer spawn failed; halting"]);
+                hw::halt_forever();
+            }
+        };
+        // The proof's cast, arranged by the bootstrap (the Unix layer
+        // needs uid 0 for a cross-domain kill — the CAPABILITY gate
+        // still applies; uid 0 never bypasses it): grant the killer a
+        // Domain(23) WRITE capability and run it as root.
+        {
+            let d = k.domain_mut(24).expect("killer domain");
+            let _ = d.caps.insert(aegis_os::capability::Capability {
+                resource: aegis_os::capability::Resource::Domain(23),
+                rights: aegis_os::capability::Rights::WRITE,
+                generation: 0,
+            });
+            d.uid = 0;
+        }
+        let kernel_cr3 = hw::read_cr3();
+        crate::sched::context::stash_parked(
+            killer.run,
+            crate::sched::context::ParkedContext::from_user_context(&killer.ctx),
+        );
+        victim.run.tables.activate();
+        crate::sched::context::begin(victim.run);
+        crate::sched::context::launch(&victim.ctx);
+        // kmain resumes when the nested dispatcher empties: both runs
+        // exited (the mailbox holds their exits).
+        hw::write_cr3(kernel_cr3);
+        crate::serial::write_str("[DBG ] kmain back after the signal pair
+");
+        let mut victim_ok = false;
+        let mut killer_ok = false;
+        while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            let clean = matches!(exit, crate::sched::context::ExitKind::Exited(0));
+            if dom == 23 {
+                victim_ok = clean;
+            }
+            if dom == 24 {
+                killer_ok = clean;
+            }
+            mm::user::destroy_user(&mut k, &mut pool, dom);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+        }
+        if !victim_ok || !killer_ok {
+            line(
+                &mut out,
+                &["[M3] signal: ERROR: victim/killer exit wrong; halting"],
+            );
+            hw::halt_forever();
+        }
+        // The forger: solo — its exit 0 certifies the refusal.
+        static FORGER_DATA: [u8; 1] = [5];
+        let forger = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            25,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &FORGER_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(&mut out, &["[M3] signal: ERROR: forger spawn failed; halting"]);
+                hw::halt_forever();
+            }
+        };
+        let kernel_cr3 = hw::read_cr3();
+        forger.run.tables.activate();
+        crate::sched::context::begin(forger.run);
+        crate::sched::context::launch(&forger.ctx);
+        let run = crate::sched::context::take();
+        hw::write_cr3(kernel_cr3);
+        let forger_ok = matches!(run.exit, crate::sched::context::ExitKind::Exited(0));
+        mm::user::destroy_user(&mut k, &mut pool, 25);
+        let _ = crate::sched::preempt::on_exit(&mut k.sched, 25);
+        if forger_ok {
+            line(
+                &mut out,
+                &["[M3] signal: handler ran, sigreturn resumed, forged frame refused"],
+            );
+        } else {
+            line(
+                &mut out,
+                &["[M3] signal: ERROR: forged frame was accepted (or the forger failed otherwise); halting"],
+            );
+            hw::halt_forever();
+        }
     }
 
     // ── 13. the terminal guard-page proof: the write must #PF, the

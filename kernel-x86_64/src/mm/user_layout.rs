@@ -29,8 +29,18 @@ pub const STACK_BASE: u64 = 0x0040_8000;
 pub const STACK_TOP: u64 = STACK_BASE + 4096;
 pub const STACK_PAGES: usize = 1;
 
+/// ADR-0023 D8: the signal trampoline — one RX page, clear of every
+/// region and guard gap (after the stack region). Content: the 9-byte
+/// `mov eax, 15; syscall; ud2` (rt_sigreturn; the ud2 catches a
+/// kernel bug that would return instead of replacing the context).
+pub const TRAMPOLINE_BASE: u64 = 0x0040_C000;
+pub const TRAMPOLINE_PAGES: usize = 1;
+
+/// The trampoline's exact bytes (mov eax,15 / syscall / ud2).
+pub const TRAMPOLINE: [u8; 9] = [0xb8, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x0b];
+
 /// Total pages a spawned user domain claims against its quota.
-pub const TOTAL_PAGES: usize = CODE_PAGES + DATA_PAGES + STACK_PAGES;
+pub const TOTAL_PAGES: usize = CODE_PAGES + DATA_PAGES + STACK_PAGES + TRAMPOLINE_PAGES;
 
 pub fn code_flags() -> MemFlags {
     MemFlags::READ | MemFlags::EXEC
@@ -59,6 +69,14 @@ mod tests {
             .expect("data region legal");
         sp.map(STACK_BASE as usize, STACK_PAGES * PAGE_SIZE, stack_flags())
             .expect("stack region legal");
+        // ADR-0023 D8: the signal trampoline (RX, after the stack
+        // region, clear of every guard gap).
+        sp.map(
+            TRAMPOLINE_BASE as usize,
+            TRAMPOLINE_PAGES * PAGE_SIZE,
+            code_flags(),
+        )
+        .expect("trampoline region legal");
         assert_eq!(sp.used_pages(), TOTAL_PAGES);
 
         // Adjacent to the code region (no guard page) → refused.
@@ -72,7 +90,7 @@ mod tests {
     #[test]
     fn regions_are_aligned_gapped_and_below_the_split() {
         use crate::mm::pte::USER_LIMIT;
-        for base in [CODE_BASE, DATA_BASE, STACK_BASE] {
+        for base in [CODE_BASE, DATA_BASE, STACK_BASE, TRAMPOLINE_BASE] {
             assert_eq!(base % 4096, 0, "{base:#x} aligned");
             assert!(base > 0, "NULL page never mappable");
             assert!(base < USER_LIMIT, "{base:#x} in the user half");
@@ -82,6 +100,8 @@ mod tests {
         let data_end = DATA_BASE + DATA_PAGES as u64 * 4096;
         assert!(DATA_BASE - code_end >= 4096, "code→data gap");
         assert!(STACK_BASE - data_end >= 4096, "data→stack gap");
+        let stack_end = STACK_BASE + STACK_PAGES as u64 * 4096;
+        assert!(TRAMPOLINE_BASE - stack_end >= 4096, "stack→trampoline gap");
         // W^X: no region is both writable and executable.
         assert!(!code_flags().contains(MemFlags::WRITE));
         assert!(!data_flags().contains(MemFlags::EXEC));

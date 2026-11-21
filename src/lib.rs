@@ -61,6 +61,7 @@ pub mod profile;
 pub mod response;
 pub mod ringbuf;
 pub mod sched;
+pub mod sigframe;
 pub mod signal;
 pub mod sys;
 pub mod syscall;
@@ -533,6 +534,9 @@ impl<const N: usize> Kernel<N> {
             .map_err(|_| proc::ProcError::UnknownProcess(pid))?;
         d.exec_intersect(declared);
         d.monitor_enforce = monitor_enforce;
+        // ADR-0023 D8: caught handlers reset to default across exec
+        // (POSIX) — the new image installs its own.
+        d.clear_caught_handlers();
         d.space.clear_for_exec();
         // Close cloexec fds, buffering the pipe releases: the domain
         // borrow and the pipe-table borrow cannot be live together.
@@ -1032,6 +1036,31 @@ impl<const N: usize> Kernel<N> {
             .min()
     }
 
+    /// ADR-0023 D8: the next signal the kernel may DELIVER to
+    /// `domain` — pending, unblocked, with an installed handler
+    /// (caught), lowest signum first — removed from the pending set
+    /// and answered with its disposition (signum, handler, restorer).
+    /// Uncaught signals stay pending (their default action is the
+    /// monitor's business, unchanged).
+    pub fn pop_catchable_signal(&mut self, domain: u32) -> Option<(u8, u64, u64)> {
+        let sig = {
+            let d = self.domains.iter().flatten().find(|d| d.id == domain)?;
+            let sig = d.signals.next_pending()?;
+            if d.sig_handlers[usize::from(sig)].is_none() {
+                return None; // pending but uncaught — not ours to deliver
+            }
+            sig
+        };
+        let d = self
+            .domains
+            .iter_mut()
+            .flatten()
+            .find(|d| d.id == domain)?;
+        let _ = d.signals.deliver();
+        let h = d.sig_handlers[usize::from(sig)]?;
+        Some((sig, h.handler, h.restorer))
+    }
+
     /// ADR-0023: the wake deadline a domain sleeps toward, if any
     /// (test/procfs visibility).
     #[must_use]
@@ -1331,6 +1360,7 @@ pub mod prelude {
     pub use crate::preempt::{Preemptor, TickDecision};
     pub use crate::ringbuf::{RingBuffer, RingError};
     pub use crate::sched::{SchedEntity, SchedError, Scheduler, NICE0_WEIGHT, NICE_TO_WEIGHT};
+    pub use crate::sigframe::{InterruptedImage, SigframeError, SIGFRAME_BYTES, USER_CANON_MAX};
     pub use crate::signal::{
         default_action, is_unblockable, SignalError, SignalSet, SignalState, SIGHUP, SIGINT,
         SIGKILL, SIGSTOP, SIGTERM, SIGUSR1, SIGUSR2,

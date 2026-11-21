@@ -156,8 +156,16 @@ fn build_user_tables<const N: usize>(
         layout::stack_flags(),
         &mut src,
     )?;
+    tables.map_region(
+        &mut space,
+        layout::TRAMPOLINE_BASE,
+        layout::TRAMPOLINE_PAGES * 4096,
+        layout::code_flags(),
+        &mut src,
+    )?;
     copy_into_frame(&tables, layout::CODE_BASE, blob);
     copy_into_frame(&tables, layout::DATA_BASE, data);
+    copy_into_frame(&tables, layout::TRAMPOLINE_BASE, &layout::TRAMPOLINE);
     Ok((tables, space))
 }
 

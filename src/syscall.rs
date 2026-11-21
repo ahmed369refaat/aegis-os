@@ -63,6 +63,16 @@ pub const SYS_SCHED_YIELD: u8 = 22;
 /// the core, the execution is kernel-side math over the calibrated
 /// TSC: the core has no clock of its own).
 pub const SYS_CLOCK_GETTIME: u8 = 23;
+/// Install a caught-signal disposition (rt_sigaction(2)-like;
+/// ADR-0023 D8).
+pub const SYS_SIGACTION: u8 = 25;
+/// Return from a signal handler (rt_sigreturn(2)-like; ADR-0023 D8).
+/// NOT gate-masked: like SYSRET itself, it is entry machinery the
+/// kernel invoked (the authority was exercised at sigaction and
+/// delivery time); the kernel-side ABI layer handles it before the
+/// policy gate and re-validates every frame field against its own
+/// delivery record.
+pub const SYS_SIGRETURN: u8 = 24;
 /// Reserved: domain exit. Always reachable; a mask without it is rejected
 /// by convention (see `profile` tests).
 pub const SYS_EXIT: u8 = 63;

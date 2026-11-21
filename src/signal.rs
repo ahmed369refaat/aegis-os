@@ -98,6 +98,20 @@ pub fn is_unblockable(sig: u8) -> bool {
     sig == SIGKILL || sig == SIGSTOP
 }
 
+/// ADR-0023 D8: a caught signal's user-side disposition — the handler
+/// entry and the restorer the handler returns to (the trampoline).
+/// Stored per signum on the domain; `fork` copies it, `execve` CLEARS
+/// it (POSIX: caught handlers reset to default across exec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigHandler {
+    pub handler: u64,
+    pub restorer: u64,
+}
+
+/// How many signals the handler table holds (signum 1..=63; index by
+/// signum, index 0 unused).
+pub const SIG_TABLE: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SignalState {
     pending: SignalSet,

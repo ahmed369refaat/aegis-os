@@ -26,7 +26,7 @@ use crate::{
     syscall::{
         SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR,
         SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE,
-        SYS_READ, SYS_SCHED_YIELD, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
+        SYS_READ, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
     },
     Kernel, KernelError,
 };
@@ -84,6 +84,14 @@ pub enum SysRequest<'a> {
     /// core records the call; the SWITCH decision is the kernel's
     /// (`Preemptor::on_yield`) because only it can park the run.
     SchedYield,
+    /// rt_sigaction(signum, handler, restorer) — ADR-0023 D8: install
+    /// a caught-signal disposition. SIGKILL/SIGSTOP refuse; signum
+    /// must be 1..=63. Pointer validation is the ABI layer's.
+    SigAction {
+        signum: u8,
+        handler: u64,
+        restorer: u64,
+    },
     /// chroot(path) — confinement change; unlike Linux, the cwd moves with
     /// the root (closes the historical chroot+cwd escape).
     Chroot {
@@ -576,6 +584,26 @@ impl<const N: usize> Kernel<N> {
                 Ok(SysValue::Count(wake as usize))
             }
             SysRequest::SchedYield => Ok(SysValue::Unit),
+            SysRequest::SigAction {
+                signum,
+                handler,
+                restorer,
+            } => {
+                if signum == 0 || signum >= 64 {
+                    return Err(SysError::InvalidArgument(u64::from(signum)));
+                }
+                if crate::signal::is_unblockable(signum) {
+                    // KILL/STOP are never catchable (the existing
+                    // invariant, now reachable from ring 3).
+                    return Err(SysError::InvalidArgument(u64::from(signum)));
+                }
+                let d = self.domain_mut(domain_id).map_err(into_sys)?;
+                d.sig_handlers[usize::from(signum)] = Some(crate::signal::SigHandler {
+                    handler,
+                    restorer,
+                });
+                Ok(SysValue::Unit)
+            }
             SysRequest::Chroot { path } => {
                 // Resolve against the *current* root, then re-root.
                 let id = self
@@ -949,6 +977,7 @@ fn syscall_nr(req: &SysRequest<'_>) -> u8 {
         SysRequest::Kill { .. } => SYS_KILL,
         SysRequest::Nanosleep { .. } => SYS_NANOSLEEP,
         SysRequest::SchedYield => SYS_SCHED_YIELD,
+        SysRequest::SigAction { .. } => SYS_SIGACTION,
         SysRequest::Chroot { .. } => SYS_CHROOT,
         SysRequest::Mkdir { .. } => SYS_MKDIR,
         SysRequest::Unlink { .. } => SYS_UNLINK,

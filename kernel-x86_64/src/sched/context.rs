@@ -107,6 +107,23 @@ pub struct UserRun {
     pub denied: u32,
     /// Measured SYSCALL→SYSRET round-trip of the first write (TSC).
     pub roundtrip_tsc: u64,
+    /// ADR-0023 D8: the in-flight DELIVERED signal (set at delivery,
+    /// consumed by rt_sigreturn) — the kernel's own frame record; the
+    /// user-side frame is never trusted without it.
+    pub delivered: Option<Delivered>,
+}
+
+/// ADR-0023 D8: the delivery record — what the kernel knows about the
+/// signal frame it pushed (the user-visible copy can be forged; this
+/// cannot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Delivered {
+    pub sig: u8,
+    /// The kernel-chosen cookie (TSC-mixed; embedded in the frame and
+    /// matched at sigreturn).
+    pub cookie: u64,
+    /// The frame's exact user address (a displaced frame refuses).
+    pub frame_rsp: u64,
 }
 
 impl UserRun {
@@ -128,6 +145,7 @@ impl UserRun {
             bad_syscalls: 0,
             denied: 0,
             roundtrip_tsc: 0,
+            delivered: None,
         }
     }
 }

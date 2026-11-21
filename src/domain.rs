@@ -63,6 +63,9 @@ pub struct Domain {
     pub fds: FdTable,
     /// Pending/blocked POSIX-style signals.
     pub signals: SignalState,
+    /// ADR-0023 D8: caught-signal dispositions, indexed by signum
+    /// (1..=63). Empty by default; fork copies, exec clears.
+    pub sig_handlers: [Option<crate::signal::SigHandler>; crate::signal::SIG_TABLE],
     /// ADR-0022 D5: per-process monitor-mode override. `None` = follow
     /// the kernel-global `MonitorMode`; `Some(false)` = AuditOnly for
     /// this process alone (the app-profile default, so Enforce stays
@@ -91,6 +94,7 @@ impl Domain {
             chroot_root: ROOT_REF,
             fds: FdTable::new(),
             signals: SignalState::new(),
+            sig_handlers: [None; crate::signal::SIG_TABLE],
             monitor_enforce: None,
         };
         // F18 (ADR-0009): the base_rights mint the initial
@@ -153,6 +157,7 @@ impl Domain {
             chroot_root: chroot,
             fds: FdTable::new(),
             signals: SignalState::new(),
+            sig_handlers: [None; crate::signal::SIG_TABLE],
             monitor_enforce: None,
         };
         let _ = d.caps.insert(Capability {
@@ -207,6 +212,7 @@ impl Domain {
             chroot_root: parent.chroot_root,
             fds: parent.fds,
             signals: SignalState::new(),
+            sig_handlers: parent.sig_handlers,
             monitor_enforce: parent.monitor_enforce,
         };
         // The child's own self-signal capability (fresh handle).
@@ -223,6 +229,12 @@ impl Domain {
     /// unalienable (a program cannot strand itself unable to exit),
     /// matching the convention every mask keeps SYS_EXIT reachable.
     /// Never widens: intersection with the live mask only.
+    /// ADR-0023 D8: exec resets caught handlers to default (POSIX) —
+    /// the new image's dispositions are its own to install.
+    pub fn clear_caught_handlers(&mut self) {
+        self.sig_handlers = [None; crate::signal::SIG_TABLE];
+    }
+
     pub fn exec_intersect(&mut self, declared: &SyscallMask) -> SyscallMask {
         self.mask = self.mask.attenuate(declared);
         self.mask = SyscallMask::from_bits(self.mask.bits() | (1u64 << SYS_EXIT));

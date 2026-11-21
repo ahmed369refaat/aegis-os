@@ -42,7 +42,8 @@ pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
 pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
 use aegis_os::sys::{SysRequest, SysValue};
 use aegis_os::syscall::{
-    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_WRITE,
+    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_KILL, SYS_NANOSLEEP, SYS_SCHED_YIELD,
+    SYS_SIGACTION, SYS_SIGRETURN, SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -68,6 +69,12 @@ pub fn linux_to_core(nr: u64) -> u64 {
         24 => SYS_SCHED_YIELD as u64,    // sched_yield(2)
         35 => SYS_NANOSLEEP as u64,      // nanosleep(2)
         228 => SYS_CLOCK_GETTIME as u64, // clock_gettime(2)
+        // (rt_sigaction's Linux nr 13 is NOT translated: it collides
+        // with the internal SYS_DUP the round-J blobs already speak —
+        // the victim blob calls the internal 25 directly; the full
+        // Linux renumbering is Phase 5's ABI-VERSION v0.4 table.)
+        15 => SYS_SIGRETURN as u64,      // rt_sigreturn(2)
+        62 => SYS_KILL as u64,           // kill(2)
         n => n,
     }
 }
@@ -169,6 +176,16 @@ mod exec {
             log_denied(run.domain, nr, "unknown syscall", -ENOSYS);
             return (-ENOSYS) as u64;
         };
+
+        // ADR-0023 D8: rt_sigreturn is ENTRY MACHINERY, like SYSRET
+        // itself — the kernel invoked it (via the trampoline it
+        // installed); the policy authority was exercised at sigaction
+        // and delivery time, so it is handled BEFORE the gate. The
+        // frame it carries is validated against the kernel's own
+        // delivery record; a forged or displaced frame refuses.
+        if nr8 == SYS_SIGRETURN {
+            return sys_sigreturn(run);
+        }
         // N2 (ADR-0007 §2): the LIVE lib domain is the gate — stats,
         // used-bits and denials land where the monitor reads them, and
         // Tighten/Quarantine apply to the very next syscall. The
@@ -185,7 +202,7 @@ mod exec {
             }
             None => gate(&run.mask, run.quarantined, nr8),
         };
-        match decision {
+        let result = match decision {
             Decision::Allowed if nr8 == SYS_EXIT => {
                 run.exit = ExitKind::Exited(a1);
                 // N2: close the window bookkeeping on the way out.
@@ -201,6 +218,8 @@ mod exec {
             Decision::Allowed if nr8 == SYS_SCHED_YIELD => sys_sched_yield(run),
             Decision::Allowed if nr8 == SYS_NANOSLEEP => sys_nanosleep(run, a1),
             Decision::Allowed if nr8 == SYS_CLOCK_GETTIME => sys_clock_gettime(run, a1, a2),
+            Decision::Allowed if nr8 == SYS_SIGACTION => sys_sigaction(run, a1, a2, a3),
+            Decision::Allowed if nr8 == SYS_KILL => sys_kill(run, a1, a2),
             // Round J: the file family runs on the LIVE lib kernel —
             // marshaled through sysabi, executed by `Kernel::execute`.
             Decision::Allowed if sysabi::FILE_FAMILY.contains(&nr8) => {
@@ -222,7 +241,232 @@ mod exec {
                 log_denied(run.domain, nr, "denied by policy", -EPERM);
                 (-EPERM) as u64
             }
+        };
+        // ADR-0023 D8: the kernel→user boundary — deliver one pending
+        // caught signal on the way out (the frame rewrite IS the
+        // delivery; SYS_EXIT and the park paths never reach here).
+        maybe_deliver_signal(run, result);
+        result
+    }
+
+    /// ADR-0023 D8: deliver one pending caught signal by rewriting the
+    /// in-flight syscall frame and pushing the signal frame onto the
+    /// user stack. The interrupted image (including THIS syscall's
+    /// result in RAX) is captured into the frame; the handler enters
+    /// with RSP at the frame (a plain `ret` reaches the trampoline)
+    /// and RDI = signum. The kernel's own delivery record (cookie +
+    /// exact frame address) rides the run; sigreturn refuses anything
+    /// that does not match it.
+    fn maybe_deliver_signal(run: &mut crate::sched::context::UserRun, result: u64) {
+        use crate::arch::syscall_frame::{
+            OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RAX, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
+        };
+        use crate::arch::syscall_entry::{frame_word, write_frame_word};
+        use crate::mm::user_range::copy_out_bytes;
+        use crate::mm::user_layout;
+        use aegis_os::sigframe::{self, InterruptedImage};
+
+        let user_rsp = crate::arch::syscall_entry::user_rsp_save();
+        // 16-byte-aligned, 136 bytes below the interrupted stack (the
+        // frame plus the trampoline's popped restorer word).
+        let new_rsp = (user_rsp.saturating_sub(136)) & !0xF;
+        // The stack span must be a present user stack page — a blown
+        // stack skips delivery (the signal stays pending; the domain's
+        // own next fault is the loud answer).
+        if !validate_user_range(run, new_rsp, sigframe::SIGFRAME_BYTES as u64, 136) {
+            return;
         }
+        let Some(k) = context::kernel_mut() else {
+            return;
+        };
+        let Some((sig, handler, restorer)) = k.pop_catchable_signal(run.domain) else {
+            return;
+        };
+        let img = InterruptedImage {
+            rip: frame_word(OFF_RCX),
+            cs: (crate::arch::gdt::USER_CODE | 3) as u64,
+            rflags: frame_word(OFF_R11),
+            rsp: user_rsp,
+            ss: (crate::arch::gdt::USER_DATA | 3) as u64,
+            gprs: [
+                result,
+                frame_word(OFF_RDI),
+                frame_word(OFF_RSI),
+                frame_word(OFF_RDX),
+                frame_word(OFF_R10),
+                frame_word(OFF_R8),
+                frame_word(OFF_R9),
+                frame_word(OFF_RBX),
+            ],
+        };
+        // The cookie: TSC-mixed, kernel-chosen, recorded only here and
+        // in the frame itself.
+        let t = crate::hw::read_tsc();
+        let cookie = t ^ (t.rotate_left(32)) ^ (u64::from(run.domain) << 48) ^ u64::from(sig);
+        let mut frame = [0u8; sigframe::SIGFRAME_BYTES];
+        sigframe::build(sig, cookie, restorer, &img, &mut frame);
+        // Write the frame onto the user stack under the blessed window
+        // (the span was validated above; the current CR3 is the run's).
+        IN_USER_COPY.store(true, Ordering::SeqCst);
+        if crate::hw::smap_active() {
+            crate::hw::stac();
+        }
+        let _ = copy_out_bytes(new_rsp, &frame, &|va, b| memops::write_u8_va(va, b));
+        if crate::hw::smap_active() {
+            crate::hw::clac();
+        }
+        IN_USER_COPY.store(false, Ordering::SeqCst);
+        // Rewrite the in-flight frame: the stub SYSRETs into the
+        // handler with RDI = signum; the interrupted RAX (this
+        // syscall's result) lives on in the signal frame.
+        write_frame_word(OFF_RCX, handler);
+        write_frame_word(OFF_RDI, u64::from(sig));
+        write_frame_word(OFF_RAX, 0);
+        crate::arch::syscall_entry::set_user_rsp_save(new_rsp);
+        run.delivered = Some(crate::sched::context::Delivered {
+            sig,
+            cookie,
+            frame_rsp: new_rsp,
+        });
+        let _ = user_layout::TRAMPOLINE_BASE; // doc anchor; restorer validated at sigaction
+    }
+
+    /// rt_sigaction(signum, handler, restorer) — ADR-0023 D8. The
+    /// handler must be a canonical user address; the restorer must be
+    /// THE trampoline (custom restorers are not supported — the
+    /// trampoline page is the only rt_sigreturn entry the kernel
+    /// honors, and it is mapped into every user address space).
+    fn sys_sigaction(
+        run: &mut crate::sched::context::UserRun,
+        signum: u64,
+        handler: u64,
+        restorer: u64,
+    ) -> u64 {
+        use crate::mm::user_layout;
+        if handler == 0 || handler > aegis_os::sigframe::USER_CANON_MAX {
+            return (-EINVAL) as u64;
+        }
+        if restorer != 0 && restorer != user_layout::TRAMPOLINE_BASE {
+            return (-EINVAL) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        let Ok(signum8) = u8::try_from(signum) else {
+            return (-EINVAL) as u64;
+        };
+        match k.execute(
+            run.domain,
+            aegis_os::sys::SysRequest::SigAction {
+                signum: signum8,
+                handler,
+                restorer: if restorer == 0 {
+                    user_layout::TRAMPOLINE_BASE
+                } else {
+                    restorer
+                },
+            },
+        ) {
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// kill(pid, sig) — Linux's nr 62 marshaled into the core's Kill
+    /// executor (the capability + Unix-uid rules + no-enumeration
+    /// properties all live there).
+    fn sys_kill(run: &mut crate::sched::context::UserRun, pid: u64, sig: u64) -> u64 {
+        if sig > 63 || pid > u32::MAX as u64 {
+            return (-EINVAL) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        match k.execute(
+            run.domain,
+            aegis_os::sys::SysRequest::Kill {
+                target: pid as u32,
+                sig: sig as u8,
+            },
+        ) {
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// rt_sigreturn() — ADR-0023 D8: read the frame the trampoline
+    /// points at (user memory — untrusted), validate EVERY field
+    /// against the kernel's delivery record (the cookie, the exact
+    /// frame address) and the pure validator (selectors, canonical
+    /// rip/rsp, sanitized rflags), then rebuild the interrupted
+    /// context through the same frame the stub SYSRETs from. A forged
+    /// or displaced frame refuses with -EINVAL; nothing user-supplied
+    /// is ever restored unsanitized.
+    fn sys_sigreturn(run: &mut crate::sched::context::UserRun) -> u64 {
+        use crate::arch::syscall_entry::{frame_word, write_frame_word};
+        use crate::arch::syscall_frame::{
+            OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RAX, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
+        };
+        use aegis_os::sigframe::{self, SIGFRAME_BYTES};
+
+        // The trampoline entered with RSP = frame + 8 (the handler's
+        // `ret` popped the restorer word); the entry parked that RSP.
+        let user_rsp = crate::arch::syscall_entry::user_rsp_save();
+        let Some(frame_rsp) = user_rsp.checked_sub(8) else {
+            return (-EINVAL) as u64;
+        };
+        // The delivery record must exist and match the frame address.
+        let Some(rec) = run.delivered else {
+            return (-EINVAL) as u64;
+        };
+        if rec.frame_rsp != frame_rsp {
+            return (-EINVAL) as u64;
+        }
+        let mut bytes = [0u8; SIGFRAME_BYTES];
+        if !validate_user_range(run, frame_rsp, SIGFRAME_BYTES as u64, SIGFRAME_BYTES as u64) {
+            return (-EFAULT) as u64;
+        }
+        IN_USER_COPY.store(true, Ordering::SeqCst);
+        if crate::hw::smap_active() {
+            crate::hw::stac();
+        }
+        for (off, b) in bytes.iter_mut().enumerate() {
+            *b = memops::read_u8_va(frame_rsp + off as u64);
+        }
+        if crate::hw::smap_active() {
+            crate::hw::clac();
+        }
+        IN_USER_COPY.store(false, Ordering::SeqCst);
+        let img = match sigframe::validate(
+            &bytes,
+            rec.cookie,
+            (crate::arch::gdt::USER_CODE | 3) as u64,
+            (crate::arch::gdt::USER_DATA | 3) as u64,
+        ) {
+            Ok(img) => img,
+            Err(_) => {
+                // Forged or displaced: refused, counted. The record
+                // stays — the next genuine sigreturn (or the domain's
+                // exit) settles it.
+                return (-EINVAL) as u64;
+            }
+        };
+        // Rebuild the interrupted context: the stub SYSRETs with the
+        // frame's slots, and the user RSP rides USER_RSP_SAVE.
+        write_frame_word(OFF_RCX, img.rip);
+        write_frame_word(OFF_R11, img.rflags);
+        write_frame_word(OFF_RAX, img.gprs[0]);
+        write_frame_word(OFF_RDI, img.gprs[1]);
+        write_frame_word(OFF_RSI, img.gprs[2]);
+        write_frame_word(OFF_RDX, img.gprs[3]);
+        write_frame_word(OFF_R10, img.gprs[4]);
+        write_frame_word(OFF_R8, img.gprs[5]);
+        write_frame_word(OFF_R9, img.gprs[6]);
+        write_frame_word(OFF_RBX, img.gprs[7]);
+        crate::arch::syscall_entry::set_user_rsp_save(img.rsp);
+        run.delivered = None;
+        let _ = frame_word; // (diagnostics anchor)
+        0
     }
 
     /// The file-family executor (Round J): marshal the six-register ABI
