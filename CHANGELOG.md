@@ -4,6 +4,38 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Changed — review round 5, Phase E: ADR-0017's first slice — the IpcMmio channel
+
+- **`kernel-x86_64/src/ipc_mmio.rs`**: a driver's register access as
+  a MESSAGE, not a volatile load. `IpcMmio` implements the `MmioBus`
+  trait (ADR-0016's seam) by forwarding every accessor through an
+  `MmioChannel` to a ring-0 **DeviceCore** that checks offset AND
+  width against the same validated window before anything volatile
+  happens — a ring-3 driver domain cannot even NAME a register
+  outside its grant. The core counts served/refused (the organic
+  monitor feed a domain cannot forge or suppress). The first slice's
+  channel runs in-process (the core is the far end); the ring-3
+  slice swaps the transport for a capability-gated IPC endpoint
+  without touching the message types or the discipline.
+- **Host proofs**: the headline ADR-0017 test — the SAME driver code
+  (a register sequence written only against the trait) runs unchanged
+  against the direct ring-0 bus and the channel, with identical
+  answers; out-of-window requests never reach the register page (a
+  poison guard proves it) and are counted; hostile widths (0/1/3/255)
+  are refused by the core; and the rogue-driver suite walks the six
+  forbidden operations (MMIO outside the window, quota overrun,
+  another domain's cookie, in-flight unmap, the absent-verdict DMA
+  gate, descriptor bounds via the channel + virtio's tests) — every
+  one refused, typed, side-effect-free, and a healthy driver keeps
+  working after each.
+- **What is NOT in this slice** (the next one, per ADR-0017's own
+  sequencing): the ring-3 transport itself (a launched driver domain
+  whose channel is an IPC endpoint), the syscall-mask + capability
+  gating on the domain's driver-facing calls, the monitor wiring of
+  the core counters, and the boot-lane marker for a live ring-3
+  driver. The broker/channel refusal proofs here are host-level; the
+  ring-3 rogue demo stays the ADR-0010 one until then.
+
 ### Changed — review round 5, Phase D: leftovers made loud
 
 - **MAX_SESSION_FRAMES is proven, and outgrowing it is LOUD**: the

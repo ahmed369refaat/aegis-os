@@ -61,9 +61,10 @@ is_elf_core() {
     [ "$t" = "4" ] # ET_CORE
 }
 
-# ── rule 3: credential patterns in text files. NOTE: this script is
-# itself excluded from the scan — the pattern literals below would
-# self-trigger. That exclusion is the only one; do not grow it.
+# ── rule 3: credential patterns in text files. NOTE: the files that
+# DEFINE these patterns are excluded from the scan — their literals
+# would self-trigger (this file + the history scanner). Nothing else
+# is excluded, ever.
 SECRET_PATTERNS=(
     '_TOKEN='
     '_SECRET='
@@ -74,7 +75,10 @@ SECRET_PATTERNS=(
     '-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
 )
 SECRET_SCAN_EXCLUDE=(
-    'scripts/check-no-binaries.sh' # this file: it defines the patterns
+    # the files that DEFINE the patterns (their literals self-trigger);
+    # round 5 added the history scanner to this class
+    'scripts/check-no-binaries.sh'
+    'scripts/check-history-clean.sh'
 )
 
 # Prints the paths among "$@" that are text files matching a pattern.

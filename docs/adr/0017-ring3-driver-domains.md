@@ -1,6 +1,6 @@
 # ADR-0017: Ring-3 driver domains — drivers as monitored, brokered clients
 
-- **Status:** Proposed (design accepted for implementation; the first slice is the `IpcMmio` channel)
+- **Status:** Accepted (the first slice — the `IpcMmio` channel + device core — landed host-proven, round 5 Phase E; the ring-3 transport + boot integration is the next slice)
 - **Stage:** M3 driver stack (the architecture ADR-0016 built its seams for)
 - **Date:** 2026-11-21
 
