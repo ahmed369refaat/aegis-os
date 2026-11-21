@@ -4,6 +4,19 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Docs — review round 4, Phase 6: ADR-0017 — ring-3 driver domains
+
+The architecture ADR-0016 built its seams for: drivers become ring-3
+monitored domains with exactly four grants — an `IpcMmio` channel
+(the device core checks every offset against the same validated
+window), broker-only DMA (domain-scoped cookies), an organic monitor
+feed the domain cannot forge, and a `Device` capability for its own
+device. A driver bug becomes a quarantined domain event, not a
+kernel compromise. The first implementation slice is the `IpcMmio`
+channel; polling stays (no IRQ routing in this phase), one domain
+per device, the domain image built with the kernel like today's
+ring-3 examples.
+
 ### Changed — driver-stack review round 4, Phase 5 (F13): ext2 parsing moves to the policy core
 
 - **`src/ext2.rs` — the on-disk parser, pure and validated.** Every
