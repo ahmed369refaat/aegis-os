@@ -46,8 +46,12 @@
 
 use aegis_os::dma::DmaVerdict;
 
-/// Devices the fixed inventory holds (fail-loud exhaustion).
-pub const MAX_PCI_DEVICES: usize = 32;
+/// Devices the fixed inventory holds (fail-loud exhaustion). The flat
+/// bus-0 world needed 32; the ADR-0020 bridge walk needs headroom for
+/// a root port + its children on top of bus 0 (q35 with one root port
+/// and one device lands ~24 — 48 leaves room for a real NIC + NVMe
+/// card without silently dropping them).
+pub const MAX_PCI_DEVICES: usize = 48;
 /// Capability-list entries recorded per device (bounded walk).
 pub const MAX_CAPS: usize = 8;
 
@@ -323,8 +327,8 @@ pub fn enumerate(
             d.device = device_id(&h);
             d.class = class_code(&h);
             d.header = header_type(&h);
-            size_bars(read, write, dev, func, &mut h, &mut d);
-            walk_caps(read, dev, func, &h, &mut d);
+            size_bars(read, write, 0, dev, func, &mut h, &mut d);
+            walk_caps(read, 0, dev, func, &h, &mut d);
             inv.devices[inv.count] = d;
             inv.count += 1;
         }
@@ -353,6 +357,7 @@ fn read_header(
 fn size_bars(
     read: &mut dyn FnMut(u8, u8, u8, u8) -> u32,
     write: &mut dyn FnMut(u8, u8, u8, u8, u32),
+    bus: u8,
     dev: u8,
     func: u8,
     h: &mut [u32; 16],
@@ -371,9 +376,9 @@ fn size_bars(
         }
         if lo_orig & 0x1 == 1 {
             // I/O BAR: probe, size (16-bit port space), restore.
-            write(0, dev, func, bar_off(i), 0xFFFF_FFFF);
-            let mask = read(0, dev, func, bar_off(i));
-            write(0, dev, func, bar_off(i), lo_orig);
+            write(bus, dev, func, bar_off(i), 0xFFFF_FFFF);
+            let mask = read(bus, dev, func, bar_off(i));
+            write(bus, dev, func, bar_off(i), lo_orig);
             if let Some(size) = bar_size_from_io_mask(mask) {
                 let bar = Bar {
                     slot: i as u8,
@@ -396,12 +401,12 @@ fn size_bars(
             }
             if is_64 {
                 let hi_orig = h[4 + i + 1];
-                write(0, dev, func, bar_off(i), 0xFFFF_FFFF);
-                write(0, dev, func, bar_off(i + 1), 0xFFFF_FFFF);
-                let lo_m = read(0, dev, func, bar_off(i));
-                let hi_m = read(0, dev, func, bar_off(i + 1));
-                write(0, dev, func, bar_off(i), lo_orig);
-                write(0, dev, func, bar_off(i + 1), hi_orig);
+                write(bus, dev, func, bar_off(i), 0xFFFF_FFFF);
+                write(bus, dev, func, bar_off(i + 1), 0xFFFF_FFFF);
+                let lo_m = read(bus, dev, func, bar_off(i));
+                let hi_m = read(bus, dev, func, bar_off(i + 1));
+                write(bus, dev, func, bar_off(i), lo_orig);
+                write(bus, dev, func, bar_off(i + 1), hi_orig);
                 let mask = (u64::from(lo_m) & 0xFFFF_F000) | (u64::from(hi_m) << 32);
                 if let Some(size) = bar_size_from_mem64_mask(mask) {
                     let bar = Bar {
@@ -416,9 +421,9 @@ fn size_bars(
                 }
                 i += 2; // the high half is consumed
             } else {
-                write(0, dev, func, bar_off(i), 0xFFFF_FFFF);
-                let mask = read(0, dev, func, bar_off(i));
-                write(0, dev, func, bar_off(i), lo_orig);
+                write(bus, dev, func, bar_off(i), 0xFFFF_FFFF);
+                let mask = read(bus, dev, func, bar_off(i));
+                write(bus, dev, func, bar_off(i), lo_orig);
                 if let Some(size) = bar_size_from_mem32_mask(mask) {
                     let bar = Bar {
                         slot: i as u8,
@@ -441,6 +446,7 @@ fn size_bars(
 /// the walk (the IDs are diagnostics, not authority).
 fn walk_caps(
     read: &mut dyn FnMut(u8, u8, u8, u8) -> u32,
+    bus: u8,
     dev: u8,
     func: u8,
     h: &[u32; 16],
@@ -460,7 +466,7 @@ fn walk_caps(
     let mut ptr = cap_ptr;
     let mut guard = 0u8;
     while ptr != 0 && d.cap_count < MAX_CAPS && guard < 48 {
-        let word = read(0, dev, func, ptr);
+        let word = read(bus, dev, func, ptr);
         let id = (word & 0xFF) as u8;
         let next = ((word >> 8) & 0xFF) as u8 & 0xFC;
         d.cap_ids[d.cap_count] = id;
@@ -661,6 +667,190 @@ mod ports {
 #[cfg(not(test))]
 pub fn enumerate_bus0() -> Inventory {
     enumerate(&mut ports::read32, &mut ports::write32)
+}
+
+// ── ADR-0020: the config-space access seam (legacy ports vs ECAM) ────
+
+/// The ECAM address of one config dword: base + (bus−start)<<20 |
+/// dev<<15 | fn<<12 | off — checked arithmetic throughout; None on any
+/// bound or overflow (a wrong address must refuse, never fault).
+#[must_use]
+pub fn ecam_addr(base: u64, start_bus: u8, bus: u8, dev: u8, func: u8, off: u8) -> Option<u64> {
+    if dev >= 32 || func >= 8 {
+        return None;
+    }
+    // The bus must sit in the window MCFG declared.
+    if bus < start_bus || bus.wrapping_sub(start_bus) > 255 {
+        return None;
+    }
+    let rel = u64::from(bus.wrapping_sub(start_bus));
+    base.checked_add(rel << 20)?
+        .checked_add(u64::from(dev) << 15)?
+        .checked_add(u64::from(func) << 12)?
+        .checked_add(u64::from(off & !0x3))
+}
+
+/// The config-space access seam: the legacy 0xCF8/0xCFC port pair
+/// (every PC; bus field rides the address word) or the MCFG's ECAM
+/// window (the UEFI-only servers where CF8 stops existing). The walk
+/// and every driver are GENERIC over the seam — the lane prints which
+/// one the machine offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CfgAccess {
+    /// Ports 0xCF8/0xCFC.
+    LegacyPorts,
+    /// The MCFG ECAM window for [start_bus, end_bus] at `base`.
+    Ecam { base: u64, start_bus: u8, end_bus: u8 },
+}
+
+impl CfgAccess {
+    /// The window bounds this access answers for (informational: the
+    /// address math is bounds-checked per access).
+    #[must_use]
+    pub fn bus_window(&self) -> (u8, u8) {
+        match *self {
+            CfgAccess::LegacyPorts => (0, 255),
+            CfgAccess::Ecam { start_bus, end_bus, .. } => (start_bus, end_bus),
+        }
+    }
+
+    /// Resolve one config dword's address through the seam — the
+    /// pure half, host-tested; the target halves wrap it below.
+    #[must_use]
+    pub fn resolve(&self, bus: u8, dev: u8, func: u8, off: u8) -> Option<u64> {
+        match *self {
+            CfgAccess::LegacyPorts => {
+                if dev >= 32 || func >= 8 {
+                    return None;
+                }
+                Some(u64::from(cfg_addr(bus, dev, func, off)))
+            }
+            CfgAccess::Ecam { base, start_bus, end_bus } => {
+                if bus < start_bus || bus > end_bus {
+                    return None;
+                }
+                ecam_addr(base, start_bus, bus, dev, func, off)
+            }
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl CfgAccess {
+    /// Read one config dword through the seam (target).
+    pub fn read32(&self, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+        match self.resolve(bus, dev, func, off) {
+            // ECAM: the dword sits at the resolved PA (direct map);
+            // out-of-window refusals read as the absent pattern.
+            Some(pa) if matches!(self, CfgAccess::Ecam { .. }) => {
+                crate::memops::read_u32(pa)
+            }
+            _ => ports::read32(bus, dev, func, off),
+        }
+    }
+
+    /// Write one config dword through the seam (target).
+    pub fn write32(&self, bus: u8, dev: u8, func: u8, off: u8, v: u32) {
+        match self.resolve(bus, dev, func, off) {
+            Some(pa) if matches!(self, CfgAccess::Ecam { .. }) => {
+                crate::memops::write_u32(pa, v)
+            }
+            _ => ports::write32(bus, dev, func, off, v),
+        }
+    }
+}
+
+// ── ADR-0020: the recursive bridge walk ──────────────────────────────
+
+/// The walk's loop/depth guards: a visited-bus set (a bridge pointing
+/// at an already-walked bus is a topology loop — recorded, not
+/// followed) and a depth cap (bridges chained deeper than any real
+/// machine are malformed firmware).
+pub const MAX_WALK_DEPTH: u8 = 8;
+
+/// The type-1 header dword at 0x18: primary(0x18) secondary(0x19)
+/// subordinate(0x1A) — the decode for the walk.
+#[must_use]
+pub const fn bridge_buses(word18: u32) -> (u8, u8, u8) {
+    (
+        (word18 & 0xFF) as u8,
+        ((word18 >> 8) & 0xFF) as u8,
+        ((word18 >> 16) & 0xFF) as u8,
+    )
+}
+
+/// Enumerate from `root_bus` THROUGH bridges: every type-1 header's
+/// secondary bus is walked recursively (bounded by the visited set and
+/// [`MAX_WALK_DEPTH`]). Devices behind bridges land in the same
+/// inventory with their real bus numbers — and the claim gate treats
+/// them like any other endpoint (ADR-0020 lifts the old bus-0-only
+/// refusal).
+pub fn enumerate_multi(
+    read: &mut dyn FnMut(u8, u8, u8, u8) -> u32,
+    write: &mut dyn FnMut(u8, u8, u8, u8, u32),
+    root_bus: u8,
+) -> Inventory {
+    let mut inv = Inventory::empty();
+    let mut visited = [false; 256];
+    walk_bus(read, write, root_bus, 0, &mut visited, &mut inv);
+    inv
+}
+
+/// One bus's sweep + the bridge recursion. The per-device work is the
+/// same shape as `enumerate`'s body (header, BARs, caps); the bridge
+/// branch reads secondary/subordinate from the type-1 header and
+/// recurses.
+fn walk_bus(
+    read: &mut dyn FnMut(u8, u8, u8, u8) -> u32,
+    write: &mut dyn FnMut(u8, u8, u8, u8, u32),
+    bus: u8,
+    depth: u8,
+    visited: &mut [bool; 256],
+    inv: &mut Inventory,
+) {
+    if depth > MAX_WALK_DEPTH || visited[bus as usize] {
+        return; // a loop or a too-deep chain: stop, loudly enough
+                // (the count shows the cap, not a hang)
+    }
+    visited[bus as usize] = true;
+    for dev in 0u8..32 {
+        let mut h = [0u32; 16];
+        if !read_header(read, bus, dev, 0, &mut h) {
+            continue;
+        }
+        let multifn = is_multifunction(&h);
+        let funcs: u8 = if multifn { 8 } else { 1 };
+        for func in 0u8..funcs {
+            if !read_header(read, bus, dev, func, &mut h) {
+                continue;
+            }
+            if inv.count == MAX_PCI_DEVICES {
+                return; // the inventory is full: honest cap
+            }
+            let mut d = EMPTY_DEV;
+            d.bus = bus;
+            d.dev = dev;
+            d.func = func;
+            d.vendor = vendor_id(&h);
+            d.device = device_id(&h);
+            d.class = class_code(&h);
+            d.header = header_type(&h);
+            size_bars(read, write, bus, dev, func, &mut h, &mut d);
+            walk_caps(read, bus, dev, func, &h, &mut d);
+            inv.devices[inv.count] = d;
+            inv.count += 1;
+            // A PCI-to-PCI bridge (type-1 header): walk its secondary
+            // bus. CardBus (type-2) stays out of scope. The visited
+            // set catches self/ancestor loops; sec 0 is unprogrammed
+            // firmware noise (bus 0 is always already visited).
+            if d.header & 0x7F == 1 {
+                let (_p, sec, _sub) = bridge_buses(read(bus, dev, func, 0x18));
+                if sec != 0 {
+                    walk_bus(read, write, sec, depth + 1, visited, inv);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -947,6 +1137,7 @@ mod tests {
             },
             0,
             0,
+            0,
             &h,
             &mut d,
         );
@@ -1058,5 +1249,192 @@ mod tests {
             let _ = is_endpoint(&h);
             let _ = describe(vendor_id(&h), device_id(&h));
         }
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+
+    /// The ECAM address math, pinned: bus<<20 | dev<<15 | fn<<12 |
+    /// off, relative to the window's start bus, with every bound and
+    /// overflow refusing.
+    #[test]
+    fn ecam_addr_is_pinned_and_bounds_checked() {
+        // The canonical q35 window: base 0xE000_0000, bus 0..255.
+        let b = 0xE000_0000u64;
+        assert_eq!(ecam_addr(b, 0, 0, 0, 0, 0x00), Some(b));
+        assert_eq!(ecam_addr(b, 0, 0, 0, 0, 0x40), Some(b + 0x40));
+        // dev rides bit 15, func bit 12.
+        assert_eq!(ecam_addr(b, 0, 0, 1, 0, 0x00), Some(b + (1 << 15)));
+        assert_eq!(ecam_addr(b, 0, 0, 0, 1, 0x00), Some(b + (1 << 12)));
+        assert_eq!(ecam_addr(b, 0, 0, 31, 0, 0x00), Some(b + (31 << 15)));
+        assert_eq!(ecam_addr(b, 0, 1, 0, 0, 0x00), Some(b + (1 << 20)));
+        assert_eq!(ecam_addr(b, 0, 255, 0, 0, 0xFC), Some(b + (255 << 20) + 0xFC));
+        // A window starting at bus 1: the offset is RELATIVE.
+        assert_eq!(ecam_addr(b, 1, 1, 0, 0, 0), Some(b));
+        assert_eq!(ecam_addr(b, 1, 2, 0, 0, 0), Some(b + (1 << 20)));
+        // The dword alignment mask: low bits are cleared, not trusted.
+        assert_eq!(ecam_addr(b, 0, 0, 0, 0, 0x43), Some(b + 0x40));
+        // Bounds: dev 32, fn 8, bus below the window.
+        assert_eq!(ecam_addr(b, 0, 0, 32, 0, 0), None);
+        assert_eq!(ecam_addr(b, 0, 0, 0, 8, 0), None);
+        assert_eq!(ecam_addr(b, 5, 4, 0, 0, 0), None, "bus below start");
+        // Overflow: a base near the top of memory.
+        assert_eq!(ecam_addr(u64::MAX - 0x1000, 0, 255, 0, 0, 0), None);
+    }
+
+    /// The access seam resolves both halves: the port address word for
+    /// legacy, the ECAM window for MCFG machines — and out-of-window
+    /// buses refuse on the ECAM side.
+    #[test]
+    fn cfg_access_resolves_both_seams() {
+        let legacy = CfgAccess::LegacyPorts;
+        assert_eq!(
+            legacy.resolve(0, 0, 0, 0x40),
+            Some(u64::from(cfg_addr(0, 0, 0, 0x40)))
+        );
+        // Legacy covers every bus (the bus rides the address word).
+        assert!(legacy.resolve(255, 31, 7, 0xFC).is_some());
+        assert_eq!(legacy.resolve(0, 32, 0, 0), None, "dev bound");
+        assert_eq!(legacy.bus_window(), (0, 255));
+
+        let ecam = CfgAccess::Ecam { base: 0xE000_0000, start_bus: 0, end_bus: 255 };
+        assert_eq!(ecam.bus_window(), (0, 255));
+        assert_eq!(ecam.resolve(0, 0, 0, 0x40), Some(0xE000_0040));
+        assert_eq!(ecam.resolve(1, 0, 0, 0), Some(0xE010_0000));
+        // A narrow MCFG window: outside refuses.
+        let narrow = CfgAccess::Ecam { base: 0xE000_0000, start_bus: 0, end_bus: 15 };
+        assert!(narrow.resolve(15, 0, 0, 0).is_some());
+        assert_eq!(narrow.resolve(16, 0, 0, 0), None, "bus above the window");
+    }
+
+    /// The type-1 dword decode: primary, secondary, subordinate.
+    #[test]
+    fn bridge_buses_decode_the_type1_dword() {
+        // primary=0, secondary=1, subordinate=1 (a root port with one
+        // device behind it).
+        assert_eq!(bridge_buses(0x0001_0100), (0, 1, 1));
+        assert_eq!(bridge_buses(0x0003_0200), (0, 2, 3));
+        assert_eq!(bridge_buses(0xFFFF_FFFF), (0xFF, 0xFF, 0xFF));
+        assert_eq!(bridge_buses(0), (0, 0, 0));
+    }
+
+    /// A fake config space for the walk tests. The dwords the walk
+    /// reads: 0x00 vendor/device, 0x08 class, 0x0C header type, 0x10
+    /// BAR0, 0x18 the type-1 bridge buses.
+    struct FakeCfg {
+        devices: [((u8, u8), (u16, u16, u16, u8, u32)); 20],
+        bridges: [(u8, u8, u32); 20],
+    }
+
+    impl FakeCfg {
+        const EMPTY: FakeCfg = FakeCfg {
+            devices: [((0, 0), (0, 0, 0, 0, 0)); 20],
+            bridges: [(0, 0, 0); 20],
+        };
+
+        fn with(devices: [((u8, u8), (u16, u16, u16, u8, u32)); 20], bridges: [(u8, u8, u32); 20]) -> FakeCfg {
+            FakeCfg { devices, bridges }
+        }
+
+        fn read(&self, bus: u8, dev: u8, off: u8) -> u32 {
+            match off {
+                0x00 => match self.devices.iter().find(|(k, _)| k.0 == bus && k.1 == dev) {
+                    Some((_, (v, d, _, _, _))) => u32::from(*v) | (u32::from(*d) << 16),
+                    None => 0xFFFF_FFFF,
+                },
+                0x08 => match self.devices.iter().find(|(k, _)| k.0 == bus && k.1 == dev) {
+                    Some((_, (_, _, c, _, _))) => u32::from(*c) << 16,
+                    None => 0xFFFF_FFFF,
+                },
+                0x0C => match self.devices.iter().find(|(k, _)| k.0 == bus && k.1 == dev) {
+                    Some((_, (_, _, _, t, _))) => u32::from(*t) << 16,
+                    None => 0xFFFF_FFFF,
+                },
+                0x10 => match self.devices.iter().find(|(k, _)| k.0 == bus && k.1 == dev) {
+                    Some((_, (_, _, _, _, b0))) => *b0,
+                    None => 0,
+                },
+                0x18 => match self.bridges.iter().find(|(b, d, _)| *b == bus && *d == dev) {
+                    Some((_, _, w)) => *w,
+                    None => 0,
+                },
+                _ => 0,
+            }
+        }
+    }
+
+    /// The walk finds devices behind a bridge: the root port on bus 0
+    /// names bus 1, and the endpoint there lands in the inventory with
+    /// its REAL bus number.
+    #[test]
+    fn the_walk_traverses_a_bridge_and_records_the_real_bus() {
+        let mut devices = [((0u8, 0u8), (0u16, 0u16, 0u16, 0u8, 0u32)); 20];
+        let mut bridges = [(0u8, 0u8, 0u32); 20];
+        devices[0] = ((0, 0), (0x8086, 0x1237, 0x0600, 0x00, 0)); // host bridge
+        devices[1] = ((0, 20), (0x8086, 0x3420, 0x0604, 0x01, 0)); // root port
+        devices[2] = ((1, 0), (0x1AF4, 0x1042, 0x0180, 0x00, 0)); // virtio-blk behind it
+        bridges[0] = (0, 20, 0x0001_0100);
+        let cfg = FakeCfg::with(devices, bridges);
+        let mut read = |b: u8, d: u8, _f: u8, o: u8| cfg.read(b, d, o);
+        let mut write = |_b: u8, _d: u8, _f: u8, _o: u8, _v: u32| {};
+        let inv = enumerate_multi(&mut read, &mut write, 0);
+        assert_eq!(inv.count, 3, "host bridge + root port + the bus-1 endpoint");
+        let behind = inv
+            .devices[..inv.count]
+            .iter()
+            .find(|d| d.vendor == 0x1AF4)
+            .expect("the device behind the root port is in the inventory");
+        assert_eq!((behind.bus, behind.dev, behind.func), (1, 0, 0));
+    }
+
+    /// A self-pointing bridge (secondary == its own bus) is a loop:
+    /// the visited set stops it, the walk still finishes.
+    #[test]
+    fn a_self_pointing_bridge_loop_is_stopped_by_the_visited_set() {
+        let mut devices = [((0u8, 0u8), (0u16, 0u16, 0u16, 0u8, 0u32)); 20];
+        let mut bridges = [(0u8, 0u8, 0u32); 20];
+        devices[0] = ((0, 0), (0x8086, 0x1237, 0x0600, 0x00, 0));
+        devices[1] = ((0, 5), (0x8086, 0x0999, 0x0604, 0x01, 0)); // a lying bridge
+        bridges[0] = (0, 5, 0x0005_0500); // secondary = its own bus 5
+        let cfg = FakeCfg::with(devices, bridges);
+        let mut read = |b: u8, d: u8, _f: u8, o: u8| cfg.read(b, d, o);
+        let mut write = |_b: u8, _d: u8, _f: u8, _o: u8, _v: u32| {};
+        let inv = enumerate_multi(&mut read, &mut write, 0);
+        assert_eq!(inv.count, 2, "no hang, no duplicated sweep");
+    }
+
+    /// A bridge chain deeper than MAX_WALK_DEPTH stops at the cap: the
+    /// endpoint living 12 bridges down must NOT be recorded, and the
+    /// walk still finishes every shallower bus.
+    #[test]
+    fn a_too_deep_bridge_chain_stops_at_the_depth_cap() {
+        let mut devices = [((0u8, 0u8), (0u16, 0u16, 0u16, 0u8, 0u32)); 20];
+        let mut bridges = [(0u8, 0u8, 0u32); 20];
+        devices[0] = ((0, 0), (0x8086, 0x1237, 0x0600, 0x00, 0));
+        // Bridge i sits at (bus i, dev 2) and names bus i+1; the
+        // endpoint sits on bus 12, i.e. 12 levels below bus 0 — past
+        // the 8-deep cap.
+        for i in 0u8..12 {
+            devices[(i + 1) as usize] = ((i, 2), (0x8086, 0x0B01, 0x0604, 0x01, 0));
+            // primary 0, secondary i+1, subordinate 12.
+            bridges[i as usize] = (i, 2, (0x0C_u32 << 16) | ((u32::from(i) + 1) << 8));
+        }
+        devices[13] = ((12, 0), (0x1AF4, 0x1042, 0x0180, 0x00, 0));
+        let cfg = FakeCfg::with(devices, bridges);
+        let mut read = |b: u8, d: u8, _f: u8, o: u8| cfg.read(b, d, o);
+        let mut write = |_b: u8, _d: u8, _f: u8, _o: u8, _v: u32| {};
+        let inv = enumerate_multi(&mut read, &mut write, 0);
+        assert_eq!(MAX_WALK_DEPTH, 8);
+        assert!(
+            !inv.devices[..inv.count].iter().any(|d| d.bus == 12),
+            "the bus-12 endpoint is past the depth cap"
+        );
+        // The chain's shallow part (within the cap) was still walked.
+        assert!(
+            inv.devices[..inv.count].iter().any(|d| d.bus == 7),
+            "bus 7 is within the cap"
+        );
     }
 }
