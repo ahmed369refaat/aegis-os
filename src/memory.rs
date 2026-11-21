@@ -8,6 +8,12 @@
 //! zeroes the pages here before they re-enter the free pool.
 
 pub const PAGE_SIZE: usize = 4096;
+
+/// ADR-0024 D1: the user-half ceiling for window allocation — the
+/// 47-bit canonical split, mirroring the kernel-side
+/// `pte::USER_LIMIT` (both are 1<<47; the allocator must never
+/// propose what the PTE layer would refuse as kernel half).
+pub const USER_CEILING: usize = 0x0000_8000_0000_0000;
 pub const MAX_REGIONS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +162,60 @@ impl AddressSpace {
 
     /// Unmap the region at `base`. Its pages are counted as scrubbed
     /// (zeroed before reuse in a real kernel) and the quota is released.
+    /// The live regions (read-only view for the window allocator and
+    /// tests; insertion order — the allocator hops, not sorts).
+    pub fn regions(&self) -> impl Iterator<Item = &Region> {
+        self.regions.iter().flatten()
+    }
+
+    /// ADR-0024 D1: find the lowest page-aligned window of `len`
+    /// bytes at or above `floor` that the ten-check policy would
+    /// ACCEPT (a full guard page of daylight on both sides, no
+    /// overlap, inside the user half). PURE over the region list —
+    /// the caller maps through the same policy and may still refuse
+    /// (quota). `None` when no window fits.
+    #[must_use]
+    pub fn find_free_window(&self, len: usize, floor: usize) -> Option<usize> {
+        use crate::memory::PAGE_SIZE as PAGE;
+        const GUARD: usize = 1; // the policy's GuardGap: >= 1 free page between regions
+        if len == 0 {
+            return None;
+        }
+        let span = len + GUARD * 2 * PAGE; // daylight both sides
+        let mut base = floor.next_multiple_of(PAGE);
+        // The candidate cursor hops over regions in BASE order — no
+        // allocation (no_std): repeatedly find the lowest region whose
+        // guard-padded span reaches at or above the cursor; each hop
+        // moves strictly up, so the loop terminates.
+        loop {
+            let mut hop_to: Option<usize> = None;
+            for r in self.regions() {
+                let r_end = r.base + r.len + GUARD * PAGE;
+                if r_end <= base {
+                    continue; // entirely below the cursor
+                }
+                // This region blocks the candidate at `base`: hop
+                // above it (keep the LOWEST such hop).
+                let above = (r.base + r.len + GUARD * PAGE).next_multiple_of(PAGE);
+                hop_to = Some(match hop_to {
+                    Some(h) if h <= above => h,
+                    _ => above,
+                });
+            }
+            match hop_to {
+                Some(h) if h > base => base = h,
+                _ => break,
+            }
+        }
+        // The user-half bound: the caller's policy refuses kernel-half
+        // bases; so does the allocator.
+        if base.checked_add(span)? <= USER_CEILING {
+            Some(base + GUARD * PAGE)
+        } else {
+            None
+        }
+    }
+
     pub fn unmap(&mut self, base: usize) -> Result<Region, MemError> {
         for slot in self.regions.iter_mut() {
             if let Some(r) = *slot {

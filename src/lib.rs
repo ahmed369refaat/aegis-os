@@ -47,6 +47,7 @@ pub mod domain;
 pub mod ext2;
 pub mod fat32;
 pub mod fd;
+pub mod frame_share;
 pub mod ipc;
 pub mod ivrs;
 pub mod memory;
@@ -1348,6 +1349,7 @@ pub mod prelude {
     pub use crate::dmar::{Dmar, DmarError, Drhd, MAX_TABLE_BYTES};
     pub use crate::domain::{Decision, Domain, DomainState};
     pub use crate::fd::{FdEntry, FdError, FdTable, FdTarget, MAX_FDS};
+    pub use crate::frame_share::{CowDecision, FrameShares, ShareError, MAX_SHARED};
     pub use crate::net::{
         NetError, Socket, SocketState, SocketTable, TokenBucket, RATE_WINDOW_TICKS,
     };
