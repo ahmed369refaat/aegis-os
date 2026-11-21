@@ -498,18 +498,55 @@ pub fn write_cfg32(dev: &PciDev, off: u8, v: u32) {
     crate::hw::outl(CFG_DATA_PORT, v);
 }
 
+/// PCI command-register bits (offset 0x04, the LOW 16 bits — the
+/// high half is Status, write-1-to-clear, and must never be echoed).
+pub const CMD_IO: u16 = 1 << 0;
+pub const CMD_MEM: u16 = 1 << 1;
+pub const CMD_BME: u16 = 1 << 2;
+
+/// The 16-bit command value with MEMORY-SPACE + BUS-MASTER set (F9:
+/// pure — the host RW1C test drives the write discipline through
+/// this, proving the Status half is never touched).
+#[must_use]
+pub const fn cmd_with_bus_master(cur: u16) -> u16 {
+    cur | CMD_MEM | CMD_BME
+}
+
+/// The 16-bit command value with MEMORY-SPACE only (the claim order,
+/// F9e: MEM before the rings are mapped, BME only after the first
+/// successful broker mapping).
+#[must_use]
+pub const fn cmd_mem_only(cur: u16) -> u16 {
+    (cur | CMD_MEM) & !CMD_BME
+}
+
+/// The quiesced command value (F9c): IO, MEM and BME all off — the
+/// state every endpoint is put into at enumeration, BEFORE the VT-d
+/// unit is enabled.
+#[must_use]
+pub const fn cmd_quiesced(cur: u16) -> u16 {
+    cur & !(CMD_IO | CMD_MEM | CMD_BME)
+}
+
 /// Clear BUS-MASTER in the command register — the F2 (ADR-0015)
 /// poison path cuts the device's DMA at the source. A 16-bit COMMAND
 /// write only: the Status half of 0x04 is write-1-to-clear, so a
 /// 32-bit read-modify-write would silently eat pending error bits
 /// (F9 converts the enable path to the same discipline).
+/// The 16-bit command value with BUS-MASTER cleared (F2/F9: the
+/// teardown and poison paths).
+#[must_use]
+pub const fn cmd_without_bus_master(cur: u16) -> u16 {
+    cur & !CMD_BME
+}
+
 #[cfg(not(test))]
 pub fn disable_bus_master(dev: &PciDev) {
     // Dword read is harmless (Status bits are only cleared by WRITES);
     // only the low word ever goes back out.
-    let cmd = read_cfg32(dev, 0x04) & 0xFFFF;
+    let cmd = (read_cfg32(dev, 0x04) & 0xFFFF) as u16;
     crate::hw::outl(CFG_ADDR_PORT, cfg_addr(dev.bus, dev.dev, dev.func, 0x04));
-    crate::hw::outw(CFG_DATA_PORT, (cmd & !0x4) as u16); // ~BME
+    crate::hw::outw(CFG_DATA_PORT, cmd_without_bus_master(cmd));
 }
 
 /// Enable MEMORY-SPACE + BUS-MASTER in the command register (offset
@@ -526,8 +563,55 @@ pub fn disable_bus_master(dev: &PciDev) {
 /// keep whatever the BAR probe / firmware left there.
 #[cfg(not(test))]
 pub fn enable_bus_master(dev: &PciDev) {
-    let cmd = read_cfg32(dev, 0x04);
-    write_cfg32(dev, 0x04, cmd | 0x6); // MEM | BM
+    // F9a: a 32-bit read-modify-write of 0x04 writes the STATUS half
+    // back too — Status is write-1-to-clear, so pending error bits
+    // (parity/abort) were silently eaten. A 16-bit COMMAND write
+    // only; the dword READ is harmless.
+    let cmd = read_cmd16(dev);
+    write_cmd16(dev, cmd_with_bus_master(cmd));
+}
+
+/// Enable MEMORY-SPACE only (the F9e claim order: the device's
+/// registers are reachable for bring-up, but it cannot DMA until the
+/// broker has mapped the rings and the caller grants bus mastering).
+#[cfg(not(test))]
+pub fn enable_mem(dev: &PciDev) {
+    let cmd = read_cmd16(dev);
+    write_cmd16(dev, cmd_mem_only(cmd));
+}
+
+/// Read the 16-bit COMMAND register (the low half of 0x04).
+#[cfg(not(test))]
+fn read_cmd16(dev: &PciDev) -> u16 {
+    (read_cfg32(dev, 0x04) & 0xFFFF) as u16
+}
+
+/// Write the 16-bit COMMAND register — never the Status half.
+#[cfg(not(test))]
+fn write_cmd16(dev: &PciDev, v: u16) {
+    crate::hw::outl(CFG_ADDR_PORT, cfg_addr(dev.bus, dev.dev, dev.func, 0x04));
+    crate::hw::outw(CFG_DATA_PORT, v);
+}
+
+/// F9c: put EVERY endpoint on bus 0 into the quiesced state (IO, MEM
+/// and BME off) — run at enumeration, BEFORE the VT-d unit is
+/// enabled, so no device decodes or DMAs while the IOMMU's own tables
+/// are being built. BAR sizing later in the scan also runs with
+/// decoding disabled (F9d: the probe writes all-ones into BAR
+/// registers; a decoding device would answer those addresses).
+/// Returns how many endpoints were quiesced.
+#[cfg(not(test))]
+pub fn quiesce_all() -> usize {
+    let inv = enumerate_bus0();
+    let mut n = 0usize;
+    for d in &inv.devices[..inv.count] {
+        if is_endpoint_header(d.header) {
+            let cmd = read_cmd16(d);
+            write_cmd16(d, cmd_quiesced(cmd));
+            n += 1;
+        }
+    }
+    n
 }
 
 #[cfg(not(test))]
@@ -557,6 +641,73 @@ pub fn enumerate_bus0() -> Inventory {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// F9 (review round 4): the command-register discipline, modeled.
+    /// The Status half of 0x04 is write-1-to-clear — the OLD 32-bit
+    /// read-modify-write of the enable path wrote Status back and
+    /// silently ATE pending error bits (proven by the model below).
+    /// The new 16-bit writes never touch it, and the claim/teardown
+    /// ORDER is pinned: quiesced -> MEM (before any ring is mapped)
+    /// -> BME (only after the broker mapped the rings) -> BME off at
+    /// teardown.
+    #[test]
+    fn command_writes_never_touch_rw1c_status_and_order_is_pinned() {
+        let cmd: u16 = CMD_IO | CMD_MEM | CMD_BME; // SeaBIOS leftovers
+        let status: u16 = 0x0008; // a pending parity-error bit (RW1C)
+
+        // The OLD form, modeled: a 32-bit RMW writes the Status word
+        // back; every set bit it echoes is CLEARED by RW1C semantics.
+        let old_rmw32 = u32::from(cmd) | (u32::from(status) << 16) | 0x6;
+        let status_after_old = status & !(old_rmw32 >> 16) as u16;
+        assert_eq!(
+            status_after_old, 0,
+            "the old 32-bit RMW ate the pending error bit"
+        );
+
+        // The new discipline: quiesce -> MEM -> BME -> disable (the
+        // write log is the sequence itself — 16-bit values only).
+        let writes = [
+            super::cmd_quiesced(cmd),
+            super::cmd_mem_only(super::cmd_quiesced(cmd)),
+            super::cmd_with_bus_master(super::cmd_mem_only(super::cmd_quiesced(cmd))),
+            super::cmd_without_bus_master(super::cmd_with_bus_master(super::cmd_mem_only(
+                super::cmd_quiesced(cmd),
+            ))),
+        ];
+        // The pending error bit was never written: it survives.
+        // (The model's status is only touched by 32-bit writes.)
+        assert_eq!(status, 0x0008, "16-bit writes never reach Status");
+        // The order, pinned.
+        assert_eq!(writes.len(), 4);
+        assert_eq!(
+            writes[0] & (super::CMD_IO | super::CMD_MEM | super::CMD_BME),
+            0,
+            "enumeration quiesces decode + DMA"
+        );
+        assert_eq!(
+            writes[1] & super::CMD_BME,
+            0,
+            "MEM before the rings exist: no BME"
+        );
+        assert_eq!(
+            writes[1] & super::CMD_MEM,
+            super::CMD_MEM,
+            "registers reachable"
+        );
+        assert_eq!(
+            writes[2] & super::CMD_BME,
+            super::CMD_BME,
+            "BME only after the broker mapped the rings"
+        );
+        assert_eq!(writes[3] & super::CMD_BME, 0, "teardown clears BME");
+        assert_eq!(
+            writes[3] & super::CMD_MEM,
+            super::CMD_MEM,
+            "MEM stays until unquiesce"
+        );
+    }
+
     use super::*;
 
     /// A fake PCI bus: one 64-byte config image per (dev, fn) plus

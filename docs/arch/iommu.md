@@ -120,3 +120,32 @@ driver domain runs).
   1+ second-level frames per domain (4 KiB granularity).
 - Broker quotas per domain: max regions, max total bytes — constants
   with a capacity self-test PR (separate, per the baseline contract).
+
+
+## The PCI command-register discipline (review round 4, F9)
+
+Every command-register write is a 16-bit COMMAND write — the Status
+half of config offset 0x04 is write-1-to-clear, and the old 32-bit
+read-modify-write of the enable path silently ate pending error bits
+(modeled and proven in
+`pci::tests::command_writes_never_touch_rw1c_status_and_order_is_pinned`).
+
+The ordering rules, all CI-pinned by the same test and exercised live
+on the lanes:
+
+1. **Enumeration quiesces everything.** `pci::quiesce_all()` clears
+   IO, MEM and BME on every bus-0 endpoint BEFORE the VT-d unit is
+   enabled — no device decodes or DMAs while the IOMMU's own tables
+   are built, and the BAR-size probes in the scan (which write
+   all-ones into address registers) run against non-decoding devices.
+2. **MEM before the rings, BME after them.** A claimed device gets
+   MEMORY-SPACE at claim time (its registers must be reachable for
+   bring-up) and BUS-MASTER only after the broker has mapped its
+   rings — a device that can DMA before its mappings exist is exactly
+   what the IOMMU exists to prevent. The identity control lane (no
+   IOMMU, no mappings) enables BME directly, and the teardown helper
+   clears BME FIRST on every teardown, refusal and poison path.
+3. **Bridges are a loud boundary.** A bridge topology this driver
+   stack cannot isolate (single-domain model, bus-0-only enumeration)
+   is reported at enumeration; devices behind bridges are never
+   claimed, and their DMA fails closed on missing context entries.

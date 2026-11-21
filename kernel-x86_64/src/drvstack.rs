@@ -56,6 +56,12 @@ fn revoke_or_quarantine<const N: usize>(
     dev: Option<&crate::pci::PciDev>,
     marker: &str,
 ) -> aegis_os::dma::RevokeOutcome {
+    // F9b: bus mastering goes off FIRST — every teardown, refusal
+    // and poison path arrives here, and none of them may leave a
+    // device that can still issue DMA while its mappings dissolve.
+    if let Some(d) = dev {
+        crate::pci::disable_bus_master(d);
+    }
     let outcome = broker.revoke_all(0);
     let mut nr = [0u8; 20];
     line(
@@ -119,6 +125,20 @@ pub fn driver_stack_step<const N: usize>(
             dmar,
         } => {
             print_found(out, rsdp_pa, &rsdp, dir_pa, dir_entries, dmar_pa, &dmar);
+            // F9c: every endpoint goes quiet (IO/MEM/BME off) BEFORE
+            // the VT-d unit is enabled — no device decodes or DMAs
+            // while the IOMMU's own tables are being built, and the
+            // later BAR sizing runs with decoding disabled.
+            let quiesced = crate::pci::quiesce_all();
+            let mut nq = [0u8; 20];
+            line(
+                out,
+                &[
+                    "[PCI ] quiesce_all before VT-d: ",
+                    strutil::dec(quiesced as u64, &mut nq),
+                    " endpoint(s) IO/MEM/BME off",
+                ],
+            );
             if let Some(mut unit) = vtd_step(k, pool, out, &dmar) {
                 proof_step(k, pool, out, &dmar, &mut unit);
                 let mut broker = broker_step(k, pool, out, unit);
@@ -794,6 +814,16 @@ fn pci_step(
                 pci::describe(d.vendor, d.device),
             ],
         );
+        if !pci::is_endpoint_header(d.header) {
+            // F9: a bridge topology this driver stack cannot isolate
+            // (single-domain Phase-2 model; devices behind bridges are
+            // not enumerated, not claimed, and their DMA fails closed
+            // on missing context entries). Say so loudly.
+            line(
+                out,
+                &["[PCI ] bridge at this slot — devices behind it are NOT driven (isolation boundary, F9)"],
+            );
+        }
         for b in d.bars[..d.bar_count].iter().flatten() {
             let mut hb = [0u8; 18];
             let mut hs = [0u8; 18];
@@ -1246,9 +1276,11 @@ fn virtio_step<const N: usize>(
         line(out, &["[VBLK] vendor caps incomplete — refusing"]);
         return;
     };
-    // Bus master on (the cluster fix — see pci::enable_bus_master):
-    // the device's DMA must actually reach memory before any ring.
-    crate::pci::enable_bus_master(dev);
+    // F9e claim order: MEMORY-SPACE now (the registers must be
+    // reachable for bring-up); BUS-MASTER only AFTER the broker has
+    // mapped the rings — a device that can DMA before its mappings
+    // exist is exactly what the IOMMU must prevent.
+    crate::pci::enable_mem(dev);
     // F5: every device-supplied number is checked before it becomes
     // an address the kernel touches.
     let resolved = match caps.resolve(dev) {
@@ -1369,6 +1401,8 @@ fn virtio_step<const N: usize>(
             " regions, IOMMU-enforced)",
         ],
     );
+    // F9e: rings mapped through the broker — NOW the device may DMA.
+    crate::pci::enable_bus_master(dev);
     mmio.setup_queue(desc_pa, avail_pa, used_pa);
     mmio.set_status(v::live_status());
     let status = mmio.status();
@@ -1712,9 +1746,8 @@ fn net_step<const N: usize>(
         line(out, &["[VNET] vendor caps incomplete — refusing"]);
         return;
     };
-    // Bus master on (the cluster fix — see pci::enable_bus_master):
-    // the device's DMA must actually reach memory before any ring.
-    crate::pci::enable_bus_master(dev);
+    // F9e: MEM now, BME only after the rings are broker-mapped.
+    crate::pci::enable_mem(dev);
     let resolved = match caps.resolve(dev) {
         Ok(r) => r,
         Err(e) => {
@@ -1845,6 +1878,8 @@ fn net_step<const N: usize>(
         out,
         &["[VNET] rings + buffers mapped via broker (8 regions, IOMMU-enforced)"],
     );
+    // F9e: rings mapped — now the device may DMA.
+    crate::pci::enable_bus_master(dev);
 
     // ── queue setup (selection precedes each setup — common-config
     // registers address the SELECTED queue) ──
@@ -2200,6 +2235,10 @@ fn gfx_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
         line(out, &["[GFX] VGA BAR0 unresolved — refusing"]);
         return;
     };
+    // F9c: quiesce_all cleared decode at enumeration — the VGA gets
+    // MEMORY-SPACE back before the framebuffer is painted (a VGA
+    // needs no bus mastering).
+    crate::pci::enable_mem(dev);
     // The linear framebuffer must sit inside the 4th-GiB MMIO window
     // the boot already maps (0xC0000000..4 GiB) — writing outside it
     // would fault.
@@ -2574,19 +2613,27 @@ fn e1k_step<const N: usize>(
         line(out, &["[E1K] BAR0 unresolved — refusing"]);
         return;
     };
-    // Bus master on: the NIC's DMA must actually reach memory (the
-    // cluster fix — see pci::enable_bus_master). Read back — a CF8
-    // discipline bug here would silently park every DMA.
-    crate::pci::enable_bus_master(dev);
+    // F9e claim order: MEM now; BME after the rings are broker-
+    // mapped — EXCEPT the identity control lane (no IOMMU, no
+    // mappings to gate on). Read back — a CF8 discipline bug here
+    // would silently park every DMA.
+    if identity {
+        crate::pci::enable_bus_master(dev);
+    } else {
+        crate::pci::enable_mem(dev);
+    }
+    // F9e: at this point MEM must be on; BME only in identity mode
+    // (the broker path grants it after the rings are mapped).
     let cmd_back = crate::pci::read_cfg32(dev, 0x04);
-    if cmd_back & 0x6 != 0x6 {
+    let want_now = if identity { 0x6 } else { 0x2 };
+    if cmd_back & want_now != want_now {
         let mut cb = [0u8; 18];
         line(
             out,
             &[
                 "[E1K] PCI command readback=0x",
                 strutil::hex(u64::from(cmd_back), &mut cb),
-                " — BUS MASTER DID NOT STICK",
+                " — the enable did not stick",
             ],
         );
     }
@@ -2652,6 +2699,8 @@ fn e1k_step<const N: usize>(
             out,
             &["[E1K] RX/TX rings + buffers mapped via broker (4 regions, IOMMU-enforced)"],
         );
+        // F9e: rings mapped — now the device may DMA.
+        crate::pci::enable_bus_master(dev);
     }
 
     // Program the rings. One RX descriptor posted (index 0), RDT=1.
@@ -2980,8 +3029,8 @@ fn nvme_step<const N: usize>(
         line(out, &["[NVME] BAR0 unresolved — refusing"]);
         return;
     };
-    // Bus master on (the cluster fix).
-    crate::pci::enable_bus_master(dev);
+    // F9e: MEM now; BME once the broker-mapped admin qpair is live.
+    crate::pci::enable_mem(dev);
     let cap = crate::memops::read_u64(mmio + NVME_CAP);
     let vs = crate::memops::read_u32(mmio + NVME_VS);
     let dstrd = (cap >> 32) & 0xF;
@@ -3082,6 +3131,8 @@ fn nvme_step<const N: usize>(
         return;
     }
     line(out, &["[NVME] admin qpair live (16 entries), CSTS.RDY=1"]);
+    // F9e: the queue frames are broker-mapped — now it may DMA.
+    crate::pci::enable_bus_master(dev);
 
     let admin_sq_db = mmio + NVME_DBA;
     let admin_cq_db = mmio + NVME_DBA + stride;
@@ -3474,8 +3525,8 @@ fn ahci_step<const N: usize>(
         line(out, &["[AHCI] ABAR (BAR5) unresolved — refusing"]);
         return;
     };
-    // Bus master on (the cluster fix).
-    crate::pci::enable_bus_master(dev);
+    // F9e: MEM now; BME after the port frames are broker-mapped.
+    crate::pci::enable_mem(dev);
     let r32 = |off: u64| crate::memops::read_u32(abar + off);
     let w32 = |off: u64, v: u32| crate::memops::write_u32(abar + off, v);
     let ghc_ae = r32(0x04) & 0x8000_0000 != 0;
@@ -3525,11 +3576,16 @@ fn ahci_step<const N: usize>(
             out,
             &["[AHCI] port 0: CLB/FB/CTBA/data mapped via broker (4 regions)"],
         );
+        // F9e: port frames mapped — now it may DMA.
+        crate::pci::enable_bus_master(dev);
     } else {
         line(
             out,
             &["[AHCI] port 0: CLB/FB/CTBA/data straight from the pool (identity, 0 regions)"],
         );
+        // F9e, identity lane: there are no broker mappings to gate
+        // on — the device needs bus mastering right away.
+        crate::pci::enable_bus_master(dev);
     }
 
     // Stop the engine, reprogram CLB/FB, restart with FRE|ST.
@@ -3652,8 +3708,8 @@ fn xhci_step<const N: usize>(
         line(out, &["[XHCI] BAR0 unresolved — refusing"]);
         return;
     };
-    // Bus master on (the cluster fix).
-    crate::pci::enable_bus_master(dev);
+    // F9e: MEM now; BME after the bring-up frames are mapped.
+    crate::pci::enable_mem(dev);
     let caplen = u64::from(crate::virtio::read_u8_pa(base));
     let ver = crate::memops::read_u16(base + 2);
     let hcs1 = crate::memops::read_u32(base + 4);
@@ -3727,6 +3783,8 @@ fn xhci_step<const N: usize>(
             " (HCH cleared, broker frames 2)",
         ],
     );
+    // F9e: the DCBAAP/CRCR frames are broker-mapped — DMA may start.
+    crate::pci::enable_bus_master(dev);
 
     // Port scan: find the attached usb-kbd.
     let mut found: Option<(u32, u32)> = None;
