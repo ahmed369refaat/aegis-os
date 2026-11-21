@@ -382,9 +382,7 @@ pub fn cli() {
 /// writable virtual address.
 pub fn monitor(addr: u64, ext: u64) {
     // SAFETY: single instruction; the arming is architectural.
-    unsafe {
-        asm!("monitor", in("rax") addr, in("rcx") ext, in("rdx") 0u64, options(nostack))
-    }
+    unsafe { asm!("monitor", in("rax") addr, in("rcx") ext, in("rdx") 0u64, options(nostack)) }
 }
 
 /// `mwait` — wait for the armed `monitor` line or an unmasked
@@ -416,7 +414,11 @@ pub fn rdrand64() -> Option<u64> {
     unsafe {
         asm!("rdrand {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nostack))
     }
-    if ok == 1 { Some(v) } else { None }
+    if ok == 1 {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 /// `rdseed` — the seed-quality entropy instruction (CPUID.07H:EBX
@@ -431,7 +433,11 @@ pub fn rdseed64() -> Option<u64> {
     unsafe {
         asm!("rdseed {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nostack))
     }
-    if ok == 1 { Some(v) } else { None }
+    if ok == 1 {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 /// Halt forever (interrupts disabled). Never returns.

@@ -155,9 +155,7 @@ pub fn read_msix(dev: &PciDev) -> Option<MsixInfo> {
     // The whole table must fit the BAR: if the LAST entry does not
     // resolve, the layout is malformed — refuse the capability, not
     // the first out-of-bounds write.
-    if table_size == 0
-        || entry_pa(bar.base, bar.size, table_off, table_size - 1).is_none()
-    {
+    if table_size == 0 || entry_pa(bar.base, bar.size, table_off, table_size - 1).is_none() {
         return None;
     }
     Some(MsixInfo {
@@ -198,8 +196,7 @@ pub fn read_entry(dev: &PciDev, info: &MsixInfo, index: u32) -> Option<(u64, u32
     let lo = u64::from(crate::memops::read_u32(pa + u64::from(ENTRY_ADDR_LO)));
     let hi = u64::from(crate::memops::read_u32(pa + u64::from(ENTRY_ADDR_HI)));
     let data = crate::memops::read_u32(pa + u64::from(ENTRY_DATA));
-    let masked =
-        crate::memops::read_u32(pa + u64::from(ENTRY_VECTOR_CTRL)) & ENTRY_MASKED != 0;
+    let masked = crate::memops::read_u32(pa + u64::from(ENTRY_VECTOR_CTRL)) & ENTRY_MASKED != 0;
     Some((lo | (hi << 32), data, masked))
 }
 
@@ -251,7 +248,10 @@ mod tests {
         assert_eq!(msix_table_size(2), 3);
         assert_eq!(msix_table_size(0), 1, "N−1 encoding: zero is one entry");
         assert_eq!(msix_table_size(0x7FF), 2048, "the max field value");
-        assert_eq!(msix_table_size(0xFFFF & !MSIX_ENABLE & !MSIX_FUNC_MASK), 2048);
+        assert_eq!(
+            msix_table_size(0xFFFF & !MSIX_ENABLE & !MSIX_FUNC_MASK),
+            2048
+        );
         // Enabled + masked + size 2 reads back consistently.
         let mc = MSIX_ENABLE | MSIX_FUNC_MASK | 2;
         assert_eq!(msix_table_size(mc), 3);
@@ -284,7 +284,11 @@ mod tests {
         assert_eq!(entry_pa(base, 0x1000, 0, 256), None);
         // A table offset near the end: only the fitting tail is valid.
         assert_eq!(entry_pa(base, 0x1000, 0xFF0, 0), Some(base + 0xFF0));
-        assert_eq!(entry_pa(base, 0x1000, 0xFF0, 1), None, "16 bytes past the end");
+        assert_eq!(
+            entry_pa(base, 0x1000, 0xFF0, 1),
+            None,
+            "16 bytes past the end"
+        );
         // Multiplication overflow: index near u32::MAX.
         assert_eq!(entry_pa(base, u64::MAX, 0, u32::MAX), None);
         // Address-space wrap: the entry's base would cross u64::MAX.

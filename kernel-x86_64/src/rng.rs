@@ -58,8 +58,10 @@ impl Pool {
         // Single CPU: the load/store pair cannot interleave (the only
         // writers are boot-step code and the interrupt-disabled
         // window paths).
-        self.state
-            .store(splitmix64(old ^ sample ^ splitmix64(sample)), Ordering::SeqCst);
+        self.state.store(
+            splitmix64(old ^ sample ^ splitmix64(sample)),
+            Ordering::SeqCst,
+        );
         self.mixes.fetch_add(1, Ordering::SeqCst);
     }
 

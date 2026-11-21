@@ -125,7 +125,14 @@ fn le32(b: &[u8], o: usize) -> u32 {
 
 fn le64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes([
-        b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+        b[o],
+        b[o + 1],
+        b[o + 2],
+        b[o + 3],
+        b[o + 4],
+        b[o + 5],
+        b[o + 6],
+        b[o + 7],
     ])
 }
 
@@ -364,7 +371,10 @@ mod tests {
         b[48] = 0x77;
         let total = b.len() as u32;
         b[4..8].copy_from_slice(&total.to_le_bytes());
-        assert!(matches!(parse_ivrs(&b), Err(IvrsError::UnknownSubtableType(_))));
+        assert!(matches!(
+            parse_ivrs(&b),
+            Err(IvrsError::UnknownSubtableType(_))
+        ));
     }
 
     #[test]

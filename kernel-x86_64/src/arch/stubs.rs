@@ -243,22 +243,11 @@ pub extern "C" fn exception_common() {
 /// vector order — the IDT wiring and the broker's slot arithmetic
 /// both index this table.
 const DEVICE_STUBS: [extern "C" fn(); 64] = [
-    irq49, irq50, irq51, irq52,
-    irq53, irq54, irq55, irq56,
-    irq57, irq58, irq59, irq60,
-    irq61, irq62, irq63, irq64,
-    irq65, irq66, irq67, irq68,
-    irq69, irq70, irq71, irq72,
-    irq73, irq74, irq75, irq76,
-    irq77, irq78, irq79, irq80,
-    irq81, irq82, irq83, irq84,
-    irq85, irq86, irq87, irq88,
-    irq89, irq90, irq91, irq92,
-    irq93, irq94, irq95, irq96,
-    irq97, irq98, irq99, irq100,
-    irq101, irq102, irq103, irq104,
-    irq105, irq106, irq107, irq108,
-    irq109, irq110, irq111, irq112,
+    irq49, irq50, irq51, irq52, irq53, irq54, irq55, irq56, irq57, irq58, irq59, irq60, irq61,
+    irq62, irq63, irq64, irq65, irq66, irq67, irq68, irq69, irq70, irq71, irq72, irq73, irq74,
+    irq75, irq76, irq77, irq78, irq79, irq80, irq81, irq82, irq83, irq84, irq85, irq86, irq87,
+    irq88, irq89, irq90, irq91, irq92, irq93, irq94, irq95, irq96, irq97, irq98, irq99, irq100,
+    irq101, irq102, irq103, irq104, irq105, irq106, irq107, irq108, irq109, irq110, irq111, irq112,
 ];
 
 /// The registry the IDT is filled from: (stub address, IST index) for

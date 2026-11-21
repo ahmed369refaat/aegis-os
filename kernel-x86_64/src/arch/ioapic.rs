@@ -66,7 +66,8 @@ const RTE_DEST_SHIFT: u64 = 56;
 /// land in reserved bits (the hardware would ignore or fault on it).
 #[must_use]
 pub fn rte_encode(vector: u8, dest_apic_id: u8, trigger: u64, masked: bool) -> u64 {
-    let mut rte = u64::from(vector) | DELIVERY_FIXED | DEST_PHYSICAL | POLARITY_ACTIVE_HIGH | trigger;
+    let mut rte =
+        u64::from(vector) | DELIVERY_FIXED | DEST_PHYSICAL | POLARITY_ACTIVE_HIGH | trigger;
     if masked {
         rte |= RTE_MASKED;
     }
@@ -191,7 +192,9 @@ impl IoApic {
             return None;
         }
         let (w0, w1) = rtbl_regs(gsi);
-        Some(u64::from(Self::read32(self.base, w0)) | (u64::from(Self::read32(self.base, w1)) << 32))
+        Some(
+            u64::from(Self::read32(self.base, w0)) | (u64::from(Self::read32(self.base, w1)) << 32),
+        )
     }
 
     /// Mask one GSI (read-modify-write its RTE with the mask bit).
@@ -216,7 +219,10 @@ mod tests {
         assert_eq!(rte_vector(rte), 0x31);
         assert_eq!(rte_dest(rte), 0);
         assert!(!rte_is_masked(rte));
-        assert_eq!(rte, 0x0000_0000_0000_0031, "fixed/physical/active-high/edge are all zero fields");
+        assert_eq!(
+            rte, 0x0000_0000_0000_0031,
+            "fixed/physical/active-high/edge are all zero fields"
+        );
         // The masked variant differs ONLY in bit 16.
         let m = rte_encode(0x31, 0, TRIGGER_EDGE, true);
         assert_eq!(m, rte | RTE_MASKED);
@@ -242,7 +248,11 @@ mod tests {
         // QEMU's IOAPIC: 24 redirection entries → bits 23:16 = 23.
         assert_eq!(max_redirections((23 << 16) | 0x11), 24);
         assert_eq!(max_redirections(0x11), 1, "zero count field is one entry");
-        assert_eq!(max_redirections(u32::MAX), 0x100, "all-ones field saturates, never wraps to 0");
+        assert_eq!(
+            max_redirections(u32::MAX),
+            0x100,
+            "all-ones field saturates, never wraps to 0"
+        );
         assert_eq!(max_redirections(0), 1);
         // The bounds check uses it.
         assert!(gsi_in_range(23, (23 << 16) | 0x11));

@@ -700,7 +700,11 @@ pub enum CfgAccess {
     /// Ports 0xCF8/0xCFC.
     LegacyPorts,
     /// The MCFG ECAM window for [start_bus, end_bus] at `base`.
-    Ecam { base: u64, start_bus: u8, end_bus: u8 },
+    Ecam {
+        base: u64,
+        start_bus: u8,
+        end_bus: u8,
+    },
 }
 
 impl CfgAccess {
@@ -710,7 +714,9 @@ impl CfgAccess {
     pub fn bus_window(&self) -> (u8, u8) {
         match *self {
             CfgAccess::LegacyPorts => (0, 255),
-            CfgAccess::Ecam { start_bus, end_bus, .. } => (start_bus, end_bus),
+            CfgAccess::Ecam {
+                start_bus, end_bus, ..
+            } => (start_bus, end_bus),
         }
     }
 
@@ -725,7 +731,11 @@ impl CfgAccess {
                 }
                 Some(u64::from(cfg_addr(bus, dev, func, off)))
             }
-            CfgAccess::Ecam { base, start_bus, end_bus } => {
+            CfgAccess::Ecam {
+                base,
+                start_bus,
+                end_bus,
+            } => {
                 if bus < start_bus || bus > end_bus {
                     return None;
                 }
@@ -742,9 +752,7 @@ impl CfgAccess {
         match self.resolve(bus, dev, func, off) {
             // ECAM: the dword sits at the resolved PA (direct map);
             // out-of-window refusals read as the absent pattern.
-            Some(pa) if matches!(self, CfgAccess::Ecam { .. }) => {
-                crate::memops::read_u32(pa)
-            }
+            Some(pa) if matches!(self, CfgAccess::Ecam { .. }) => crate::memops::read_u32(pa),
             _ => ports::read32(bus, dev, func, off),
         }
     }
@@ -752,9 +760,7 @@ impl CfgAccess {
     /// Write one config dword through the seam (target).
     pub fn write32(&self, bus: u8, dev: u8, func: u8, off: u8, v: u32) {
         match self.resolve(bus, dev, func, off) {
-            Some(pa) if matches!(self, CfgAccess::Ecam { .. }) => {
-                crate::memops::write_u32(pa, v)
-            }
+            Some(pa) if matches!(self, CfgAccess::Ecam { .. }) => crate::memops::write_u32(pa, v),
             _ => ports::write32(bus, dev, func, off, v),
         }
     }
@@ -1270,7 +1276,10 @@ mod walk_tests {
         assert_eq!(ecam_addr(b, 0, 0, 0, 1, 0x00), Some(b + (1 << 12)));
         assert_eq!(ecam_addr(b, 0, 0, 31, 0, 0x00), Some(b + (31 << 15)));
         assert_eq!(ecam_addr(b, 0, 1, 0, 0, 0x00), Some(b + (1 << 20)));
-        assert_eq!(ecam_addr(b, 0, 255, 0, 0, 0xFC), Some(b + (255 << 20) + 0xFC));
+        assert_eq!(
+            ecam_addr(b, 0, 255, 0, 0, 0xFC),
+            Some(b + (255 << 20) + 0xFC)
+        );
         // A window starting at bus 1: the offset is RELATIVE.
         assert_eq!(ecam_addr(b, 1, 1, 0, 0, 0), Some(b));
         assert_eq!(ecam_addr(b, 1, 2, 0, 0, 0), Some(b + (1 << 20)));
@@ -1299,12 +1308,20 @@ mod walk_tests {
         assert_eq!(legacy.resolve(0, 32, 0, 0), None, "dev bound");
         assert_eq!(legacy.bus_window(), (0, 255));
 
-        let ecam = CfgAccess::Ecam { base: 0xE000_0000, start_bus: 0, end_bus: 255 };
+        let ecam = CfgAccess::Ecam {
+            base: 0xE000_0000,
+            start_bus: 0,
+            end_bus: 255,
+        };
         assert_eq!(ecam.bus_window(), (0, 255));
         assert_eq!(ecam.resolve(0, 0, 0, 0x40), Some(0xE000_0040));
         assert_eq!(ecam.resolve(1, 0, 0, 0), Some(0xE010_0000));
         // A narrow MCFG window: outside refuses.
-        let narrow = CfgAccess::Ecam { base: 0xE000_0000, start_bus: 0, end_bus: 15 };
+        let narrow = CfgAccess::Ecam {
+            base: 0xE000_0000,
+            start_bus: 0,
+            end_bus: 15,
+        };
         assert!(narrow.resolve(15, 0, 0, 0).is_some());
         assert_eq!(narrow.resolve(16, 0, 0, 0), None, "bus above the window");
     }
@@ -1334,7 +1351,10 @@ mod walk_tests {
             bridges: [(0, 0, 0); 20],
         };
 
-        fn with(devices: [((u8, u8), (u16, u16, u16, u8, u32)); 20], bridges: [(u8, u8, u32); 20]) -> FakeCfg {
+        fn with(
+            devices: [((u8, u8), (u16, u16, u16, u8, u32)); 20],
+            bridges: [(u8, u8, u32); 20],
+        ) -> FakeCfg {
             FakeCfg { devices, bridges }
         }
 
@@ -1381,8 +1401,7 @@ mod walk_tests {
         let mut write = |_b: u8, _d: u8, _f: u8, _o: u8, _v: u32| {};
         let inv = enumerate_multi(&mut read, &mut write, 0);
         assert_eq!(inv.count, 3, "host bridge + root port + the bus-1 endpoint");
-        let behind = inv
-            .devices[..inv.count]
+        let behind = inv.devices[..inv.count]
             .iter()
             .find(|d| d.vendor == 0x1AF4)
             .expect("the device behind the root port is in the inventory");

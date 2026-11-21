@@ -36,7 +36,10 @@ pub(crate) fn irq_step(out: &mut dyn FnMut(&str), madt: Option<&crate::drvstack:
     use crate::irq;
 
     let Some(m) = madt else {
-        line(out, &["[IRQ ] ioapic: no MADT interrupt view — refusing closed"]);
+        line(
+            out,
+            &["[IRQ ] ioapic: no MADT interrupt view — refusing closed"],
+        );
         return;
     };
     let Some(base) = m.primary_ioapic() else {
@@ -149,7 +152,10 @@ pub(crate) fn ir_setup_step<const N: usize>(
         return;
     }
     let Ok(frame) = pool.alloc_for(&mut k.frames, crate::drvstack::VTD_TABLE_OWNER) else {
-        line(out, &["[IR  ] IRTE frame allocation failed — not enabling (fail-closed)"]);
+        line(
+            out,
+            &["[IR  ] IRTE frame allocation failed — not enabling (fail-closed)"],
+        );
         return;
     };
     // The frame arrives scrubbed (the pool discipline): every IRTE
@@ -173,7 +179,10 @@ pub(crate) fn ir_setup_step<const N: usize>(
             );
         }
         Err(_) => {
-            line(out, &["[IR  ] enable handshake failed — not enabling (fail-closed)"]);
+            line(
+                out,
+                &["[IR  ] enable handshake failed — not enabling (fail-closed)"],
+            );
             let _ = pool.free(&mut k.frames, frame, crate::drvstack::VTD_TABLE_OWNER);
         }
     }
