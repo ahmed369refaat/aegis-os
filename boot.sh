@@ -25,7 +25,7 @@ STUB_OBJ=target/stub.o
 IMAGE=target/aegis-boot.elf
 
 echo "==> [0/4] building the ring-3 example blobs (rustc --emit=obj + objcopy)"
-for b in ring3-hello ring3-rogue ring3-edge ring3-preempt; do
+for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files; do
     rustc --edition 2021 --crate-type=lib --emit=obj \
           --target x86_64-unknown-none -O "examples/$b/src/lib.rs" \
           -o "target/$b.o"
@@ -347,7 +347,13 @@ if [ "$MODE" = "verify" ]; then
     grep -qF "[SEC ] ring3 NX-exec blocked: #PF (I/D)" "$LOG" || { echo "VERIFY FAIL: ring-3 NX security marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 kernel-VA read blocked: #PF (U/S)" "$LOG" || { echo "VERIFY FAIL: ring-3 U/S security marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 unauthorized syscall refused (-ENOSYS, audited)" "$LOG" || { echo "VERIFY FAIL: ring-3 syscall gate marker missing"; ok=0; }
-    grep -qF "[RING3] ring-3 isolation live: 7 runs" "$LOG" || { echo "VERIFY FAIL: ring-3 acceptance marker missing"; ok=0; }
+    grep -qF "[RING3] files domain exited(42): pipe+dup+file lifecycle verified from CPL=3" "$LOG" || { echo "VERIFY FAIL: round-J files marker missing"; ok=0; }
+    grep -qF "[RING3] ring-3 syscall surface: OPEN/READ/WRITE/CLOSE/PIPE/DUP live on the lib kernel" "$LOG" || { echo "VERIFY FAIL: round-J syscall-surface marker missing"; ok=0; }
+    grep -qF "J:pipe ok" "$LOG" || { echo "VERIFY FAIL: round-J pipe marker (from CPL=3) missing"; ok=0; }
+    grep -qF "J:dup ok" "$LOG" || { echo "VERIFY FAIL: round-J dup marker (from CPL=3) missing"; ok=0; }
+    grep -qF "J:file ok" "$LOG" || { echo "VERIFY FAIL: round-J file marker (from CPL=3) missing"; ok=0; }
+    grep -qF "J:neg ok" "$LOG" || { echo "VERIFY FAIL: round-J negative-probe marker (from CPL=3) missing"; ok=0; }
+    grep -qF "[RING3] ring-3 isolation live: 8 runs" "$LOG" || { echo "VERIFY FAIL: ring-3 acceptance marker missing"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the

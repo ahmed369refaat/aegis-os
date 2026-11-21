@@ -101,6 +101,10 @@ pub enum KernelError {
     /// ADR-0004: endpoint-table refusals crossing the supervisor API
     /// boundary (table exhaustion, dead ids, non-conferable rights).
     Ipc(crate::ipc::IpcError),
+    /// Round J: `reserve_stdio` found a real target sitting in one of
+    /// fds 0..=2 — the runtime may only reserve what is free (or
+    /// already reserved). Carries the offending fd.
+    StdioSlotOccupied(u8),
 }
 
 /// The sample kernel: owns domains, the behavior monitor, the telemetry
@@ -220,6 +224,29 @@ impl<const N: usize> Kernel<N> {
         Ok(())
     }
 
+    /// Round J: reserve fds 0/1/2 for the runtime (the stdio triplet a
+    /// spawned domain starts with, Unix-style). The slots are installed
+    /// as `FdTarget::Reserved` so the domain's own `pipe()`/`open()`
+    /// allocations begin at fd 3 — the runtime's device alias (the
+    /// console behind fd 1) and the fd table can never collide. Only a
+    /// supervisor calls this (spawn-time, before the domain runs);
+    /// refusing a real target keeps it from silently shadowing one.
+    pub fn reserve_stdio(&mut self, id: u32) -> Result<(), KernelError> {
+        let d = self.domain_mut(id)?;
+        for fd in 0u8..=2 {
+            match d.fds.get(fd) {
+                None => {
+                    d.fds
+                        .replace_at(fd, FdTarget::Reserved)
+                        .map_err(|_| KernelError::StdioSlotOccupied(fd))?;
+                }
+                Some(entry) if entry.target == FdTarget::Reserved => {}
+                Some(_) => return Err(KernelError::StdioSlotOccupied(fd)),
+            }
+        }
+        Ok(())
+    }
+
     /// Mutable access to a domain (its fields are public: address space,
     /// fd table, signal state, credentials). The syscall gate is the only
     /// way to *execute* anything; this accessor is for supervisors and the
@@ -268,6 +295,7 @@ impl<const N: usize> Kernel<N> {
                         let _ = self.pipes.release_write(p);
                     }
                     FdTarget::File(_) => {}
+                    FdTarget::Reserved => {}
                 }
             }
         }

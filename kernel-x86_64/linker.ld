@@ -67,7 +67,12 @@ SECTIONS
         __stack_guard = .;
         . += 4096;
         stack_bottom = .;
-        . += 256K;
+        /* Round J: 256K -> 512K. The measured driver-stack call chain
+         * bottoms out barely 1.6 KiB above stack_bottom at 256K — a
+         * 4 KiB kmain local overflowed into the guard page (which
+         * caught it, as designed). The margin is now honest. Image +
+         * bss + stack stay well inside the single 2 MiB page. */
+        . += 512K;
         stack_top = .;
         . = ALIGN(4096);
         __bss_end = .;

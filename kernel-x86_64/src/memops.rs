@@ -100,6 +100,18 @@ pub fn read_u8_va(va: u64) -> u8 {
     unsafe { (va as *const u8).read_volatile() }
 }
 
+/// Write one byte at a user (or kernel) VA — the copy-OUT twin of
+/// `read_u8_va` (Round J, SYS_READ): byte-exact, so a validated
+/// destination span can never fault. The only volatile writer the
+/// user-copy path is allowed to use.
+///
+/// SAFETY: `va` must be mapped and writable (the caller validates
+/// every covering page as a present user page first).
+pub fn write_u8_va(va: u64, val: u8) {
+    // SAFETY: see function docs.
+    unsafe { (va as *mut u8).write_volatile(val) }
+}
+
 /// Volatile 64-bit read at the *virtual* address `va` (no translation).
 ///
 /// SAFETY: `va` must be 8-byte aligned, mapped and readable. N1

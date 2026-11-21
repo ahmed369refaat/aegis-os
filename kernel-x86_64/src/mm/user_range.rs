@@ -115,6 +115,74 @@ pub fn copy_user_bytes(
     len
 }
 
+/// Round J, SYS_READ: the copy-OUT mirror — write exactly
+/// `bytes.len()` bytes to `[buf, buf+bytes.len())`, byte-at-a-time,
+/// never a byte more. The writer must be `memops::write_u8_va` on
+/// target (the same N1 byte-exactness discipline, now in the outward
+/// direction); host tests pass a bounded fake.
+pub fn copy_out_bytes(buf: u64, bytes: &[u8], write: &dyn Fn(u64, u8)) -> u64 {
+    for (off, b) in bytes.iter().enumerate() {
+        write(buf + off as u64, *b);
+    }
+    bytes.len() as u64
+}
+
+/// Why a bounded C-string read from user memory refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CstrError {
+    /// No NUL within `max` bytes — the path is not path-shaped.
+    TooLong,
+    /// The walk touched a page that is not a present user page (or the
+    /// address is outside the user half, or would wrap).
+    Fault,
+}
+
+/// Round J, SYS_OPEN: read a NUL-terminated string from user memory,
+/// bounded by `max`, page-checking as the walk goes (a short string
+/// before an absent page succeeds; the walk stops at the NUL). Fills
+/// `out` with the string bytes (no NUL) and returns their length.
+///
+/// The page check happens BEFORE the first byte of each page is read —
+/// a string ending exactly at a page boundary never touches the next
+/// page, and a string whose NUL would land in an absent page faults
+/// only if the walk actually reaches past the last good byte... which
+/// it must, to see the terminator: a missing NUL inside an absent page
+/// is a Fault, never a silent short read.
+pub fn read_user_cstr(
+    buf: u64,
+    max: usize,
+    user_limit: u64,
+    page: u64,
+    is_user_page: &dyn Fn(u64) -> bool,
+    read: &dyn Fn(u64) -> u8,
+    out: &mut [u8],
+) -> Result<usize, CstrError> {
+    debug_assert!(out.len() >= max, "out must hold the max bound");
+    let mut last_page = u64::MAX;
+    for i in 0..max {
+        let va = match buf.checked_add(i as u64) {
+            Some(va) => va,
+            None => return Err(CstrError::Fault),
+        };
+        if va >= user_limit {
+            return Err(CstrError::Fault);
+        }
+        let va_page = va & !(page - 1);
+        if va_page != last_page {
+            if !is_user_page(va_page) {
+                return Err(CstrError::Fault);
+            }
+            last_page = va_page;
+        }
+        let b = read(va);
+        if b == 0 {
+            return Ok(i);
+        }
+        out[i] = b;
+    }
+    Err(CstrError::TooLong)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +353,111 @@ mod tests {
             PAGE,
             &one_page
         ));
+    }
+
+    /// Round J: the copy-out mirror never writes a byte outside
+    /// [buf, buf+len).
+    #[test]
+    fn copy_out_bytes_never_escapes_the_range() {
+        use core::cell::RefCell;
+        let store = RefCell::new([0xFFu8; 8]);
+        let write = |va: u64, b: u8| {
+            assert!(
+                (0x200..0x204).contains(&va),
+                "copy-out wrote outside the range: {va:#x}"
+            );
+            store.borrow_mut()[(va - 0x200) as usize] = b;
+        };
+        let n = copy_out_bytes(0x200, &[7, 8, 9], &write);
+        assert_eq!(n, 3);
+        assert_eq!(&store.borrow()[..4], &[7, 8, 9, 0xFF]);
+        // Empty copy touches nothing.
+        assert_eq!(copy_out_bytes(0x999_0000, &[], &write), 0);
+    }
+
+    /// Round J: the bounded C-string reader — the SYS_OPEN path model.
+    #[test]
+    fn read_cstr_stops_at_the_terminator_and_bounds_the_walk() {
+        let two_pages = |va: u64| va == 0x1000 || va == 0x2000;
+        // "/note\0" in the first page.
+        let mem = |va: u64| match va {
+            0x1000 => b'/',
+            0x1001 => b'n',
+            0x1002 => b'o',
+            0x1003 => b't',
+            0x1004 => b'e',
+            _ => 0,
+        };
+        let mut out = [0u8; 32];
+        assert_eq!(
+            read_user_cstr(0x1000, 16, LIMIT, PAGE, &two_pages, &mem, &mut out),
+            Ok(5)
+        );
+        assert_eq!(&out[..5], b"/note");
+        // No NUL within the bound: TooLong, never a silent short read.
+        let no_nul = |_va: u64| b'x';
+        assert_eq!(
+            read_user_cstr(0x1000, 4, LIMIT, PAGE, &two_pages, &no_nul, &mut out),
+            Err(CstrError::TooLong)
+        );
+        // The walk crossing into an absent page faults — the NUL is
+        // not there to stop it first (starting near the page end so
+        // the bound genuinely crosses).
+        let one_page = |va: u64| va == 0x1000;
+        assert_eq!(
+            read_user_cstr(0x1FF0, 32, LIMIT, PAGE, &one_page, &no_nul, &mut out),
+            Err(CstrError::Fault)
+        );
+        // A kernel-half address faults before any byte is read.
+        assert_eq!(
+            read_user_cstr(
+                0xFFFF_8000_0000_0000,
+                4,
+                LIMIT,
+                PAGE,
+                &one_page,
+                &no_nul,
+                &mut out
+            ),
+            Err(CstrError::Fault)
+        );
+        // Wraparound faults.
+        assert_eq!(
+            read_user_cstr(u64::MAX - 1, 4, LIMIT, PAGE, &one_page, &no_nul, &mut out),
+            Err(CstrError::Fault)
+        );
+    }
+
+    /// Round J: a string ending exactly at a page boundary — the NUL
+    /// lands on the last byte of a page, so the next page is never
+    /// touched (the boundary walk is exact, not worst-case).
+    #[test]
+    fn read_cstr_at_page_boundaries_touches_only_what_it_reads() {
+        use core::cell::Cell;
+        let present = |va: u64| va == 0x1000 || va == 0x2000;
+        let checks = Cell::new(0u32);
+        let page_seen = |va: u64| {
+            checks.set(checks.get() + 1);
+            va == 0x1000 || va == 0x2000
+        };
+        // 0x1FFF is the NUL (last byte of page 0x1000).
+        let mem = |va: u64| if va == 0x1FFF { 0 } else { b'a' };
+        let mut out = [0u8; 32];
+        assert_eq!(
+            read_user_cstr(0x1FF0, 16, LIMIT, PAGE, &page_seen, &mem, &mut out),
+            Ok(15)
+        );
+        assert_eq!(out[..15], [b'a'; 15]);
+        // Exactly one page check: page 0x1000 — page 0x2000 is never
+        // asked about.
+        assert_eq!(checks.get(), 1, "the walk must not over-check pages");
+        // The empty string (NUL at the first byte) is a legal path of
+        // length 0... the VFS will refuse it, but the copy layer
+        // reports what is there.
+        let nul_first = |_va: u64| 0u8;
+        assert_eq!(
+            read_user_cstr(0x1000, 16, LIMIT, PAGE, &present, &nul_first, &mut out),
+            Ok(0)
+        );
     }
 }

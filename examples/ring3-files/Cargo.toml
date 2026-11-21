@@ -1,0 +1,9 @@
+[package]
+name = "ring3-files"
+version = "0.2.0"
+edition = "2021"
+description = "AegisOS ring-3 example: the file lifecycle — pipe, dup, open/read/write/close + negative probes. Built to a flat blob by boot.sh (rustc --emit=obj + objcopy); NOT a workspace member."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"

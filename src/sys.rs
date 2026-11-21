@@ -155,6 +155,12 @@ pub enum SysError {
     /// silent success. The monitor counts the attempt (the gate already
     /// marks it used).
     NotImplemented(u8),
+    /// Round J: I/O on a runtime-reserved descriptor (the stdio
+    /// triplet). The slot exists — `alloc` cannot hand it out — but the
+    /// policy core refuses to read or write through it; the runtime's
+    /// device path (the console behind fd 1) serves it outside this
+    /// table. Carries the fd.
+    Reserved(u8),
     /// F13: a memory-policy refusal from MMAP/MUNMAP (identity kept).
     Mem(crate::memory::MemError),
     Fd(FdError),
@@ -177,7 +183,7 @@ pub enum NetOpenError {
     Net(crate::net::NetError),
 }
 
-impl Kernel {
+impl<const N: usize> Kernel<N> {
     /// The executing syscall entry point: gate first, then execute.
     pub fn syscall<'a>(
         &mut self,
@@ -193,6 +199,21 @@ impl Kernel {
             Ok(Decision::BadSyscall(id)) => return Err(SysError::BadSyscall(id)),
             Err(e) => return Err(into_sys(e)),
         }
+        // Phase 2: execute against the kernel's Linux-like state.
+        self.execute(domain_id, req)
+    }
+
+    /// Round J: Phase 2 alone — the executor, WITHOUT the gate. The
+    /// ring-3 runtime calls this after running its own `dispatch` (the
+    /// same gate, on the live domain, where the denial/used accounting
+    /// must land exactly once); calling `syscall` from there would run
+    /// the gate a second time and double every counter. Library callers
+    /// that have not gated must use `syscall`.
+    pub fn execute<'a>(
+        &mut self,
+        domain_id: u32,
+        req: SysRequest<'a>,
+    ) -> Result<SysValue, SysError> {
         // Phase 2: execute against the kernel's Linux-like state.
         let (creds, root, cwd) = {
             let d = self.domain_mut(domain_id).map_err(into_sys)?;
@@ -308,6 +329,10 @@ impl Kernel {
                         Ok(SysValue::Count(n))
                     }
                     FdTarget::PipeWrite(_) => Err(SysError::BadFd(fd)),
+                    // Round J: the stdio triplet exists but is not
+                    // readable through the policy core (the runtime's
+                    // device serves it, or nobody does).
+                    FdTarget::Reserved => Err(SysError::Reserved(fd)),
                 }
             }
             SysRequest::Write { fd, bytes } => {
@@ -348,6 +373,13 @@ impl Kernel {
                         Ok(SysValue::Count(n))
                     }
                     FdTarget::PipeRead(_) => Err(SysError::BadFd(fd)),
+                    // Round J: reserved descriptors are not writable
+                    // through the policy core. The ring-3 runtime's
+                    // console alias (fd 1) is served by the device path
+                    // BEFORE this executor is reached, so landing here
+                    // means the alias was closed or the caller forged
+                    // the fd — refuse, never fake a byte count.
+                    FdTarget::Reserved => Err(SysError::Reserved(fd)),
                 }
             }
             SysRequest::Close { fd } => {
@@ -369,6 +401,11 @@ impl Kernel {
                         let _ = self.pipes.release_write(p);
                     }
                     FdTarget::File(_) => {}
+                    // Round J: closing a reserved slot frees it for
+                    // later allocation — after this, the runtime's
+                    // device alias no longer has a table entry and the
+                    // fd can be handed out by pipe()/open().
+                    FdTarget::Reserved => {}
                 }
                 Ok(SysValue::Unit)
             }
@@ -429,6 +466,9 @@ impl Kernel {
                     FdTarget::PipeRead(p) => self.pipes.acquire_read(p),
                     FdTarget::PipeWrite(p) => self.pipes.acquire_write(p),
                     FdTarget::File(_) => Ok(()),
+                    // Round J: a reserved slot carries no pipe/end
+                    // refcount — dup copies it like any entry.
+                    FdTarget::Reserved => Ok(()),
                 };
                 acquire.map_err(SysError::Pipe)?;
                 // Replace the target fd, releasing whatever it held
@@ -450,6 +490,7 @@ impl Kernel {
                                 let _ = self.pipes.release_write(p);
                             }
                             FdTarget::File(_) => {}
+                            FdTarget::Reserved => {}
                         }
                         return Err(SysError::Fd(e));
                     }
@@ -463,6 +504,7 @@ impl Kernel {
                             let _ = self.pipes.release_write(p);
                         }
                         FdTarget::File(_) => {}
+                        FdTarget::Reserved => {}
                     }
                 }
                 // The duplicate carries the source's file offset. NOTE:
@@ -741,7 +783,7 @@ impl Kernel {
     }
 }
 
-impl Kernel {
+impl<const N: usize> Kernel<N> {
     /// Best-effort fd close used by rollback paths (never fails the caller).
     /// F18 (ADR-0009): require an FsNode capability covering `parent`
     /// (the operation's parent directory) with `access`. Unix DAC
@@ -912,5 +954,9 @@ fn into_sys(e: KernelError) -> SysError {
         // non-privileged domain is a permission denial, full stop.
         KernelError::NotAuthorized(_) => SysError::PermissionDenied,
         KernelError::Ipc(e) => SysError::Ipc(e),
+        // Round J: a supervisor-side reservation refusal surfacing
+        // through a syscall-shaped path — the caller tried to operate
+        // where the stdio slots were already spoken for.
+        KernelError::StdioSlotOccupied(fd) => SysError::Reserved(fd),
     }
 }

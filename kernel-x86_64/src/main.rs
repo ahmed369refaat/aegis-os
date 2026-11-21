@@ -77,7 +77,14 @@ pub mod rng;
 pub mod runtime;
 pub mod sched;
 pub mod strutil;
-#[cfg(not(test))]
+// Round J: the outer cfg(not(test)) on `pub mod syscall` was a hidden
+// debt — it compiled the whole module (its 3 host tests included) out
+// of every `cargo test` run, and the tests' missing `SyscallMask`
+// import went unnoticed for exactly that long. The module gates its
+// own target-only `mod exec` internally; the host-safe gate/route
+// layer and its tests now build and run on the host like every other
+// module.
+pub mod sysabi;
 pub mod syscall;
 pub mod virtio;
 

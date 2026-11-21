@@ -52,6 +52,44 @@ static RING3_EDGE: &[u8] = include_bytes!("../blob/ring3-edge.bin");
 /// `preempt-demo` build reads it (see preempt_demo below).
 #[cfg(feature = "preempt-demo")]
 static RING3_PREEMPT: &[u8] = include_bytes!("../blob/ring3-preempt.bin");
+/// Round J: the file-lifecycle blob — pipe round-trip, dup survival,
+/// open/write/read-back through an independent cursor, and the errno
+/// refusals, all from CPL=3 through the LIVE lib kernel.
+static RING3_FILES: &[u8] = include_bytes!("../blob/ring3-files.bin");
+
+/// Round J: the files blob's data page. The blob's literal addresses
+/// (0x403000..) are the contract — this builds the matching array.
+/// A `static`, evaluated at compile time into .rodata: the first
+/// draft built it on kmain's stack (4 KiB of locals), and the boot
+/// stack's absent guard page caught the result — the driver-stack
+/// call chain bottoms out barely 1.6 KiB above stack_bottom, so the
+/// extra page pushed RSP through the guard and #PF'd (err=2: a
+/// supervisor write to a not-present page — the guard doing exactly
+/// its job). Zero stack cost now; the stack also grew 256K→512K
+/// (linker.ld) so the margin is honest, not lucky.
+const fn put4096(d: &mut [u8; 4096], off: usize, bytes: &[u8]) {
+    let mut i = 0;
+    while i < bytes.len() {
+        d[off + i] = bytes[i];
+        i += 1;
+    }
+}
+
+const fn ring3_files_data() -> [u8; 4096] {
+    let mut d = [0u8; 4096];
+    put4096(&mut d, 0x000, b"pipe bytes from cpl3\n"); // MSG1 (21)
+    put4096(&mut d, 0x040, b"dup keeps ends alive\n"); // MSG2 (21)
+    put4096(&mut d, 0x080, b"aegis file roundtrip\n"); // FMSG (21)
+    put4096(&mut d, 0x0C0, b"/pub/round-j.txt\0"); // PATH (17)
+    put4096(&mut d, 0x100, b"/no/such/file\0"); // NXPATH (14)
+    put4096(&mut d, 0x140, b"J:pipe ok\n"); // M1 (10)
+    put4096(&mut d, 0x160, b"J:dup ok\n"); // M2 (9)
+    put4096(&mut d, 0x180, b"J:file ok\n"); // M3 (10)
+    put4096(&mut d, 0x1A0, b"J:neg ok\n"); // M4 (9)
+    d
+}
+
+static FILES_DATA: [u8; 4096] = ring3_files_data();
 /// The exact message the hello blob writes from ring-3 (its length is
 /// baked into the blob's `mov edx, 26`).
 const RING3_MSG: &[u8] = b"hello from ring 3 (CPL=3)\n";
@@ -1063,7 +1101,138 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     }
     k.set_monitor_mode(aegis_os::monitor::MonitorMode::Enforce);
     mm::user::destroy_user(&mut k, &mut pool, 12);
-    line(&mut out, &["[RING3] ring-3 isolation live: 7 runs (hello/NX/kernel-VA/forged/edge/monitor-quarantine/audit-only), kernel intact"]);
+
+    // ── Run 8 (Round J): the file lifecycle from CPL=3 — the ring-3
+    // syscall surface crosses the fd line. A kernel-resident
+    // supervisor (uid 0) prepares /pub world-writable first (the
+    // init-prepares-/tmp pattern), then a service-profile domain runs
+    // the whole Unix dance through the LIVE lib kernel: pipe() ->
+    // (3,4) (the stdio triplet keeps 0..2), a pipe round-trip with
+    // byte-verified read-back, a dup keeping the read end alive past
+    // its original's close, open(O_CREAT)/write/read-back through the
+    // duplicate's independent cursor, close of the original with the
+    // dup reading EOF — and the three errno refusals (EBADF, ENOENT,
+    // EBADF). Every answer is checked IN THE BLOB; exit 42 means all
+    // of them verified, 99 means the first wrong answer. ──
+    let supervisor_ok = matches!(
+        k.create_domain_with(13, aegis_os::profile::service_profile(), 0, 0, 0),
+        Ok(())
+    ) && matches!(
+        k.syscall(
+            13,
+            aegis_os::sys::SysRequest::Mkdir {
+                path: "/pub",
+                mode: aegis_os::vfs::Mode(0o777),
+            }
+        ),
+        Ok(_)
+    );
+    let _ = k.destroy_domain(13);
+    if !supervisor_ok {
+        line(
+            &mut out,
+            &["[RING3] ERROR: /pub preparation failed; halting"],
+        );
+        hw::halt_forever();
+    }
+    let spawn = match mm::user::spawn_user_blob(
+        &mut k,
+        &mut pool,
+        14,
+        aegis_os::profile::service_profile(),
+        RING3_FILES,
+        &FILES_DATA,
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(&mut out, &["[RING3] ERROR: files spawn failed; halting"]);
+            hw::halt_forever();
+        }
+    };
+    line(
+        &mut out,
+        &["[RING3] launching domain 14 (service profile): the file lifecycle at CPL=3"],
+    );
+    let kernel_cr3 = hw::read_cr3();
+    spawn.run.tables.activate();
+    crate::sched::context::begin(spawn.run);
+    crate::sched::context::launch(&spawn.ctx);
+    // — ring-3 ran here; SYS_EXIT faulted us back to exactly this point —
+    let run = crate::sched::context::take();
+    hw::write_cr3(kernel_cr3);
+    match run.exit {
+        // 101 = the markers (38) + both pipe writes + the file write
+        // (21 each): every byte the run contributed, counted.
+        crate::sched::context::ExitKind::Exited(42) if run.write_bytes == 101 => {
+            line(
+                &mut out,
+                &["[RING3] files domain exited(42): pipe+dup+file lifecycle verified from CPL=3"],
+            );
+            line(
+                &mut out,
+                &["[RING3] ring-3 syscall surface: OPEN/READ/WRITE/CLOSE/PIPE/DUP live on the lib kernel"],
+            );
+        }
+        crate::sched::context::ExitKind::Fault {
+            vector,
+            cr2,
+            error_code,
+            rip,
+            user_rsp,
+        } => {
+            let mut b1 = [0u8; 20];
+            let mut b2 = [0u8; 18];
+            let mut b3 = [0u8; 18];
+            let mut b4 = [0u8; 18];
+            let mut b5 = [0u8; 18];
+            line(
+                &mut out,
+                &[
+                    "[RING3] files fault record: vector=",
+                    strutil::dec(vector as u64, &mut b1),
+                    " cr2=",
+                    strutil::hex(cr2, &mut b2),
+                    " err=",
+                    strutil::hex(error_code, &mut b3),
+                    " rip=",
+                    strutil::hex(rip, &mut b4),
+                    " rsp=",
+                    strutil::hex(user_rsp, &mut b5),
+                ],
+            );
+            line(&mut out, &["[RING3] ERROR: files run faulted; halting"]);
+            hw::halt_forever();
+        }
+        _ => {
+            // The honest record: WHICH exit code and how many bytes —
+            // a 99 names the blob's first failed check, a 42 with a
+            // short count names the accounting.
+            let mut b1 = [0u8; 20];
+            let mut b2 = [0u8; 20];
+            let mut b3 = [0u8; 20];
+            serial::write_str("[RING3] files run: exit=");
+            match run.exit {
+                crate::sched::context::ExitKind::Exited(c) => {
+                    serial::write_str(strutil::dec(c, &mut b1))
+                }
+                crate::sched::context::ExitKind::Fault { vector, .. } => {
+                    serial::write_str("fault(v=");
+                    serial::write_str(strutil::dec(vector as u64, &mut b2));
+                    serial::write_str(")");
+                }
+            }
+            serial::write_str(" write_bytes=");
+            serial::write_str(strutil::dec(run.write_bytes, &mut b3));
+            serial::write_str("\n");
+            line(
+                &mut out,
+                &["[RING3] ERROR: files run ended unexpectedly; halting"],
+            );
+            hw::halt_forever();
+        }
+    }
+    mm::user::destroy_user(&mut k, &mut pool, 14);
+    line(&mut out, &["[RING3] ring-3 isolation live: 8 runs (hello/NX/kernel-VA/forged/edge/monitor-quarantine/audit-only/files), kernel intact"]);
 
     // M2-W2 / ADR-0012: the preemption demo is behind the `preempt-demo`
     // feature — see ADR-0012 (open issues) for why the default boot does

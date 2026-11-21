@@ -86,6 +86,16 @@ pub fn spawn_user_blob<const N: usize>(
     // matches this id so a destroy reclaims everything at once).
     k.create_domain(id, profile)
         .map_err(|_| SpawnError::Domain)?;
+    // Round J: the stdio triplet. fds 0/1/2 go to the runtime (the
+    // console device alias lives behind fd 1), so the domain's own
+    // pipe()/open() allocations begin at fd 3, Unix-style — the device
+    // alias and the fd table can never collide. On a fresh domain this
+    // cannot fail; the rollback below still covers the impossible
+    // branch honestly.
+    if k.reserve_stdio(id).is_err() {
+        let _ = k.destroy_domain(id);
+        return Err(SpawnError::Domain);
+    }
     // N3: transactional from here on — the old code returned early on
     // any failure (PML4 alloc, a region map, pool exhaustion), leaving
     // the lib domain registered and frames owned by the id. Every

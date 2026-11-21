@@ -27,7 +27,13 @@
 //!   a syscall clobbers exactly RAX (result), RCX and R11 (the
 //!   architecture's syscall rip/rflags carriers). Everything else —
 //!   including RBX, which the stub borrows for the TSC measurement —
-//!   is restored bit-for-bit.
+//!   is restored bit-for-bit — including the **user RSP** (Round J):
+//!   SYSRET restores only RIP/RFLAGS, and the stub has switched RSP
+//!   to the kernel stack on entry, so the stub itself carries the
+//!   user's stack pointer across (USER_RSP_SAVE) and reloads it right
+//!   before SYSRETQ. Before round J every sysret silently returned to
+//!   ring-3 running on the kernel's stack pointer — invisible because
+//!   no earlier blob ever touched its stack.
 //! - **Round-trip measurement**: RDTSC brackets the dispatch call; the
 //!   delta lands in `ROUNDTRIP` (plain store; single CPU) and kmain
 //!   prints it as the acceptance number.
@@ -60,6 +66,21 @@ static ROUNDTRIP: AtomicU64 = AtomicU64::new(0);
 /// The syscall-entry stack top (RIP-relative read; the GS path arrives
 /// with Stage 4's SMP work — see docs/arch/syscall-entry.md).
 static SYSCALL_RSP: AtomicU64 = AtomicU64::new(0);
+
+/// Round J: the user RSP of the in-flight syscall. SYSRET restores
+/// RIP/RFLAGS (from RCX/R11) but NOT RSP — and the stub switches RSP
+/// to the kernel stack on entry — so the user's stack pointer must be
+/// carried across the excursion explicitly or every sysret returns to
+/// ring-3 running on the KERNEL's stack pointer. Hidden since PR-1.4:
+/// every ring-3 blob before round J was pure register code that never
+/// touched its stack, so the first `call`/`push` in ring-3 history
+/// (the files blob's verify subroutine) was the first to expose it —
+/// a #PF pushing a return address through a kernel-half RSP. Written
+/// by the stub BEFORE the stack switch (the only moment the value
+/// exists in a register), read back right before SYSRETQ. Single CPU
+/// + IF=0 through the whole kernel side: exactly one excursion is ever
+/// in flight, the same lifetime discipline as SYSCALL_RSP itself.
+static USER_RSP_SAVE: AtomicU64 = AtomicU64::new(0);
 
 fn percpu_kstack_top() -> u64 {
     crate::arch::percpu::get().kstack_top
@@ -119,6 +140,9 @@ pub extern "C" fn syscall_entry() {
                                        // so the stub enforces the no-nesting
                                        // invariant itself; SYSRET restores the
                                        // user's IF from R11)
+        "movq %rsp, {ursp}(%rip)",     // Round J: park the USER RSP —
+                                       // SYSRET will not restore it, and
+                                       // the switch below destroys it
         "movq {srsp}(%rip), %rsp",     // SYSCALL switches no stack; we do
         // ── park the user registers (SyscallFrame order) ──
         "pushq $0",                    // pad (alignment)
@@ -167,10 +191,13 @@ pub extern "C" fn syscall_entry() {
         "movq {off_r10}(%rsp), %r10",
         "movq {off_r8}(%rsp), %r8",
         "movq {off_r9}(%rsp), %r9",
-        "addq $96, %rsp",
+        "movq {ursp}(%rip), %rsp",     // Round J: the user's RSP back —
+                                       // SYSRET restores RIP/RFLAGS only,
+                                       // so this is the ONLY RSP restore
         "swapgs",                      // GS ← user value
         "sysretq",                     // CPL=3, RFLAGS from R11
         srsp = sym SYSCALL_RSP,
+        ursp = sym USER_RSP_SAVE,
         dispatch = sym crate::syscall::syscall_dispatch,
         rt = sym ROUNDTRIP,
         off_rax = const OFF_RAX,

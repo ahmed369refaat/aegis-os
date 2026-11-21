@@ -69,3 +69,10 @@
 # need (byte pairs would depend on the region's per-byte decode;
 # dword reads smear the neighboring register into the value).
 100
+# 101 -> Round J (the ring-3 file lifecycle): +1 — memops::write_u8_va,
+# the byte-exact copy-OUT twin of read_u8_va (ADR-0007 §1's discipline
+# in the outward direction): SYS_READ's validated destination span
+# copies through it under the blessed SMAP window, never a byte more.
+# The syscall stub's USER_RSP save/restore is inline asm in an
+# already-counted naked function (no new unsafe sites).
+101

@@ -18,6 +18,15 @@ pub enum FdTarget {
     PipeRead(u32),
     /// Writing end of pipe id.
     PipeWrite(u32),
+    /// Round J: a runtime-owned descriptor (the stdio triplet 0/1/2 a
+    /// spawned domain starts with, Unix-style). The policy core holds
+    /// the slot so `alloc` can never hand it out — the runtime's device
+    /// alias (the console behind fd 1) and the fd table then cannot
+    /// collide — but refuses all I/O through it: `Reserved` is "exists,
+    /// not readable or writable here". Close and dup treat it as a
+    /// plain entry (closing frees the slot; dup copies it without any
+    /// pipe refcount work).
+    Reserved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

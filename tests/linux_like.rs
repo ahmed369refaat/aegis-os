@@ -861,3 +861,255 @@ fn mkdir_unlink_roundtrip_and_nonempty_dir() {
         Err(SysError::Vfs(VfsError::NotFound))
     );
 }
+
+// ─── Round J: the stdio triplet, Reserved targets, and the gate/execute split ───
+
+#[test]
+fn reserve_stdio_moves_allocation_past_the_triplet() {
+    let mut k = kernel_with_tree();
+    k.reserve_stdio(SERVICE).unwrap();
+    // The domain's own allocations now begin at fd 3, Unix-style —
+    // the runtime's device alias (console behind fd 1) and the fd
+    // table cannot collide anymore.
+    assert_eq!(
+        k.syscall(SERVICE, SysRequest::Pipe),
+        Ok(SysValue::FdPair(3, 4))
+    );
+    assert_eq!(
+        k.syscall(
+            SERVICE,
+            SysRequest::Open {
+                path: "/pub/scratch",
+                mode: Mode(0o644),
+                create: true,
+                read: true,
+                write: true,
+                truncate: false
+            }
+        ),
+        Ok(SysValue::Fd(5))
+    );
+}
+
+#[test]
+fn reserved_fds_refuse_io_but_close_and_dup_like_entries() {
+    let mut k = kernel_with_tree();
+    k.reserve_stdio(SERVICE).unwrap();
+    let mut buf = [0u8; 4];
+    // The policy core refuses I/O through the reserved triplet.
+    assert_eq!(
+        k.syscall(
+            SERVICE,
+            SysRequest::Read {
+                fd: 0,
+                buf: &mut buf
+            }
+        ),
+        Err(SysError::Reserved(0))
+    );
+    assert_eq!(
+        k.syscall(
+            SERVICE,
+            SysRequest::Write {
+                fd: 1,
+                bytes: b"no"
+            }
+        ),
+        Err(SysError::Reserved(1))
+    );
+    // dup copies a Reserved entry like any other (no refcount work).
+    assert_eq!(
+        k.syscall(SERVICE, SysRequest::Dup { fd: 1, new_fd: 9 }),
+        Ok(SysValue::Fd(9))
+    );
+    assert_eq!(
+        k.syscall(
+            SERVICE,
+            SysRequest::Write {
+                fd: 9,
+                bytes: b"no"
+            }
+        ),
+        Err(SysError::Reserved(9))
+    );
+    // Closing a reserved slot frees it: lowest-free hands fd 1 back out
+    // (fd 0 and fd 2 stay reserved — only 1 was closed).
+    assert_eq!(
+        k.syscall(SERVICE, SysRequest::Close { fd: 1 }),
+        Ok(SysValue::Unit)
+    );
+    assert_eq!(
+        k.syscall(SERVICE, SysRequest::Pipe),
+        Ok(SysValue::FdPair(1, 3))
+    );
+}
+
+#[test]
+fn reserve_stdio_refuses_real_targets_and_is_idempotent() {
+    let mut k = kernel_with_tree();
+    // A real target already sitting in 0..=2: refuse, shadowing is worse.
+    k.syscall(
+        SERVICE,
+        SysRequest::Open {
+            path: "/home/notes.txt",
+            mode: Mode(0o644),
+            create: false,
+            read: true,
+            write: false,
+            truncate: false,
+        },
+    )
+    .unwrap(); // fd 0
+    assert_eq!(
+        k.reserve_stdio(SERVICE),
+        Err(KernelError::StdioSlotOccupied(0))
+    );
+    // Idempotent on a clean reservation.
+    k.reserve_stdio(PARSER).unwrap();
+    assert_eq!(k.reserve_stdio(PARSER), Ok(()));
+}
+
+#[test]
+fn execute_runs_only_after_the_caller_gates_the_split_contract() {
+    let mut k = kernel_with_tree();
+    // The parser profile has no OPEN bit: `syscall` (gate + execute)
+    // refuses, exactly as before.
+    assert_eq!(
+        k.syscall(PARSER, open_notes()),
+        Err(SysError::Masked(SYS_OPEN))
+    );
+    assert_eq!(k.domain_mut(PARSER).unwrap().stats.denied_syscalls, 1);
+    // `execute` is Phase 2 ALONE — it never gates, by contract. This
+    // is the seam the ring-3 runtime uses: it runs its own `dispatch`
+    // (where the live accounting must land) and only an Allowed
+    // reaches `execute`. Proof that the caller MUST gate: execute
+    // hands the parser a real fd for a syscall its mask forbids.
+    let fd = k.execute(PARSER, open_notes()).unwrap();
+    assert_eq!(fd, SysValue::Fd(0));
+    // And the denial counter did not move — no double accounting.
+    assert_eq!(k.domain_mut(PARSER).unwrap().stats.denied_syscalls, 1);
+    // A runtime that gated first (dispatch → Allowed) then executed
+    // sees the served path accounted exactly once by its own dispatch.
+    assert_eq!(k.dispatch(SERVICE, SYS_OPEN).unwrap(), Decision::Allowed);
+    assert!(k.execute(SERVICE, open_notes()).is_ok());
+}
+
+fn open_notes() -> SysRequest<'static> {
+    SysRequest::Open {
+        path: "/home/notes.txt",
+        mode: Mode(0o644),
+        create: false,
+        read: true,
+        write: false,
+        truncate: false,
+    }
+}
+
+/// Round J, the boot's run-8 phase F exactly as the files blob drives
+/// it (same domain shape, same /pub, same fd arithmetic): if this
+/// passes on the host, the boot-side failure is in the marshaling
+/// layer, not the executor.
+#[test]
+fn files_blob_phase_f_on_the_host() {
+    let mut k = Kernel::new();
+    // The boot's supervisor (uid 0) prepares /pub world-writable.
+    k.create_domain_with(13, service_profile(), 0, 0, 0)
+        .unwrap();
+    k.syscall(
+        13,
+        SysRequest::Mkdir {
+            path: "/pub",
+            mode: Mode(0o777),
+        },
+    )
+    .unwrap();
+    let _ = k.destroy_domain(13);
+    // The blob's domain: service profile, derived uid (1000 + 14).
+    // (The boot's spawn_user_blob reserves the stdio triplet; this
+    // host stand-in does the same by hand.)
+    k.create_domain(14, service_profile()).unwrap();
+    k.reserve_stdio(14).unwrap();
+    // Phase P's leftovers: pipe (3,4), dup(3 -> 7), close(3).
+    assert_eq!(k.syscall(14, SysRequest::Pipe), Ok(SysValue::FdPair(3, 4)));
+    assert_eq!(
+        k.syscall(14, SysRequest::Dup { fd: 3, new_fd: 7 }),
+        Ok(SysValue::Fd(7))
+    );
+    assert_eq!(
+        k.syscall(14, SysRequest::Close { fd: 3 }),
+        Ok(SysValue::Unit)
+    );
+    // Phase F: open(O_CREAT|O_RDWR, 0644) -> 5.
+    let fd = match k
+        .syscall(
+            14,
+            SysRequest::Open {
+                path: "/pub/round-j.txt",
+                mode: Mode(0o644),
+                create: true,
+                read: true,
+                write: true,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    {
+        SysValue::Fd(fd) => fd,
+        other => panic!("open: {:?}", other),
+    };
+    // fd 3 was freed by close(3): lowest-free recycles it (the Unix
+    // rule the blob asserts live).
+    assert_eq!(fd, 3);
+    // dup(3 -> 6) BEFORE the write: the duplicate's cursor is 0.
+    assert_eq!(
+        k.syscall(14, SysRequest::Dup { fd: 3, new_fd: 6 }),
+        Ok(SysValue::Fd(6))
+    );
+    // write 21 bytes of FMSG via the original.
+    let fmsg = b"aegis file roundtrip\n";
+    assert_eq!(fmsg.len(), 21);
+    assert_eq!(
+        k.syscall(14, SysRequest::Write { fd: 3, bytes: fmsg }),
+        Ok(SysValue::Count(21))
+    );
+    // read back through the duplicate's snapshot cursor.
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        k.syscall(
+            14,
+            SysRequest::Read {
+                fd: 6,
+                buf: &mut buf
+            }
+        ),
+        Ok(SysValue::Count(21))
+    );
+    assert_eq!(&buf[..21], fmsg);
+    // close the original; the duplicate survives and reads EOF.
+    assert_eq!(
+        k.syscall(14, SysRequest::Close { fd: 3 }),
+        Ok(SysValue::Unit)
+    );
+    // and the closed fd refuses a write — the blob's third negative.
+    assert_eq!(
+        k.syscall(
+            14,
+            SysRequest::Write {
+                fd: 3,
+                bytes: b"no"
+            }
+        ),
+        Err(SysError::BadFd(3))
+    );
+    let mut tail = [0u8; 8];
+    assert_eq!(
+        k.syscall(
+            14,
+            SysRequest::Read {
+                fd: 6,
+                buf: &mut tail
+            }
+        ),
+        Ok(SysValue::Count(0))
+    );
+}
