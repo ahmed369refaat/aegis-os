@@ -47,6 +47,7 @@ pub mod domain;
 pub mod ext2;
 pub mod fd;
 pub mod ipc;
+pub mod ivrs;
 pub mod memory;
 pub mod monitor;
 pub mod net;

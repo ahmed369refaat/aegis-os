@@ -64,3 +64,8 @@
 # sources — retry-able primitives whose carry-flag gate is
 # materialized with setc into a byte register).
 99
+# 100 -> Round H (the watchdogs, ADR-0019's platform follow-up): +1 —
+# hw::inw, the 16-bit I/O read the ICH9 TCO watchdog's registers
+# need (byte pairs would depend on the region's per-byte decode;
+# dword reads smear the neighboring register into the value).
+100
