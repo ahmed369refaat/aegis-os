@@ -15,6 +15,48 @@
 
 ---
 
+## 0. Round 6 update (ADR-0019 + ADR-0020) — what this round closed
+
+Read this section as a delta against the rows below, which describe
+the earlier baseline. Proven the same way this document demands
+(host tests + CI lane markers):
+
+- **The interrupt chain (was "no interrupts beyond the timer"):**
+  the interrupt broker owns vectors 49..=112 (one per device,
+  EOI-first delivery into per-device mailboxes with lost-counting);
+  the IOAPIC routes ISA IRQ 1 through the MADT's override table and
+  the QMP key delivers end to end through a bounded MWAIT/spin
+  window; x2APIC is enabled when offered; virtio-net's MSI-X table
+  points at a broker vector (message interrupts, no poll); and VT-d
+  interrupt remapping turns on when the DMAR declares it — IRTE n
+  mirrors broker slot n, the remapped MSI format is pinned against
+  QEMU's decoder, and the `--verify-q35-ir` lane proves it with
+  `intremap=on`. See ADR-0019.
+- **Multi-bus PCI (was "bus 0 flat, CF8/CFC only"):** the ECAM
+  config seam (MCFG-driven, bounds-checked address math) plus the
+  recursive bridge walk (visited-set + depth-capped); devices behind
+  root ports are enumerated and claim their own IOMMU domains — the
+  q35 lane boots a pcie-root-port with a virtio-blk behind it. See
+  ADR-0020.
+- **Platform slice:** FADT-sourced power-off/reboot (PM1a + the
+  reset register, loud legacy fallbacks); TSC calibrated against the
+  live HPET (the tick's cadence is measured, not guessed); entropy
+  sources live (RDRAND/RDSEED + virtio-rng → a splitmix64 pool — a
+  mixer, NOT yet a CSPRNG; ChaCha20 + KASLR remain open); C0 idle
+  (MONITOR/MWAIT) wakes on a real delivery; and the storage stack
+  reads a real partition table (protective MBR + GPT, both CRC-32s
+  enforced, typed hostile refusals — ext2 rides the partition base).
+- **Still open from the rows below (honest):** UEFI boot/GOP,
+  Secure Boot, USB enumeration beyond xHCI bring-up, ext4 write +
+  FAT32 (the ESP), dm-verity/encryption, TPM 2.0, SMP, the
+  watchdogs, kvmclock, AMD-Vi (IVRS), TCP/IP + TLS, the remaining
+  virtio devices (scsi/balloon/console/vsock/input/gpu), the cloud
+  NICs (ENA/gVNIC/Hyper-V), and the ring-3 delivery of interrupts
+  into driver domains (the mailbox + domain record are the landing
+  pad; the transport slice follows ADR-0017).
+
+---
+
 ## 1. Where the code actually is (verified baseline)
 
 | Area | What is proven today | Proof |
