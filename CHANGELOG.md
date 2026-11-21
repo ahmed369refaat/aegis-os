@@ -4,6 +4,33 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Changed — driver-stack review round 4, Phase 5 (F13): ext2 parsing moves to the policy core
+
+- **`src/ext2.rs` — the on-disk parser, pure and validated.** Every
+  structure the boot walk consumed (superblock, inode, dirent) moves
+  from the kernel's raw field reads into the policy lib as pure
+  functions over byte slices: magic/inode-size sanity, inode-number
+  and block-range geometry math (every step checked against the
+  superblock's own counts), inode extents bounded by the slice, and
+  a directory walk where a hostile record (rec_len < 8 + name_len,
+  not 4-aligned, zero, running past the block, or a name crossing
+  the caller's slice edge) is a typed refusal — never a skipped
+  record, never a panic.
+- **The kernel keeps the transport and the markers**: sector reads
+  through AHCI, the boot markers byte-identical (the lane grep pins
+  hello.txt's line verbatim), and explicit refusal markers naming
+  the policy verdict on hostile images.
+- **Host tests pin the parser from every side**: the real
+  `mkext2.py` image (mirrored by a test builder) parses end-to-end
+  to "HELLO-AEGIS-EXT2."; hostile superblocks (bad magic, inode
+  sizes 0/999/130, truncation) refuse; hostile inode numbers and
+  blocks refuse; hostile dirents refuse-never-skip; the exact
+  512-byte-sector shape the kernel hands the parser (a last record
+  padding its rec_len to the 1 KiB block end, past the slice) is
+  pinned as its own test; and a deterministic 2000-iteration fuzz
+  (seeded corruptions biased at the format's structures) runs the
+  full parse chain with zero panics.
+
 ### Fixed — driver-stack review round 4, Phase 5 (F12): ACPI firmware-table validation
 
 - **`read_table` (the DMAR/RSDT path) now verifies the ACPI

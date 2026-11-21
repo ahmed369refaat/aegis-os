@@ -44,6 +44,7 @@ pub mod capability;
 pub mod dma;
 pub mod dmar;
 pub mod domain;
+pub mod ext2;
 pub mod fd;
 pub mod ipc;
 pub mod memory;
