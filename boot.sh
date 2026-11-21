@@ -79,7 +79,7 @@ case "${1:-}" in
                   -netdev user,id=n1
                   -device e1000,netdev=n1
                   -drive id=nvme0,if=none,format=raw,file=target/nvme0.img
-                  -device nvme,serial=AEGISN1 -device nvme-ns,drive=nvme0
+                  -device nvme,serial=AEGISN1,num_queues=2 -device nvme-ns,drive=nvme0
                   -drive id=sd0,if=none,format=raw,file=target/sdisk0.img
                   -device ide-hd,drive=sd0,bus=ide.0
                   -drive id=usb0,if=none,format=raw,file=target/usb0.img
@@ -99,6 +99,9 @@ case "${1:-}" in
       "[E1K] RX: "  # the OFFER parsed: full round trip through the IOMMU
       "[VNET] RX: "  # both NICs live
       "[NVME] admin qpair live"  # controller enable + queue pair
+      "[NVME] Identify: serial=\"AEGISN1 \""  # F11: the identify data page arrives (not PA 0)
+      "[NVME] I/O qpair QID1 created (CQ+SQ)"  # F11: entry sizes + PRP both accepted
+      "[NVME] read LBA0:"  # F11: a 512-byte read through the IOMMU
       "[NVME] teardown: revoke_all(0) →"  # count varies with how far the ext2 helper mapped
       "[AHCI] ABAR live:"  # port + signature proven
       "[AHCI] teardown: revoke_all(0) →"  # same

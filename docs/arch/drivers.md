@@ -87,7 +87,7 @@ comments and tests:
 | AHCI/SATA (ich9, q35) | **LIVE incl. ext2 mount** | ABAR/GHC/PI read, port-0 SIG=0x101, IDENTIFY with the REAL serial (QM000001), **the ext2 mount runs: superblock → root dir → hello.txt read through the IOMMU (ADR-0014)** |
 | virtio-net | **complete** | handshake, MAC/link, both queues, 8 broker frames, **full DHCP DISCOVER→slirp→OFFER round trip through the IOMMU (ADR-0014)**, teardown |
 | e1000 | **complete** | rings programmed, **full DHCP round trip through the IOMMU** AND in identity mode on the control lane, teardown |
-| NVMe | **admin proven, data gated** | CAP/version/RDY, admin qpair live, Identify submitted — no completion |
+| NVMe | **fully live (F11): identify + I/O qpair + LBA read through the IOMMU** | CAP/version/RDY, identify data lands, CreateIoCq/SQ pass, read LBA0 completes |
 | USB xHCI | **bring-up FULLY LIVE** (item 12 first slice) | caps (v0 read as 0? HCSPARAMS MaxSlots=64 MaxPorts=8), halt→reset→DCBAAP+MaxSlotsEn+CRCR→RUN (HCH cleared), **port 0 device attached speed=4 (the usb-storage)** — register-only path, no device DMA needed |
 | screen/GPU (VBE) | **pixel-proven** | 7/7 sampled pixels in the QMP screendump |
 | PS/2 keyboard | **round-trip + negotiated** | QMP send-key → scancode 0x1e; THEN the real 0xF0/0x02 scancode-set-2 exchange, ACK 0xfa (translation restored for delivery — measured on this build) |
@@ -214,7 +214,8 @@ it back); the marker now reports the event TRB type.
 
 ### Still open (with the evidence trail)
 
-- **NVMe — one precisely-bounded anomaly: the device reads prp1 as 0**.
+- **NVMe prp1=0 — SOLVED (F11)**: two compounding layout quirks,
+  both measured, plus a lane device property.
 
   The 2026-11-20 session took the NVMe from "no completion" to a
   nearly-complete admin flow. Four driver bugs fixed, each verified
@@ -244,22 +245,37 @@ it back); the marker now reports the event TRB type.
   machinery is correct, and refusal paths tear down (revoke + scrub
   + free, the lane greps are count-agnostic).
 
-  The remaining anomaly, with the evidence: **every executed command
-  reads prp1 (SQ entry bytes 16-23) as 0** — the Identify's 4 KiB
-  data write lands at **PA 0** (proven: the serial bytes "AEGI…"
-  from serial=AEGISN1 read back at PA 0), and the CreateIoCq now
-  refuses with SC=2 (invalid field — a CQ at address 0). Meanwhile
-  bytes 0-7 and 40-43 of the SAME entry arrive correctly, our
-  kernel's same-PA readback shows the written prp1, the vtd trace
-  shows the SQ fetch translating iova 0x1189000 → gpa 0x1189000
-  (identity), and the split-32-bit-store experiment made no
-  difference. Eliminated: entry layout/size (NVME_SQES=6), doorbell
-  offsets, register values (ASQ/AQA read back correct), u64 stores,
-  the phase poll. Next experiment: the no-IOMMU control (an NVMe on
-  the q35-neg lane pattern) — the old motivation (isolating the
-  pass-through fast path) is gone with ADR-0014, but the control
-  still cleanly separates vtd-translation effects from everything
-  else.
+  The anomaly is closed — it was TWO layout quirks of this QEMU's
+  nvme, plus one lane device property, compounding so each fix looked
+  wrong while the other cause masked it:
+
+  5. **The command's data pointer is read from SQE bytes 24-31**
+     (the spec's PRP2 slot), not 16-23 (PRP1). Measured by planting
+     a distinct page in every PRP-candidate slot: the identify DMA
+     faulted at exactly the +24 plant's address (1024 IOMMU write
+     faults on its page) and ignored the +16 plant; the historical
+     "data lands at PA 0" was this bug writing the page at pointer 0
+     back when pass-through let it through (ADR-0014's era). The
+     driver now writes the pointer at BOTH slots — spec hardware
+     ignores PRP2 for single-page aligned buffers, so both worlds
+     work.
+  6. **The CC entry-size fields sit at bits 19:16 (IOSQES) and
+     23:20 (IOCQES)** in this QEMU, not the spec's 23:20/27:24.
+     Measured by QEMU's own trace — after a spec-layout
+     0x0064_0001 write, `pci_nvme_err_invalid_create_cq_entry_size
+     iosqes 4 iocqes 6`. The 2026-11-20 session had the RIGHT value
+     (0x0046_0001), "fixed" it into the spec layout chasing the
+     prp1 symptom, and unknowingly traded one SC=2 cause for
+     another. CC is now 0x0046_0001 again.
+  7. **The lane's nvme device needs `num_queues=N`** (default 0 —
+     no I/O queue pairs at all; `max_ioqpairs=64` is only a cap).
+     The boot lane now passes `num_queues=2`.
+
+  After all three: the Identify data page arrives (serial
+  "AEGISN1", VID 0x1b36), CreateIoCq + CreateIoSq pass, and a
+  512-byte LBA-0 read completes through the IOMMU — the lane greps
+  pin all of it. The no-IOMMU control experiment the old note
+  planned is unnecessary: the mechanism is fully identified.
 - **AHCI second command — SOLVED (ADR-0014)**. The historical reading
   ("stale FIS", "CI writes vanish") was wrong: the command table
   read-back showed the driver's bytes present in RAM all along, and

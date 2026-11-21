@@ -45,10 +45,16 @@ fn nvme_submit(bus: &BarMmio, db_off: u64, sq: u64, tail: &mut u16, cmd: &NvmeCm
     crate::memops::write_u64(e, 0);
     crate::memops::write_u32(e, cmd.opcode | (cmd.cid << 16)); // cdw0
     crate::memops::write_u32(e + 4, cmd.nsid);
-    // NOTE: prp1 as split u32 halves made no difference — the 8-byte
-    // store is not the cause (see the prp1 anomaly note in drivers.md).
+    // F11: QEMU 10.0's nvme reads the command's data pointer from SQE
+    // bytes 24-31, where the spec puts PRP2 — measured by planting a
+    // distinct page in every PRP-candidate slot: the identify DMA
+    // targeted the +24 plant and ignored the +24=0 original (the
+    // historical "data landed at PA 0" was this exact bug before the
+    // IOMMU existed to catch it). A spec-compliant controller ignores
+    // PRP2 for single-page aligned buffers, so writing the pointer at
+    // BOTH slots is correct here and safe on real hardware.
     crate::memops::write_u64(e + 16, cmd.prp1);
-    crate::memops::write_u64(e + 24, 0);
+    crate::memops::write_u64(e + 24, cmd.prp1);
     crate::memops::write_u32(e + 40, cmd.cdw10);
     crate::memops::write_u32(e + 44, cmd.cdw11);
     crate::memops::write_u32(e + 48, cmd.cdw12);
@@ -237,16 +243,20 @@ pub(crate) fn nvme_step<const N: usize>(
         session.close(out);
         return;
     }
-    // Admin queue pair (16 entries) + CC: EN | MPS=0 (4 KiB pages) |
-    // IOSQES=6 (64 B SQ entries, bits 20-23) | IOCQES=4 (16 B CQ
-    // entries, bits 16-19). 0x460001 had the two nibbles SWAPPED
-    // (IOSQES=4/IOCQES=6) and every executed command read prp1=0 —
-    // the data writes landed at PA 0 (measured: the serial bytes
-    // AEGI at PA 0).
+    // Admin queue pair (16 entries) + CC. F11's second half: THIS
+    // QEMU reads IOSQES from CC bits 19:16 and IOCQES from bits
+    // 23:20 — measured by QEMU's own
+    // pci_nvme_err_invalid_create_cq_entry_size(iosqes 4, iocqes 6)
+    // after a spec-layout 0x0064_0001 write. The NVMe 1.4 spec puts
+    // IOSQES at 23:20 / IOCQES at 27:24; the previous session read
+    // that layout, swapped the nibbles, and unknowingly traded one
+    // SC=2 cause (the PRP offset, fixed above) for another (these
+    // bits). 0x0046_0001 = EN | IOSQES=6 (64 B SQ) | IOCQES=4 (16 B
+    // CQ) in the layout this QEMU implements.
     if !(bus.write32(NVME_AQA, (15 << 16) | 15)
         && bus.write64(NVME_ASQ, asq)
         && bus.write64(NVME_ACQ, acq)
-        && bus.write32(NVME_CC, 0x0064_0001))
+        && bus.write32(NVME_CC, 0x0046_0001))
     {
         line(
             out,
