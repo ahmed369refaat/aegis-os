@@ -18,6 +18,11 @@
 //! `hw` MSR wrappers. The register map and every encoding are pure and
 //! host-tested; only `init`/`arm`/`eoi` touch the device.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only users (driver steps and their helpers), so items only
+// they use look dead there — they are used by the boot build.
+#![cfg_attr(test, allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 #[cfg(not(test))]
 use crate::hw;
 #[cfg(not(test))]

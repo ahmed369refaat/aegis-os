@@ -1,5 +1,11 @@
 //! virtio-net: RX/TX rings through the broker, the DHCP round trip.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use super::netutil;
 use crate::frames::FramePool;
 use crate::strutil;
@@ -25,7 +31,6 @@ struct NetQueue {
 }
 
 /// Publish head descriptor `desc_idx` on the queue's avail ring.
-#[cfg(not(test))]
 fn net_publish(q: &NetQueue, desc_idx: u16) -> u16 {
     use crate::virtio as v;
     let idx = v::read_u16_pa(q.avail_pa + 2);
@@ -539,3 +544,30 @@ pub(crate) fn net_step<const N: usize>(
 // ── the classic PC devices: screen (VBE on QEMU's std VGA), keyboard
 // (PS/2 i8042), clock (MC146818 RTC) — polling drivers, no DMA, so
 // the broker is not involved; the framebuffer is CPU-written MMIO ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The avail publish: the slot takes the descriptor index, the
+    /// ring's idx advances (free-running; the slot wraps modulo
+    /// qsize).
+    #[test]
+    fn net_publish_advances_the_avail_ring() {
+        use crate::virtio as v;
+        let phys = crate::drvstack::testharness::FakePhys::new(4);
+        let q = NetQueue {
+            qsize: 4,
+            notify_off: 0,
+            desc_pa: phys.pa(0),
+            avail_pa: phys.pa(4096),
+            used_pa: phys.pa(8192),
+        };
+        v::write_u16_pa(phys.pa(4096) + 2, 3); // idx at qsize-1
+        let next = net_publish(&q, 7);
+        assert_eq!(next, 4, "the idx is free-running");
+        // the slot went to 3 % 4 = 3 and holds desc 7
+        assert_eq!(crate::virtio::read_u16_pa(phys.pa(4096) + 4 + 2 * 3), 7);
+        assert_eq!(crate::virtio::read_u16_pa(phys.pa(4096) + 2), 4);
+    }
+}

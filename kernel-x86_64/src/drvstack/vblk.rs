@@ -1,5 +1,11 @@
 //! virtio-blk: the modern virtio handshake + queue rings through the broker.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use crate::frames::FramePool;
 use crate::strutil;
 use crate::strutil::line;
@@ -32,7 +38,6 @@ struct VblkQueue {
 /// the device reads (OUT) or writes (IN). The queue travels as an
 /// argument — no statics, no unsafe (the Phase-1 driver-domain model
 /// owns per-domain state when multiple devices exist).
-#[cfg(not(test))]
 fn submit(q: &VblkQueue, data_pa: u64, sector: u64, req_type: u32) -> u16 {
     use crate::virtio as v;
     v::write_blk_header(q.ctrl_pa, req_type, sector);
@@ -501,3 +506,88 @@ pub(crate) fn virtio_step<const N: usize>(
 
 // ── Phase 2: the virtio-net driver — same transport, two queues,
 // and a real DHCP round trip through slirp ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 3-descriptor request chain, pinned: header (device reads),
+    /// data (device writes for IN), status (device writes) — plus the
+    /// avail-ring publish and its modulo advance.
+    #[test]
+    fn submit_builds_the_three_descriptor_chain() {
+        use crate::virtio as v;
+        let phys = crate::drvstack::testharness::FakePhys::new(5);
+        let desc = phys.pa(0);
+        let avail = phys.pa(4096);
+        let ctrl = phys.pa(8192);
+        let data = phys.pa(12288);
+        let q = VblkQueue {
+            qsize: 8,
+            notify_off: 0,
+            desc_pa: desc,
+            avail_pa: avail,
+            used_pa: phys.pa(16384),
+            ctrl_pa: ctrl,
+            cookies: [0; 4],
+        };
+        let wrote = submit(&q, data, 4, v::BLK_T_IN);
+        // desc 0: the 16-byte header, NEXT, next=1
+        assert_eq!(crate::memops::read_u64(desc), ctrl);
+        assert_eq!(crate::virtio::read_u16_pa(desc + 8), 16);
+        assert_eq!(
+            u16::from(crate::virtio::read_u8_pa(desc + 12)),
+            u16::from(v::DESC_F_NEXT)
+        );
+        assert_eq!(crate::virtio::read_u8_pa(desc + 14), 1);
+        // desc 1: the 512-byte data page, NEXT|WRITE for IN, next=2
+        assert_eq!(crate::memops::read_u64(desc + 16), data);
+        assert_eq!(crate::virtio::read_u16_pa(desc + 16 + 8), 512);
+        assert_eq!(
+            u16::from(crate::virtio::read_u8_pa(desc + 16 + 12)),
+            u16::from(v::DESC_F_NEXT) | u16::from(v::DESC_F_WRITE)
+        );
+        assert_eq!(crate::virtio::read_u8_pa(desc + 16 + 14), 2);
+        // desc 2: the status byte, WRITE, last
+        assert_eq!(crate::memops::read_u64(desc + 32), ctrl + 512);
+        assert_eq!(crate::virtio::read_u16_pa(desc + 32 + 8), 1);
+        assert_eq!(
+            u16::from(crate::virtio::read_u8_pa(desc + 32 + 12)),
+            u16::from(v::DESC_F_WRITE)
+        );
+        assert_eq!(crate::virtio::read_u8_pa(desc + 32 + 14), 0);
+        // the avail ring: slot 0 holds desc 0, idx advanced
+        assert_eq!(crate::virtio::read_u16_pa(avail + 4), 0);
+        assert_eq!(crate::virtio::read_u16_pa(avail + 2), wrote);
+        // OUT flips the data descriptor's WRITE bit off
+        let _ = submit(&q, data, 4, 1 /* OUT */);
+        assert_eq!(
+            u16::from(crate::virtio::read_u8_pa(desc + 16 + 12)),
+            u16::from(v::DESC_F_NEXT),
+            "OUT: the device reads the data page"
+        );
+    }
+
+    /// The avail index wraps modulo the queue size.
+    #[test]
+    fn submit_wraps_the_avail_index() {
+        use crate::virtio as v;
+        let phys = crate::drvstack::testharness::FakePhys::new(5);
+        let q = VblkQueue {
+            qsize: 2,
+            notify_off: 0,
+            desc_pa: phys.pa(0),
+            avail_pa: phys.pa(4096),
+            used_pa: phys.pa(8192),
+            ctrl_pa: phys.pa(12288),
+            cookies: [0; 4],
+        };
+        // idx at qsize-1: the SLOT index wraps modulo qsize (the
+        // avail idx itself is free-running per the spec)
+        v::write_u16_pa(phys.pa(4096) + 2, 1);
+        let idx = submit(&q, phys.pa(16384), 0, v::BLK_T_IN);
+        assert_eq!(idx, 2, "the avail idx is free-running (1 + 1)");
+        // the slot write went to slot 1 % 2 = 1: avail[1] holds desc 0
+        assert_eq!(crate::virtio::read_u16_pa(phys.pa(4096) + 4 + 2 * 1), 0);
+    }
+}

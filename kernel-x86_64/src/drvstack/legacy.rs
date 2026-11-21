@@ -1,5 +1,11 @@
 //! The legacy devices: VBE framebuffer, the i8042 PS/2 keyboard, the MC146818 RTC.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use super::line;
 use crate::strutil;
 
@@ -7,6 +13,12 @@ use crate::strutil;
 const VBE_INDEX: u16 = 0x1CE;
 
 const VBE_DATA: u16 = 0x1CF;
+
+/// BCD decode (the MC146818's packed fields): 0x59 -> 59. Hostile
+/// nibbles (A-F) decode to their face value, never panic.
+fn bcd_decode(v: u8) -> u64 {
+    u64::from((v >> 4) & 0xF) * 10 + u64::from(v & 0xF)
+}
 
 #[cfg(not(test))]
 fn vbe_w(reg: u16, val: u16) {
@@ -244,7 +256,7 @@ pub(crate) fn rtc_step(out: &mut dyn FnMut(&str)) {
     while r(0x0A) & 0x80 != 0 && spins < 2_000_000 {
         spins += 1;
     }
-    let bcd = |v: u8| -> u64 { u64::from((v >> 4) & 0xF) * 10 + u64::from(v & 0xF) };
+    let bcd = bcd_decode;
     let (sec, min, hour) = (bcd(r(0x00)), bcd(r(0x02)), bcd(r(0x04) & 0x3F));
     let (day, mon) = (bcd(r(0x07)), bcd(r(0x08)));
     let (year, cent) = (bcd(r(0x09)), bcd(r(0x32)));
@@ -274,3 +286,21 @@ pub(crate) fn rtc_step(out: &mut dyn FnMut(&str)) {
 // full TX→slirp→RX network round trip virtio-net's QEMU-side TX
 // blocker could not exercise. Same broker discipline as everything
 // else: the descriptor rings and buffers are IOMMU-mapped frames ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bcd_decodes_the_mc146818_fields() {
+        assert_eq!(bcd_decode(0x00), 0);
+        assert_eq!(bcd_decode(0x09), 9);
+        assert_eq!(bcd_decode(0x59), 59);
+        assert_eq!(bcd_decode(0x20), 20); // 2026's tens digit
+                                          // hostile nibbles (the RTC's BCD mode with garbage) decode to
+                                          // their face value, never panic — the marker prints whatever
+                                          // comes out and the boot continues.
+        assert_eq!(bcd_decode(0xFF), 165);
+        assert_eq!(bcd_decode(0xA0), 100);
+    }
+}

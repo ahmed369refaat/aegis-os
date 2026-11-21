@@ -1,5 +1,11 @@
 //! PCI enumeration, BAR sizing, capability walk, and the claim gate.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use super::hw_code;
 use super::line;
 use crate::strutil;
@@ -12,6 +18,7 @@ use aegis_os::dmar::Dmar;
 /// virtio-blk: endpoint + not-bridge-class + IOMMU verdict + not
 /// RMRR-covered, then the broker's `assign_device`. On machines
 /// without the IOMMU the claim refuses — the negative proof.
+#[cfg(not(test))]
 pub(crate) fn pci_step(
     out: &mut dyn FnMut(&str),
     dmar: &Dmar,

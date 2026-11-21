@@ -1,5 +1,11 @@
 //! The e1000 NIC: descriptors through the broker + the DHCP round trip.
 
+// Host-test builds (round 5, Phase B) compile this module WITHOUT its
+// boot-only step functions, so their imports and helpers look unused
+// there — they are used by the boot build. The host tests drive the
+// pure logic that stays.
+#![cfg_attr(test, allow(unused_imports, unused_mut, dead_code))]
+
 use super::netutil;
 use crate::frames::FramePool;
 use crate::mmio::MmioBus;
@@ -36,6 +42,22 @@ const E1K_NDESC: u64 = 16;
 /// network round trip through the IOMMU (the e1000's MMIO-driven
 /// descriptor path is exactly what QEMU's virtio-net TX bottom-half
 /// declines to exercise on this lane).
+/// One legacy TX descriptor at `pa`: buffer address, length, and the
+/// EOP|IFCS|RS command byte. Pure PA writes (host-testable: memops is
+/// identity on host).
+fn build_tx_desc(pa: u64, addr: u64, len: u32) {
+    crate::memops::write_u64(pa, addr); // desc[0].buffer_addr
+    crate::memops::write_u32(pa + 8, len); // length
+    crate::memops::write_u32(pa + 12, 0); // cso/css/special
+    netutil::put8(pa + 11, 0x0B); // cmd: EOP | IFCS | RS
+}
+
+/// Is the RX descriptor at `pa` done? (the descriptor-done bit, byte
+/// 12 of the legacy RX descriptor).
+fn rx_desc_done(pa: u64) -> bool {
+    crate::virtio::read_u8_pa(pa + 12) & 1 != 0
+}
+
 #[cfg(not(test))]
 pub(crate) fn e1k_step<const N: usize>(
     k: &mut aegis_os::Kernel<N>,
@@ -265,10 +287,7 @@ pub(crate) fn e1k_step<const N: usize>(
 
     // Build + TX the DISCOVER.
     netutil::build_dhcp_discover_at(tx_buf, mac);
-    crate::memops::write_u64(tx_ring, tx_buf); // desc[0].buffer_addr
-    crate::memops::write_u32(tx_ring + 8, 290); // length
-    crate::memops::write_u32(tx_ring + 12, 0); // cso/css/special
-    netutil::put8(tx_ring + 11, 0x0B); // cmd: EOP | IFCS | RS
+    build_tx_desc(tx_ring, tx_buf, 290);
     if !bus.write32(E1K_TDT, 1) {
         line(
             out,
@@ -321,7 +340,7 @@ pub(crate) fn e1k_step<const N: usize>(
     while crate::virtio::read_u8_pa(rx_ring + 12) & 1 == 0 && spins < 3_000_000_000 {
         spins += 1;
     }
-    if crate::virtio::read_u8_pa(rx_ring + 12) & 1 == 0 {
+    if !rx_desc_done(rx_ring) {
         let (Some(rdh), Some(rdt), Some(rctl)) = (
             bus.read32(E1K_RDH),
             bus.read32(E1K_RDT),
@@ -644,4 +663,41 @@ pub(crate) fn e1k_cross_device_probe_step<const N: usize>(
     // probe domain released.
     let _ = broker.unmap_region(v_dom, view.cookie);
     let _ = pool.free(&mut k.frames, victim, crate::drvstack::VTD_TABLE_OWNER);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tx_descriptor_carries_addr_len_and_the_cmd_byte() {
+        let phys = crate::drvstack::testharness::FakePhys::new(1);
+        let pa = phys.pa(0);
+        build_tx_desc(pa, 0xABCD_0000, 290);
+        assert_eq!(crate::memops::read_u64(pa), 0xABCD_0000);
+        // the legacy layout: length u16 at bytes 8-9, the cmd byte at
+        // 11 (it overlaps the driver's u32 length store — faithful to
+        // the original code path)
+        assert_eq!(crate::virtio::read_u16_pa(pa + 8), 290);
+        assert_eq!(crate::virtio::read_u8_pa(pa + 11), 0x0B, "EOP|IFCS|RS");
+        assert_eq!(crate::memops::read_u32(pa + 12), 0, "cso/css/special zero");
+    }
+
+    #[test]
+    fn rx_done_is_the_descriptor_done_bit_only() {
+        let phys = crate::drvstack::testharness::FakePhys::new(1);
+        let pa = phys.pa(0);
+        crate::memops::write_u32(pa + 12, 0);
+        assert!(!rx_desc_done(pa));
+        crate::memops::write_u32(pa + 12, 1);
+        assert!(rx_desc_done(pa));
+        // hostile garbage in the NEIGHBORING fields (the descriptor's
+        // first 8 bytes, and bytes 16+) must not flip the DD bit
+        crate::memops::write_u64(pa, 0xFFFF_FFFF_FFFF_FFFF);
+        crate::memops::write_u64(pa + 16, 0xFFFF_FFFF_FFFF_FFFF);
+        assert!(rx_desc_done(pa), "only bit 0 of byte 12 is the DD bit");
+        // and clearing just that bit clears it
+        crate::memops::write_u32(pa + 12, 0xFFFF_FFFE);
+        assert!(!rx_desc_done(pa));
+    }
 }
