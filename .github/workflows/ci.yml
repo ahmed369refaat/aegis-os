@@ -137,6 +137,13 @@ jobs:
         run: |
           scripts/check-no-binaries.sh --self-test
           scripts/check-no-binaries.sh
+      - name: History scan (report-only until the HUMAN purge lands)
+        # Round 5, Phase C: scans every reachable blob for the incident
+        # classes. FAILS (report-only) while the core dump is still in
+        # history — the purge is a human step (docs/incident-core-dump.md).
+        # After the purge: change --report to --strict here so a
+        # recurrence fails the build.
+        run: scripts/check-history-clean.sh
 
   fmt:
     name: Formatting (rustfmt)
