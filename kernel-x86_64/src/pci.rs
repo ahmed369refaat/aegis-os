@@ -490,6 +490,20 @@ pub fn write_cfg32(dev: &PciDev, off: u8, v: u32) {
     crate::hw::outl(CFG_DATA_PORT, v);
 }
 
+/// Clear BUS-MASTER in the command register — the F2 (ADR-0015)
+/// poison path cuts the device's DMA at the source. A 16-bit COMMAND
+/// write only: the Status half of 0x04 is write-1-to-clear, so a
+/// 32-bit read-modify-write would silently eat pending error bits
+/// (F9 converts the enable path to the same discipline).
+#[cfg(not(test))]
+pub fn disable_bus_master(dev: &PciDev) {
+    // Dword read is harmless (Status bits are only cleared by WRITES);
+    // only the low word ever goes back out.
+    let cmd = read_cfg32(dev, 0x04) & 0xFFFF;
+    crate::hw::outl(CFG_ADDR_PORT, cfg_addr(dev.bus, dev.dev, dev.func, 0x04));
+    crate::hw::outw(CFG_DATA_PORT, (cmd & !0x4) as u16); // ~BME
+}
+
 /// Enable MEMORY-SPACE + BUS-MASTER in the command register (offset
 /// 0x04). THE cluster fix: without bit 2 QEMU parks the device's
 /// `bus_master_enable_region` disabled — every device DMA read

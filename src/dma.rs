@@ -121,6 +121,10 @@ pub enum DmaError {
     QuotaBytes,
     /// Broker region table exhausted.
     TableFull,
+    /// The arch layer's translation-table budget cannot cover the
+    /// mapping (ADR-0015 F1: refused atomically, before any entry is
+    /// written).
+    OutOfTables,
     /// The arch implementation refused (its own typed error surfaced
     /// by the kernel glue; opaque code here).
     Hardware(u8),
@@ -152,12 +156,21 @@ pub trait DmaProt {
     /// Map the contiguous run `[base, base+len)` into `dom`'s
     /// second-level tables (identity IOVA, ADR-0013 D4). Called only
     /// with broker-validated page-aligned, in-bounds runs.
+    ///
+    /// **Atomic (ADR-0015 F1):** on `Err` the tables are exactly as
+    /// they were — no SLPTE of this call survives, no table frame it
+    /// linked is ever handed out again, and the implementation's
+    /// accounting does not move. The reusable `contract` module (test
+    /// builds) pins the trait-observable half of this guarantee.
     fn map_run(&mut self, dom: u32, base: u64, len: u64, dir: DmaDir) -> Result<(), DmaError>;
 
     /// Unmap the run and invalidate; returns only after the hardware
     /// is quiesced (bounded waits are the implementation's contract,
-    /// ADR-0013 D4/D5). Frames return to the pool through
-    /// scrub-on-free on the kernel side.
+    /// ADR-0013 D4/D5). Unmapping a range that is (partially) absent
+    /// is `Ok` — idempotent cleanup the revoke paths rely on.
+    ///
+    /// A FAILED unmap leaves the mapping live in hardware: the caller
+    /// must quarantine the frames, never free them (ADR-0015 F2).
     fn unmap_run(&mut self, dom: u32, base: u64, len: u64) -> Result<(), DmaError>;
 }
 
@@ -177,6 +190,27 @@ impl Default for DmaQuotas {
             max_bytes: 4 * 1024 * 1024,
         }
     }
+}
+
+/// What a domain teardown produced (ADR-0015 F2). `revoked` regions
+/// are fully released. `poisoned` regions are ones whose hardware
+/// unmap FAILED: the mapping is still live, the frames must be
+/// quarantined (never freed, never re-allocated) and the device's bus
+/// mastering cleared, until `retry_poisoned` succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RevokeOutcome {
+    pub revoked: usize,
+    pub poisoned: usize,
+}
+
+/// A poisoned region, named for the KERNEL's quarantine bookkeeping
+/// (which frames to hold). Kernel-internal: driver domains never see
+/// addresses (ADR-0013 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoisonedRegion {
+    pub dom: u32,
+    pub base: u64,
+    pub len: u64,
 }
 
 /// One live region. Copy by design: bookkeeping only — the hardware
@@ -207,6 +241,9 @@ pub struct RegionView {
 pub struct DmaBroker<P: DmaProt> {
     prot: P,
     slots: [Option<Region>; MAX_DMA_REGIONS],
+    /// Regions whose hardware unmap failed (ADR-0015 F2): still live
+    /// in hardware, still holding their quota, never silently freed.
+    poisoned: [Option<Region>; MAX_DMA_REGIONS],
     next_cookie: u64,
     quotas: DmaQuotas,
 }
@@ -216,6 +253,7 @@ impl<P: DmaProt> DmaBroker<P> {
         DmaBroker {
             prot,
             slots: [None; MAX_DMA_REGIONS],
+            poisoned: [None; MAX_DMA_REGIONS],
             next_cookie: 1,
             quotas,
         }
@@ -250,12 +288,20 @@ impl<P: DmaProt> DmaBroker<P> {
     }
 
     fn live_regions_of(&self, dom: u32) -> usize {
-        self.slots.iter().flatten().filter(|r| r.dom == dom).count()
+        // Poisoned regions are still mapped in hardware (their unmap
+        // failed): they hold the quota until retry_poisoned succeeds.
+        self.slots
+            .iter()
+            .chain(self.poisoned.iter())
+            .flatten()
+            .filter(|r| r.dom == dom)
+            .count()
     }
 
     fn bytes_of(&self, dom: u32) -> u64 {
         self.slots
             .iter()
+            .chain(self.poisoned.iter())
             .flatten()
             .filter(|r| r.dom == dom)
             .map(|r| r.len)
@@ -329,12 +375,18 @@ impl<P: DmaProt> DmaBroker<P> {
     /// The driver reports device work on the region complete (the
     /// abort handshake's final step). Double-complete is a stale
     /// handle: fail closed.
-    pub fn region_complete(&mut self, cookie: u64) -> Result<(), DmaError> {
+    ///
+    /// F3 (ADR-0015): the cookie is DOMAIN-SCOPED — a cookie that
+    /// belongs to another domain returns the same `InvalidHandle` as
+    /// an unknown one, so a foreign domain can neither complete nor
+    /// PROBE another domain's regions. `dom` always comes from the
+    /// kernel, never from a driver.
+    pub fn region_complete(&mut self, dom: u32, cookie: u64) -> Result<(), DmaError> {
         let r = self
             .slots
             .iter_mut()
             .flatten()
-            .find(|r| r.cookie == cookie)
+            .find(|r| r.dom == dom && r.cookie == cookie)
             .ok_or(DmaError::InvalidHandle)?;
         if !r.in_flight {
             return Err(DmaError::InvalidHandle);
@@ -347,11 +399,17 @@ impl<P: DmaProt> DmaBroker<P> {
     /// then free the slot. Refuses while device work is in flight
     /// (`AbortRequired` — the driver must complete first, ADR-0013
     /// D6). The cookie dies forever.
-    pub fn unmap_region(&mut self, cookie: u64) -> Result<(), DmaError> {
+    ///
+    /// F3 (ADR-0015): the cookie is DOMAIN-SCOPED — a foreign cookie
+    /// is `InvalidHandle`, identical to an unknown one (no oracle).
+    pub fn unmap_region(&mut self, dom: u32, cookie: u64) -> Result<(), DmaError> {
         let slot = self
             .slots
             .iter()
-            .position(|s| s.as_ref().is_some_and(|r| r.cookie == cookie))
+            .position(|s| {
+                s.as_ref()
+                    .is_some_and(|r| r.dom == dom && r.cookie == cookie)
+            })
             .ok_or(DmaError::InvalidHandle)?;
         let r = self.slots[slot].expect("checked above");
         if r.in_flight {
@@ -363,18 +421,60 @@ impl<P: DmaProt> DmaBroker<P> {
     }
 
     /// Domain teardown / quarantine: unmap everything the domain
-    /// holds, handshake or not — the domain is dying and its frames
-    /// are being reclaimed (scrubbed by the pool on the kernel side).
-    /// Returns how many regions were revoked.
-    pub fn revoke_all(&mut self, dom: u32) -> usize {
-        let mut revoked = 0;
+    /// holds, handshake or not — the domain is dying. F2 (ADR-0015):
+    /// a region whose hardware unmap FAILS is **poisoned** — it moves
+    /// to the poison list (still live in hardware, still holding its
+    /// quota), its frames must be quarantined by the kernel and the
+    /// device's bus mastering cleared; `retry_poisoned` is the only
+    /// release path. Nothing a failed unmap covers is ever freed.
+    pub fn revoke_all(&mut self, dom: u32) -> RevokeOutcome {
+        let mut out = RevokeOutcome::default();
         for slot in self.slots.iter_mut() {
             if let Some(r) = slot.take_if(|r| r.dom == dom) {
-                let _ = self.prot.unmap_run(r.dom, r.base, r.len);
-                revoked += 1;
+                if self.prot.unmap_run(r.dom, r.base, r.len).is_ok() {
+                    out.revoked += 1;
+                } else {
+                    // The poison list has the same capacity as slots
+                    // and only fills from them: a grave is always free.
+                    if let Some(grave) = self.poisoned.iter_mut().find(|g| g.is_none()) {
+                        *grave = Some(r);
+                    }
+                    out.poisoned += 1;
+                }
             }
         }
-        revoked
+        out
+    }
+
+    /// Re-attempt the hardware unmap for every poisoned region (F2,
+    /// ADR-0015). On success the region finally leaves the poison
+    /// list — only then may the kernel release its frames from
+    /// quarantine (scrub-on-free). Returns how many were released and
+    /// how many remain poisoned.
+    pub fn retry_poisoned(&mut self) -> RevokeOutcome {
+        let mut out = RevokeOutcome::default();
+        for grave in self.poisoned.iter_mut() {
+            if let Some(r) = grave.as_ref() {
+                if self.prot.unmap_run(r.dom, r.base, r.len).is_ok() {
+                    *grave = None;
+                    out.revoked += 1;
+                } else {
+                    out.poisoned += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// The poisoned regions (kernel quarantine bookkeeping, F2).
+    /// Addresses are kernel-internal — driver domains never see them
+    /// (ADR-0013 D4).
+    pub fn poisoned_regions(&self) -> impl Iterator<Item = PoisonedRegion> + '_ {
+        self.poisoned.iter().flatten().map(|r| PoisonedRegion {
+            dom: r.dom,
+            base: r.base,
+            len: r.len,
+        })
     }
 
     /// Live region count for a domain (telemetry + tests).
@@ -419,6 +519,7 @@ pub enum DmaRefusal {
     QuotaRegions,
     QuotaBytes,
     TableFull,
+    OutOfTables,
     AbortRequired,
     InvalidCookie,
     Hardware,
@@ -434,6 +535,7 @@ impl From<DmaError> for DmaRefusal {
             DmaError::QuotaRegions => DmaRefusal::QuotaRegions,
             DmaError::QuotaBytes => DmaRefusal::QuotaBytes,
             DmaError::TableFull => DmaRefusal::TableFull,
+            DmaError::OutOfTables => DmaRefusal::OutOfTables,
             DmaError::AbortRequired => DmaRefusal::AbortRequired,
             DmaError::InvalidHandle => DmaRefusal::InvalidCookie,
             DmaError::Hardware(_) => DmaRefusal::Hardware,
@@ -537,6 +639,7 @@ impl DmaRefusal {
             DmaRefusal::QuotaRegions => 5,
             DmaRefusal::QuotaBytes => 6,
             DmaRefusal::TableFull => 7,
+            DmaRefusal::OutOfTables => 11,
             DmaRefusal::AbortRequired => 8,
             DmaRefusal::InvalidCookie => 9,
             DmaRefusal::Hardware => 10,
@@ -552,11 +655,51 @@ impl DmaRefusal {
             5 => Some(DmaRefusal::QuotaRegions),
             6 => Some(DmaRefusal::QuotaBytes),
             7 => Some(DmaRefusal::TableFull),
+            11 => Some(DmaRefusal::OutOfTables),
             8 => Some(DmaRefusal::AbortRequired),
             9 => Some(DmaRefusal::InvalidCookie),
             10 => Some(DmaRefusal::Hardware),
             _ => None,
         }
+    }
+}
+
+/// The `DmaProt` contract-test harness (ADR-0015 F1): the invariants
+/// every implementation must satisfy, checked through the trait
+/// surface alone. Run against the fake (dma tests) and against the
+/// real `Vtd` (kernel arch tests) — one harness, both worlds.
+#[cfg(any(test, feature = "dma-contract"))]
+pub mod contract {
+    use super::*;
+
+    /// Round trips are clean and repeatable; unmapping an absent
+    /// range is `Ok` (idempotent cleanup — the revoke paths rely on
+    /// it, and a failed map must not leave the range poisoned).
+    pub fn exercise(p: &mut dyn DmaProt, dom: u32, base: u64, len: u64) {
+        p.map_run(dom, base, len, DmaDir::Bidirectional)
+            .expect("map");
+        p.unmap_run(dom, base, len).expect("unmap after map");
+        p.unmap_run(dom, base, len)
+            .expect("unmap of an absent range is benign and idempotent");
+        p.map_run(dom, base, len, DmaDir::ToDevice)
+            .expect("remap after a clean unmap");
+        p.unmap_run(dom, base, len).expect("unmap after remap");
+    }
+
+    /// Atomicity (F1): after a FAILED map of `[base, base+len)` the
+    /// protection state must be indistinguishable from "never
+    /// mapped" — the cleanup unmap succeeds, is idempotent, and the
+    /// caller arranges the failure (an injected fake error or an
+    /// exhausted table budget).
+    pub fn exercise_atomicity(p: &mut dyn DmaProt, dom: u32, base: u64, len: u64) {
+        assert!(
+            p.map_run(dom, base, len, DmaDir::Bidirectional).is_err(),
+            "the caller arranged a failing map"
+        );
+        p.unmap_run(dom, base, len)
+            .expect("no residual mapping after a failed map (F1)");
+        p.unmap_run(dom, base, len)
+            .expect("cleanup unmap is idempotent");
     }
 }
 
@@ -749,8 +892,8 @@ mod tests {
         let c = b2.map_region(1, 0x11000, K, DmaDir::ToDevice);
         assert!(c.is_err(), "dom 1's byte budget is still spent");
         let cookie = 1; // dom 1's first region
-        b2.region_complete(cookie).unwrap();
-        b2.unmap_region(cookie).unwrap();
+        b2.region_complete(1, cookie).unwrap();
+        b2.unmap_region(1, cookie).unwrap();
         assert!(b2.map_region(1, 0x11000, K, DmaDir::ToDevice).is_ok());
     }
 
@@ -758,33 +901,35 @@ mod tests {
     fn abort_before_unmap_is_enforced() {
         let mut b = DmaBroker::new(FakeProt::available(48), DmaQuotas::default());
         let v = b.map_region(1, 0x1000, K, DmaDir::Bidirectional).unwrap();
-        assert_eq!(b.unmap_region(v.cookie), Err(DmaError::AbortRequired));
-        // The hardware mapping is untouched by the refusal.
+        assert_eq!(b.unmap_region(1, v.cookie), Err(DmaError::AbortRequired));
+        // A foreign domain's unmap of the same cookie: InvalidHandle
+        // (F3 — no oracle), and the hardware stays untouched.
+        assert_eq!(b.unmap_region(2, v.cookie), Err(DmaError::InvalidHandle));
         assert_eq!(b.prot().ops.len(), 1);
-        b.region_complete(v.cookie).unwrap();
+        b.region_complete(1, v.cookie).unwrap();
         // Double-complete fails closed.
-        assert_eq!(b.region_complete(v.cookie), Err(DmaError::InvalidHandle));
-        b.unmap_region(v.cookie).unwrap();
+        assert_eq!(b.region_complete(1, v.cookie), Err(DmaError::InvalidHandle));
+        b.unmap_region(1, v.cookie).unwrap();
         assert_eq!(
             b.prot().ops,
             vec![("map", 1, 0x1000, K), ("unmap", 1, 0x1000, K)]
         );
         // Unmap AFTER unmap: stale cookie.
-        assert_eq!(b.unmap_region(v.cookie), Err(DmaError::InvalidHandle));
+        assert_eq!(b.unmap_region(1, v.cookie), Err(DmaError::InvalidHandle));
     }
 
     #[test]
     fn cookies_are_never_reused_no_aba() {
         let mut b = DmaBroker::new(FakeProt::available(48), DmaQuotas::default());
         let a = b.map_region(1, 0x1000, K, DmaDir::ToDevice).unwrap();
-        b.region_complete(a.cookie).unwrap();
-        b.unmap_region(a.cookie).unwrap();
+        b.region_complete(1, a.cookie).unwrap();
+        b.unmap_region(1, a.cookie).unwrap();
         let c = b.map_region(1, 0x1000, K, DmaDir::ToDevice).unwrap();
         assert_ne!(a.cookie, c.cookie, "slot reuse never revives a cookie");
-        assert_eq!(b.region_complete(a.cookie), Err(DmaError::InvalidHandle));
-        assert_eq!(b.unmap_region(a.cookie), Err(DmaError::InvalidHandle));
+        assert_eq!(b.region_complete(1, a.cookie), Err(DmaError::InvalidHandle));
+        assert_eq!(b.unmap_region(1, a.cookie), Err(DmaError::InvalidHandle));
         // Complete on a stranger's cookie is refused.
-        assert_eq!(b.region_complete(9999), Err(DmaError::InvalidHandle));
+        assert_eq!(b.region_complete(1, 9999), Err(DmaError::InvalidHandle));
     }
 
     #[test]
@@ -822,8 +967,8 @@ mod tests {
             Err(DmaError::TableFull)
         );
         // Unmap one slot and the table serves again.
-        b.region_complete(1).unwrap();
-        b.unmap_region(1).unwrap();
+        b.region_complete(1, 1).unwrap();
+        b.unmap_region(1, 1).unwrap();
         assert!(b.map_region(2, 0x1000, K, DmaDir::ToDevice).is_ok());
     }
 
@@ -835,19 +980,135 @@ mod tests {
         let other = b.map_region(2, 0x11000, K, DmaDir::ToDevice).unwrap();
         // a is in flight; c is complete. Both must go: teardown skips
         // the handshake by design (the domain is dying).
-        b.region_complete(c.cookie).unwrap();
-        let n = b.revoke_all(1);
-        assert_eq!(n, 2);
+        b.region_complete(1, c.cookie).unwrap();
+        let out = b.revoke_all(1);
+        assert_eq!(
+            out,
+            RevokeOutcome {
+                revoked: 2,
+                poisoned: 0
+            }
+        );
         assert_eq!(b.live_regions(1), 0);
         assert_eq!(b.live_regions(2), 1, "other domains untouched");
         assert_eq!(b.prot().ops.iter().filter(|o| o.0 == "unmap").count(), 2);
         // Revoke on a domain with nothing is a clean zero.
-        assert_eq!(b.revoke_all(9), 0);
+        assert_eq!(b.revoke_all(9), RevokeOutcome::default());
         // The survivor still completes and unmaps normally.
-        b.region_complete(other.cookie).unwrap();
-        b.unmap_region(other.cookie).unwrap();
+        b.region_complete(2, other.cookie).unwrap();
+        b.unmap_region(2, other.cookie).unwrap();
         // And dom 1's cookies stayed monotonic across the teardown.
         assert!(a.cookie < c.cookie);
+    }
+
+    /// F2 (ADR-0015): a failed hardware unmap must NOT silently drop
+    /// the region and hand its frames back. Poisoned regions stay
+    /// recorded, hold their quota (the mapping is still live), are
+    /// enumerable for kernel quarantine, and only retry_poisoned — on
+    /// success — releases them.
+    #[test]
+    fn revoke_all_poisons_on_unmap_failure_and_retry_releases() {
+        let quotas = DmaQuotas {
+            max_regions: 2,
+            max_bytes: 8 * K,
+        };
+        let mut prot = FakeProt::available(48);
+        prot.fail_unmap = true;
+        let mut b = DmaBroker::new(prot, quotas);
+        let a = b.map_region(1, 0x1000, K, DmaDir::ToDevice).unwrap();
+        let c = b.map_region(1, 0x9000, K, DmaDir::ToDevice).unwrap();
+        assert_ne!(a.cookie, c.cookie);
+        let out = b.revoke_all(1);
+        assert_eq!(
+            out,
+            RevokeOutcome {
+                revoked: 0,
+                poisoned: 2
+            }
+        );
+        // Still live in hardware: the quota stays spent (no grants
+        // over device-reachable pages).
+        assert_eq!(b.live_regions(1), 2);
+        assert_eq!(b.bytes_used(1), 2 * K);
+        assert_eq!(
+            b.map_region(1, 0x11000, K, DmaDir::ToDevice),
+            Err(DmaError::QuotaRegions),
+            "poisoned regions hold their quota"
+        );
+        // Kernel quarantine bookkeeping can name them (addresses are
+        // kernel-internal, ADR-0013 D4).
+        assert!(b
+            .poisoned_regions()
+            .any(|p| p.dom == 1 && p.base == 0x1000 && p.len == K));
+        assert!(b
+            .poisoned_regions()
+            .any(|p| p.dom == 1 && p.base == 0x9000 && p.len == K));
+        // Other domains are unaffected by the poison.
+        assert!(b.map_region(2, 0x1000, K, DmaDir::ToDevice).is_ok());
+        // Retry while the hardware still fails: nothing is released.
+        assert_eq!(
+            b.retry_poisoned(),
+            RevokeOutcome {
+                revoked: 0,
+                poisoned: 2
+            }
+        );
+        assert_eq!(b.live_regions(1), 2);
+        // Hardware recovers: retry releases both, the quota frees, a
+        // fresh grant succeeds.
+        b.prot_mut().fail_unmap = false;
+        assert_eq!(
+            b.retry_poisoned(),
+            RevokeOutcome {
+                revoked: 2,
+                poisoned: 0
+            }
+        );
+        assert_eq!(b.live_regions(1), 0);
+        assert_eq!(b.poisoned_regions().count(), 0);
+        assert!(b.map_region(1, 0x11000, K, DmaDir::ToDevice).is_ok());
+    }
+
+    /// F3 (ADR-0015): cookies are domain-scoped. A foreign cookie
+    /// returns EXACTLY the unknown-cookie error — no way to probe,
+    /// complete, or unmap another domain's regions.
+    #[test]
+    fn cross_domain_cookies_are_not_an_oracle() {
+        let mut b = DmaBroker::new(FakeProt::available(48), DmaQuotas::default());
+        let v = b.map_region(1, 0x1000, K, DmaDir::Bidirectional).unwrap();
+        // Another domain, dom 1's cookie vs a nonsense cookie: the
+        // same InvalidHandle (error equality — no oracle).
+        assert_eq!(b.region_complete(2, v.cookie), b.region_complete(2, 9999));
+        assert_eq!(b.unmap_region(2, v.cookie), b.unmap_region(2, 9999));
+        assert_eq!(b.region_complete(2, v.cookie), Err(DmaError::InvalidHandle));
+        assert_eq!(b.unmap_region(2, v.cookie), Err(DmaError::InvalidHandle));
+        // The owner still has full control.
+        b.region_complete(1, v.cookie).unwrap();
+        // In-flight cleared for the OWNER only; a foreign unmap is
+        // still InvalidHandle, not AbortRequired (no state oracle).
+        assert_eq!(b.unmap_region(2, v.cookie), Err(DmaError::InvalidHandle));
+        b.unmap_region(1, v.cookie).unwrap();
+        // Stale after the owner's unmap: every domain sees the same.
+        assert_eq!(b.region_complete(1, v.cookie), Err(DmaError::InvalidHandle));
+        assert_eq!(b.unmap_region(1, v.cookie), Err(DmaError::InvalidHandle));
+        // Double-complete on the owner's own cookie: stale handle.
+        let w = b.map_region(1, 0x1000, K, DmaDir::ToDevice).unwrap();
+        b.region_complete(1, w.cookie).unwrap();
+        assert_eq!(b.region_complete(1, w.cookie), Err(DmaError::InvalidHandle));
+        assert_eq!(b.unmap_region(2, w.cookie), Err(DmaError::InvalidHandle));
+        b.unmap_region(1, w.cookie).unwrap();
+    }
+
+    /// The reusable DmaProt contract harness (ADR-0015 F1), run
+    /// against the fake here; the kernel arch tests run the same
+    /// harness against the real `Vtd`.
+    #[test]
+    fn fake_prot_satisfies_the_dma_contract() {
+        let mut prot = FakeProt::available(48);
+        contract::exercise(&mut prot, 1, 0x1000, K);
+        // Fail the NEXT map call (exercise consumed the first index).
+        prot.fail_map_on = Some(prot.map_calls);
+        contract::exercise_atomicity(&mut prot, 1, 0x1000, 2 * K);
     }
 
     #[test]
@@ -928,10 +1189,11 @@ mod tests {
         buf[0] = 1;
         buf[9] = 4;
         assert_eq!(DmaRequest::decode(&buf), Err(DmaError::BadTag(4)));
-        // Refused with a reason code that does not exist.
+        // Refused with a reason code that does not exist (11 is the
+        // live OutOfTables refusal since ADR-0015 — 12 is the void).
         buf[0] = 2;
-        buf[1] = 11;
-        assert_eq!(DmaReply::decode(&buf), Err(DmaError::BadTag(11)));
+        buf[1] = 12;
+        assert_eq!(DmaReply::decode(&buf), Err(DmaError::BadTag(12)));
     }
 
     #[test]
@@ -992,6 +1254,10 @@ mod tests {
         );
         assert_eq!(DmaRefusal::from(DmaError::TableFull), DmaRefusal::TableFull);
         assert_eq!(
+            DmaRefusal::from(DmaError::OutOfTables),
+            DmaRefusal::OutOfTables
+        );
+        assert_eq!(
             DmaRefusal::from(DmaError::AbortRequired),
             DmaRefusal::AbortRequired
         );
@@ -1048,15 +1314,15 @@ mod tests {
     fn slot_reuse_across_domains_keeps_cookies_monotonic() {
         let mut b = DmaBroker::new(FakeProt::available(48), DmaQuotas::default());
         let a = b.map_region(1, 0x1000, K, DmaDir::ToDevice).unwrap();
-        b.region_complete(a.cookie).unwrap();
-        b.unmap_region(a.cookie).unwrap();
+        b.region_complete(1, a.cookie).unwrap();
+        b.unmap_region(1, a.cookie).unwrap();
         // The freed slot serves ANOTHER domain, with a fresh cookie.
         let c = b.map_region(2, 0x9000, K, DmaDir::ToDevice).unwrap();
         assert_ne!(a.cookie, c.cookie);
-        assert_eq!(b.unmap_region(a.cookie), Err(DmaError::InvalidHandle));
+        assert_eq!(b.unmap_region(1, a.cookie), Err(DmaError::InvalidHandle));
         // And dom 2's region is completable by its own cookie.
-        b.region_complete(c.cookie).unwrap();
-        b.unmap_region(c.cookie).unwrap();
+        b.region_complete(2, c.cookie).unwrap();
+        b.unmap_region(2, c.cookie).unwrap();
     }
 
     #[test]
@@ -1071,7 +1337,13 @@ mod tests {
             b.map_region(1, 0x9000, K, DmaDir::ToDevice),
             Err(DmaError::QuotaRegions)
         );
-        assert_eq!(b.revoke_all(1), 1);
+        assert_eq!(
+            b.revoke_all(1),
+            RevokeOutcome {
+                revoked: 1,
+                poisoned: 0
+            }
+        );
         assert_eq!(
             b.map_region(1, 0x9000, K, DmaDir::ToDevice),
             Ok(RegionView { cookie: 2, len: K })
@@ -1086,12 +1358,15 @@ mod tests {
         // completes the release.
         let mut b = DmaBroker::new(FakeProt::available(48), DmaQuotas::default());
         let v = b.map_region(1, 0x1000, K, DmaDir::ToDevice).unwrap();
-        b.region_complete(v.cookie).unwrap();
+        b.region_complete(1, v.cookie).unwrap();
         b.prot_mut().fail_unmap = true;
-        assert_eq!(b.unmap_region(v.cookie), Err(DmaError::Hardware(9)));
+        assert_eq!(b.unmap_region(1, v.cookie), Err(DmaError::Hardware(9)));
         assert_eq!(b.live_regions(1), 1, "the region survives a failed unmap");
+        // The handle path keeps the region in its slot (retryable by
+        // the same cookie); only the revoke path poisons (F2).
+        assert_eq!(b.poisoned_regions().count(), 0);
         b.prot_mut().fail_unmap = false;
-        b.unmap_region(v.cookie).unwrap();
+        b.unmap_region(1, v.cookie).unwrap();
         assert_eq!(b.live_regions(1), 0);
     }
 
@@ -1107,8 +1382,8 @@ mod tests {
             b.map_region(1, 0x9000, K, DmaDir::ToDevice),
             Err(DmaError::Absent)
         );
-        b.region_complete(v.cookie).unwrap();
-        b.unmap_region(v.cookie).unwrap();
+        b.region_complete(1, v.cookie).unwrap();
+        b.unmap_region(1, v.cookie).unwrap();
         assert_eq!(b.live_regions(1), 0);
     }
 

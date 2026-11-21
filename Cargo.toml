@@ -12,6 +12,12 @@ path = "src/lib.rs"
 # Intentionally empty: core-only, no_std, zero supply-chain surface.
 [dependencies]
 
+# Test-only contract harness shared with the kernel's host tests
+# (ADR-0015 F1): the kernel's dev-dependency enables it; normal
+# builds — including the bare-metal kernel — never see it.
+[features]
+dma-contract = []
+
 # The bootable kernel lives in kernel-x86_64/ (path dependency, still zero
 # external crates). default-members keeps plain `cargo build`/`cargo test`
 # at the root scoped to the policy library.

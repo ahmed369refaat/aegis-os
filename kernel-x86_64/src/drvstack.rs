@@ -37,6 +37,67 @@ fn line(out: &mut dyn FnMut(&str), parts: &[&str]) {
 /// leak; the ledger says so).
 pub const VTD_TABLE_OWNER: u32 = 42;
 
+/// F2 (ADR-0015) teardown semantics, shared by every driver path:
+/// revoke the domain, print the byte-compatible happy-path marker,
+/// and on POISON fail closed — the device's bus mastering goes off,
+/// frames inside poisoned ranges are quarantined (QUARANTINE_OWNER,
+/// never freed while the device can still reach them) and only the
+/// clean frames return to the pool. Every teardown and refusal path
+/// goes through here, so no driver can hand a device-reachable page
+/// back to the allocator.
+#[allow(clippy::too_many_arguments)]
+fn revoke_or_quarantine<const N: usize>(
+    k: &mut aegis_os::Kernel<N>,
+    pool: &mut FramePool<N>,
+    out: &mut dyn FnMut(&str),
+    broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
+    owner: u32,
+    frames: &[u64],
+    dev: Option<&crate::pci::PciDev>,
+    marker: &str,
+) -> aegis_os::dma::RevokeOutcome {
+    let outcome = broker.revoke_all(0);
+    let mut nr = [0u8; 20];
+    line(
+        out,
+        &[
+            marker,
+            strutil::dec(outcome.revoked as u64, &mut nr),
+            " region(s) unmapped; frames return scrubbed",
+        ],
+    );
+    if outcome.poisoned > 0 {
+        if let Some(d) = dev {
+            crate::pci::disable_bus_master(d);
+        }
+        let mut np = [0u8; 20];
+        line(
+            out,
+            &[
+                marker,
+                " POISON: ",
+                strutil::dec(outcome.poisoned as u64, &mut np),
+                " region(s) still mapped in hardware — bus mastering off, frames QUARANTINED (ADR-0015 F2)",
+            ],
+        );
+        for &pa in frames {
+            let hit = broker
+                .poisoned_regions()
+                .any(|p| pa >= p.base && pa + 4096 <= p.base + p.len);
+            if hit {
+                let _ = pool.quarantine(pa, crate::frames::QUARANTINE_OWNER);
+            } else {
+                let _ = pool.free(&mut k.frames, pa, owner);
+            }
+        }
+    } else {
+        for &pa in frames {
+            let _ = pool.free(&mut k.frames, pa, owner);
+        }
+    }
+    outcome
+}
+
 /// The driver-stack entry point (kmain step 14): discover the
 /// firmware's DMA-remapping description, print the ADR-0013 marker
 /// set, and — when a DMAR exists — bring the real VT-d unit up
@@ -576,7 +637,7 @@ fn broker_step<const N: usize>(
     );
 
     // Abort-before-unmap: with work in flight the unmap must refuse.
-    match broker.unmap_region(view.cookie) {
+    match broker.unmap_region(0, view.cookie) {
         Err(DmaError::AbortRequired) => {
             line(
                 out,
@@ -602,9 +663,11 @@ fn broker_step<const N: usize>(
             return broker;
         }
     }
-    broker.region_complete(view.cookie).expect("fresh complete");
     broker
-        .unmap_region(view.cookie)
+        .region_complete(0, view.cookie)
+        .expect("fresh complete");
+    broker
+        .unmap_region(0, view.cookie)
         .expect("complete released the region");
     line(
         out,
@@ -658,10 +721,21 @@ fn broker_step<const N: usize>(
         out,
         &[
             "[IOMMU] broker: revoke_all(0) → ",
-            strutil::dec(revoked as u64, &mut n5),
+            strutil::dec(revoked.revoked as u64, &mut n5),
             " region(s) unmapped (teardown path)",
         ],
     );
+    if revoked.poisoned > 0 {
+        let mut n6 = [0u8; 20];
+        line(
+            out,
+            &[
+                "[IOMMU] broker: POISON: ",
+                strutil::dec(revoked.poisoned as u64, &mut n6),
+                " region(s) un-unmappable — quarantined (ADR-0015 F2)",
+            ],
+        );
+    }
 
     // The verdict line Phase 1's claim path gates on.
     line(out, &["[IOMMU] dma-drivers=1 (broker live over VT-d)"]);
@@ -1364,10 +1438,10 @@ fn virtio_step<const N: usize>(
     // SLPTE reads back absent (P=0) AND FSTS.PPF sets: the IOMMU
     // faulted the access to a page the broker unmapped.
     broker
-        .region_complete(cookies[4])
+        .region_complete(0, cookies[4])
         .expect("data region live");
     broker
-        .unmap_region(cookies[4])
+        .unmap_region(0, cookies[4])
         .expect("abort handshake done");
     let _ = pool.free(&mut k.frames, data_pa, VBLK_OWNER);
     // The tables' own verdict, read back from the walk the device must
@@ -1429,15 +1503,15 @@ fn virtio_step<const N: usize>(
     }
 
     // ── teardown: revoke the rest with the device still attached ──
-    let revoked = broker.revoke_all(0);
-    let mut nr = [0u8; 20];
-    line(
+    revoke_or_quarantine(
+        k,
+        pool,
         out,
-        &[
-            "[VBLK] teardown: broker revoke_all(0) → ",
-            strutil::dec(revoked as u64, &mut nr),
-            " region(s) unmapped; frames return scrubbed",
-        ],
+        broker,
+        VBLK_OWNER,
+        &frames,
+        Some(dev),
+        "[VBLK] teardown: broker revoke_all(0) → ",
     );
 }
 
@@ -1841,19 +1915,16 @@ fn net_step<const N: usize>(
             out,
             &["[VNET] TX: DISCOVER published+kicked (290 bytes, xid=0xa6515151) — QEMU did not consume it (open: TX bh)"],
         );
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
+        revoke_or_quarantine(
+            k,
+            pool,
             out,
-            &[
-                "[VNET] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
+            broker,
+            VNET_OWNER,
+            &frames,
+            Some(dev),
+            "[VNET] teardown: revoke_all(0) → ",
         );
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, VNET_OWNER);
-        }
         return;
     }
     line(
@@ -1933,19 +2004,16 @@ fn net_step<const N: usize>(
     }
 
     // ── teardown: revoke + scrub (the broker discipline) ──
-    let revoked = broker.revoke_all(0);
-    let mut nr = [0u8; 20];
-    line(
+    revoke_or_quarantine(
+        k,
+        pool,
         out,
-        &[
-            "[VNET] teardown: revoke_all(0) → ",
-            strutil::dec(revoked as u64, &mut nr),
-            " region(s) unmapped; frames return scrubbed",
-        ],
+        broker,
+        VNET_OWNER,
+        &frames,
+        Some(dev),
+        "[VNET] teardown: revoke_all(0) → ",
     );
-    for &pa in frames.iter() {
-        let _ = pool.free(&mut k.frames, pa, VNET_OWNER);
-    }
 }
 
 // ── the classic PC devices: screen (VBE on QEMU's std VGA), keyboard
@@ -2486,20 +2554,18 @@ fn e1k_step<const N: usize>(
                 &["[E1K] teardown (identity): frames freed, no broker regions"],
             );
         } else {
-            let revoked = broker.revoke_all(0);
-            let mut nr = [0u8; 20];
-            line(
+            revoke_or_quarantine(
+                k,
+                pool,
                 out,
-                &[
-                    "[E1K] teardown: revoke_all(0) → ",
-                    strutil::dec(revoked as u64, &mut nr),
-                    " region(s) unmapped; frames return scrubbed",
-                ],
+                broker,
+                E1K_OWNER,
+                &frames,
+                Some(dev),
+                "[E1K] teardown: revoke_all(0) → ",
             );
         }
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, E1K_OWNER);
-        }
+
         return;
     }
     line(
@@ -2555,15 +2621,15 @@ fn e1k_step<const N: usize>(
                 &["[E1K] teardown (identity): frames freed, no broker regions"],
             );
         } else {
-            let revoked = broker.revoke_all(0);
-            let mut nr = [0u8; 20];
-            line(
+            revoke_or_quarantine(
+                k,
+                pool,
                 out,
-                &[
-                    "[E1K] teardown: revoke_all(0) → ",
-                    strutil::dec(revoked as u64, &mut nr),
-                    " region(s) unmapped; frames return scrubbed",
-                ],
+                broker,
+                E1K_OWNER,
+                &frames,
+                Some(dev),
+                "[E1K] teardown: revoke_all(0) → ",
             );
         }
         for &pa in frames.iter() {
@@ -2642,20 +2708,22 @@ fn e1k_step<const N: usize>(
             out,
             &["[E1K] teardown (identity): frames freed, no broker regions"],
         );
+        for &pa in frames.iter() {
+            let _ = pool.free(&mut k.frames, pa, E1K_OWNER);
+        }
     } else {
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
+        // The helper owns frame freeing on the broker path — and on
+        // poison, quarantines them (ADR-0015 F2).
+        revoke_or_quarantine(
+            k,
+            pool,
             out,
-            &[
-                "[E1K] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
+            broker,
+            E1K_OWNER,
+            &frames,
+            Some(dev),
+            "[E1K] teardown: revoke_all(0) → ",
         );
-    }
-    for &pa in frames.iter() {
-        let _ = pool.free(&mut k.frames, pa, E1K_OWNER);
     }
 }
 
@@ -2828,11 +2896,16 @@ fn nvme_step<const N: usize>(
             out,
             &["[NVME] controller did not disable (CSTS.RDY stuck) — refusing"],
         );
-        let revoked = broker.revoke_all(0);
-        let _ = revoked;
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
-        }
+        revoke_or_quarantine(
+            k,
+            pool,
+            out,
+            broker,
+            NVME_OWNER,
+            &frames,
+            Some(dev),
+            "[NVME] teardown: revoke_all(0) → ",
+        );
         return;
     }
     // Admin queue pair (16 entries) + CC: EN | MPS=0 (4 KiB pages) |
@@ -2936,19 +3009,16 @@ fn nvme_step<const N: usize>(
                 }),
             ],
         );
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
+        revoke_or_quarantine(
+            k,
+            pool,
             out,
-            &[
-                "[NVME] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
+            broker,
+            NVME_OWNER,
+            &frames,
+            Some(dev),
+            "[NVME] teardown: revoke_all(0) → ",
         );
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
-        }
         return;
     };
     a_head = a_head.wrapping_add(1) & 15;
@@ -3042,19 +3112,16 @@ fn nvme_step<const N: usize>(
             ],
         );
         line(out, &["[NVME] CreateIoCq did not complete — refusing"]);
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
+        revoke_or_quarantine(
+            k,
+            pool,
             out,
-            &[
-                "[NVME] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
+            broker,
+            NVME_OWNER,
+            &frames,
+            Some(dev),
+            "[NVME] teardown: revoke_all(0) → ",
         );
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
-        }
         return;
     };
     a_head = a_head.wrapping_add(1) & 15;
@@ -3069,19 +3136,16 @@ fn nvme_step<const N: usize>(
                 " — refusing",
             ],
         );
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
+        revoke_or_quarantine(
+            k,
+            pool,
             out,
-            &[
-                "[NVME] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
+            broker,
+            NVME_OWNER,
+            &frames,
+            Some(dev),
+            "[NVME] teardown: revoke_all(0) → ",
         );
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
-        }
         return;
     }
     cid += 1;
@@ -3102,19 +3166,16 @@ fn nvme_step<const N: usize>(
     );
     let Some((_, st)) = nvme_poll(acq, a_head, 1, 10_000_000) else {
         line(out, &["[NVME] CreateIoSq did not complete — refusing"]);
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
+        revoke_or_quarantine(
+            k,
+            pool,
             out,
-            &[
-                "[NVME] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
+            broker,
+            NVME_OWNER,
+            &frames,
+            Some(dev),
+            "[NVME] teardown: revoke_all(0) → ",
         );
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
-        }
         return;
     };
     a_head = a_head.wrapping_add(1) & 15;
@@ -3129,19 +3190,16 @@ fn nvme_step<const N: usize>(
                 " — refusing",
             ],
         );
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
+        revoke_or_quarantine(
+            k,
+            pool,
             out,
-            &[
-                "[NVME] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
+            broker,
+            NVME_OWNER,
+            &frames,
+            Some(dev),
+            "[NVME] teardown: revoke_all(0) → ",
         );
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
-        }
         return;
     }
     line(out, &["[NVME] I/O qpair QID1 created (CQ+SQ)"]);
@@ -3165,19 +3223,16 @@ fn nvme_step<const N: usize>(
     );
     let Some((_, st)) = nvme_poll(iocq, 0, 1, 100_000_000) else {
         line(out, &["[NVME] read LBA0 did not complete — refusing"]);
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
+        revoke_or_quarantine(
+            k,
+            pool,
             out,
-            &[
-                "[NVME] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
+            broker,
+            NVME_OWNER,
+            &frames,
+            Some(dev),
+            "[NVME] teardown: revoke_all(0) → ",
         );
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
-        }
         return;
     };
     if st != 0 {
@@ -3190,19 +3245,16 @@ fn nvme_step<const N: usize>(
                 " — refusing",
             ],
         );
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
+        revoke_or_quarantine(
+            k,
+            pool,
             out,
-            &[
-                "[NVME] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
+            broker,
+            NVME_OWNER,
+            &frames,
+            Some(dev),
+            "[NVME] teardown: revoke_all(0) → ",
         );
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
-        }
         return;
     }
     let d0 = crate::memops::read_u64(data2);
@@ -3217,19 +3269,16 @@ fn nvme_step<const N: usize>(
     );
 
     // Teardown with the device live.
-    let revoked = broker.revoke_all(0);
-    let mut nr = [0u8; 20];
-    line(
+    revoke_or_quarantine(
+        k,
+        pool,
         out,
-        &[
-            "[NVME] teardown: revoke_all(0) → ",
-            strutil::dec(revoked as u64, &mut nr),
-            " region(s) unmapped; frames return scrubbed",
-        ],
+        broker,
+        NVME_OWNER,
+        &frames,
+        Some(dev),
+        "[NVME] teardown: revoke_all(0) → ",
     );
-    for &pa in frames.iter() {
-        let _ = pool.free(&mut k.frames, pa, NVME_OWNER);
-    }
 }
 
 // ── AHCI/SATA (checklist item 7): the q35's built-in ich9-ahci —
@@ -3399,20 +3448,22 @@ fn ahci_step<const N: usize>(
             out,
             &["[AHCI] teardown (identity): frames freed, no broker regions"],
         );
+        for &pa in frames.iter() {
+            let _ = pool.free(&mut k.frames, pa, AHCI_OWNER);
+        }
     } else {
-        let revoked = broker.revoke_all(0);
-        let mut nr = [0u8; 20];
-        line(
+        // The helper owns frame freeing on the broker path — and on
+        // poison, quarantines them (ADR-0015 F2).
+        revoke_or_quarantine(
+            k,
+            pool,
             out,
-            &[
-                "[AHCI] teardown: revoke_all(0) → ",
-                strutil::dec(revoked as u64, &mut nr),
-                " region(s) unmapped; frames return scrubbed",
-            ],
+            broker,
+            AHCI_OWNER,
+            &frames,
+            Some(dev),
+            "[AHCI] teardown: revoke_all(0) → ",
         );
-    }
-    for &pa in frames.iter() {
-        let _ = pool.free(&mut k.frames, pa, AHCI_OWNER);
     }
 }
 
@@ -3553,19 +3604,16 @@ fn xhci_step<const N: usize>(
             );
         }
     }
-    let revoked = broker.revoke_all(0);
-    let mut nr = [0u8; 20];
-    line(
+    revoke_or_quarantine(
+        k,
+        pool,
         out,
-        &[
-            "[XHCI] teardown: revoke_all(0) → ",
-            strutil::dec(revoked as u64, &mut nr),
-            " region(s) unmapped; frames return scrubbed",
-        ],
+        broker,
+        XHCI_OWNER,
+        &frames,
+        Some(dev),
+        "[XHCI] teardown: revoke_all(0) → ",
     );
-    for &pa in frames.iter() {
-        let _ = pool.free(&mut k.frames, pa, XHCI_OWNER);
-    }
 }
 
 // ── ACPI table completion (item 14) + HPET (item 15): walk the
@@ -4115,17 +4163,14 @@ fn xhci_cmdring_step<const N: usize>(
         ],
     );
     let _ = advanced;
-    let revoked = broker.revoke_all(0);
-    let mut nr = [0u8; 20];
-    line(
+    revoke_or_quarantine(
+        k,
+        pool,
         out,
-        &[
-            "[XTRB] teardown: revoke_all(0) → ",
-            strutil::dec(revoked as u64, &mut nr),
-            " region(s) unmapped; frames return scrubbed",
-        ],
+        broker,
+        XHCI_OWNER,
+        &frames,
+        Some(dev),
+        "[XTRB] teardown: revoke_all(0) → ",
     );
-    for &pa in frames.iter() {
-        let _ = pool.free(&mut k.frames, pa, XHCI_OWNER);
-    }
 }

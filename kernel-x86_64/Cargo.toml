@@ -21,3 +21,9 @@ preempt-demo = []
 # `aegis_os`): still zero external crates.
 [dependencies]
 aegis-os = { path = ".." }
+
+# Host tests only: pulls the shared DmaProt contract harness
+# (ADR-0015 F1) into the aegis-os build for THIS target profile
+# alone — the release kernel image builds without it.
+[dev-dependencies]
+aegis-os = { path = "..", features = ["dma-contract"] }

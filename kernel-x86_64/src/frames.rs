@@ -38,6 +38,12 @@ pub enum FrameError {
     Unaligned(u64),
 }
 
+/// F2 (ADR-0015): the quarantine owner — frames under it are never
+/// freed while the device that lost its IOMMU unmap can still reach
+/// them; only `retry_poisoned` success plus an explicit `free`
+/// releases them (scrub-on-free then applies as usual).
+pub const QUARANTINE_OWNER: u32 = 0x5AFE_F002;
+
 /// Per-frame ownership + the scrub primitive. The buddy allocator itself
 /// is passed in explicitly (it is the `Kernel.frames` field, so the pool
 /// and the syscall layer share one instance — "managed by the existing
@@ -108,6 +114,17 @@ impl<const N: usize> FramePool<N> {
         self.scrub_calls += 1;
         self.owner[f] = None;
         buddy.free(f).map_err(FrameError::Buddy)
+    }
+
+    /// F2 (ADR-0015): quarantine one frame — the ownership tag moves
+    /// to `owner` (QUARANTINE_OWNER); the frame does NOT return to the
+    /// buddy and is NOT scrubbed. Used for regions whose IOMMU unmap
+    /// failed: the device can still reach the page, so it must never
+    /// be handed to anyone else.
+    pub fn quarantine(&mut self, pa: u64, owner: u32) -> Result<(), FrameError> {
+        let f = self.frame_of(pa)?;
+        self.owner[f] = Some(owner);
+        Ok(())
     }
 
     /// Free (and scrub) every frame owned by `owner` — the domain destroy

@@ -493,6 +493,111 @@ fn slpt_unmap_page(slpt_root: u64, iova: u64) -> bool {
     true
 }
 
+/// F1 (ADR-0015): how many NEW table frames the run `[base,
+/// base+len)` needs, given the tree as it stands — a pure read-only
+/// simulation of the walk `slpt_map_page` performs. Distinct markers
+/// stand in for tables the run would create, so later pages in the
+/// same run walk THROUGH the simulation (a shared new PD is counted
+/// once, each of its PTs once). `None` means the run would need more
+/// tables than the whole budget (or the end overflows — the broker
+/// pre-validates; defense in depth): refuse before touching anything.
+fn tables_needed(slpt_root: u64, base: u64, len: u64) -> Option<usize> {
+    // Markers live in a range no real table PA can occupy (real
+    // frames are host addresses, far below 2^48).
+    const MARKER_BASE: u64 = 0xFFFF_FFFF_0000_0000;
+    // (entry key, marker) pairs; entry keys may be real entry
+    // addresses or marker-derived keys — the ranges cannot collide.
+    let mut created = [(0u64, 0u64); TABLE_BUDGET];
+    let mut n = 0usize;
+    let end = base.checked_add(len)?;
+    let mut pa = base;
+    while pa < end {
+        let mut table = slpt_root;
+        let mut sim = false; // inside a table this run would create
+        for level in (2..=4u8).rev() {
+            let key = table.wrapping_add(slpt_index(pa, level) * 8);
+            if sim {
+                if let Some(&(_, m)) = created[..n].iter().find(|(k, _)| *k == key) {
+                    table = m;
+                } else {
+                    if n >= TABLE_BUDGET {
+                        return None; // demand exceeds the whole budget
+                    }
+                    let m = MARKER_BASE.wrapping_add(n as u64);
+                    created[n] = (key, m);
+                    n += 1;
+                    table = m;
+                }
+            } else {
+                let entry = crate::memops::read_u64(key);
+                if entry & ENTRY_P != 0 {
+                    table = entry & ADDR_MASK;
+                } else {
+                    if n >= TABLE_BUDGET {
+                        return None; // demand exceeds the whole budget
+                    }
+                    let m = MARKER_BASE.wrapping_add(n as u64);
+                    created[n] = (key, m);
+                    n += 1;
+                    table = m;
+                    sim = true;
+                }
+            }
+        }
+        pa += PAGE_SIZE as u64;
+    }
+    Some(n)
+}
+
+/// F1 invariant (ADR-0015), pure: no table frame is referenced by two
+/// parents. Walks every domain's second-level tree, collecting each
+/// table node (the roots and every present non-leaf child); any
+/// repeated frame is the aliasing corruption mode — the pre-fix
+/// `map_run` rolled its cursor back on error and re-handed frames the
+/// failed attempt had already linked. Returns the first aliased frame
+/// on failure.
+#[cfg(test)]
+pub fn check_no_table_aliasing(vtd: &Vtd) -> Result<(), u64> {
+    // The forest cannot exceed the table budget: every node came from
+    // the same bounded arena.
+    let mut seen = [0u64; TABLE_BUDGET];
+    let mut n = 0usize;
+    for &root in vtd.dom_slpt.iter().flatten() {
+        collect_tables(root, 4, &mut seen, &mut n)?;
+    }
+    Ok(())
+}
+
+/// Depth-first table-forest collection for `check_no_table_aliasing`.
+/// Level 1 (the PT) is a table node; its entries are leaf SLPTEs and
+/// are not descended into.
+#[cfg(test)]
+fn collect_tables(
+    table: u64,
+    level: u8,
+    seen: &mut [u64; TABLE_BUDGET],
+    n: &mut usize,
+) -> Result<(), u64> {
+    if seen[..*n].contains(&table) {
+        return Err(table); // two parents, one frame
+    }
+    if *n >= TABLE_BUDGET {
+        return Err(table); // forest exceeds the budget: impossible
+    }
+    seen[*n] = table;
+    *n += 1;
+    if level <= 1 {
+        return Ok(());
+    }
+    for i in 0..512u64 {
+        let e = crate::memops::read_u64(table + i * 8);
+        if e & ENTRY_P != 0 {
+            collect_tables(e & ADDR_MASK, level - 1, seen, n)?;
+        }
+    }
+    Ok(())
+}
+
 impl Vtd {
     /// Enqueue one invalidation descriptor into the IQ frame (RAM
     /// writes + tail math only — the doorbell is target-only, so host
@@ -669,12 +774,29 @@ impl DmaProt for Vtd {
         // Identity IOVA (D4): the device-visible address IS the
         // physical address; writes per direction. The broker has
         // already bounds-checked base+len against the HAW.
+        //
+        // F1 (ADR-0015): map_run is ATOMIC — a refusal leaves the
+        // tables exactly as it found them. (1) The table demand is
+        // computed by a pure read-only walk and checked against the
+        // budget BEFORE anything is written; (2) the cursor commits
+        // every frame it linked on EVERY exit path, so a table frame
+        // is never handed to two parents; (3) any residual error
+        // rolls back every page this call wrote (clear + invalidate).
+        let needed = tables_needed(slpt, base, len).ok_or(DmaError::OutOfTables)?;
+        if self.table_cursor + needed > TABLE_BUDGET {
+            return Err(DmaError::OutOfTables);
+        }
         let write = matches!(dir, DmaDir::FromDevice | DmaDir::Bidirectional);
-        let tables = &self.tables;
+        let tables = self.tables;
         let mut cursor = self.table_cursor;
+        let end = base.checked_add(len).ok_or(DmaError::Overflow)?;
         let mut pa = base;
-        while pa < base + len {
+        let mut pages = 0u64;
+        while pa < end {
             let r = slpt_map_page(slpt, pa, pa, write, &mut || {
+                // The precheck above proved the budget covers the run;
+                // the guard stays for defense in depth (and keeps the
+                // rollback path exercised if the walks ever diverge).
                 if cursor >= TABLE_BUDGET {
                     None
                 } else {
@@ -683,11 +805,32 @@ impl DmaProt for Vtd {
                     Some(t)
                 }
             });
-            r.map_err(|_| DmaError::Hardware(3))?;
-            self.mapped_pages += 1;
+            if r.is_err() {
+                // Roll back the pages this call wrote, then one
+                // domain-wide invalidation so nothing caches them.
+                // Tables already linked STAY owned — the cursor
+                // commit below never re-hands them.
+                let mut q = base;
+                while q < pa {
+                    if slpt_unmap_page(slpt, q) {
+                        self.unmapped_pages += 1;
+                    }
+                    q += PAGE_SIZE as u64;
+                }
+                let desc = qi_desc_iotlb_domain((dom + 1) as u16);
+                self.qi_enqueue(&desc);
+                let inv = self.qi_kick_and_drain();
+                self.table_cursor = cursor;
+                return Err(match inv {
+                    Ok(()) => DmaError::Hardware(3), // the map failed
+                    Err(_) => DmaError::Hardware(4), // AND the invalidation
+                });
+            }
+            pages += 1;
             pa += PAGE_SIZE as u64;
         }
         self.table_cursor = cursor;
+        self.mapped_pages += pages;
         Ok(())
     }
 
@@ -1125,6 +1268,168 @@ mod tests {
         // The leaf keeps the direction: Bidirectional -> P|W.
         let leaf = crate::memops::read_u64(table + slpt_index(pa, 1) * 8);
         assert_eq!(leaf & 3, 3);
+    }
+
+    /// F1 (ADR-0015): `map_run` is atomic. A run that cannot fit the
+    /// remaining table budget must leave ZERO SLPTEs behind, must not
+    /// advance `mapped_pages`, and — the corruption mode — must never
+    /// let a later map re-hand a table frame the failed attempt
+    /// already linked into a tree (two parents, one frame).
+    #[test]
+    fn map_run_is_atomic_on_budget_exhaustion() {
+        let arena = Arena::new(TABLE_BUDGET);
+        let mut vtd = plan_vtd(&arena).unwrap();
+        vtd.assign_device(0, 0, 0, (0x03, 0)).unwrap();
+        let slpt = vtd.dom_slpt[0].unwrap();
+        let base = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        // Burn all but two table frames: every fresh 1 GiB stride
+        // costs exactly PD + PT (the low-address PML4/PDPT chain
+        // exists after the first map).
+        // Burn the budget down to EXACTLY two frames. A fresh 1 GiB
+        // region costs PD+PT (the first map also builds the PDPT
+        // chain); a fresh 2 MiB region inside a walked 1 GiB region
+        // costs exactly one PT — the fine-tuning step.
+        let mut strides = 0u64;
+        while TABLE_BUDGET - vtd.tables_used() > 3 {
+            vtd.map_run(0, base + (strides << 30), 4096, DmaDir::ToDevice)
+                .unwrap();
+            strides += 1;
+        }
+        let mut sub = 0u64;
+        while TABLE_BUDGET - vtd.tables_used() > 2 {
+            vtd.map_run(
+                0,
+                base + ((strides - 1) << 30) + (sub + 1) * 0x20_0000,
+                4096,
+                DmaDir::ToDevice,
+            )
+            .unwrap();
+            sub += 1;
+        }
+        assert_eq!(TABLE_BUDGET - vtd.tables_used(), 2);
+        let cursor_before = vtd.table_cursor;
+        let pages_before = vtd.mapped_pages();
+        // A run spanning TWO fresh 1 GiB regions needs 4 tables; only
+        // 2 remain. The refusal must touch nothing.
+        let run_base = base + ((strides as u64 + 1) << 30);
+        assert!(
+            vtd.map_run(0, run_base, 2 << 30, DmaDir::Bidirectional)
+                .is_err(),
+            "the run cannot fit the remaining budget"
+        );
+        for off in [0, 4096, 1 << 30, (1 << 30) + 4096] {
+            assert!(
+                vtd.slpte_of(slpt, run_base + off).is_none(),
+                "residual SLPTE at +{off} after a refused map (F1: map_run must be atomic)"
+            );
+        }
+        assert_eq!(
+            vtd.table_cursor, cursor_before,
+            "a refused map consumes no tables (F1)"
+        );
+        assert_eq!(
+            vtd.mapped_pages(),
+            pages_before,
+            "no page accounting for a refused map"
+        );
+        assert!(
+            check_no_table_aliasing(&vtd).is_ok(),
+            "aliasing after the refusal (F1)"
+        );
+        // And the follow-up map in a fresh region must not re-hand
+        // anything the failed attempt touched: with the pre-fix code
+        // the rolled-back cursor handed the linked frames out AGAIN —
+        // exactly what check_no_table_aliasing exists to catch.
+        let after = base + ((strides as u64 + 3) << 30);
+        vtd.map_run(0, after, 4096, DmaDir::ToDevice).unwrap();
+        assert!(vtd.slpte_of(slpt, after).is_some());
+        assert!(
+            check_no_table_aliasing(&vtd).is_ok(),
+            "a table frame was handed to two parents (F1 aliasing)"
+        );
+        assert_eq!(vtd.table_cursor, TABLE_BUDGET);
+    }
+
+    /// The reusable `DmaProt` contract harness (ADR-0015 F1) against
+    /// the REAL Vtd — the same invariants the fake is held to.
+    #[test]
+    fn dma_prot_contract_passes() {
+        let arena = Arena::new(TABLE_BUDGET);
+        let mut vtd = plan_vtd(&arena).unwrap();
+        vtd.assign_device(0, 0, 0, (0x03, 0)).unwrap();
+        let base = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        aegis_os::dma::contract::exercise(&mut vtd, 0, base, 4096);
+        // Atomicity arm: exhaust the whole table budget, then a run
+        // spanning fresh regions must refuse and leave nothing.
+        let mut strides = 0u64;
+        while TABLE_BUDGET - vtd.tables_used() > 3 {
+            vtd.map_run(0, base + (strides << 30), 4096, DmaDir::ToDevice)
+                .unwrap();
+            strides += 1;
+        }
+        let mut sub = 0u64;
+        while TABLE_BUDGET - vtd.tables_used() > 0 {
+            vtd.map_run(
+                0,
+                base + ((strides - 1) << 30) + (sub + 1) * 0x20_0000,
+                4096,
+                DmaDir::ToDevice,
+            )
+            .unwrap();
+            sub += 1;
+        }
+        let doomed = base + ((strides + 1) << 30);
+        aegis_os::dma::contract::exercise_atomicity(&mut vtd, 0, doomed, 2 << 30);
+        // And the forest stayed alias-free through all of it.
+        assert!(check_no_table_aliasing(&vtd).is_ok());
+    }
+
+    /// F1 (ADR-0015): deterministic property test — random map/unmap
+    /// sequences over a tiny table budget never panic, never leave a
+    /// residual SLPTE after a refusal, and never alias a table frame.
+    #[test]
+    fn xorshift_map_unmap_sequences_stay_atomic_and_unaliased() {
+        let arena = Arena::new(TABLE_BUDGET);
+        let mut vtd = plan_vtd(&arena).unwrap();
+        vtd.assign_device(0, 0, 0, (0x03, 0)).unwrap();
+        let slpt = vtd.dom_slpt[0].unwrap();
+        let base = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // 40 fresh 1 GiB regions x (PD+PT) exceeds the 64-frame
+        // budget partway through: refusals are guaranteed, not lucky.
+        for _ in 0..300 {
+            let r = next();
+            let pa = base + ((r % 40) << 30) + ((r >> 8) % 512) * 4096;
+            let pages = (r >> 20) % 4 + 1; // 1..=4 pages, may cross a 2 MiB edge
+            match vtd.map_run(0, pa, pages * 4096, DmaDir::Bidirectional) {
+                Ok(()) => {
+                    assert!(vtd.slpte_of(slpt, pa).is_some(), "mapped head present");
+                }
+                Err(_) => {
+                    for k in 0..pages {
+                        assert!(
+                            vtd.slpte_of(slpt, pa + k * 4096).is_none(),
+                            "residual SLPTE at +{} after a refused map (F1)",
+                            k * 4096
+                        );
+                    }
+                }
+            }
+            assert!(
+                check_no_table_aliasing(&vtd).is_ok(),
+                "table aliasing mid-sequence (F1)"
+            );
+            if next() & 1 == 0 {
+                let _ = vtd.unmap_run(0, pa, pages * 4096);
+                assert!(check_no_table_aliasing(&vtd).is_ok());
+            }
+        }
     }
 
     #[test]

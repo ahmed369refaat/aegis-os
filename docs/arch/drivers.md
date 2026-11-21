@@ -185,6 +185,22 @@ Re-measured, before → after (all on the q35 lane unless noted):
   next-experiment is obsolete (there is no fast path anymore). Still
   open; the no-IOMMU control remains the next experiment.
 
+### ADR-0015 (2026-11-21): IOMMU integrity — atomic map_run, poisoned-region quarantine, domain-scoped cookies
+
+Review round 4 Phase 2 (F1–F3), all host-tested plus live on the
+lanes: `map_run` refuses atomically (pure `tables_needed` precompute +
+rollback + always-committed cursor — no residual SLPTEs, no table
+frame under two parents, pinned by a 300-step xorshift property test
+and the shared `dma::contract` harness run against the fake AND the
+real Vtd); `revoke_all` returns `{revoked, poisoned}` with poisoned
+regions never freed (FramePool `QUARANTINE_OWNER`, BME off via the
+new 16-bit `pci::disable_bus_master`, `retry_poisoned()` the only
+release — one `revoke_or_quarantine` helper now serves all 19 teardown
+and refusal sites, which also fixed the VBLK teardown frame leak and
+its untruthful marker); cookies are domain-scoped with foreign cookies
+indistinguishable from unknown ones. The happy-path lane markers are
+byte-identical; poison lines appear only when they occur.
+
 ### xHCI TRB: the No-Op command completes end-to-end
 
 `xhci_cmdring_step` re-brings the controller up, programs an event

@@ -4,6 +4,35 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Fixed — driver-stack review round 4, Phase 2 (ADR-0015): IOMMU integrity
+
+- **F1 — `map_run` is atomic** (a `DmaProt` contract guarantee now):
+  the table demand is precomputed by a pure read-only walk and checked
+  against the budget BEFORE anything is written; the table cursor
+  commits every linked frame on every exit path (a table frame is
+  never handed to two parents); residual errors roll back every page
+  the call wrote. Pinned by `map_run_is_atomic_on_budget_exhaustion`
+  (red on the pre-fix code), a 300-step xorshift property test, the
+  pure `check_no_table_aliasing` walk, and a reusable
+  `dma::contract` harness run against BOTH the fake and the real Vtd.
+- **F2 — revoke fails closed**: `revoke_all` returns
+  `{revoked, poisoned}`; a region whose hardware unmap failed is
+  poisoned (still live in hardware, still holding its quota,
+  enumerable for kernel quarantine), its frames are re-tagged under a
+  `QUARANTINE_OWNER` in the FramePool and never freed, the device's
+  bus mastering is cut (new `pci::disable_bus_master`, a 16-bit
+  command write that never echoes the RW1C Status half), and
+  `retry_poisoned()` is the only release path. All 19 drvstack
+  teardown/refusal sites route through one `revoke_or_quarantine`
+  helper (this also fixes the VBLK teardown frame leak and its lying
+  "frames return scrubbed" marker).
+- **F3 — cookies are domain-scoped**:
+  `region_complete(dom, cookie)` / `unmap_region(dom, cookie)`; a
+  foreign cookie returns the same `InvalidHandle` as an unknown one
+  (no oracle), and the domain id always comes from the kernel.
+- Typed `DmaError::OutOfTables` (+ wire refusal 11) for the atomic
+  budget refusal.
+
 ### Fixed — driver-stack review round 4, Phase 0 + Phase 1 (ADR-0014)
 
 - **P0.1**: the 8 MiB ELF core dump committed as `kernel-x86_64/core`
