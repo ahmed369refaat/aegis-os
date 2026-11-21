@@ -56,6 +56,7 @@ pub mod boot;
 // runs on the host against the testharness fakes; the boot-only step
 // functions stay #[cfg(not(test))] inside their modules.
 pub mod drvstack;
+pub mod ipc_mmio;
 #[cfg(not(test))]
 pub mod kmain;
 pub mod mm;

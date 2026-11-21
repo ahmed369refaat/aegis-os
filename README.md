@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml/badge.svg)](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests: 498](https://img.shields.io/badge/tests-498%20passing-brightgreen.svg)](tests/)
+[![Tests: 502](https://img.shields.io/badge/tests-502%20passing-brightgreen.svg)](tests/)
 [![Boot](https://img.shields.io/badge/boots%20in%20QEMU-ring--3%20isolation%20live%20%F0%9F%9F%A2-brightgreen.svg)](#quick-start)
 
 > The name: **Aegis** (the shield). One rule shapes the whole design: everything runs inside an isolated `Domain`, and every privilege is granted once and can only ever shrink.
@@ -34,7 +34,7 @@
 ./boot.sh --verify  # same, plus assert the M1 + exception-selftest markers
 
 cargo test                       # 309 policy-core tests
-cargo test -p aegis-kernel       # 189 host tests: boot + arch/mm/gate/ring-3 encodings
+cargo test -p aegis-kernel       # 193 host tests: boot + arch/mm/gate/ring-3 encodings
 cargo build --target thumbv7em-none-eabihf   # the core still builds for bare-metal ARM
 ```
 
