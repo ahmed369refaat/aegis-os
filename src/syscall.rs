@@ -59,6 +59,10 @@ pub const SYS_WAIT: u8 = 20;
 pub const SYS_NANOSLEEP: u8 = 21;
 /// Volunteer the rest of the current slice (sched_yield(2)-like).
 pub const SYS_SCHED_YIELD: u8 = 22;
+/// Read a clock (clock_gettime(2)-like; ADR-0023 — the GATE lives in
+/// the core, the execution is kernel-side math over the calibrated
+/// TSC: the core has no clock of its own).
+pub const SYS_CLOCK_GETTIME: u8 = 23;
 /// Reserved: domain exit. Always reachable; a mask without it is rejected
 /// by convention (see `profile` tests).
 pub const SYS_EXIT: u8 = 63;

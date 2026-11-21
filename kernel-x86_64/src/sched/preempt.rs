@@ -35,6 +35,15 @@ use crate::strutil;
 use aegis_os::preempt::{Preemptor, TickDecision};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// ADR-0023 D7: the guarded quiescent state. True only around the
+/// idle `sti; hlt` — the ONE place the kernel runs with interrupts
+/// on at CPL0, and the only CPL0 frame shape the tick handler lets
+/// through (after the masked/stale-IRR check).
+static IDLE: AtomicBool = AtomicBool::new(false);
+/// How many hlt-wake cycles the idle state has served (kmain's
+/// sleep-proof marker).
+static IDLE_HLTS: AtomicU64 = AtomicU64::new(0);
+
 /// One timer tick in TSC cycles (TSC-deadline mode): ~10 ms at a
 /// 2.5 GHz reference TSC. Only cadence — never correctness — depends
 /// on this; the monitor windows carry their own clock. This is the
@@ -125,6 +134,15 @@ pub fn on_timer_tick(frame: &mut ExceptionFrame) {
         if lapic::timer_masked() {
             return;
         }
+        // ADR-0023 D7: the idle loop's hlt — the one legal CPL0 tick.
+        // Acknowledge (EOI above), re-arm (above), run the wake pass
+        // (sleepers wake inside Kernel::tick), and return to the hlt.
+        if IDLE.load(Ordering::SeqCst) {
+            if let Some(k) = context::kernel_mut() {
+                k.tick(hw::read_tsc());
+            }
+            return;
+        }
         serial::write_str("[IRQ ] KERNEL BUG: timer tick from CPL0 — halting\n");
         hw::halt_forever();
     }
@@ -205,6 +223,38 @@ pub fn switches() -> u64 {
 /// next runnable domain, if any (kmain's handover path).
 pub fn on_exit(sched: &mut aegis_os::sched::Scheduler, exited: u32) -> Option<u32> {
     PREEMPTOR.on_exit(sched, exited)
+}
+
+/// Is the kernel in the guarded idle state right now? (The tick
+/// handler's CPL0 carve-out asks.)
+#[must_use]
+pub fn is_idle() -> bool {
+    IDLE.load(Ordering::SeqCst)
+}
+
+/// How many hlt-wake cycles the idle state served.
+#[must_use]
+pub fn idle_hlts() -> u64 {
+    IDLE_HLTS.load(Ordering::SeqCst)
+}
+
+/// ADR-0023 D7: the guarded quiescent state — flag, sti, hlt, cli,
+/// unflag. The tick that wakes the hlt runs the handler's idle
+/// branch (acknowledge, re-arm, `Kernel::tick` — sleeper wakes land
+/// there) and returns here; the caller then re-picks.
+pub fn idle_hlt() {
+    IDLE.store(true, Ordering::SeqCst);
+    hw::sti();
+    hw::hlt_once();
+    hw::cli();
+    IDLE.store(false, Ordering::SeqCst);
+    IDLE_HLTS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// ADR-0023 D3: the yield decision against the one scheduler (the
+/// syscall path's entry into the host-tested `Preemptor::on_yield`).
+pub fn yield_decision(sched: &mut aegis_os::sched::Scheduler, current: u32) -> Option<u32> {
+    PREEMPTOR.on_yield(sched, current)
 }
 
 /// Pause the timer (mask the LVT entry): ADR-0019's bounded delivery

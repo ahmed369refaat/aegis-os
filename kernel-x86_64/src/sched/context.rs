@@ -369,6 +369,62 @@ mod entry {
     /// The active run, or `None` between runs.
     static mut USER_RUN: Option<UserRun> = None;
 
+    /// ADR-0023: a snapshot of the kernel resume chain — the resume
+    /// point plus the parked callee-saved registers. A NESTED
+    /// dispatcher (sched/park.rs: the yield/sleep paths) overwrites
+    /// all eight slots with every `resume_parked`; when its run set
+    /// empties it restores the chain so `resume_kernel` lands back in
+    /// the OUTER launch (kmain), exactly as a flat kmain-only boot
+    /// would. Single CPU, no nesting beyond one level (the park paths
+    /// run only from the one in-flight syscall).
+    #[derive(Clone, Copy)]
+    pub struct ResumeChain {
+        rsp: u64,
+        rip: u64,
+        rbx: u64,
+        rbp: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+    }
+
+    /// Snapshot the current resume chain (see `ResumeChain`).
+    ///
+    /// SAFETY: single CPU; plain reads of the eight statics.
+    pub fn save_resume_chain() -> ResumeChain {
+        // SAFETY: no concurrent writer (single CPU, IF=0 on this path).
+        unsafe {
+            ResumeChain {
+                rsp: RESUME_RSP,
+                rip: RESUME_RIP,
+                rbx: PARK_RBX,
+                rbp: PARK_RBP,
+                r12: PARK_R12,
+                r13: PARK_R13,
+                r14: PARK_R14,
+                r15: PARK_R15,
+            }
+        }
+    }
+
+    /// Restore a saved resume chain (see `ResumeChain`).
+    ///
+    /// SAFETY: single CPU; plain writes of the eight statics.
+    pub fn restore_resume_chain(chain: &ResumeChain) {
+        // SAFETY: no concurrent writer (single CPU, IF=0 on this path).
+        unsafe {
+            RESUME_RSP = chain.rsp;
+            RESUME_RIP = chain.rip;
+            PARK_RBX = chain.rbx;
+            PARK_RBP = chain.rbp;
+            PARK_R12 = chain.r12;
+            PARK_R13 = chain.r13;
+            PARK_R14 = chain.r14;
+            PARK_R15 = chain.r15;
+        }
+    }
+
     /// N2 (ADR-0007 §2): the live lib Kernel, set once by kmain before
     /// the first ring-3 launch. The ring-3 syscall path gates through
     /// it (stats, denials, Tighten/Quarantine apply to the very next
@@ -810,6 +866,13 @@ mod entry {
         );
     }
 }
+
+/// ADR-0023: re-export of the entry-mod resume-chain API (the
+/// nested dispatcher in sched/park.rs saves/restores the launch
+/// point around its resume_parked calls). Boot-only like the module
+/// it re-exports.
+#[cfg(not(test))]
+pub use entry::{restore_resume_chain, save_resume_chain, ResumeChain};
 
 #[cfg(not(test))]
 pub use entry::{

@@ -40,7 +40,10 @@ pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
 /// active run — a CPL0 fault *before* this is the documented
 /// launch-relay limitation; after it, a CPL0 fault is a kernel bug.
 pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
-use aegis_os::syscall::{gate, SYSCALL_COUNT, SYS_EXIT, SYS_WRITE};
+use aegis_os::sys::{SysRequest, SysValue};
+use aegis_os::syscall::{
+    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_WRITE,
+};
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
 pub const EPERM: i64 = 1;
@@ -53,6 +56,21 @@ pub const ENOSYS: i64 = 38;
 /// Longest SYS_WRITE the kernel will service in one call (bounds the
 /// copy loop; user code wanting more loops itself).
 pub const MAX_WRITE: usize = 256;
+
+/// ADR-0023: the Linux-ABI numbers of the time family map onto the
+/// core's internal ids (the numbers below 64 that coincide with Linux
+/// — read/write/open/close — pass through unchanged; the full
+/// renumbering table is Phase 5's ABI-VERSION v0.4). Translation
+/// BEFORE normalization: clock_gettime's 228 must not die in the
+/// bounds check.
+pub fn linux_to_core(nr: u64) -> u64 {
+    match nr {
+        24 => SYS_SCHED_YIELD as u64,    // sched_yield(2)
+        35 => SYS_NANOSLEEP as u64,      // nanosleep(2)
+        228 => SYS_CLOCK_GETTIME as u64, // clock_gettime(2)
+        n => n,
+    }
+}
 
 /// Normalize the raw RAX syscall number: `None` for anything outside
 /// `0..SYSCALL_COUNT` — **checked on the full u64 before any cast**, so
@@ -132,6 +150,9 @@ mod exec {
     /// value RAX carries back to ring-3.
     pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 {
         SYSCALLS_SERVED.store(true, Ordering::SeqCst);
+        // ADR-0023: translate the Linux ABI numbers first (identity
+        // for everything that already coincides).
+        let nr = linux_to_core(nr);
         let run = context::current();
 
         // Full-width bounds check first (see `normalize_nr`), then the
@@ -177,6 +198,9 @@ mod exec {
                 context::resume_kernel();
             }
             Decision::Allowed if nr8 == SYS_WRITE => sys_write(run, a1, a2, a3),
+            Decision::Allowed if nr8 == SYS_SCHED_YIELD => sys_sched_yield(run),
+            Decision::Allowed if nr8 == SYS_NANOSLEEP => sys_nanosleep(run, a1),
+            Decision::Allowed if nr8 == SYS_CLOCK_GETTIME => sys_clock_gettime(run, a1, a2),
             // Round J: the file family runs on the LIVE lib kernel —
             // marshaled through sysabi, executed by `Kernel::execute`.
             Decision::Allowed if sysabi::FILE_FAMILY.contains(&nr8) => {
@@ -340,6 +364,101 @@ mod exec {
                 Err(-EFAULT)
             }
         }
+    }
+
+    /// sched_yield(2) — ADR-0023 D3: charge the slice, then either
+    /// park-and-switch (the fair pick exists) or return 0 (solo).
+    fn sys_sched_yield(run: &mut crate::sched::context::UserRun) -> u64 {
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        match crate::sched::preempt::yield_decision(&mut k.sched, run.domain) {
+            Some(_) => crate::sched::park::park_current_from_syscall(0),
+            None => 0,
+        }
+    }
+
+    /// nanosleep(2) — ADR-0023: read the timespec ONCE (page-checked,
+    /// under the SMAP window), convert through THE calibrated clock
+    /// (the same number the tick rides), register the sleep in the
+    /// core, then park the run; the idle state covers the
+    /// nothing-else-runnable case. The parked copy resumes with RAX=0
+    /// — the syscall "returns" when the sleeper wakes.
+    fn sys_nanosleep(run: &mut crate::sched::context::UserRun, req: u64) -> u64 {
+        if !validate_user_range(run, req, 16, 16) {
+            let _ = context::kernel_mut().map(|k| k.report_fault(run.domain));
+            return (-EFAULT) as u64;
+        }
+        let mut ts = [0u8; 16];
+        IN_USER_COPY.store(true, Ordering::SeqCst);
+        if crate::hw::smap_active() {
+            crate::hw::stac();
+        }
+        for (off, b) in ts.iter_mut().enumerate() {
+            *b = memops::read_u8_va(req + off as u64);
+        }
+        if crate::hw::smap_active() {
+            crate::hw::clac();
+        }
+        IN_USER_COPY.store(false, Ordering::SeqCst);
+        let Some((sec, nsec)) = crate::clock::parse_timespec(&ts) else {
+            return (-EINVAL) as u64;
+        };
+        let Some(ns) = crate::clock::timespec_to_ns(sec, nsec) else {
+            return (-EINVAL) as u64;
+        };
+        if ns == 0 {
+            // A zero sleep is a plain yield without the queue dance.
+            return 0;
+        }
+        let Some(cycles) = crate::clock::ns_to_cycles(ns) else {
+            return (-EINVAL) as u64;
+        };
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        match k.execute(
+            run.domain,
+            SysRequest::Nanosleep {
+                now: crate::hw::read_tsc(),
+                cycles,
+            },
+        ) {
+            Ok(SysValue::Count(_)) => crate::sched::park::park_current_from_syscall(0),
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// clock_gettime(2) — ADR-0023 D4: CLOCK_MONOTONIC and
+    /// CLOCK_REALTIME (equal: no RTC wiring yet — documented, not
+    /// faked), computed from the calibrated TSC, copied out
+    /// byte-exact through the page-checked write window.
+    fn sys_clock_gettime(run: &mut crate::sched::context::UserRun, clk: u64, ts: u64) -> u64 {
+        use crate::mm::user_range::copy_out_bytes;
+        if clk > 1 {
+            return (-EINVAL) as u64;
+        }
+        if !validate_user_range(run, ts, 16, 16) {
+            let _ = context::kernel_mut().map(|k| k.report_fault(run.domain));
+            return (-EFAULT) as u64;
+        }
+        let ns = crate::clock::now_ns();
+        let sec = (ns / 1_000_000_000u128) as u64;
+        let nsec = (ns % 1_000_000_000u128) as u64;
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&sec.to_le_bytes());
+        out[8..].copy_from_slice(&nsec.to_le_bytes());
+        IN_USER_COPY.store(true, Ordering::SeqCst);
+        if crate::hw::smap_active() {
+            crate::hw::stac();
+        }
+        let _ = copy_out_bytes(ts, &out, &|va, b| memops::write_u8_va(va, b));
+        if crate::hw::smap_active() {
+            crate::hw::clac();
+        }
+        IN_USER_COPY.store(false, Ordering::SeqCst);
+        0
     }
 
     /// SYS_READ(fd, buf, len): the executor fills a KERNEL buffer

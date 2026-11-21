@@ -2,7 +2,8 @@
 //! domain table.
 //!
 //! - **Pids never repeat within a boot**: a monotonic counter starting
-//!   at [`FIRST_DYNAMIC_PID`] (supervisor-created static domains keep
+//!   at [`FIRST_DYNAMIC_PID`][crate::proc::FIRST_DYNAMIC_PID]
+//!   (supervisor-created static domains keep
 //!   small ids; PID 1 is init by convention). A stale wait/kill
 //!   handle therefore fails closed FOREVER instead of hitting an
 //!   unrelated successor — monotonic ids replace generation counters.

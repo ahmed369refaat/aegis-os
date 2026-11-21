@@ -75,4 +75,15 @@
 # copies through it under the blessed SMAP window, never a byte more.
 # The syscall stub's USER_RSP save/restore is inline asm in an
 # already-counted naked function (no new unsafe sites).
-101
+# 106 -> ADR-0023 (M3 Phase 2): +5 — sched/park.rs joins the sched/
+#      allowlist (the live callee-saved register read, the
+#      entry-published frame deref, the asm block), hw::hlt_once (the
+#      guarded idle hlt), and the syscall entry's frame-publish store
+#      rides the existing naked stub (no new unsafe site there).
+
+# 110 -> ADR-0023 (M3 Phase 2, slice 2): +4 — the ResumeChain
+#      save/restore reads and writes (sched/context.rs entry), the
+#      completed-mailbox static-mut borrows (sched/park.rs), and the
+#      OFF_* frame-read closure. All single-CPU IF=0 statics with
+#      per-item SAFETY notes.
+110

@@ -4,5 +4,8 @@
 //! around the same `UserContext`/`UserRun`/`ParkedContext` types.
 pub mod context;
 
+/// ADR-0023: parking from inside a syscall (yield/sleep).
+pub mod park;
+
 #[cfg(not(test))]
 pub mod preempt;

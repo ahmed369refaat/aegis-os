@@ -55,6 +55,7 @@ pub mod boot;
 // the per-driver pure logic (SQE/CQE, descriptors, FIS, DHCP, TRBs)
 // runs on the host against the testharness fakes; the boot-only step
 // functions stay #[cfg(not(test))] inside their modules.
+pub mod clock;
 pub mod drvstack;
 pub mod ipc_mmio;
 #[cfg(not(test))]

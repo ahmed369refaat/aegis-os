@@ -630,6 +630,9 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
                 if (1_000_000u128..16_000_000_000u128).contains(&hz128) {
                     let hz = hz128 as u64;
                     crate::sched::preempt::set_tick_interval(hz / 100); // 10 ms
+                                                                        // ADR-0023: the same measurement is THE clock —
+                                                                        // clock_gettime and ns↔cycle conversions read it.
+                    crate::clock::set_calibrated(hz);
                     let mut m = [0u8; 20];
                     line(
                         out,

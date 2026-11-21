@@ -442,6 +442,16 @@ pub fn rdseed64() -> Option<u64> {
     }
 }
 
+/// One hlt (ADR-0023: the guarded idle state's sleep — interrupts are
+/// ON around it; the tick that wakes it runs the handler's idle
+/// carve-out). The caller guarantees the quiescent state: single CPU,
+/// nothing runnable, IF managed around the call.
+///
+/// SAFETY: a bare hlt; no memory access, no side effects.
+pub fn hlt_once() {
+    unsafe { asm!("hlt") }
+}
+
 /// Halt forever (interrupts disabled). Never returns.
 pub fn halt_forever() -> ! {
     loop {

@@ -82,6 +82,23 @@ static SYSCALL_RSP: AtomicU64 = AtomicU64::new(0);
 ///   in flight, the same lifetime discipline as SYSCALL_RSP itself.
 static USER_RSP_SAVE: AtomicU64 = AtomicU64::new(0);
 
+/// ADR-0023: the in-flight syscall's frame address (the post-push
+/// RSP), published right before `call dispatch` so the park paths
+/// (nanosleep/yield, sched/park.rs) can rebuild the user image from
+/// it. Same lifetime discipline as USER_RSP_SAVE: single CPU, IF=0,
+/// exactly one excursion in flight.
+static SYSCALL_FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// The published address of the in-flight syscall's frame.
+pub fn syscall_frame_addr() -> u64 {
+    SYSCALL_FRAME.load(Ordering::Relaxed)
+}
+
+/// Round J's parked user RSP, read by the park paths.
+pub fn user_rsp_save() -> u64 {
+    USER_RSP_SAVE.load(Ordering::Relaxed)
+}
+
 fn percpu_kstack_top() -> u64 {
     crate::arch::percpu::get().kstack_top
 }
@@ -172,6 +189,8 @@ pub extern "C" fn syscall_entry() {
         "movq {off_rdx}(%rsp), %rcx",  // a3   (user RDX)
         "movq {off_r10}(%rsp), %r8",   // a4   (user R10)
         "movq {off_r8}(%rsp), %r9",    // a5   (user R8)
+        "movq %rsp, {sfrm}(%rip)",     // ADR-0023: publish the frame
+                                       // address for the park paths
         "call {dispatch}",
         // ── result + t1 ──
         "movq %rax, {off_rax}(%rsp)",  // result into the user-RAX slot
@@ -198,6 +217,7 @@ pub extern "C" fn syscall_entry() {
         "sysretq",                     // CPL=3, RFLAGS from R11
         srsp = sym SYSCALL_RSP,
         ursp = sym USER_RSP_SAVE,
+        sfrm = sym SYSCALL_FRAME,
         dispatch = sym crate::syscall::syscall_dispatch,
         rt = sym ROUNDTRIP,
         off_rax = const OFF_RAX,

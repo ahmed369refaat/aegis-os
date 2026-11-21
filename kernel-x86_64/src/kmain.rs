@@ -1250,6 +1250,90 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     //      later claim paths fail closed on it.
     crate::drvstack::driver_stack_step(&mut k, &mut pool, &mut out);
 
+    // ── 15. ADR-0023: the sleep/idle proof — the first process that
+    //      parks ITSELF and the first guarded idle the machine ever
+    //      served. The sleeper (mode 2, its own data page) verifies
+    //      IN the blob: two monotonic clock reads bracketing a 100 ms
+    //      nanosleep (the delta must COVER the span — the wake cannot
+    //      land early) and a sched_yield while solo (must answer 0);
+    //      exit(0) only when every step verified. With nothing else
+    //      runnable, the sleep engages the idle state (sti+hlt under
+    //      the tick's IDLE carve-out) — the hlt count proves the
+    //      machine slept instead of spinning. ──
+    {
+        static SLEEPER_DATA: [u8; 0x50] = {
+            let mut d = [0u8; 0x50];
+            d[0] = 2; // mode 2: the sleeper
+            d
+        };
+        let sleeper = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            22,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &SLEEPER_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(
+                    &mut out,
+                    &["[M3] sleep: ERROR: sleeper spawn failed; halting"],
+                );
+                hw::halt_forever();
+            }
+        };
+        let kernel_cr3 = hw::read_cr3();
+        sleeper.run.tables.activate();
+        crate::sched::context::begin(sleeper.run);
+        crate::sched::context::launch(&sleeper.ctx);
+        // kmain resumes HERE when the nested dispatcher's run set
+        // empties (the sleeper exited; its exit sits in the completed
+        // mailbox — teardown stays the spawner's contract).
+        hw::write_cr3(kernel_cr3);
+        let mut clean_exit = false;
+        let mut saw_exit = false;
+        while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            saw_exit = true;
+            if dom == 22 {
+                clean_exit = matches!(exit, crate::sched::context::ExitKind::Exited(0));
+            }
+            mm::user::destroy_user(&mut k, &mut pool, dom);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+        }
+        let idles = crate::sched::preempt::idle_hlts();
+        if clean_exit && saw_exit && idles >= 1 {
+            let mut b = [0u8; 20];
+            line(
+                &mut out,
+                &[
+                    "[M3] sleep: idle engaged (hlt cycles=",
+                    strutil::dec(idles, &mut b),
+                    "), 100ms wake landed on time, exit 0",
+                ],
+            );
+        } else {
+            line(
+                &mut out,
+                &["[M3] sleep: ERROR: exit or idle count wrong; halting"],
+            );
+            hw::halt_forever();
+        }
+        let mut b1 = [0u8; 20];
+        line(
+            &mut out,
+            &[
+                "[M3] clock: ring-3 clock_gettime verified by the blob (tsc_hz=",
+                strutil::dec(crate::clock::tsc_hz(), &mut b1),
+                if crate::clock::calibrated() {
+                    ", HPET-calibrated)"
+                } else {
+                    ", fallback cadence)"
+                },
+            ],
+        );
+    }
+
     // ── 13. the terminal guard-page proof: the write must #PF, the
     // dispatch must confirm CR2 is exactly the guard page, print the
     // marker, and power off cleanly (CI greps it). Reached only when
