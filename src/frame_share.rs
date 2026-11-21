@@ -141,8 +141,16 @@ impl FrameShares {
 /// What the fault path should do with a user page fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CowDecision {
-    /// Copy the frame, remap RW, resume the faulting instruction.
+    /// Copy the frame, remap RW at the copy, resume the faulting
+    /// instruction (refs > 1: another address space still maps the
+    /// original).
     Copy,
+    /// Re-promote the PTE to writable IN PLACE — no copy (refs == 1:
+    /// every sibling already copied; the last holder owns the frame
+    /// outright, it just still wears the fork's demote). Found live:
+    /// the first sibling's copy drops refs to one, and the second
+    /// writer's identical fault was refused by the refs>1 premise.
+    Promote,
     /// Not ours to fix: the existing fault semantics apply (the
     /// monitor's record and the domain's death).
     NotCow,
@@ -171,14 +179,16 @@ pub fn cow_decision(
     refs: Option<u32>,
     is_write: bool,
 ) -> CowDecision {
-    if pte_present
-        && pte_user
-        && !pte_writable
-        && region_writable
-        && refs.is_some_and(|r| r > 1)
-        && is_write
-    {
-        CowDecision::Copy
+    if pte_present && pte_user && !pte_writable && region_writable && is_write {
+        match refs {
+            Some(r) if r > 1 => CowDecision::Copy,
+            // A lone reference on a demoted page: the demote outlived
+            // its reason — the frame is already private.
+            Some(1) => CowDecision::Promote,
+            // No entry: the page never shared (a plain read-only
+            // mapping — the write is a real violation).
+            _ => CowDecision::NotCow,
+        }
     } else {
         CowDecision::NotCow
     }
@@ -204,21 +214,22 @@ mod tests {
                         for refs in [None, Some(1), Some(2), Some(9)] {
                             for write in [false, true] {
                                 let got = cow_decision(present, pte_w, user, region_w, refs, write);
-                                // EQUIVALENCE, not a count: Copy exactly
-                                // when all six conditions hold.
-                                let spelled_out = present
-                                    && !pte_w
-                                    && user
-                                    && region_w
-                                    && refs.is_some_and(|r| r > 1)
-                                    && write;
+                                // EQUIVALENCE, not a count: the Copy
+                                // family exactly when the five page
+                                // conditions hold AND a refcount exists;
+                                // the family splits by the count
+                                // (Copy >1, Promote ==1).
+                                let page_conditions =
+                                    present && !pte_w && user && region_w && write;
+                                let want = if !page_conditions || refs.is_none() {
+                                    CowDecision::NotCow
+                                } else if refs == Some(1) {
+                                    CowDecision::Promote
+                                } else {
+                                    CowDecision::Copy
+                                };
                                 assert_eq!(
-                                    got,
-                                    if spelled_out {
-                                        CowDecision::Copy
-                                    } else {
-                                        CowDecision::NotCow
-                                    },
+                                    got, want,
                                     "({present}, {pte_w}, {user}, {region_w}, {refs:?}, {write})"
                                 );
                             }

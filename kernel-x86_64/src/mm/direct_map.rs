@@ -1,6 +1,23 @@
-//! Direct-map translation (ADR-0002): every physical address below 1 GiB
-//! is reachable at `DIRECT_MAP_BASE + pa`, RW, kernel-only, never
-//! executable. Pure arithmetic — host-tested.
+//! Direct-map translation (ADR-0002, the access rules restated by
+//! ADR-0024 D3): every physical address below 1 GiB is reachable at
+//! `DIRECT_MAP_BASE + pa`, RW, kernel-only, never executable. Pure
+//! arithmetic — host-tested.
+//!
+//! WHO MAY REACH THROUGH IT (the ADR-0024 D3 rules, one place):
+//! - THE KERNEL ITSELF, as the memory manager: every page-table walk,
+//!   PTE edit, frame scrub, and page copy goes through this window —
+//!   addressing all of RAM is the memory manager's job, exactly once,
+//!   in one place (the allowlisted `memops` + the table walks).
+//! - NOBODY ELSE. The identity map is DEAD (PML4[0] zeroed at `mm::init`
+//!   and asserted by read-back — the `identity=pml4[0]:0` boot line);
+//!   devices reach memory ONLY through the DMA broker's cookies on
+//!   IOMMU lanes (ADR-0013 D6) or through pool-owned identity frames on
+//!   the no-IOMMU lane (the documented degradation); ring-3 reaches
+//!   memory ONLY through the ten-check policy's PTEs (spawn's layout
+//!   or ADR-0024 D1's mmap windows). An ambient physical window for
+//!   anyone but the manager is the thing ADR-0002 killed.
+//! - If untrusted kernel modules ever arrive (ROADMAP: driver
+//!   isolation), the per-owner windowing question reopens.
 
 /// PML4[273]: the direct-map window base.
 pub const DIRECT_MAP_BASE: u64 = 0xFFFF_8880_0000_0000;

@@ -429,8 +429,9 @@ mod entry {
     ///
     /// SAFETY: single CPU, IF=0 on the caller's path.
     pub fn park_chain_take() -> Option<ResumeChain> {
-        // SAFETY: see the static's doc.
-        unsafe { PARK_CHAIN.take() }
+        // SAFETY: see the static's doc; addr_of_mut avoids the
+        // static_mut_refs lint on the .take().
+        unsafe { (*core::ptr::addr_of_mut!(PARK_CHAIN)).take() }
     }
 
     /// Snapshot the current resume chain (see `ResumeChain`).

@@ -64,6 +64,22 @@ fn the_table_is_bounded_and_refuses_loudly() {
 use aegis_os::frame_share::cow_decision;
 
 #[test]
+fn a_lone_demoted_page_promotes_instead_of_copying() {
+    // The sibling already copied: refs==1, the PTE still demoted, the
+    // region says writable — the write is served by re-promoting the
+    // PTE in place (no copy, no allocation, no refcount change).
+    assert_eq!(
+        cow_decision(true, false, true, true, Some(1), true),
+        CowDecision::Promote
+    );
+    // The same page READ (not written) stays NotCow.
+    assert_eq!(
+        cow_decision(true, false, true, true, Some(1), false),
+        CowDecision::NotCow
+    );
+}
+
+#[test]
 fn cow_fires_exactly_on_shared_writable_region_writes_to_demoted_ptes() {
     // The one true Copy: present, user, PTE read-only, region
     // writable, shared, write fault.
@@ -96,15 +112,6 @@ fn everything_else_is_not_cow() {
             true,
             false,
             Some(2),
-            true,
-        ),
-        (
-            "private page (refs=1)",
-            true,
-            false,
-            true,
-            true,
-            Some(1),
             true,
         ),
         (

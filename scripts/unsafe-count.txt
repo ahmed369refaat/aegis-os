@@ -100,4 +100,12 @@
 #      dispatcher's unwind), the five USER_RBP/R12-R15 stub slots
 #      (user_callee_saved), and the diagnostic register reads
 #      (current_rsp/current_r12) that hunted the SysV lesson.
-120
+
+# 117 -> ADR-0024 D2 (follow-up): -3 — live_callee_saved DELETED (it
+#      read the user's callee-saved registers live at dispatch depth,
+#      which reads the compiler's scratch — SysV preserves the user's
+#      values in the callees' frames, not in the registers; both park
+#      paths now read the stub's USER_RBP/R12-R15 slots, and the
+#      wrong-by-principle helper is gone so nobody can reach for it
+#      again), and the diagnostic register reads that hunted it.
+117

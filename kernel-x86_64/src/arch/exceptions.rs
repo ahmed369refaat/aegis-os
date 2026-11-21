@@ -727,16 +727,26 @@ fn try_cow_recovery(f: &ExceptionFrame) -> bool {
         })
         .is_some_and(|r| r.flags.0 & MemFlags::WRITE.0 != 0);
     let refs = crate::sched::context::shares_mut().refs(pa);
-    if cow_decision(
+    match cow_decision(
         leaf & PTE_P != 0,
         leaf & PTE_W != 0,
         leaf & PTE_U != 0,
         region_writable,
         refs,
         is_write,
-    ) != CowDecision::Copy
-    {
-        return false;
+    ) {
+        CowDecision::NotCow => return false,
+        // The last holder of a demoted page: no copy, no allocation —
+        // re-promote the PTE in place and serve the write.
+        CowDecision::Promote => {
+            if !run.tables.replace_leaf(cr2, pa, true) {
+                return false;
+            }
+            pte::flush_tlb_page(cr2);
+            crate::mm::shares::note_cow_copy();
+            return true;
+        }
+        CowDecision::Copy => {}
     }
 
     // The fix: one private frame under the faulting domain's tag, the

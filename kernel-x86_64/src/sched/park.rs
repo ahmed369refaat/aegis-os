@@ -45,41 +45,6 @@ pub fn current_rsp() -> u64 {
     rsp
 }
 
-/// The live callee-saved registers `[rbp, r12, r13, r14, r15]` —
-/// their USER values, preserved through the dispatch call by the SysV
-/// ABI (the stub's frame does not carry them; nothing else can).
-///
-/// FIXED output registers, deliberately: free `out(reg)` allocation
-/// may hand an output slot a register this very asm reads LATER
-/// (e.g. the r13 store landing in %r14 before %r14 is read) — the
-/// exact CPUID lesson (ADR-0011 §C), found live here when the fork
-/// proof's parked images carried garbage r12/r13 and both runs died
-/// writing through them. The five scratches (rax/rcx/rdx/rsi/rdi) are
-/// caller-saved and named as clobbers by the asm! itself, so no
-/// surrounding code can hold anything live across them.
-///
-/// SAFETY: pure register reads into fixed scratches; no memory
-/// access, no side effects.
-unsafe fn live_callee_saved() -> [u64; 5] {
-    let (v0, v1, v2, v3, v4);
-    unsafe {
-        core::arch::asm!(
-            "movq %rbp, %rax",
-            "movq %r12, %rcx",
-            "movq %r13, %rdx",
-            "movq %r14, %rsi",
-            "movq %r15, %rdi",
-            lateout("rax") v0,
-            lateout("rcx") v1,
-            lateout("rdx") v2,
-            lateout("rsi") v3,
-            lateout("rdi") v4,
-            options(att_syntax, nostack, preserves_flags)
-        );
-    }
-    [v0, v1, v2, v3, v4]
-}
-
 /// Build the parked image of an in-flight syscall: every user GPR
 /// from the entry's frame (RAX replaced by `result`), the user
 /// rip/rflags from the frame's RCX/R11 slots (the SYSCALL convention),
@@ -197,7 +162,7 @@ pub fn completed_drain() -> Option<(u32, crate::sched::context::ExitKind)> {
 
 #[cfg(not(test))]
 mod boot {
-    use super::{live_callee_saved, parked_from_syscall, record_completed, SyscallImage};
+    use super::{parked_from_syscall, record_completed, SyscallImage};
     use crate::arch::syscall_entry;
     use crate::arch::syscall_frame::{
         OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
@@ -261,10 +226,13 @@ mod boot {
             // read is 8-byte aligned inside it.
             unsafe { *((base + off) as *const u64) }
         };
-        // SAFETY: pure register reads of this context's callee-saved
-        // values — their user values, preserved across dispatch by the
-        // SysV ABI.
-        let live = unsafe { live_callee_saved() };
+        // The user's callee-saved five from the STUB SLOTS — the
+        // parked-from-current twin's fix applies here too: a live read
+        // at this depth reads the compiler's scratch (SysV preserves
+        // the user's values in the CALLEES' frames, not in the
+        // registers; found live — the yield path's parked images
+        // carried garbage r12 and the resumed parent wrote through 3).
+        let live = crate::arch::syscall_entry::user_callee_saved();
         let ctx = parked_from_syscall(SyscallImage {
             rdi: read(OFF_RDI),
             rsi: read(OFF_RSI),

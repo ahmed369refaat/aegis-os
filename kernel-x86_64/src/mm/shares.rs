@@ -97,10 +97,8 @@ pub fn reclaim_domain_frames<const N: usize>(
         let shares = context::shares_mut();
         if let Some(orig) = shares.owner_of(pa) {
             let last = matches!(shares.release(pa), Ok(true));
-            if last {
-                if pool.free(buddy, pa, orig).is_ok() {
-                    freed += 1;
-                }
+            if last && pool.free(buddy, pa, orig).is_ok() {
+                freed += 1;
             }
         } else if pool.free(buddy, pa, owner).is_ok() {
             freed += 1;

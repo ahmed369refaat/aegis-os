@@ -178,7 +178,7 @@ pub fn destroy_user<const N: usize>(k: &mut Kernel<N>, pool: &mut FramePool<N>, 
     // space still maps is RELEASED, not freed (the last holder frees,
     // under the ORIGINAL owner's tag); private frames free outright.
     // The buffer is sized by the live owned count (no allocation).
-    let owned = pool.owned_by(id) as usize;
+    let owned = pool.owned_by(id);
     let mut buf = [const { None }; 1024];
     let buf = if owned <= buf.len() {
         &mut buf[..owned.max(1)]
