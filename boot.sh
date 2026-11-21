@@ -354,6 +354,9 @@ if [ "$MODE" = "verify" ]; then
     grep -qF "J:file ok" "$LOG" || { echo "VERIFY FAIL: round-J file marker (from CPL=3) missing"; ok=0; }
     grep -qF "J:neg ok" "$LOG" || { echo "VERIFY FAIL: round-J negative-probe marker (from CPL=3) missing"; ok=0; }
     grep -qF "[RING3] ring-3 isolation live: 8 runs" "$LOG" || { echo "VERIFY FAIL: ring-3 acceptance marker missing"; ok=0; }
+  # ADR-0023 (M3 Phase 2): the ungated two-run preemption proof —
+  # two ring-3 processes interleaved, the CPU-hog starved nobody.
+  grep -qF "[M3] preempt: 2 runs interleaved" "$LOG" || { echo "VERIFY FAIL: M3 preemption-interleave marker missing"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the

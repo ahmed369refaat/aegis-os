@@ -297,6 +297,16 @@ pub fn mask_timer() {
     write32(REG_LVT_TIMER, lvt | LVT_MASKED);
 }
 
+/// Is the timer's LVT entry masked right now? ADR-0023: the delivery
+/// windows run under this mask; a timer tick delivered at CPL0 while
+/// masked is the stale pre-window IRR (an expiry that landed while the
+/// kernel ran IF=0 — the mask gates NEW expiries, not an already-set
+/// IRR), and the tick path drops it instead of halting.
+#[cfg(not(test))]
+pub fn timer_masked() -> bool {
+    read32(REG_LVT_TIMER) & LVT_MASKED != 0
+}
+
 /// Unmask the timer's LVT entry (resume ticks after the window).
 #[cfg(not(test))]
 pub fn unmask_timer() {

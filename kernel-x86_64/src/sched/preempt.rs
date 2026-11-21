@@ -112,7 +112,19 @@ pub fn on_timer_tick(frame: &mut ExceptionFrame) {
     // means the kernel got preempted — impossible by construction, so
     // halt loudly instead of switching stacks on a frame shape that
     // does not carry the CPL3 tail.
+    //
+    // ADR-0023 carve-out (found by the ungated proof on q35): a CPL0
+    // frame while the timer LVT is MASKED is the stale pre-window IRR
+    // — an expiry that landed while the kernel ran IF=0 (after the
+    // demo armed the timer), whose IRR the window's mask cannot
+    // retract; the window's sti delivers it. The delivery windows'
+    // contract (only our vectors fire, the timer paused) is intact:
+    // acknowledge (the EOI above) and DROP. No switch may ever happen
+    // on a CPL0 frame; an UNMASKED CPL0 tick remains the loud halt.
     if frame.cs & 3 != 3 {
+        if lapic::timer_masked() {
+            return;
+        }
         serial::write_str("[IRQ ] KERNEL BUG: timer tick from CPL0 — halting\n");
         hw::halt_forever();
     }

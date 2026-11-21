@@ -462,7 +462,11 @@ mod entry {
     /// How many ring-3 runs may be parked at once. Small, fixed, and
     /// fail-loud: a full table is a bookkeeping bug, never something to
     /// paper over (the F14 discipline).
-    pub const MAX_PARKED_RUNS: usize = 4;
+    /// ADR-0023 D6: the parked table grows with the process table —
+    /// MAX_DOMAINS runs may be parked-runnable at once (the run queue's
+    /// storage; every runnable-but-not-running domain has exactly one
+    /// entry, the running one is USER_RUN).
+    pub const MAX_PARKED_RUNS: usize = aegis_os::MAX_DOMAINS;
 
     static mut PARKED: [Option<(UserRun, ParkedContext)>; MAX_PARKED_RUNS] =
         [const { None }; MAX_PARKED_RUNS];

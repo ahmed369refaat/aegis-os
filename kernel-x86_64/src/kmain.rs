@@ -47,10 +47,9 @@ static RING3_ROGUE: &[u8] = include_bytes!("../blob/ring3-rogue.bin");
 /// The N1 edge blob: tail-of-page writes that must succeed and a
 /// page-crossing write that must return -EFAULT (ADR-0007 §1).
 static RING3_EDGE: &[u8] = include_bytes!("../blob/ring3-edge.bin");
-/// The M2-W2 preemption blob: the spinner (mode 0) and the writer
-/// (mode 1) of the starvation-freedom proof (ADR-0012). Only the
-/// `preempt-demo` build reads it (see preempt_demo below).
-#[cfg(feature = "preempt-demo")]
+/// The ADR-0012 preemption blob: the spinner (mode 0) and the writer
+/// (mode 1) of the starvation-freedom proof. Ungated since ADR-0023:
+/// the proof is part of every default boot lane.
 static RING3_PREEMPT: &[u8] = include_bytes!("../blob/ring3-preempt.bin");
 /// Round J: the file-lifecycle blob — pipe round-trip, dup survival,
 /// open/write/read-back through an independent cursor, and the errno
@@ -1233,13 +1232,14 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     mm::user::destroy_user(&mut k, &mut pool, 14);
     line(&mut out, &["[RING3] ring-3 isolation live: 8 runs (hello/NX/kernel-VA/forged/edge/monitor-quarantine/audit-only/files), kernel intact"]);
 
-    // M2-W2 / ADR-0012: the preemption demo is behind the `preempt-demo`
-    // feature — see ADR-0012 (open issues) for why the default boot does
-    // not arm the timer yet: the machinery is host-tested and the
-    // interleaving was demonstrated (ADR-0012 §Evidence), but a
-    // release+LTO argument-codegen anomaly in this toolchain
-    // destabilizes the demo spawn path.
-    #[cfg(feature = "preempt-demo")]
+    // ADR-0023: the preemption proof is UN-GATED — part of every
+    // default boot lane. The ADR-0012 release+LTO argument-codegen
+    // anomaly stays worked around by the named-static data pages below
+    // (the anomaly itself was never root-caused; the workaround has
+    // held on every lane since). The timer stays armed for the rest of
+    // the boot: the driver stack's ADR-0019 IF-windows pause it
+    // explicitly (pause_ticks/resume_ticks), and the kernel-side IF=0
+    // discipline makes every other CPL0 stretch tick-proof.
     preempt_demo(&mut k, &mut pool, &mut out);
 
     // ── 14. driver stack (ADR-0013): ACPI/DMAR discovery (PR 0.3)
@@ -1305,7 +1305,6 @@ fn drain_telemetry(
 
 /// Step 12 (ADR-0012): the starvation-freedom proof. Feature-gated —
 /// see the call site and ADR-0012's open-issues section.
-#[cfg(feature = "preempt-demo")]
 fn preempt_demo<const N: usize>(
     k: &mut aegis_os::Kernel<N>,
     pool: &mut FramePool<N>,
@@ -1322,10 +1321,10 @@ fn preempt_demo<const N: usize>(
     // spinner is still runnable, and the tick path must have switched
     // domains — both impossible without interrupt-driven preemption.
     line(
-            &mut out,
+            out,
             &["[SCHD] preemption demo: retiring the M1 hello domain (a kernel-resident CFS entity must never be preemptor-picked)"],
         );
-    mm::user::destroy_user(&mut k, &mut pool, 1);
+    mm::user::destroy_user(k, pool, 1);
 
     crate::sched::preempt::arm();
 
@@ -1363,8 +1362,8 @@ fn preempt_demo<const N: usize>(
     }
 
     let spinner = match mm::user::spawn_user_blob(
-        &mut k,
-        &mut pool,
+        k,
+        pool,
         20,
         aegis_os::profile::service_profile(),
         RING3_PREEMPT,
@@ -1372,13 +1371,13 @@ fn preempt_demo<const N: usize>(
     ) {
         Ok(sp) => sp,
         Err(_) => {
-            line(&mut out, &["[SCHD] ERROR: spinner spawn failed; halting"]);
+            line(out, &["[SCHD] ERROR: spinner spawn failed; halting"]);
             hw::halt_forever();
         }
     };
     let writer = match mm::user::spawn_user_blob(
-        &mut k,
-        &mut pool,
+        k,
+        pool,
         21,
         aegis_os::profile::service_profile(),
         RING3_PREEMPT,
@@ -1386,12 +1385,12 @@ fn preempt_demo<const N: usize>(
     ) {
         Ok(sp) => sp,
         Err(_) => {
-            line(&mut out, &["[SCHD] ERROR: writer spawn failed; halting"]);
+            line(out, &["[SCHD] ERROR: writer spawn failed; halting"]);
             hw::halt_forever();
         }
     };
     line(
-            &mut out,
+            out,
             &["[SCHD] preempt demo: spinner=20 (400M iters, no syscalls) writer=21 (4 writes), timer live"],
         );
 
@@ -1427,7 +1426,7 @@ fn preempt_demo<const N: usize>(
                     // blobs touch nothing but their own pages.
                     let mut bv = [0u8; 20];
                     line(
-                        &mut out,
+                        out,
                         &[
                             "[SCHD] ERROR: domain ",
                             strutil::dec(finished as u64, &mut bv),
@@ -1436,7 +1435,7 @@ fn preempt_demo<const N: usize>(
                     );
                     let mut bv2 = [0u8; 20];
                     line(
-                        &mut out,
+                        out,
                         &[
                             "[SCHD] fault vector=",
                             strutil::dec(*vector as u64, &mut bv2),
@@ -1449,7 +1448,7 @@ fn preempt_demo<const N: usize>(
             let mut b2 = [0u8; 20];
             let mut b3 = [0u8; 20];
             line(
-                &mut out,
+                out,
                 &[
                     "[SCHD] domain ",
                     strutil::dec(finished as u64, &mut b1),
@@ -1473,19 +1472,16 @@ fn preempt_demo<const N: usize>(
         if finished == 20 {
             spinner_clean_exit = matches!(run.exit, crate::sched::context::ExitKind::Exited(7));
         }
-        mm::user::destroy_user(&mut k, &mut pool, finished);
+        mm::user::destroy_user(k, pool, finished);
         match crate::sched::preempt::on_exit(&mut k.sched, finished) {
             Some(next) => {
                 let Some((nrun, nctx)) = crate::sched::context::take_parked(next) else {
-                    line(
-                        &mut out,
-                        &["[SCHD] ERROR: handover target not parked; halting"],
-                    );
+                    line(out, &["[SCHD] ERROR: handover target not parked; halting"]);
                     hw::halt_forever();
                 };
                 let mut b = [0u8; 20];
                 line(
-                    &mut out,
+                    out,
                     &[
                         "[SCHD] handover: CPU -> domain ",
                         strutil::dec(next as u64, &mut b),
@@ -1507,7 +1503,7 @@ fn preempt_demo<const N: usize>(
         let mut b1 = [0u8; 20];
         let mut b2 = [0u8; 20];
         line(
-            &mut out,
+            out,
             &[
                 "[SCHD] preempt: switches=",
                 strutil::dec(switches, &mut b1),
@@ -1521,19 +1517,33 @@ fn preempt_demo<const N: usize>(
     if preempt_pass {
         let mut b = [0u8; 20];
         line(
-                &mut out,
+                out,
                 &[
                     "[SCHD] starvation-freedom: writer (21) finished while spinner (20) still runnable, writes=",
                     strutil::dec(writer_writes, &mut b),
                 ],
             );
         line(
-                &mut out,
+                out,
                 &["[VERDICT] M2-W2 PREEMPTION: PASS — timer-driven CFS, ring-3 preemptible, monitor windows close on tick"],
             );
+        // ADR-0023's M3 marker (boot.sh greps this on every lane):
+        // two ring-3 processes interleaved under preemption and the
+        // CPU-hog starved nobody.
+        {
+            let mut b = [0u8; 20];
+            line(
+                out,
+                &[
+                    "[M3] preempt: 2 runs interleaved (switches=",
+                    strutil::dec(switches, &mut b),
+                    "), hog starved nobody",
+                ],
+            );
+        }
     } else {
         line(
-                &mut out,
+                out,
                 &["[SCHD] ERROR: preemption proof incomplete (see the switches/ticks/exits above); halting"],
             );
         hw::halt_forever();
