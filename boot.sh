@@ -110,7 +110,7 @@ case "${1:-}" in
       "[MCFG] ECAM base"  # parsed
       "[KBD2] negotiated scancode set 2, ack="  # the real 0xF0/0x02 exchange
       "[KBD2] scancode"  # the QMP round trip
-      "[EXT2] mount gated: the second AHCI command reads a STALE FIS"  # the honest split
+      "[EXT2] hello.txt (inode 12, 17 bytes): \"HELLO-AEGIS-EXT2.\" ← read-only ext2 over AHCI"  # the mount LIVE (ADR-0014: the stale FIS was three driver bugs)
       "[E1K] teardown: revoke_all(0) →"
       "[GFX] VBE 640x480x32 linear"  # the mode engaged
       "[RTC] 2026-"  # the MC146818 read the host clock
@@ -123,11 +123,16 @@ case "${1:-}" in
                   -netdev user,id=n1
                   -device e1000,netdev=n1
                   -object filter-dump,id=f1,netdev=n1,file=/tmp/e1k-noiommu.pcap
+                  -drive id=sd0,if=none,format=raw,file=target/sdisk0.img
+                  -device ide-hd,drive=sd0,bus=ide.0
                   -d guest_errors -trace enable=e1000* -trace enable=e1000x*)
     EXTRA_GREPS=(
       "[E1K] identity mode:"  # the control lane: same driver, no IOMMU
       "[E1K] TX: DHCP DISCOVER sent"
       "[E1K] RX:"
+      "[AHCI] identity mode:"  # ADR-0014 step 5: the stale-FIS control
+      "[AHCI] IDENTIFY completed:"  # command 1 must complete here too
+      "[EXT2] hello.txt (inode 12, 17 bytes): \"HELLO-AEGIS-EXT2.\" ← read-only ext2 over AHCI"  # ADR-0014: the mount works on BOTH lanes
     )
     ;;
 esac
@@ -140,15 +145,26 @@ fi
 # -no-reboot turns a triple fault into a clean QEMU exit instead of a loop.
 QEMU_ARGS=("${MACHINE_ARGS[@]}" -kernel "$IMAGE" -display none -serial stdio -no-reboot)
 
-# The q35 driver-stack lane needs its disk image (64 KiB of noise is
-# enough — the kernel reads a sector, it does not care about content).
-if [ "$MODE" = "verify" ] && [ "${1:-}" = "--verify-q35" ]; then
+# The q35 driver-stack lane needs its disk images (64 KiB of noise is
+# enough — the kernel reads a sector, it does not care about content —
+# except sdisk0, which must be the REAL ext2 image the mount reads).
+# They are generated here so the lane is self-contained in CI (they
+# used to exist only on one dev machine — a latent CI break).
+if [ "$MODE" = "verify" ] && { [ "${1:-}" = "--verify-q35" ] || [ "${1:-}" = "--verify-q35-noiommu" ]; }; then
   dd if=/dev/urandom of=target/vdisk0.img bs=1K count=64 status=none
+fi
+if [ "$MODE" = "verify" ] && [ "${1:-}" = "--verify-q35" ]; then
+  dd if=/dev/zero of=target/nvme0.img bs=1K count=128 status=none
+  dd if=/dev/zero of=target/usb0.img  bs=1K count=64  status=none
+fi
+if [ "$MODE" = "verify" ] && { [ "${1:-}" = "--verify-q35" ] || [ "${1:-}" = "--verify-q35-noiommu" ]; }; then
+  python3 "$(dirname "$0")/scripts/mkext2.py"
 fi
 
 if [ "$MODE" = "verify" ]; then
   LOG=$(mktemp)
-  trap 'rm -f "$LOG"' EXIT
+  TRACE_LOG=""
+  trap 'rm -f "$LOG" "$TRACE_LOG"' EXIT
   case "${1:-}" in
     --verify-q35)
       echo "==> [4/4] booting in QEMU (TCG, q35 + intel-iommu) — M1/M2 markers + ADR-0013 DMAR discovery"
@@ -175,7 +191,16 @@ if [ "$MODE" = "verify" ]; then
     touch "$LOG"
     (python3 "$(dirname "$0")/scripts/qmp_drive.py" "$LOG" >/tmp/qmp-drive.log 2>&1 &)
   fi
-  timeout "$QEMU_TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" | tee "$LOG"
+  # ADR-0014: the q35 lane runs with the VT-d trace on, so the lane
+  # can PROVE no device takes the pass-through fast path. The trace
+  # (log backend) lands on stderr; the serial log stays on stdout.
+  if [ "${1:-}" = "--verify-q35" ]; then
+    TRACE_LOG=$(mktemp)
+    timeout "$QEMU_TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" \
+      -trace enable=vtd_* 2>"$TRACE_LOG" | tee "$LOG"
+  else
+    timeout "$QEMU_TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" | tee "$LOG"
+  fi
   END=$(date +%s.%N)
   echo
   echo "boot wall-clock: $(awk -v e="$END" -v s="$START" 'BEGIN { printf "%.2f", e - s }') s (QEMU startup included)"
@@ -253,6 +278,18 @@ if [ "$MODE" = "verify" ]; then
       grep -qF "[PCI ] scan bus 0: " "$LOG" || { echo "VERIFY FAIL: PCI inventory marker missing"; ok=0; }
       grep -qF "0x1af4" "$LOG" || { echo "VERIFY FAIL: the virtio-blk must be in the inventory"; ok=0; }
 grep -qF "(virtio-blk) → dom 0 ok (broker assigned)" "$LOG" || { echo "VERIFY FAIL: the virtio-blk claim must go through the broker"; ok=0; }
+      # ── ADR-0014: translation is REAL or the lane fails ──
+      # (a) No device may take the pass-through fast path. Under the
+      #     old TT=0b10 this fired 8x for six devices.
+      if grep -q vtd_pt_enable_fast_path "$TRACE_LOG" 2>/dev/null; then
+        echo "VERIFY FAIL: vtd_pt_enable_fast_path fired $(grep -c vtd_pt_enable_fast_path "$TRACE_LOG")x — a device is in pass-through (ADR-0014)"
+        ok=0
+      fi
+      # (b) The enforcement probe must prove the IOMMU faults DMA to a
+      #     broker-unmapped page (PPF) and that the SLPTE read back
+      #     after unmap is absent (P=0).
+      grep -qF "[VBLK] enforcement: PPF=yes" "$LOG" || { echo "VERIFY FAIL: the enforcement probe must print PPF=yes (ADR-0014)"; ok=0; }
+      grep -qF "[VBLK] enforcement: slpte P=0 after unmap" "$LOG" || { echo "VERIFY FAIL: the SLPTE read-back after unmap must be absent (ADR-0014)"; ok=0; }
       ;;
     --verify-q35-noiommu)
       grep -qF "[IOMMU] dmar: absent" "$LOG" || { echo "VERIFY FAIL: the no-iommu lane must report dmar: absent (fail-closed)"; ok=0; }

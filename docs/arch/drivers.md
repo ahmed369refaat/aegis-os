@@ -17,8 +17,9 @@ No driver talks to a device directly. The path is always:
    bridge; not RMRR-covered; the IOMMU verdict must be live. Any
    refusal is fail-closed: the driver gets no device.
 3. **Broker assignment** (`DmaBroker::assign_device`) — the VT-d
-   context entry is written (P | TT=0b10 | SLPTPTR) and the device is
-   bound to its domain.
+   context entry is written (P | TT=0b00 multi-level | SLPTPTR) and
+   the device is bound to its domain (ADR-0014: TT=0b10 was
+   pass-through — the tables were never walked).
 4. **Map-then-tell** — every frame the device will DMA is
    `map_region`ed through the broker BEFORE any address reaches the
    device. The device never sees an unmapped address.
@@ -55,9 +56,12 @@ comments and tests:
   forbidden (notify reads are undefined).
 - **VT-d GCMD is written as one accumulated word** (Linux's pattern);
   QEMU interprets a missing enabled bit as a DISABLE command — a
-  single-bit TE write silently disabled the invalidation queue. And
-  the context entry's TT bits 3:2 = 0b10 select the four-level walk
-  (QEMU decodes depth = 2 + TT).
+  single-bit TE write silently disabled the invalidation queue. The
+  context entry's TT bits 3:2 = 0b00 select the multi-level walk
+  (ADR-0014: the old "depth = 2 + TT" note was wrong — the depth is
+  2 + AW from the HIGH word, and TT=0b10 was pass-through, measured
+  as vtd_pt_enable_fast_path for six devices plus an enforcement
+  probe that completed against an unmapped page with PPF=no).
 
 ## The classic devices (polling, no DMA, no broker)
 
@@ -75,15 +79,14 @@ comments and tests:
   update-in-progress guarded; the marker carries the live host time.
 - **Serial console** — the boot's primary output channel.
 
-## Status and open items (honest ledger, updated 2026-11-20 late)
+## Status and open items (honest ledger, updated 2026-11-21 — ADR-0014)
 
 | Driver | Status | Proof |
 | --- | --- | --- |
-| virtio-blk | **complete** | sector read status=OK; write+read-back round trip; teardown revoke+scrub |
-| virtio-blk enforcement probe | **partial** | request to a broker-unmapped page completed with status OK, no PPF — page-selective invalidation is the candidate fix |
-| AHCI/SATA (ich9, q35) | **FIRST SLICE FULLY LIVE** | ABAR/GHC/PI read, port-0 SIG=0x101 (SATA disk), stop+CLB/FB/FRE/ST with broker frames, IDENTIFY DEVICE **completed** (word0=0x40, 512 bytes DMA through the IOMMU), teardown 4 regions |
-| virtio-net | **90%** | handshake, MAC/link, both queues, 8 broker-mapped frames, queue-1 readback, DHCP DISCOVER built (checksum vector-tested) and published+kicked, teardown |
-| e1000 | **register/ring-proven, no egress** | MAC/link from RAL/RAH/STATUS, rings programmed (readback), descriptor consumed (TDH 0→1) — but the packet never leaves (empty pcap, zero translate/fault events for 00:04.0) |
+| virtio-blk | **complete, enforced** | sector read status=OK; write+read-back round trip; **enforcement probe PPF=yes, SLPTE absent after unmap (ADR-0014)**; teardown revoke+scrub |
+| AHCI/SATA (ich9, q35) | **LIVE incl. ext2 mount** | ABAR/GHC/PI read, port-0 SIG=0x101, IDENTIFY with the REAL serial (QM000001), **the ext2 mount runs: superblock → root dir → hello.txt read through the IOMMU (ADR-0014)** |
+| virtio-net | **complete** | handshake, MAC/link, both queues, 8 broker frames, **full DHCP DISCOVER→slirp→OFFER round trip through the IOMMU (ADR-0014)**, teardown |
+| e1000 | **complete** | rings programmed, **full DHCP round trip through the IOMMU** AND in identity mode on the control lane, teardown |
 | NVMe | **admin proven, data gated** | CAP/version/RDY, admin qpair live, Identify submitted — no completion |
 | USB xHCI | **bring-up FULLY LIVE** (item 12 first slice) | caps (v0 read as 0? HCSPARAMS MaxSlots=64 MaxPorts=8), halt→reset→DCBAAP+MaxSlotsEn+CRCR→RUN (HCH cleared), **port 0 device attached speed=4 (the usb-storage)** — register-only path, no device DMA needed |
 | screen/GPU (VBE) | **pixel-proven** | 7/7 sampled pixels in the QMP screendump |
@@ -93,7 +96,7 @@ comments and tests:
 | ACPI MADT/MCFG (item 14) | **parsed** | 1 LAPIC + 1 IOAPIC @0xFEC00000; ECAM base 0xB0000000 bus 0..255 |
 | USB enumeration / HID | **not started** | next xHCI slice: TRB rings, address device, interrupt-IN |
 | virtio-gpu / e1000-data / NVMe-data | **blocked on the device-DMA cluster** (below) | |
-| Block layer + ext2 (item 8) | **first slice written, mount gated** | the image builder (scripts/mkext2.py: valid 1KiB-block rev-1 ext2 with hello.txt) + the full kernel parser (superblock → group descriptor → root inode → directory walk → file inode → data) are in the tree and run on the LIVE AHCI port; the mount is gated by the second-command no-op below — IDENTIFY (first command) completes with 512 bytes of DMA, ANY subsequent READ (0xC8 and 0x25 both tried, IS cleared, FRE live, identical headers/FIS/PRDT machinery) completes as TFD=0x50 with no PRDT transfer and no D2H FIS |
+| Block layer + ext2 (item 8) | **mounted, file read live** | the image builder (scripts/mkext2.py) + the full kernel parser run on the LIVE AHCI port: superblock ok (magic 0xef53, inode_size=128) → root inode → hello.txt read ("HELLO-AEGIS-EXT2.") — on BOTH the IOMMU lane and the no-IOMMU control lane (the historical "second-command no-op" was three driver bugs; see ADR-0014 below) |
 
 ### The device-DMA cluster: SOLVED — the missing PCI bus-master enable
 
@@ -139,6 +142,48 @@ lane (`[VNET] RX: 602 bytes — DHCP OFFER yiaddr=10.0.2.15`, same for
 on the no-IOMMU control lane. The e1000's TX DD poll reads desc+12
 bit 0 (E1000_TXD_STAT_DD=0x1; a +14 detour was wrong and is
 reverted — the writeback pci_dma_write()s the dword at +12).
+
+### ADR-0014 (2026-11-21): the IOMMU was in pass-through — and the tables are load-bearing now
+
+Review round 4 found that `context_entry` set TT=0b10 — **pass-through**
+per the VT-d spec §9.3 and QEMU's `VTD_CONTEXT_TT_PASS_THROUGH` — so no
+device ever walked the second-level tables (trace:
+`vtd_pt_enable_fast_path` ×8 for six devices; the enforcement probe's
+request to an unmapped page completed with status OK and PPF=no). Full
+verification trail in ADR-0014. Fixing TT surfaced a SECOND latent bug:
+`slpte_table` wrote non-leaf entries without the W bit, and VT-d checks
+R/W at EVERY level of the walk — so the first live device write faulted
+FR_WRITE at level 4 (reads passed, and writes only succeeded when
+served from QEMU's IOTLB page cache, which checks the leaf alone).
+
+Re-measured, before → after (all on the q35 lane unless noted):
+
+- **virtio-blk enforcement probe**: request to the unmapped page
+  completed, PPF=no → **request completes with device-side error,
+  PPF=yes, SLPTE read-back P=0**. The lane now FAILS if
+  `vtd_pt_enable_fast_path` appears in a `-trace enable=vtd_*` run, or
+  the probe does not print `PPF=yes`.
+- **virtio-net TX "stall" (open item)**: DISCOVER published, "QEMU did
+  not consume it" → **full DHCP round trip through the IOMMU**. The
+  stall was the non-leaf W bit: the device's read of the avail ring
+  succeeded while its fetches faulted quietly.
+- **e1000 "no egress"**: descriptor consumed, no packet → **full DHCP
+  round trip through the IOMMU** (same root cause).
+- **AHCI second command / ext2 mount (open item)**: reproduced on the
+  no-IOMMU control lane — refuting the vIOMMU bounce-buffer hypothesis
+  — and was **three driver bugs**, found by trace + command-table
+  read-back: (1) the PRDT byte count written into the entry's reserved
+  dword instead of `flags_size` at +0x0C (every sglist was "1 byte";
+  QEMU `prdt_tbl_entry_size` = `(flags_size & MASK)+1`); (2) the
+  READ-DMA-EXT FIS LBA fields at bytes 9-11 instead of 4-10 (LBA 2 was
+  read as LBA 2<<24 — off the image); (3) the sector-count byte 12
+  never written (0 = 65536 sectors → the measured 32 MiB prepare_buf
+  limit). After the fixes the mount runs end-to-end on BOTH lanes.
+- **NVMe prp1=0**: **unchanged** by the TT fix — the signature
+  (identify data landing at PA 0, CreateIoCq SC=2) is identical under
+  real translation, and the old "isolate the pass-through fast path"
+  next-experiment is obsolete (there is no fast path anymore). Still
+  open; the no-IOMMU control remains the next experiment.
 
 ### xHCI TRB: the No-Op command completes end-to-end
 
@@ -195,20 +240,20 @@ it back); the marker now reports the event TRB type.
   difference. Eliminated: entry layout/size (NVME_SQES=6), doorbell
   offsets, register values (ASQ/AQA read back correct), u64 stores,
   the phase poll. Next experiment: the no-IOMMU control (an NVMe on
-  the q35-neg lane pattern) to isolate the vtd pass-through fast
-  path (`vtd_pt_enable_fast_path` fires at our doorbell).
-- **AHCI second command** (gates the ext2 first slice): the first
-  command on a fresh port (IDENTIFY) completes with 512 bytes of
-  PRDT DMA; the second command reads a **STALE FIS** — the
-  IDENTIFY's `27 80 EC` bytes where the READ's `27 80 25 40` was
-  written — and later CI writes vanish between the kernel and QEMU
-  (7 issued, 2 logged). A TFD busy-wait before each issue and port
-  IS clearing were added and did not change it. **Retested after the
-  bus-master/context-entry fixes: the signature is unchanged.** The
-  NVMe prp1 anomaly (same session) shows devices can read SOME
-  fields of a guest-written structure and not others — the AHCI
-  stale-FIS has the same shape and should be re-examined with the
-  same trace-driven method.
+  the q35-neg lane pattern) — the old motivation (isolating the
+  pass-through fast path) is gone with ADR-0014, but the control
+  still cleanly separates vtd-translation effects from everything
+  else.
+- **AHCI second command — SOLVED (ADR-0014)**. The historical reading
+  ("stale FIS", "CI writes vanish") was wrong: the command table
+  read-back showed the driver's bytes present in RAM all along, and
+  the QEMU trace showed the device executing our READ-DMA-EXT with a
+  65536-sector count and a 1-byte PRDT. Three driver bugs (PRDT DBC
+  offset, FIS LBA offsets, missing sector count) — the vIOMMU
+  bounce-buffer hypothesis is refuted (the signature reproduced on
+  the no-IOMMU control lane before the fix, and both lanes mount
+  after it). Kept here as the visible retraction of the old
+  conclusion.
 
 ### Retraction
 

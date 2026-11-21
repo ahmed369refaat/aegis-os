@@ -109,6 +109,9 @@ pub fn driver_stack_step<const N: usize>(
             let mut broker = broker;
             let inv = pci_step(out, &aegis_os::dmar::Dmar::absent_stub(), &mut broker);
             e1k_step(k, pool, out, &mut broker, &inv);
+            // ADR-0014 step 5: the stale-FIS control lane — the SAME
+            // AHCI two-command sequence without the vIOMMU.
+            ahci_step(k, pool, out, &mut broker, &inv);
         }
         Discovery::Failed(err) => {
             line(
@@ -1351,11 +1354,15 @@ fn virtio_step<const N: usize>(
         return;
     }
 
-    // ── THE ENFORCEMENT PROBE (ADR-0013's payoff) ──
+    // ── THE ENFORCEMENT PROBE (ADR-0013's payoff; ADR-0014 makes it
+    // honest — under the old TT=0b10 this request COMPLETED with
+    // status=0 and PPF never set, because the device was in
+    // pass-through and never walked the tables) ──
     // Complete the data region and unmap it through the broker (the
     // full abort handshake — the honest path), return the frame, then
-    // ask the device to DMA into the now-unmapped page. The IOMMU
-    // must fault it; nothing the device does reaches RAM.
+    // ask the device to DMA into the now-unmapped page. Proof = the
+    // SLPTE reads back absent (P=0) AND FSTS.PPF sets: the IOMMU
+    // faulted the access to a page the broker unmapped.
     broker
         .region_complete(cookies[4])
         .expect("data region live");
@@ -1363,44 +1370,62 @@ fn virtio_step<const N: usize>(
         .unmap_region(cookies[4])
         .expect("abort handshake done");
     let _ = pool.free(&mut k.frames, data_pa, VBLK_OWNER);
+    // The tables' own verdict, read back from the walk the device must
+    // now take: the SLPTE for the dead page must be absent (P=0).
+    let slpt_root = broker.prot().dom_slpt(0);
+    let pte_absent = match slpt_root {
+        Some(root) => broker.prot().slpte_of(root, data_pa).is_none(),
+        None => false, // no SLPT root: the proof cannot even be attempted
+    };
     let want = submit(&queue, data_pa, 0, v::BLK_T_IN); // the dead page
     mmio.notify(0, notify_off);
     let completed = poll_used(&queue, want);
     let fsts = broker.prot().fsts();
     let ppf = fsts & crate::arch::vtd::FSTS_PPF != 0;
     let mut hf = [0u8; 18];
-    match completed {
-        None => {
+    line(
+        out,
+        &[
+            "[VBLK] enforcement: slpte ",
+            if slpt_root.is_none() {
+                "NO SLPT ROOT — INVESTIGATE"
+            } else if pte_absent {
+                "P=0 after unmap (the table no longer names the page)"
+            } else {
+                "STILL PRESENT after unmap — INVESTIGATE"
+            },
+            ", fsts=",
+            strutil::hex(u64::from(fsts), &mut hf),
+        ],
+    );
+    match (completed, ppf) {
+        (None, true) => {
             line(
                 out,
-                &[
-                    "[VBLK] enforcement: request to the unmapped page did NOT complete, fsts=",
-                    strutil::hex(u64::from(fsts), &mut hf),
-                    " PPF=",
-                    if ppf { "yes" } else { "no" },
-                    " — unmapped DMA faults (ADR-0013 D1/D6)",
-                ],
+                &["[VBLK] enforcement: PPF=yes — the request to the unmapped page did NOT complete; the IOMMU faulted the access (ADR-0013 D1/D6 proven)"],
             );
         }
-        Some(_) => {
+        (Some(_), true) => {
             let st = v::read_u8_pa(ctrl_pa + 512);
             let mut ns = [0u8; 20];
             line(
                 out,
                 &[
-                    "[VBLK] enforcement: request completed WITH ERROR status=",
+                    "[VBLK] enforcement: PPF=yes — the IOMMU faulted the access (request completed with device-side error status=",
                     strutil::dec(u64::from(st), &mut ns),
-                    " fsts=",
-                    strutil::hex(u64::from(fsts), &mut hf),
-                    " PPF=",
-                    if ppf { "yes" } else { "no" },
-                    " — the DMA was blocked at the IOMMU",
+                    ")",
                 ],
             );
         }
-    }
-    if !ppf {
-        line(out, &["[VBLK] enforcement: PPF did NOT set — INVESTIGATE (fault recording may need the FRCD walk)"]);
+        (_, false) => {
+            // The device reached (or stalled on) a page the broker
+            // unmapped with no recorded IOMMU fault: the isolation
+            // property is ABSENT on this boot. Say so loudly.
+            line(
+                out,
+                &["[VBLK] enforcement: ENFORCEMENT FAILURE — PPF=no (no IOMMU fault for the unmapped page; see ADR-0014)"],
+            );
+        }
     }
 
     // ── teardown: revoke the rest with the device still attached ──
@@ -3230,9 +3255,16 @@ fn ahci_step<const N: usize>(
         line(out, &["[AHCI] no AHCI to drive on this machine"]);
         return;
     };
-    if matches!(broker.verdict(), DmaVerdict::Absent { .. }) {
-        line(out, &["[AHCI] broker verdict absent — refusing to drive"]);
-        return;
+    // The no-IOMMU control lane (ADR-0014 step 5): the SAME two-command
+    // IDENTIFY→READ sequence with unbrokered frames. If the stale-FIS
+    // signature disappears here, it is a vIOMMU emulation artifact; if
+    // it reproduces, the driver owns it (see drivers.md).
+    let identity = matches!(broker.verdict(), DmaVerdict::Absent { .. });
+    if identity {
+        line(
+            out,
+            &["[AHCI] identity mode: no IOMMU on this machine — same two-command sequence, unbrokered frames (the stale-FIS control lane)"],
+        );
     }
     let Some(abar) = crate::pci::mem_bar_base(dev, 5) else {
         line(out, &["[AHCI] ABAR (BAR5) unresolved — refusing"]);
@@ -3275,19 +3307,26 @@ fn ahci_step<const N: usize>(
         }
     }
     let [clb, ctba, fis, data] = frames;
-    for &pa in frames.iter() {
-        if broker
-            .map_region(0, pa, 4096, DmaDir::Bidirectional)
-            .is_err()
-        {
-            line(out, &["[AHCI] broker refused a frame — refusing"]);
-            return;
+    if !identity {
+        for &pa in frames.iter() {
+            if broker
+                .map_region(0, pa, 4096, DmaDir::Bidirectional)
+                .is_err()
+            {
+                line(out, &["[AHCI] broker refused a frame — refusing"]);
+                return;
+            }
         }
+        line(
+            out,
+            &["[AHCI] port 0: CLB/FB/CTBA/data mapped via broker (4 regions)"],
+        );
+    } else {
+        line(
+            out,
+            &["[AHCI] port 0: CLB/FB/CTBA/data straight from the pool (identity, 0 regions)"],
+        );
     }
-    line(
-        out,
-        &["[AHCI] port 0: CLB/FB/CTBA/data mapped via broker (4 regions)"],
-    );
 
     // Stop the engine, reprogram CLB/FB, restart with FRE|ST.
     let cmd = r32(0x100 + 0x18);
@@ -3316,10 +3355,11 @@ fn ahci_step<const N: usize>(
     crate::memops::write_u64(ctba + 40, 0);
     crate::memops::write_u64(ctba + 48, 0);
     crate::memops::write_u64(ctba + 56, 0);
-    // PRDT entry 0 at ctba+0x80: data page, byte count 512-1.
+    // PRDT entry 0 at ctba+0x80: data page; byte count in the LAST
+    // dword (+0x8C, zero-based DBC — see ahci_read_dma's note).
     crate::memops::write_u64(ctba + 0x80, data);
-    crate::memops::write_u32(ctba + 0x88, 511);
-    crate::memops::write_u32(ctba + 0x8C, 0);
+    crate::memops::write_u32(ctba + 0x88, 0);
+    crate::memops::write_u32(ctba + 0x8C, 511);
 
     // Issue and poll CI bit 0.
     w32(0x100 + 0x38, 1);
@@ -3338,7 +3378,11 @@ fn ahci_step<const N: usize>(
                 strutil::hex(u64::from(w0), &mut h),
                 " serial[0..8]=0x",
                 strutil::hex(sn, &mut hs),
-                " (512 bytes through the IOMMU)",
+                if identity {
+                    " (512 bytes, identity lane)"
+                } else {
+                    " (512 bytes through the IOMMU)"
+                },
             ],
         );
         // The block layer's first slice rides the LIVE port: read-only
@@ -3350,16 +3394,23 @@ fn ahci_step<const N: usize>(
             &["[AHCI] IDENTIFY issued, no completion on this lane (open: the device-DMA cluster; see drivers.md)"],
         );
     }
-    let revoked = broker.revoke_all(0);
-    let mut nr = [0u8; 20];
-    line(
-        out,
-        &[
-            "[AHCI] teardown: revoke_all(0) → ",
-            strutil::dec(revoked as u64, &mut nr),
-            " region(s) unmapped; frames return scrubbed",
-        ],
-    );
+    if identity {
+        line(
+            out,
+            &["[AHCI] teardown (identity): frames freed, no broker regions"],
+        );
+    } else {
+        let revoked = broker.revoke_all(0);
+        let mut nr = [0u8; 20];
+        line(
+            out,
+            &[
+                "[AHCI] teardown: revoke_all(0) → ",
+                strutil::dec(revoked as u64, &mut nr),
+                " region(s) unmapped; frames return scrubbed",
+            ],
+        );
+    }
     for &pa in frames.iter() {
         let _ = pool.free(&mut k.frames, pa, AHCI_OWNER);
     }
@@ -3704,25 +3755,44 @@ fn ahci_read_dma(abar: u64, clb: u64, ctba: u64, buf: u64, lba: u64) -> bool {
     // H2D FIS: READ DMA EXT (0x25, 48-bit LBA) — the modern AHCI
     // path Linux uses; the 28-bit 0xC8 completed as a no-op on this
     // QEMU build (measured: TFD=0x50, no data, no D2H FIS).
-    crate::memops::write_u64(ctba, 0x27 | (0x80 << 8) | (0x25 << 16) | (0x40 << 24));
+    // ADR-0014 step 5, the layout QEMU actually parses (ahci.c
+    // handle_reg_h2d_fis): bytes 4-6 LBA 0-23, byte 7 device, bytes
+    // 8-10 LBA 24-47, bytes 12-13 sector count. The original code put
+    // the LBA at bytes 9-11 and NEVER wrote byte 12 (0 = 65536
+    // sectors, measured as prepare_buf limit=32 MiB, so LBA 2 read as
+    // LBA 2<<24 — off the image): the "stale FIS" was this driver
+    // bug, not QEMU's FIS cache — the cmd-table read-back showed the
+    // driver's bytes present in RAM all along.
+    crate::memops::write_u32(ctba, 0x27 | (0x80 << 8) | (0x25 << 16));
+    // dword 1 (bytes 4-7): LBA low 24 bits, device 0x40 (LBA select).
+    crate::memops::write_u32(
+        ctba + 4,
+        ((lba & 0xFF) as u32)
+            | ((((lba >> 8) & 0xFF) as u32) << 8)
+            | ((((lba >> 16) & 0xFF) as u32) << 16)
+            | (0x40u32 << 24),
+    );
+    // dword 2 (bytes 8-11): LBA bits 24-47, feature 15:8 = 0.
     crate::memops::write_u32(
         ctba + 8,
-        (1u32)
-            | (((lba & 0xFF) as u32) << 8)
-            | ((((lba >> 8) & 0xFF) as u32) << 16)
-            | ((((lba >> 16) & 0xFF) as u32) << 24),
+        (((lba >> 24) & 0xFF) as u32)
+            | ((((lba >> 32) & 0xFF) as u32) << 8)
+            | ((((lba >> 40) & 0xFF) as u32) << 16),
     );
-    crate::memops::write_u32(
-        ctba + 12,
-        (((lba >> 24) & 0xFF) as u32) | ((((lba >> 32) & 0xFF) as u32) << 8),
-    );
+    // dword 3 (bytes 12-15): sector count 7:0 = 1 at byte 12; count
+    // 15:8 and control zero.
+    crate::memops::write_u32(ctba + 12, 1);
     crate::memops::write_u64(ctba + 16, 0);
     crate::memops::write_u64(ctba + 24, 0);
     crate::memops::write_u64(ctba + 32, 0);
-    // PRDT: buf, byte count 512-1.
+    // PRDT: buf at +0x80; the byte count lives in the entry's LAST
+    // dword (+0x8C — QEMU's AHCI_SG { addr, reserved, flags_size },
+    // zero-based DBC at bits 21:0, I at bit 31). Writing it at +0x88
+    // (the reserved dword) made every entry "1 byte" (measured:
+    // prepare_buf prepared=1, no DMA transfer).
     crate::memops::write_u64(ctba + 0x80, buf);
-    crate::memops::write_u32(ctba + 0x88, 511);
-    crate::memops::write_u32(ctba + 0x8C, 0);
+    crate::memops::write_u32(ctba + 0x88, 0);
+    crate::memops::write_u32(ctba + 0x8C, 511);
     // QEMU's handle_cmd silently SKIPS the command when the IDE
     // engine still reports BSY/DRQ (the tail of the previous PIO
     // command — measured: CI stays set, no FIS, no data; ahci.c:1317
@@ -3769,7 +3839,7 @@ fn ext2_over_ahci(out: &mut dyn FnMut(&str), abar: u64, clb: u64, ctba: u64, fis
         line(
             out,
             &[
-                "[EXT2] mount gated: the second AHCI command reads a STALE FIS (QEMU trace: handle_cmd dumps the IDENTIFY FIS 27-80-EC where the READ FIS 27-80-25-40 was written) and later CI writes vanish; the cmd-table mapping under the IOMMU serves cached bytes — the second-command open item, drivers.md",
+                "[EXT2] superblock read failed: the sector did not land (the ADR-0014 forensics line below carries the command-table state; the historical stale-FIS reading was three driver bugs — see drivers.md)",
             ],
         );
         line(
@@ -3784,6 +3854,34 @@ fn ext2_over_ahci(out: &mut dyn FnMut(&str), abar: u64, clb: u64, ctba: u64, fis
                 " — magic 0x",
                 strutil::hex(u64::from(magic), &mut hd3),
                 " != 0xef53 — refusing",
+            ],
+        );
+        // ADR-0014 step 5 forensics: what did the driver actually leave
+        // in the header and the command table?
+        let mut hc = [0u8; 18];
+        let mut ht = [0u8; 18];
+        let mut t0 = [0u8; 18];
+        let mut t1 = [0u8; 18];
+        let mut t2 = [0u8; 18];
+        let mut pd = [0u8; 18];
+        let mut pc = [0u8; 18];
+        line(
+            out,
+            &[
+                "[EXT2] dbg cmdtbl: hdr0=0x",
+                strutil::hex(u64::from(crate::memops::read_u32(clb)), &mut hc),
+                " hdr_ctba=0x",
+                strutil::hex(u64::from(crate::memops::read_u32(clb + 8)), &mut ht),
+                " fis_d0=0x",
+                strutil::hex(u64::from(crate::memops::read_u32(ctba)), &mut t0),
+                " fis_d1=0x",
+                strutil::hex(u64::from(crate::memops::read_u32(ctba + 4)), &mut t1),
+                " fis_d2=0x",
+                strutil::hex(u64::from(crate::memops::read_u32(ctba + 8)), &mut t2),
+                " prdt_dba=0x",
+                strutil::hex(crate::memops::read_u64(ctba + 0x80), &mut pd),
+                " prdt_dbc=0x",
+                strutil::hex(u64::from(crate::memops::read_u32(ctba + 0x88)), &mut pc),
             ],
         );
         return;

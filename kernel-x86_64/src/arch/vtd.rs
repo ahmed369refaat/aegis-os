@@ -104,20 +104,24 @@ pub const fn root_entry(ctx_table_pa: u64) -> u64 {
     ENTRY_P | (ctx_table_pa & ADDR_MASK)
 }
 
-/// Context entry for a device: present, translation-type 0 (multi-
-/// level), **AW = 2** (the 4-level/48-bit page walk — bits 11:8;
-/// Linux's `context_set_address_width(ctx, agaw)`. Without it the
-/// walk runs TWO levels and reads PML4 slots at the wrong shift:
-/// measured "slpte permission error level=2" on the first device
-/// DMA), the domain's second-level root. (DID rides the high word —
-/// `context_entry_hi`.)
+/// Context entry for a device: present, **TT = 0b00** (multi-level —
+/// the device's requests are translated through the second-level
+/// tables; 0b10 would be PASS-THROUGH, the tables ignored entirely —
+/// VT-d spec §9.3, QEMU `VTD_CONTEXT_TT_PASS_THROUGH`, ADR-0014),
+/// **AW = 2** in the high word (the 4-level/48-bit page walk — QEMU
+/// `vtd_ce_get_level` = `2 + (hi & 7)`), the domain's second-level
+/// root in the low word (QEMU `vtd_ce_get_slpt_base` = `lo & ~0xfff`).
+/// (DID rides the high word — `context_entry_hi`.)
 #[must_use]
 pub const fn context_entry(slpt_root_pa: u64, _did: u16) -> u64 {
-    // TT bits 3:2 = 0b10: QEMU decodes the walk depth as 2+TT (TT=00
-    // walks two levels and mis-reads my 4-level tables — measured
-    // "slpte permission error level=2" on the first device DMA; bits
-    // 11:8 are reserved and rejected outright).
-    ENTRY_P | (0b10 << 2) | (slpt_root_pa & ADDR_MASK)
+    // TT bits 3:2 = 0b00 (multi-level). The old "QEMU decodes the walk
+    // depth as 2+TT" comment was wrong: the depth is 2 + AW from the
+    // HIGH word (bits 64+0-2), and TT=0b10 actually selected
+    // pass-through — every assigned device's IOMMU address space was
+    // bypassed (vtd_pt_enable_fast_path ×8 for six devices, and the
+    // enforcement probe's unmapped-page request completed with
+    // status=0 and PPF=no; the full evidence trail is ADR-0014).
+    ENTRY_P | (slpt_root_pa & ADDR_MASK)
 }
 
 /// High word of a context entry: DID at bits 8-23 and **AW = 2 at
@@ -141,10 +145,15 @@ pub const fn slpte_leaf(phys: u64, write: bool) -> u64 {
     ENTRY_P | (if write { SLPT_W } else { 0 }) | (phys & ADDR_MASK)
 }
 
-/// Second-level non-leaf entry: present, nothing else.
+/// Second-level non-leaf entry: present AND writable. VT-d (like x86
+/// page tables, and QEMU's `vtd_iova_to_slpte`) checks R/W at EVERY
+/// level of the walk, so a non-leaf without W blocks every device
+/// write that is not served from the IOTLB page cache — measured live
+/// as FR_WRITE at level 4 on the virtio-blk data page while cached
+/// pages' writes succeeded (ADR-0014). The leaf carries the direction.
 #[must_use]
 pub const fn slpte_table(child_pa: u64) -> u64 {
-    ENTRY_P | (child_pa & ADDR_MASK)
+    ENTRY_P | SLPT_W | (child_pa & ADDR_MASK)
 }
 
 // ── queued-invalidation descriptors (128-bit: 4 words) ──
@@ -882,15 +891,13 @@ mod tests {
             1,
             "present, address low bits masked"
         );
-        // Context: present, TT=0, AW=2 (4-level), SLPTPTR; DID high.
+        // Context: present, TT=0b00 (multi-level — the ONLY translation
+        // mode; 0b10 is PASS-THROUGH per VT-d spec §9.3 and QEMU's
+        // VTD_CONTEXT_TT_PASS_THROUGH, ADR-0014), AW=2 (4-level),
+        // SLPTPTR; DID high.
         let lo = context_entry(0x2000, 5);
-        assert_eq!(lo & 0xFFF, 0x9, "P | TT=0b10 (the 4-level walk)");
+        assert_eq!(lo & 0xFFF, 0x1, "P only — TT=0b00 (multi-level)");
         assert_eq!(lo & ADDR_MASK, 0x2000);
-        assert_eq!(
-            lo & (3 << 2),
-            0b10 << 2,
-            "TT=0b10 (QEMU's 4-level walk selector)"
-        );
         assert_eq!(
             context_entry_hi(5),
             (5 << 8) | 2,
@@ -899,8 +906,29 @@ mod tests {
         // SLPT leaves: P, W per direction, frame address.
         assert_eq!(slpte_leaf(0x7000, false), 0x7001);
         assert_eq!(slpte_leaf(0x7000, true), 0x7003);
-        assert_eq!(slpte_table(0x9000), 0x9001);
-        assert_eq!(slpte_table(0x9000) & SLPT_W, 0, "non-leaf carries no W");
+        assert_eq!(slpte_table(0x9000), 0x9003);
+        assert_eq!(
+            slpte_table(0x9000) & SLPT_W,
+            SLPT_W,
+            "non-leaf carries W: the walk checks R/W at every level (ADR-0014)"
+        );
+    }
+
+    /// ADR-0014 regression: the TT bits 3:2 of a context entry must
+    /// never be nonzero. 0b10 is pass-through (QEMU's
+    /// vtd_as_pt_enabled() → IOMMU_RW with no translation, then
+    /// vtd_pt_enable_fast_path() bypasses the IOMMU entirely) and 0b01
+    /// requires device-TLB support. Both silently delete the
+    /// DMA-isolation property ADR-0013 exists to provide.
+    #[test]
+    fn tt_bits_are_never_pass_through() {
+        for (slpt, did) in [(0x2000, 0), (0, 5), (0xFED9_0000, 0xFFFF)] {
+            assert_eq!(
+                context_entry(slpt, did) & (3 << 2),
+                0,
+                "TT must be 0b00 (multi-level); any nonzero TT silently disables translation"
+            );
+        }
     }
 
     #[test]
@@ -1061,6 +1089,42 @@ mod tests {
             used_before + 2,
             "new 1 GiB chain: PD + PT"
         );
+    }
+
+    /// ADR-0014: VT-d second-level walks check R/W at EVERY level —
+    /// QEMU's `vtd_iova_to_slpte` applies `access_right_check` to
+    /// non-leaf entries too, so a non-leaf without W blocks every
+    /// device write that is not served from the IOTLB page cache.
+    /// Measured live on the q35 lane: `vtd_dmar_fault fault 5
+    /// (VTD_FR_WRITE) addr 0x1189000 write 1` at level 4 for the
+    /// virtio-blk data page, while writes to IOTLB-cached pages
+    /// succeeded. Non-leaf entries must be present AND writable; the
+    /// leaf keeps carrying the direction.
+    #[test]
+    fn nonleaf_entries_grant_the_walk_rw() {
+        let arena = Arena::new(TABLE_BUDGET);
+        let mut vtd = plan_vtd(&arena).unwrap();
+        vtd.assign_device(0, 0, 0, (0x03, 0)).unwrap();
+        let slpt = vtd.dom_slpt[0].unwrap();
+        let pa = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        vtd.map_run(0, pa, 4096, DmaDir::Bidirectional).unwrap();
+        // Walk exactly like the device does: levels 4..=2 must each
+        // present a readable + writable entry, or a fresh write
+        // translation faults before it ever reaches the leaf.
+        let mut table = slpt;
+        for level in (2..=4u8).rev() {
+            let entry = crate::memops::read_u64(table + slpt_index(pa, level) * 8);
+            assert_eq!(entry & 1, 1, "level {level}: present");
+            assert_eq!(
+                entry & 2,
+                2,
+                "level {level}: W must be set on non-leaf entries (ADR-0014)"
+            );
+            table = entry & ADDR_MASK;
+        }
+        // The leaf keeps the direction: Bidirectional -> P|W.
+        let leaf = crate::memops::read_u64(table + slpt_index(pa, 1) * 8);
+        assert_eq!(leaf & 3, 3);
     }
 
     #[test]

@@ -4,6 +4,33 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Fixed — driver-stack review round 4, Phase 0 + Phase 1 (ADR-0014)
+
+- **P0.1**: the 8 MiB ELF core dump committed as `kernel-x86_64/core`
+  (environment block included) is untracked; `.gitignore` covers core
+  files; `scripts/check-no-binaries.sh` (self-tested, CI-wired) fails
+  on tracked ELF cores, oversize files, and credential patterns;
+  `docs/incident-core-dump.md` is the maintainer runbook (token
+  rotation + history purge are human steps).
+- **P0.2**: clippy clean on the pinned toolchain for BOTH profiles
+  (host: 5 errors; kernel target: 43 more behind `cfg(not(test))`),
+  plus the asm-pattern guard generalized off its %rbx-only heuristic
+  (false positive on `cpuid1_ecx`).
+- **ADR-0014**: context entries carried TT=0b10 — pass-through — so no
+  device ever walked the second-level tables (`vtd_pt_enable_fast_path`
+  ×8, six devices; enforcement probe completed against an unmapped
+  page). TT=0b00 + non-leaf entries now carry W (VT-d checks R/W at
+  every level). The q35 lane boots with `-trace enable=vtd_*` and
+  FAILS on any fast-path event or a missing `PPF=yes`.
+- Cascades solved by real translation: virtio-net and e1000 full DHCP
+  round trips through the IOMMU; AHCI's "stale FIS" was three driver
+  bugs (PRDT DBC offset, FIS LBA offsets, missing sector count) — the
+  ext2 mount now reads hello.txt on BOTH the IOMMU and no-IOMMU lanes.
+- Boot-lane hygiene: the q35/q35-neg lanes now generate all their disk
+  images (previously they existed only on one dev machine — a latent
+  CI break), and the no-IOMMU control lane carries the AHCI control
+  experiment.
+
 ### Added — PR-1.1: exception machinery (`kernel-x86_64/src/arch/`, ADR-0005)
 
 - Kernel-owned GDT/TSS/IDT mirroring the boot stub's selector map (the

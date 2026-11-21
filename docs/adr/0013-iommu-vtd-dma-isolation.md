@@ -162,6 +162,16 @@ Domain-id allocation: monotonic, one per live driver domain, freed on
 domain teardown (16-bit space vs MAX_DOMAINS=4 today — no pressure;
 recorded as a construction parameter).
 
+> **Correction (2026-11-20, review round 4):** the implementation
+> shipped TT=0b10 in `context_entry` — pass-through, the exact
+> opposite of this section — while this text claimed "no passthrough
+> entries". Every device's DMA bypassed the tables
+> (`vtd_pt_enable_fast_path` ×8, six devices) and the enforcement
+> probe's request against an unmapped page completed with PPF=no.
+> ADR-0014 carries the verification and the fix; the tables are
+> load-bearing from that commit on. Recorded here so the wrong
+> history stays visible.
+
 ### D4 — Mapping model
 
 Per-domain second-level tables, 4 KiB granularity (QEMU's `fs1gp`
