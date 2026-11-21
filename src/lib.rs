@@ -50,6 +50,7 @@ pub mod ipc;
 pub mod memory;
 pub mod monitor;
 pub mod net;
+pub mod part;
 pub mod pipe;
 pub mod preempt;
 pub mod profile;
