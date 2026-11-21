@@ -17,10 +17,15 @@
   STAR=`(0x18<<48)|(0x30<<32)`, LSTAR=entry, FMASK=IF|TF|DF (`0x700`),
   enables EFER.SCE, and parks `0` in KERNEL_GS_BASE (the swapgs
   partner: launch swaps GS→user/KGS→percpu, every entry/exit pair
-  balances). The naked entry: `swapgs` → RSP from a static (SYSCALL
-  switches no stack itself) → park 12 quadwords (SysV-aligned) →
-  RDTSC t0 → call the dispatch with the 6-register ABI → RDTSC t1 →
-  restore everything except RAX/RCX/R11 → `swapgs` → `sysretq`.
+  balances). The naked entry: `swapgs` → park the USER RSP into
+  `USER_RSP_SAVE` (SYSRET restores only RIP/RFLAGS — round J found the
+  stub had never carried the user's stack pointer back, so every sysret
+  returned to ring-3 running on the kernel's stack; invisible while
+  every blob was pure register code, exposed by the first `call` in
+  ring-3 history) → RSP from a static (SYSCALL switches no stack
+  itself) → park 12 quadwords (SysV-aligned) → RDTSC t0 → call the
+  dispatch with the 6-register ABI → RDTSC t1 → restore everything
+  except RAX/RCX/R11 → reload the user RSP → `swapgs` → `sysretq`.
 - **`syscall.rs` (kernel)** — the gate runs first through the *same*
   lib code as kernel-resident domains (`aegis_os::syscall::gate`,
   extracted verbatim in this PR), the syscall number is bounds-checked

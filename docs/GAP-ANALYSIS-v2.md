@@ -85,12 +85,22 @@ full brief.
 
 ### 2.1 Core execution & isolation
 
-- **Ring-3 reliability: DONE** (ADR-0010). **Ring-3 syscall surface: ~3%.
-  The dispatch in `kernel-x86_64/src/syscall.rs` executes WRITE and EXIT
-  only; the lib implements ~20.** Every profile-allowed syscall must
-  reach the same executor the lib tests exercise, table-driven, through
-  the same `gate()`. Until then, "multi-domain system" means "kernel demo
-  with user-mode guest actors".
+- **Ring-3 reliability: DONE** (ADR-0010). **Ring-3 syscall surface:
+  the file family is LIVE (round J) — OPEN/READ/WRITE/CLOSE/PIPE/DUP
+  marshal through the host-tested `sysabi` layer and execute on the
+  lib kernel's own state (`Kernel::execute`, after the runtime's gate
+  pass), with bidirectional page-validated user-pointer copies and the
+  stdio triplet reserved at spawn; proven live by the eighth boot run
+  (`ring3-files`: pipe round-trip, dup survival, file
+  create/write/read-back, the errno refusals). Round J also fixed two
+  hidden debts of the entry path: SYSRET never restored the user RSP
+  (exposed by the first `call` in ring-3 history), and an outer
+  `#[cfg(not(test))]` had been compiling the syscall module's tests
+  out of every host run. **Still -ENOSYS at the ring-3 entry:
+  MMAP/MUNMAP/SPAWN/IPC/NET/KILL/CHROOT/MKDIR/UNLINK — the lib
+  implements them; the marshaling follows the same sysabi pattern.**
+  Until then, "multi-domain system" still means "kernel demo with
+  user-mode guest actors" — but the demo now reads and writes files.
 - **No interrupts, no timer, no preemption.** The kernel runs IF=0; user
   code runs IF=1 (`USER_RFLAGS=0x202`) but only the PIC-masked catch-all
   gates 32..=47 exist; nothing arms a source; the Scheduler is never

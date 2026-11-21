@@ -39,3 +39,4 @@ it does not merge.
 | [0018](0018-one-iommu-domain-per-device.md) | One IOMMU domain per device: kernel-allocated ids, scoped sessions, sized table budget | Accepted (review round 5, Phase A) |
 | [0019](0019-interrupt-broker-msix-irte.md) | The interrupt chain: broker-owned vectors, IOAPIC, MSI/MSI-X, VT-d IRTE, the delivery window, and the platform slice (FADT power, TSC calibration, entropy, GPT) | Accepted (review round 6 — host-proven + lane markers; the IR lane ships this round, proven in CI) |
 | [0020](0020-multi-bus-pci-ecam.md) | Multi-bus PCI: the ECAM config seam + the recursive bridge walk, lifting the bus-0-only refusal | Accepted (review round 6) |
+| [0021](0021-ring3-syscall-surface.md) | The ring-3 syscall surface: the marshaling seam and the gate/execute split | Accepted (round J — the file family live, the eighth boot run) |

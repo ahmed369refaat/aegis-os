@@ -46,14 +46,17 @@ stays) · POSIX ABI → Stage 5 · drivers → Stage 6 · hardening
 capability generations, ten-check memory policy, in-memory VFS + Unix DAC
 + chroot, pipes, signals, fd tables, CFS, buddy allocator, rate-limited
 brokered sockets, capability-endpoint async IPC, behavior monitor with
-graduated response) — 326 lib tests; a bootable two-stage x86_64 kernel
+graduated response) — 331 lib tests; a bootable two-stage x86_64 kernel
 (ELF32 multiboot stub → ELF64 kernel) with a real 4096-frame pool,
 scrub-on-free verified by read-back, per-domain page tables, SMEP/SMAP,
-kernel-image W^X, SYSCALL/SYSRET ring-3 entry, and the seven-run ring-3
-sequence asserted by the CI boot test — 253 kernel host tests; 579 total,
+kernel-image W^X, SYSCALL/SYSRET ring-3 entry (with the user-RSP
+park/restore round J exposed and fixed), and the eight-run ring-3
+sequence asserted by the CI boot test — the eighth run is the file
+lifecycle (OPEN/READ/WRITE/CLOSE/PIPE/DUP live on the lib kernel,
+round J) — 265 kernel host tests; 596 total,
 zero external dependencies, unsafe confined to the allowlist (arch/,
 boot/, hw.rs, memops.rs, sched/ — as defined in scripts/check_unsafe.sh,
-ratcheted at 100).
+ratcheted at 101).
 
 **Round 6 ("G", ADR-0019/0020):** the interrupt chain is live —
 the broker-owned device vectors (49..=112), the IOAPIC line path
