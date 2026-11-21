@@ -243,7 +243,10 @@ pub fn parse_gpt_header(sector: &[u8]) -> Result<GptHeader, PartError> {
     if hdr.entries_lba == 0 || hdr.entries_lba >= hdr.first_usable {
         return Err(PartError::BadGeometry);
     }
-    if hdr.entry_size < 128 || hdr.entry_size as usize > SECTOR || hdr.entry_size % 128 != 0 {
+    if hdr.entry_size < 128
+        || hdr.entry_size as usize > SECTOR
+        || !hdr.entry_size.is_multiple_of(128)
+    {
         return Err(PartError::BadEntrySize(hdr.entry_size));
     }
     let table_bytes = hdr.num_entries as usize * hdr.entry_size as usize;

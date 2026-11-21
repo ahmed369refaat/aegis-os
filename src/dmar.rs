@@ -265,7 +265,7 @@ pub struct DeviceScope {
     /// IOAPIC id / HPET number for those kinds; 0 for PCI kinds.
     pub enumeration_id: u8,
     pub start_bus: u8,
-    /// Bridge hops, path[0] = the device itself for endpoint scopes.
+    /// Bridge hops, path\[0\] = the device itself for endpoint scopes.
     pub path: [(u8, u8); MAX_SCOPE_PATH],
     pub path_len: usize,
 }

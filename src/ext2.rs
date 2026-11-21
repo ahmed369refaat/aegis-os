@@ -111,7 +111,7 @@ impl Superblock {
 pub struct Inode {
     pub mode: u16,
     pub size: u32,
-    /// i_block[0] — the first direct block (all this demo reads).
+    /// i_block\[0\] — the first direct block (all this demo reads).
     pub block0: u32,
 }
 

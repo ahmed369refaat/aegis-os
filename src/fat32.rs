@@ -172,13 +172,12 @@ impl Bpb {
             });
         }
         let rel = u64::from(c - 2) * u64::from(self.sectors_per_cluster);
-        Ok(self
-            .data_lba
+        self.data_lba
             .checked_add(rel)
             .ok_or(Fat32Error::ClusterOutOfRange {
                 cluster: c,
                 max: self.cluster_count + 1,
-            })?)
+            })
     }
 
     /// The partition-relative LBA of the FAT sector holding cluster
@@ -301,7 +300,7 @@ pub fn walk_file_chain(
         return Ok(0);
     }
     let cluster_bytes = u64::from(bpb.sectors_per_cluster) * 512;
-    let needed = ((u64::from(len) + cluster_bytes - 1) / cluster_bytes) as u32;
+    let needed = u64::from(len).div_ceil(cluster_bytes) as u32;
     if needed > bpb.cluster_count {
         return Err(Fat32Error::ChainTooLong {
             needed,
@@ -400,7 +399,7 @@ mod tests {
         // marker is 17 bytes ("HEAD:AEGIS-FAT32:"), the tail 8.
         let mut content = Vec::with_capacity(1200);
         content.extend_from_slice(b"HEAD:AEGIS-FAT32:");
-        content.extend(std::iter::repeat(b'0').take(1200 - 17 - 8));
+        content.extend(std::iter::repeat_n(b'0', 1200 - 17 - 8));
         content.extend_from_slice(b":TAIL-OK");
         assert_eq!(content.len(), 1200);
         put(&mut img, 1065, &content[..512]);
@@ -488,7 +487,7 @@ mod tests {
     #[test]
     fn hostile_bpbs_are_refused() {
         let img = build_image();
-        let mut m = |f: fn(&mut Vec<u8>)| {
+        let m = |f: fn(&mut Vec<u8>)| {
             let mut img = img.clone();
             f(&mut img);
             Bpb::parse(&img[0..512])
@@ -697,7 +696,7 @@ mod tests {
     #[test]
     fn fuzzed_images_never_panic() {
         let img = build_image();
-        let mut state = 0xC0FF_EE01_BADC_0DEu64;
+        let mut state = 0x0C0F_FEE0_1BAD_C0DE_u64;
         let mut next = || {
             state ^= state << 13;
             state ^= state >> 7;
