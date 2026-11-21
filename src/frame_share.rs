@@ -24,9 +24,9 @@ pub enum ShareError {
     Overflow(u64),
 }
 
-/// The per-frame reference table.
+/// The per-frame reference table: `(pa, refs, original_owner)`.
 pub struct FrameShares {
-    entries: [Option<(u64, u32)>; MAX_SHARED],
+    entries: [Option<(u64, u32, u32)>; MAX_SHARED],
 }
 
 impl Default for FrameShares {
@@ -43,22 +43,29 @@ impl FrameShares {
         }
     }
 
-    /// Add one reference to `pa`, inserting it if this is the first.
-    pub fn acquire(&mut self, pa: u64) -> Result<(), ShareError> {
+    /// Add one NEW HOLDER of `pa`. Insertion semantics (found by the
+    /// fork/reclaim model test before it ever ran on the kernel): a
+    /// private frame becoming shared already has its original holder,
+    /// so the entry starts at TWO references — the owner's own mapping
+    /// plus this new one. A frame already in the table just gains one
+    /// (and keeps the ORIGINAL owner — the entry is the frame's
+    /// provenance, not the caller's).
+    pub fn acquire(&mut self, pa: u64, owner: u32) -> Result<(), ShareError> {
         for slot in self.entries.iter_mut() {
             match *slot {
-                Some((p, refs)) if p == pa => {
+                Some((p, refs, owner0)) if p == pa => {
                     let next = refs.checked_add(1).ok_or(ShareError::Overflow(pa))?;
-                    *slot = Some((pa, next));
+                    *slot = Some((p, next, owner0));
                     return Ok(());
                 }
                 _ => {}
             }
         }
-        // Absent: insert at the first free slot.
+        // Absent: insert at the first free slot — refs = 2 (the
+        // original private holder + the new sharer).
         for slot in self.entries.iter_mut() {
             if slot.is_none() {
-                *slot = Some((pa, 1));
+                *slot = Some((pa, 2, owner));
                 return Ok(());
             }
         }
@@ -71,12 +78,12 @@ impl FrameShares {
     pub fn release(&mut self, pa: u64) -> Result<bool, ShareError> {
         for slot in self.entries.iter_mut() {
             match *slot {
-                Some((p, refs)) if p == pa => {
+                Some((p, refs, owner)) if p == pa => {
                     if refs == 1 {
                         *slot = None;
                         return Ok(true);
                     }
-                    *slot = Some((pa, refs - 1));
+                    *slot = Some((p, refs - 1, owner));
                     return Ok(false);
                 }
                 _ => {}
@@ -85,14 +92,25 @@ impl FrameShares {
         Err(ShareError::NotHeld(pa))
     }
 
+    /// The frame's ORIGINAL pool owner (the tag the last holder frees
+    /// under), when shared.
+    #[must_use]
+    pub fn owner_of(&self, pa: u64) -> Option<u32> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|&&(p, _, _)| p == pa)
+            .map(|&(_, _, o)| o)
+    }
+
     /// The current count, or `None` when the frame is not shared.
     #[must_use]
     pub fn refs(&self, pa: u64) -> Option<u32> {
         self.entries
             .iter()
             .flatten()
-            .find(|&&(p, _)| p == pa)
-            .map(|&(_, r)| r)
+            .find(|&&(p, _, _)| p == pa)
+            .map(|&(_, r, _)| r)
     }
 
     /// Whether more than one holder maps `pa`.
@@ -106,14 +124,14 @@ impl FrameShares {
     #[cfg(test)]
     pub fn set_refs_for_test(&mut self, pa: u64, refs: u32) {
         for slot in self.entries.iter_mut() {
-            if matches!(*slot, Some((p, _)) if p == pa) {
-                *slot = Some((pa, refs));
+            if matches!(*slot, Some((p, _, _)) if p == pa) {
+                *slot = Some((pa, refs, 0));
                 return;
             }
         }
         for slot in self.entries.iter_mut() {
             if slot.is_none() {
-                *slot = Some((pa, refs));
+                *slot = Some((pa, refs, 0));
                 return;
             }
         }
@@ -174,7 +192,7 @@ mod tests {
     fn refcount_overflow_refuses_instead_of_saturating_silently() {
         let mut s = FrameShares::new();
         s.set_refs_for_test(0x3000, u32::MAX);
-        assert_eq!(s.acquire(0x3000), Err(ShareError::Overflow(0x3000)));
+        assert_eq!(s.acquire(0x3000, 1), Err(ShareError::Overflow(0x3000)));
     }
 
     #[test]

@@ -42,7 +42,7 @@ pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
 pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
 use aegis_os::sys::{SysRequest, SysValue};
 use aegis_os::syscall::{
-    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_KILL, SYS_MMAP, SYS_MUNMAP,
+    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_KILL, SYS_MMAP, SYS_MUNMAP,
     SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_WRITE,
 };
 
@@ -78,6 +78,7 @@ pub fn linux_to_core(nr: u64) -> u64 {
         // Linux renumbering is Phase 5's ABI-VERSION v0.4 table.)
         15 => SYS_SIGRETURN as u64, // rt_sigreturn(2)
         62 => SYS_KILL as u64,      // kill(2)
+        57 => SYS_FORK as u64,      // fork(2)
         n => n,
     }
 }
@@ -225,6 +226,7 @@ mod exec {
             Decision::Allowed if nr8 == SYS_KILL => sys_kill(run, a1, a2),
             Decision::Allowed if nr8 == SYS_MMAP => sys_mmap(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_MUNMAP => sys_munmap(run, a1, a2),
+            Decision::Allowed if nr8 == SYS_FORK => sys_fork(run),
             // Round J: the file family runs on the LIVE lib kernel —
             // marshaled through sysabi, executed by `Kernel::execute`.
             Decision::Allowed if sysabi::FILE_FAMILY.contains(&nr8) => {
@@ -805,6 +807,69 @@ mod exec {
             Ok(_) => 0,
             Err(_) => (-EINVAL) as u64,
         }
+    }
+
+    /// fork() — ADR-0024 D2: the core's fork_process (masks ∩, caps ∩
+    /// minus parent-aimed, fds, creds — round K's semantics) followed
+    /// by the memory half this round adds: the page-table tree cloned
+    /// with every shared user frame refcounted and every WRITABLE page
+    /// demoted read-only on BOTH sides. The child enters the world
+    /// parked with the parent's syscall image and RAX=0; the parent
+    /// returns the child's id. The first write on either side faults,
+    /// and the fault path's CoW branch copies the frame privately.
+    fn sys_fork(run: &mut crate::sched::context::UserRun) -> u64 {
+        use crate::mm::page_table::PoolSource;
+
+        let parent = run.domain;
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        let child = match k.fork_process(parent) {
+            Ok(c) => c,
+            Err(aegis_os::proc::ProcError::UnknownProcess(_)) => {
+                return (-sysabi::ESRCH) as u64;
+            }
+            Err(aegis_os::proc::ProcError::Quarantined(_)) => {
+                return (-sysabi::EPERM) as u64;
+            }
+            // The capacity family (children limit, table/meta
+            // exhaustion): the Unix "try again".
+            Err(_) => return (-sysabi::EAGAIN) as u64,
+        };
+        // The child's table frames allocate under the CHILD's tag;
+        // shared data frames keep their provenance in the table.
+        let Some(pool) = context::pool_mut() else {
+            let _ = k.destroy_domain(child);
+            return (-ENOMEM) as u64;
+        };
+        let tables = {
+            let mut src = PoolSource::new(pool, &mut k.frames, child);
+            let shares = context::shares_mut();
+            match run.tables.clone_for_fork(&mut src, shares, parent) {
+                Ok(t) => t,
+                Err(_) => {
+                    // The clone rolled itself back; undo the core fork.
+                    let _ = k.destroy_domain(child);
+                    return (-ENOMEM) as u64;
+                }
+            }
+        };
+        // The child's run: a fresh accounting shell over the shared
+        // memory (the snapshot mask is the parent's — the LIVE gate
+        // reads the child's own domain record).
+        let child_run = crate::sched::context::UserRun::new(
+            tables,
+            run.space.clone(),
+            child,
+            run.mask,
+            run.quarantined,
+        );
+        // The child's register image: the parent's in-flight syscall
+        // with RAX=0 (the fork convention), stashed parked (the unsafe
+        // lives in park.rs's wrapper — this module is unsafe-free).
+        let ctx = crate::sched::park::parked_from_current_syscall(0);
+        crate::sched::context::stash_parked(child_run, ctx);
+        child as u64
     }
 
     /// SYS_READ(fd, buf, len): the executor fills a KERNEL buffer

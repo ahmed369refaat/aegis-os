@@ -611,7 +611,13 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // exec attack, a kernel-address read, and a forged syscall — each
     // a fresh policy-mapped domain, each ending in SYS_EXIT or a
     // user-mode fault the kernel survives.
-    let syscall_stack = match mm::stacks::alloc(&mut pool, &mut k.frames, 2) {
+    // ADR-0024 D2: 8 pages (was 2). The fork path's dispatch depth —
+    // sys_fork → clone_for_fork's bookkeeping → fork_process →
+    // Domain::forked's ~3.5 KiB frame — measured past 8 KiB and the
+    // GUARD caught it exactly as F15 built it to (a loud #PF at the
+    // guard, not silent .bss corruption). The margin is now honest
+    // rather than lucky; the slot holds up to 511.
+    let syscall_stack = match mm::stacks::alloc(&mut pool, &mut k.frames, 8) {
         Ok(st) => st,
         Err(_) => {
             line(
@@ -1295,10 +1301,6 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // empties (the sleeper exited; its exit sits in the completed
         // mailbox — teardown stays the spawner's contract).
         hw::write_cr3(kernel_cr3);
-        crate::serial::write_str(
-            "[DBG ] kmain back after the sleeper pair
-",
-        );
         let mut clean_exit = false;
         let mut saw_exit = false;
         while let Some((dom, exit)) = crate::sched::park::completed_drain() {
@@ -1429,10 +1431,6 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // kmain resumes when the nested dispatcher empties: both runs
         // exited (the mailbox holds their exits).
         hw::write_cr3(kernel_cr3);
-        crate::serial::write_str(
-            "[DBG ] kmain back after the signal pair
-",
-        );
         let mut victim_ok = false;
         let mut killer_ok = false;
         while let Some((dom, exit)) = crate::sched::park::completed_drain() {
@@ -1554,6 +1552,86 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 strutil::hex(cr2, &mut h),
             ],
         );
+    }
+
+    // ── 18. ADR-0024 D2: the fork/CoW proof — fork's memory half,
+    //      live. The forker (mode 7) mmaps a page, writes a pattern,
+    //      forks (the tree clones, every writable page demoted RO on
+    //      both sides, every shared frame refcounted), and BOTH sides
+    //      write through the demotion — the parent a new pattern, the
+    //      child a different one — each write served by a PRIVATE
+    //      copy-on-write frame, each read-back verifying its own
+    //      pattern. kmain runs the child through the parked handover
+    //      after the parent exits, then tears both down and counts
+    //      the reclaim. ──
+    {
+        static FORKER_DATA: [u8; 1] = [7]; // mode 7
+        let forker = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            27,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &FORKER_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(&mut out, &["[M3] cow: ERROR: forker spawn failed; halting"]);
+                hw::halt_forever();
+            }
+        };
+        let kernel_cr3 = hw::read_cr3();
+        forker.run.tables.activate();
+        crate::sched::context::begin(forker.run);
+        crate::sched::context::launch(&forker.ctx);
+        // kmain resumes when the nested dispatcher empties: the parent
+        // yields right after the fork (deterministic — a tick stealing
+        // the child mid-run would race the exits), the child runs to
+        // its exit, the parent resumes and finishes, and BOTH exits
+        // land in the completed mailbox (the K2 nested-dispatcher
+        // shape; teardown stays the spawner's contract).
+        hw::write_cr3(kernel_cr3);
+        let mut parent_ok = false;
+        let mut child_ok = false;
+        while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            let clean = matches!(exit, crate::sched::context::ExitKind::Exited(0));
+            if dom == 27 {
+                parent_ok = clean;
+            } else {
+                child_ok = clean;
+            }
+            mm::user::destroy_user(&mut k, &mut pool, dom);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+        }
+        let copies = crate::mm::shares::cow_copies();
+        if parent_ok && child_ok && copies >= 2 {
+            let mut b = [0u8; 20];
+            line(
+                &mut out,
+                &[
+                    "[M3] cow: fork shared, ",
+                    strutil::dec(copies, &mut b),
+                    " CoW copies served, both exits clean, frames reclaimed",
+                ],
+            );
+        } else {
+            let mut b1 = [0u8; 20];
+            let mut b2 = [0u8; 20];
+            let mut b3 = [0u8; 20];
+            line(
+                &mut out,
+                &[
+                    "[M3] cow: ERROR: parent_ok=",
+                    strutil::dec(parent_ok as u64, &mut b1),
+                    " child_ok=",
+                    strutil::dec(child_ok as u64, &mut b2),
+                    " copies=",
+                    strutil::dec(copies, &mut b3),
+                    "; halting",
+                ],
+            );
+            hw::halt_forever();
+        }
     }
 
     // ── 13. the terminal guard-page proof: the write must #PF, the

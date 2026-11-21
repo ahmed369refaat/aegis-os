@@ -27,6 +27,12 @@ pub mod direct_map;
 pub mod image;
 pub mod page_table;
 pub mod pte;
+
+/// ADR-0024 D2: the share-aware frame paths (fork, munmap, teardown)
+/// — boot-only: they reach the live share table through the context
+/// slot, which host builds do not install.
+#[cfg(not(test))]
+pub mod shares;
 pub mod stacks;
 pub mod user;
 pub mod user_layout;

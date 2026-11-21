@@ -114,6 +114,30 @@ pub fn write_frame_word(off: u64, val: u64) {
     unsafe { *((base + off) as *mut u64) = val };
 }
 
+/// ADR-0024 D2: the user's callee-saved registers (rbp, r12, r13,
+/// r14, r15), parked by the stub AT ENTRY — the same lifetime
+/// discipline as USER_RSP_SAVE. They CANNOT be read live at dispatch
+/// depth: past the stub's `call`, rbp/r12-15 are the RUST COMPILER'S
+/// scratch (SysV makes every callee preserve them, which means the
+/// user's values live in the callees' stack frames, not in the
+/// registers — found live when the fork path's parked images carried
+/// compiler scratch as user state and both runs died writing through
+/// garbage r12). The stub stores them before anything can clobber;
+/// SYSRET needs no restore (the whole kernel path preserved them).
+static mut USER_RBP: u64 = 0;
+static mut USER_R12: u64 = 0;
+static mut USER_R13: u64 = 0;
+static mut USER_R14: u64 = 0;
+static mut USER_R15: u64 = 0;
+
+/// The user's callee-saved register values parked at syscall entry,
+/// in `[rbp, r12, r13, r14, r15]` order.
+pub fn user_callee_saved() -> [u64; 5] {
+    // SAFETY: single CPU, one in-flight excursion; the stub wrote
+    // these before `call dispatch` and nothing else touches them.
+    unsafe { [USER_RBP, USER_R12, USER_R13, USER_R14, USER_R15] }
+}
+
 /// Round J's parked user RSP, read by the park paths.
 pub fn user_rsp_save() -> u64 {
     USER_RSP_SAVE.load(Ordering::Relaxed)
@@ -183,6 +207,11 @@ pub extern "C" fn syscall_entry() {
                                        // so the stub enforces the no-nesting
                                        // invariant itself; SYSRET restores the
                                        // user's IF from R11)
+        "movq %rbp, {ubp}(%rip)",       // ADR-0024: park the user's
+        "movq %r12, {ur12}(%rip)",      // callee-saved five BEFORE
+        "movq %r13, {ur13}(%rip)",      // anything can clobber them
+        "movq %r14, {ur14}(%rip)",      // (SYSRET needs no restore:
+        "movq %r15, {ur15}(%rip)",      // the kernel path preserves)
         "movq %rsp, {ursp}(%rip)",     // Round J: park the USER RSP —
                                        // SYSRET will not restore it, and
                                        // the switch below destroys it
@@ -243,6 +272,11 @@ pub extern "C" fn syscall_entry() {
         "sysretq",                     // CPL=3, RFLAGS from R11
         srsp = sym SYSCALL_RSP,
         ursp = sym USER_RSP_SAVE,
+        ubp = sym USER_RBP,
+        ur12 = sym USER_R12,
+        ur13 = sym USER_R13,
+        ur14 = sym USER_R14,
+        ur15 = sym USER_R15,
         sfrm = sym SYSCALL_FRAME,
         dispatch = sym crate::syscall::syscall_dispatch,
         rt = sym ROUNDTRIP,

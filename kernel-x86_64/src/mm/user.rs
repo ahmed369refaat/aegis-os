@@ -174,7 +174,30 @@ fn build_user_tables<const N: usize>(
 /// called from kmain after `resume_kernel`.
 #[cfg(not(test))]
 pub fn destroy_user<const N: usize>(k: &mut Kernel<N>, pool: &mut FramePool<N>, id: u32) {
-    pool.free_all_owned(&mut k.frames, id);
+    // ADR-0024 D2: the shares-aware teardown — a frame another address
+    // space still maps is RELEASED, not freed (the last holder frees,
+    // under the ORIGINAL owner's tag); private frames free outright.
+    // The buffer is sized by the live owned count (no allocation).
+    let owned = pool.owned_by(id) as usize;
+    let mut buf = [const { None }; 1024];
+    let buf = if owned <= buf.len() {
+        &mut buf[..owned.max(1)]
+    } else {
+        &mut buf[..]
+    };
+    let freed = crate::mm::shares::reclaim_domain_frames(pool, &mut k.frames, id, buf);
+    if freed != owned {
+        // A short buffer or a cross-owner refusal leaked frames — the
+        // loud place to catch it (the boot proof counts the reclaim).
+        let mut b = [0u8; 20];
+        crate::serial::write_str("[MM ] teardown domain ");
+        crate::serial::write_str(crate::strutil::dec(u64::from(id), &mut b));
+        crate::serial::write_str(": freed ");
+        crate::serial::write_str(crate::strutil::dec(freed as u64, &mut b));
+        crate::serial::write_str(" of ");
+        crate::serial::write_str(crate::strutil::dec(owned as u64, &mut b));
+        crate::serial::write_str(" owned frames\n");
+    }
     let _ = k.destroy_domain(id);
 }
 

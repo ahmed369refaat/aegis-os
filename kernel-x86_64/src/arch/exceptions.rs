@@ -244,6 +244,15 @@ fn dispatch(f: &mut ExceptionFrame) {
             serial::write_str("[EXC] CPL3 fault with no user run — halting (kernel bug)\n");
             hw::halt_forever();
         }
+        // ADR-0024 D2: the RECOVERABLE fault — a write to a
+        // copy-on-write page (fork demoted it RO on both sides; the
+        // region says writable; the frame is shared). The check is the
+        // pure truth table; the fix is one private frame, one page
+        // copy, one PTE repoint, one invlpg — and this handler simply
+        // RETURNS, so the iretq re-executes the faulting instruction.
+        if f.vector == 14 && try_cow_recovery(f) {
+            return;
+        }
         // SAFETY: CPL3 frames physically carry the rsp/ss tail (the CPU
         // pushed it); reading one word past `rflags` is in-bounds here.
         let user_rsp = unsafe { core::ptr::addr_of!(f.rflags).add(1).read() };
@@ -681,4 +690,84 @@ pub fn arm_guard_read(va: u64) {
         );
     }
     ARMED_DG.store(false, Ordering::SeqCst);
+}
+
+/// ADR-0024 D2: serve one copy-on-write fault, or answer `false` (the
+/// fault is not ours to fix — the fatal path applies). PURE decision
+/// over the live state, then the fix: a fresh private frame, the page
+/// copy through the direct map, the PTE repointed RW, the old frame's
+/// reference released, the TLB entry dropped.
+fn try_cow_recovery(f: &ExceptionFrame) -> bool {
+    use crate::mm::pte::{self, PTE_P, PTE_U, PTE_W};
+    use crate::mm::ADDR_MASK;
+    use aegis_os::frame_share::{cow_decision, CowDecision};
+    use aegis_os::memory::MemFlags;
+
+    let run = crate::sched::context::current();
+    let cr2 = crate::hw::read_cr2();
+    // A CPL3 fault in the KERNEL half is a violation by definition —
+    // and walking the user tables for a kernel VA would descend into
+    // the shared kernel half's HUGE-LEAF entries and read them as
+    // page tables (found live: the kernel-VA-read proof faulted into
+    // a direct-map walk and panicked in pa_to_va). Never ours.
+    if cr2 >= pte::USER_LIMIT {
+        return false;
+    }
+    let is_write = f.error_code & 0x2 != 0;
+    let Some(leaf) = run.tables.pte_of(cr2) else {
+        return false;
+    };
+    let pa = leaf & ADDR_MASK;
+    let region_writable = run
+        .space
+        .regions()
+        .find(|r| {
+            let base = r.base as u64;
+            cr2 >= base && cr2 < base + r.len as u64
+        })
+        .is_some_and(|r| r.flags.0 & MemFlags::WRITE.0 != 0);
+    let refs = crate::sched::context::shares_mut().refs(pa);
+    if cow_decision(
+        leaf & PTE_P != 0,
+        leaf & PTE_W != 0,
+        leaf & PTE_U != 0,
+        region_writable,
+        refs,
+        is_write,
+    ) != CowDecision::Copy
+    {
+        return false;
+    }
+
+    // The fix: one private frame under the faulting domain's tag, the
+    // page copied byte-for-byte through the direct map (CR3-
+    // independent), the leaf repointed RW at the copy.
+    let (Some(pool), Some(k)) = (
+        crate::sched::context::pool_mut(),
+        crate::sched::context::kernel_mut(),
+    ) else {
+        return false;
+    };
+    let Ok(fresh) = pool.alloc_for(&mut k.frames, run.domain) else {
+        return false; // OOM on a CoW fix: the fatal path applies
+    };
+    let mut off = 0u64;
+    while off < pte::PAGE_SIZE_U64 {
+        let word = crate::memops::read_u64(pa + off);
+        crate::memops::write_u64(fresh + off, word);
+        off += 8;
+    }
+    if !run.tables.replace_leaf(cr2, fresh, true) {
+        // The walk found no leaf after all (a race the pure check
+        // could not see — single CPU makes this unreachable; still,
+        // never leave a private frame stranded).
+        let _ = pool.free(&mut k.frames, fresh, run.domain);
+        return false;
+    }
+    // The shared frame loses one holder (never the last: refs > 1 is
+    // the decision's premise — the release keeps >= 1).
+    let _ = crate::sched::context::shares_mut().release(pa);
+    pte::flush_tlb_page(cr2);
+    crate::mm::shares::note_cow_copy();
+    true
 }

@@ -53,6 +53,8 @@ _ring3_start:
     je 11f                            /* mode 5: the forger */
     cmp al, 6
     je 12f                            /* mode 6: the mmap proof */
+    cmp al, 7
+    je 13f                            /* mode 7: the fork/CoW proof */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -169,7 +171,7 @@ _ring3_start:
     call next_instr
 next_instr:
     pop rsi
-    add rsi, 0x1A5                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
+    add rsi, 0x232                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
     mov rdx, 0x0040C000               /* the kernel's trampoline page */
     syscall
     test rax, rax
@@ -287,6 +289,57 @@ killer_spin:
     mov rax, [r13]
     jmp 116f                          /* unreachable; the fault wins */
 
+13: /* ── mode 7: the fork/CoW proof (ADR-0024 D2) ──────────────── */
+    /* a private mmap page — the CoW subject */
+    mov eax, 4
+    xor edi, edi
+    mov rsi, 4096
+    mov edx, 3
+    syscall
+    mov r12, rax                      /* survives syscalls AND the
+                                         fork's parked image */
+    cmp rax, 0x0040D000
+    jb 120f
+    /* the parent pattern */
+    mov rax, 0x1111AAAA
+    mov [r12], rax
+    /* fork — the Linux nr 57 (translated to the internal 18) */
+    mov eax, 57
+    syscall
+    test rax, rax
+    jz fork_child                     /* the child's rax is 0 */
+    /* ── the parent: rax = the child id ── */
+    /* sched_yield: hand the CPU to the child NOW (deterministic —
+       the tick could otherwise steal it mid-run and the exits would
+       race); the child runs to its exit through the nested
+       dispatcher, and this code resumes when the child is done. */
+    mov eax, 24
+    syscall
+    test rax, rax
+    jnz 123f
+    /* Overwrite the pattern: the page was demoted at fork, so this
+       write takes the CoW fault and lands on a private copy. */
+    mov rax, 0x2222BBBB
+    mov [r12], rax
+    mov rbx, [r12]
+    cmp rbx, rax
+    jne 121f
+    mov eax, 63
+    xor edi, edi                      /* 0: parent verified */
+    syscall
+
+fork_child:
+    /* ── the child: rax = 0, r12 = the same window ── */
+    /* A DIFFERENT pattern: its own CoW copy, its own page. */
+    mov rax, 0x3333CCCC
+    mov [r12], rax
+    mov rbx, [r12]
+    cmp rbx, rax
+    jne 122f
+    mov eax, 63
+    xor edi, edi                      /* 0: child verified */
+    syscall
+
 sig_handler:                          /* SIGUSR1: set the flag, ret */
     mov rax, 0x51515151
     mov qword ptr [0x00403060], rax
@@ -330,6 +383,18 @@ sig_handler:                          /* SIGUSR1: set the flag, ret */
     syscall
 116: mov eax, 63
     mov edi, 116                      /* the freed read did NOT fault */
+    syscall
+120: mov eax, 63
+    mov edi, 120                      /* the mmap window below the floor */
+    syscall
+121: mov eax, 63
+    mov edi, 121                      /* the parent's CoW write failed */
+    syscall
+122: mov eax, 63
+    mov edi, 122                      /* the child's CoW write failed */
+    syscall
+123: mov eax, 63
+    mov edi, 123                      /* the post-fork yield failed */
     syscall
 "#,
 );

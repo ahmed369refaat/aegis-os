@@ -25,6 +25,10 @@ pub const PTE_U: u64 = 1 << 2;
 pub const PTE_G: u64 = 1 << 8;
 /// No-execute (needs EFER.NXE).
 pub const PTE_NX: u64 = 1 << 63;
+/// The page-size bit (PDE/PDPTE): a huge-page leaf. ADR-0024: the
+/// user half is never built with leaves; a fork walk that meets one
+/// refuses rather than guess at sharing its extent.
+pub const PTE_PS: u64 = 1 << 7;
 
 /// Flags for one mapped page, policy-flavored. `r` is kept for API
 /// fidelity with `MemFlags`; on x86-64 a present PTE is always readable

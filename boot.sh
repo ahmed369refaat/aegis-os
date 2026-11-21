@@ -367,6 +367,9 @@ if [ "$MODE" = "verify" ]; then
   # ADR-0024 D1: the mmap proof (two windows, a real munmap, the
   # freed read faulting).
   grep -qF "[M3] mmap: 2 windows mapped+verified" "$LOG" || { echo "VERIFY FAIL: M3 mmap marker missing"; ok=0; }
+  # ADR-0024 D2: the fork/CoW proof (demote, two private copies,
+  # clean exits, full reclaim).
+  grep -qF "[M3] cow: fork shared" "$LOG" || { echo "VERIFY FAIL: M3 cow marker missing"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the

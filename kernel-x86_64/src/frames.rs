@@ -148,6 +148,24 @@ impl<const N: usize> FramePool<N> {
     }
 
     #[must_use]
+    /// ADR-0024 D2: gather every frame index currently owned by
+    /// `owner` into `out` (stopping at the buffer's end — the caller
+    /// sizes it with `owned_by`). Returns how many were gathered.
+    /// Gathering BEFORE acting: freeing mutates the owner array.
+    pub fn collect_owned(&self, owner: u32, out: &mut [Option<usize>]) -> usize {
+        let mut n = 0usize;
+        for (f, o) in self.owner.iter().enumerate() {
+            if *o == Some(owner) {
+                if n >= out.len() {
+                    break;
+                }
+                out[n] = Some(f);
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn owned_by(&self, owner: u32) -> usize {
         self.owner.iter().filter(|o| **o == Some(owner)).count()
     }

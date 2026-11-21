@@ -23,29 +23,61 @@
 
 use crate::sched::context::ParkedContext;
 
+/// The current R12 (diagnostics/profiling; pure register read).
+///
+/// SAFETY: one register read, no memory access, no side effects.
+pub fn current_r12() -> u64 {
+    let v: u64;
+    unsafe {
+        core::arch::asm!("movq %r12, %rax", lateout("rax") v, options(att_syntax, nostack, preserves_flags));
+    }
+    v
+}
+
+/// The current RSP (diagnostics/profiling; pure register read).
+///
+/// SAFETY: one register read, no memory access, no side effects.
+pub fn current_rsp() -> u64 {
+    let rsp: u64;
+    unsafe {
+        core::arch::asm!("movq %rsp, {rsp}", rsp = out(reg) rsp, options(att_syntax, nostack, preserves_flags));
+    }
+    rsp
+}
+
 /// The live callee-saved registers `[rbp, r12, r13, r14, r15]` —
 /// their USER values, preserved through the dispatch call by the SysV
 /// ABI (the stub's frame does not carry them; nothing else can).
 ///
-/// SAFETY: pure register reads; no memory access, no side effects.
+/// FIXED output registers, deliberately: free `out(reg)` allocation
+/// may hand an output slot a register this very asm reads LATER
+/// (e.g. the r13 store landing in %r14 before %r14 is read) — the
+/// exact CPUID lesson (ADR-0011 §C), found live here when the fork
+/// proof's parked images carried garbage r12/r13 and both runs died
+/// writing through them. The five scratches (rax/rcx/rdx/rsi/rdi) are
+/// caller-saved and named as clobbers by the asm! itself, so no
+/// surrounding code can hold anything live across them.
+///
+/// SAFETY: pure register reads into fixed scratches; no memory
+/// access, no side effects.
 unsafe fn live_callee_saved() -> [u64; 5] {
-    let (rbp, r12, r13, r14, r15);
+    let (v0, v1, v2, v3, v4);
     unsafe {
         core::arch::asm!(
-            "movq %rbp, {rbp}",
-            "movq %r12, {r12}",
-            "movq %r13, {r13}",
-            "movq %r14, {r14}",
-            "movq %r15, {r15}",
-            rbp = out(reg) rbp,
-            r12 = out(reg) r12,
-            r13 = out(reg) r13,
-            r14 = out(reg) r14,
-            r15 = out(reg) r15,
+            "movq %rbp, %rax",
+            "movq %r12, %rcx",
+            "movq %r13, %rdx",
+            "movq %r14, %rsi",
+            "movq %r15, %rdi",
+            lateout("rax") v0,
+            lateout("rcx") v1,
+            lateout("rdx") v2,
+            lateout("rsi") v3,
+            lateout("rdi") v4,
             options(att_syntax, nostack, preserves_flags)
         );
     }
-    [rbp, r12, r13, r14, r15]
+    [v0, v1, v2, v3, v4]
 }
 
 /// Build the parked image of an in-flight syscall: every user GPR
@@ -77,7 +109,7 @@ pub(crate) struct SyscallImage {
     pub live: [u64; 5],
 }
 
-fn parked_from_syscall(img: SyscallImage) -> ParkedContext {
+pub(crate) fn parked_from_syscall(img: SyscallImage) -> ParkedContext {
     let SyscallImage {
         rdi,
         rsi,
@@ -163,21 +195,9 @@ pub fn completed_drain() -> Option<(u32, crate::sched::context::ExitKind)> {
     None
 }
 
-/// ADR-0023: the saved outer resume chain. A STATIC, deliberately:
-/// the kernel stack is SHARED (the stub reloads SYSCALL_RSP on every
-/// syscall), so every run the nested dispatcher resumes reuses the
-/// stack top — a frame-local chain would be overwritten mid-excursion
-/// (found live: the pair proof crashed jumping through a chain whose
-/// words were packed domain ids from the reused stack). The .bss slot
-/// is nobody's scratch.
-#[cfg(not(test))]
-static mut SAVED_CHAIN: [Option<crate::sched::context::ResumeChain>; 1] = [const { None }; 1];
-
 #[cfg(not(test))]
 mod boot {
-    use super::{
-        live_callee_saved, parked_from_syscall, record_completed, SyscallImage, SAVED_CHAIN,
-    };
+    use super::{live_callee_saved, parked_from_syscall, record_completed, SyscallImage};
     use crate::arch::syscall_entry;
     use crate::arch::syscall_frame::{
         OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
@@ -187,6 +207,36 @@ mod boot {
     use crate::sched::preempt;
     use crate::serial;
     use crate::strutil;
+
+    /// ADR-0024 D2: build the parked image of the IN-FLIGHT syscall
+    /// (the fork path's child image) — the frame reads, the live
+    /// callee-saved reads, and the mapping, all owned here where the
+    /// unsafe lives (syscall.rs is unsafe-free by policy).
+    pub fn parked_from_current_syscall(result: u64) -> crate::sched::context::ParkedContext {
+        use crate::arch::syscall_entry::{frame_word, user_rsp_save};
+        use crate::arch::syscall_frame::{
+            OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
+        };
+        // The user's callee-saved five, parked by the stub AT ENTRY
+        // (reading them live here would read the compiler's scratch —
+        // SysV preserves them in the CALLEES' frames, not in the
+        // registers; see user_callee_saved's doc).
+        let live = crate::arch::syscall_entry::user_callee_saved();
+        parked_from_syscall(SyscallImage {
+            rdi: frame_word(OFF_RDI),
+            rsi: frame_word(OFF_RSI),
+            rdx: frame_word(OFF_RDX),
+            r10: frame_word(OFF_R10),
+            r8: frame_word(OFF_R8),
+            r9: frame_word(OFF_R9),
+            user_rip: frame_word(OFF_RCX),
+            user_rflags: frame_word(OFF_R11),
+            rbx: frame_word(OFF_RBX),
+            user_rsp: user_rsp_save(),
+            result,
+            live,
+        })
+    }
 
     /// Park the in-flight syscall's run (its result already baked into
     /// the parked image) and hand the CPU onward: the fair pick if one
@@ -334,12 +384,11 @@ mod boot {
     fn dispatch_next() -> ! {
         // kmain's launch point, before any resume_parked of ours
         // overwrites the eight slots — in a .bss STATIC (see
-        // SAVED_CHAIN's doc: the shared stack is not ours to keep
-        // locals alive across excursions).
-        // SAFETY: single CPU, IF=0; the one slot is this module's.
-        unsafe {
-            *core::ptr::addr_of_mut!(SAVED_CHAIN[0]) = Some(context::save_resume_chain());
-        }
+        // The outer chain lives in the context entry slot (beside
+        // RESUME_RIP/PARK_* — the proven storage; a module-local
+        // static here came out of the linker EIGHT times over, one
+        // copy per CGU, states diverging — see PARK_CHAIN's doc).
+        context::park_chain_save(context::save_resume_chain());
         loop {
             let now = hw::read_tsc();
             if let Some(k) = context::kernel_mut() {
@@ -396,9 +445,7 @@ mod boot {
             }
             // Nothing runnable, nothing sleeping: the run set is empty
             // — unwind to the outer launch point.
-            // SAFETY: see the save site.
-            let chain = unsafe { *core::ptr::addr_of!(SAVED_CHAIN[0]) };
-            if let Some(chain) = chain {
+            if let Some(chain) = context::park_chain_take() {
                 context::restore_resume_chain(&chain);
                 context::resume_kernel();
             }
@@ -410,7 +457,7 @@ mod boot {
 }
 
 #[cfg(not(test))]
-pub use boot::park_current_from_syscall;
+pub use boot::{park_current_from_syscall, parked_from_current_syscall};
 
 #[cfg(test)]
 mod tests {

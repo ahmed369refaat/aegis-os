@@ -325,6 +325,256 @@ impl PageTables {
         Some(e & ADDR_MASK)
     }
 
+    /// Free every TABLE frame of a (possibly partial) user-half tree
+    /// by walking it — rollback for `clone_for_fork`. Frees tables
+    /// only; leaf data frames are the caller's business.
+    fn free_user_tree(pml4_pa: u64, src: &mut dyn FrameSource) {
+        for pml4i in 0..256usize {
+            let pml4e = Self::entry(pml4_pa, pml4i);
+            if pml4e & pte::PTE_P == 0 {
+                continue;
+            }
+            for pdpti in 0..512usize {
+                let pdpte = Self::entry(pml4e & ADDR_MASK, pdpti);
+                if pdpte & pte::PTE_P == 0 {
+                    continue;
+                }
+                for pdi in 0..512usize {
+                    let pde = Self::entry(pdpte & ADDR_MASK, pdi);
+                    if pde & pte::PTE_P == 0 {
+                        continue;
+                    }
+                    let _ = src.free_frame(pde & ADDR_MASK);
+                }
+                let _ = src.free_frame(pdpte & ADDR_MASK);
+            }
+            let _ = src.free_frame(pml4e & ADDR_MASK);
+        }
+    }
+
+    /// ADR-0024 D2: fork's memory half — clone the whole USER half of
+    /// this table tree into a child tree, sharing every mapped frame.
+    ///
+    /// TWO PASSES, in this order, so a failure never leaves the PARENT
+    /// modified:
+    /// 1. Build the child's tree top-down, copying every present user
+    ///    PTE. WRITABLE user pages are copied READ-ONLY into the child
+    ///    (the CoW demote-marker); every shared user frame's refcount
+    ///    is acquired (owner = `owner`, the PARENT's domain — a frame
+    ///    already shared from an earlier fork keeps its ORIGINAL owner
+    ///    entry, which is exactly the provenance the last free needs).
+    ///    Mid-way failure rolls back: the child's table frames free and
+    ///    every acquired refcount releases.
+    /// 2. Demote the PARENT's writable user PTEs to read-only (no
+    ///    allocation, cannot fail) with a per-page `invlpg` — the
+    ///    parent's CR3 is live at fork time.
+    ///
+    /// Both sides then see every shared writable page RO; the first
+    /// write on either side faults, and the fault path's CoW branch
+    /// copies the frame and remaps it RW privately.
+    pub fn clone_for_fork(
+        &self,
+        src: &mut dyn FrameSource,
+        shares: &mut aegis_os::frame_share::FrameShares,
+        owner: u32,
+    ) -> Result<PageTables, MapError> {
+        // ── pass 1: the child's tree ──────────────────────────────
+        let child_pml4 = src.alloc_frame()?;
+        memops::scrub_frame(child_pml4);
+        // (table|PTE_P|PTE_W|PTE_U — intermediate entries are plain
+        // kernel-owned pointers into the user half's subtrees)
+        let mid_flags = pte::PTE_P | pte::PTE_W | pte::PTE_U;
+
+        // Rollback bookkeeping: every shared frame PA acquired so far
+        // (released on rollback). The child's TABLE frames are freed
+        // by walking the tree itself (no buffer bound).
+        let mut acquired: [u64; aegis_os::frame_share::MAX_SHARED] =
+            [0; aegis_os::frame_share::MAX_SHARED];
+        let mut acquired_n = 0usize;
+
+        let mut result: Result<(), MapError> = Ok(());
+        'outer: for pml4i in 0..256usize {
+            let p_pml4e = Self::entry(self.pml4_pa, pml4i);
+            if p_pml4e & pte::PTE_P == 0 {
+                continue;
+            }
+            let pdpt_pa = src.alloc_frame();
+            let pdpt_pa = match pdpt_pa {
+                Ok(f) => f,
+                Err(e) => {
+                    result = Err(e);
+                    break 'outer;
+                }
+            };
+
+            Self::set_entry(child_pml4, pml4i, pdpt_pa | mid_flags);
+            for pdpti in 0..512usize {
+                let p_pdpte = Self::entry(p_pml4e & ADDR_MASK, pdpti);
+                if p_pdpte & pte::PTE_P == 0 {
+                    continue;
+                }
+                // A 1-GiB leaf in the USER half: not a shape this
+                // kernel builds (mm::init maps the kernel half's
+                // direct map as leaves) — refuse rather than guess.
+                if p_pdpte & pte::PTE_PS != 0 {
+                    result = Err(MapError::KernelHalf(0));
+                    break 'outer;
+                }
+                let pd_pa = match src.alloc_frame() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        result = Err(e);
+                        break 'outer;
+                    }
+                };
+
+                Self::set_entry(pdpt_pa, pdpti, pd_pa | mid_flags);
+                for pdi in 0..512usize {
+                    let p_pde = Self::entry(p_pdpte & ADDR_MASK, pdi);
+                    if p_pde & pte::PTE_P == 0 {
+                        continue;
+                    }
+                    if p_pde & pte::PTE_PS != 0 {
+                        result = Err(MapError::KernelHalf(0));
+                        break 'outer;
+                    }
+                    let pt_pa = match src.alloc_frame() {
+                        Ok(f) => f,
+                        Err(e) => {
+                            result = Err(e);
+                            break 'outer;
+                        }
+                    };
+
+                    Self::set_entry(pd_pa, pdi, pt_pa | mid_flags);
+                    for pti in 0..512usize {
+                        let pte_v = Self::entry(p_pde & ADDR_MASK, pti);
+                        if pte_v & pte::PTE_P == 0 {
+                            continue;
+                        }
+                        let pa = pte_v & ADDR_MASK;
+                        let flags = pte_v & !ADDR_MASK;
+                        if flags & pte::PTE_U == 0 {
+                            // A kernel leaf inside a user-half walk:
+                            // not a shape this kernel builds; copy it
+                            // verbatim without sharing (it is not
+                            // domain-owned memory).
+                            Self::set_entry(pt_pa, pti, pte_v);
+                            continue;
+                        }
+                        let writable = flags & pte::PTE_W != 0;
+                        if shares.acquire(pa, owner).is_err() {
+                            // TableFull / Overflow: the share table
+                            // refused — surface as the pool-shaped
+                            // ENOMEM the ABI maps.
+                            result = Err(MapError::KernelHalf(pa));
+                            break 'outer;
+                        }
+                        if acquired_n < acquired.len() {
+                            acquired[acquired_n] = pa;
+                            acquired_n += 1;
+                        }
+                        // The child's copy: RO when the parent is
+                        // writable (the demote marker).
+                        let child_flags = if writable { flags & !pte::PTE_W } else { flags };
+                        Self::set_entry(pt_pa, pti, pa | child_flags);
+                    }
+                }
+            }
+        }
+
+        if let Err(e) = result {
+            // Rollback: release what pass 1 acquired, then free the
+            // child's whole table tree by WALKING it (every table
+            // frame the partial build allocated). Best-effort, like
+            // map_region's rollback. The parent was never touched.
+            for pa in acquired[..acquired_n].iter() {
+                let _ = shares.release(*pa);
+            }
+            Self::free_user_tree(child_pml4, src);
+            let _ = src.free_frame(child_pml4);
+            return Err(e);
+        }
+
+        // The SHARED KERNEL half (PML4[256..512] — the direct map at
+        // 273, the image at 511): copied VERBATIM, the way a spawned
+        // run's tables get it. Found live: without these entries the
+        // child's CR3 has no kernel half, and the first kernel-side
+        // access under it (the very stack the child's enter runs on)
+        // faults at a half-present address.
+        for pml4i in 256..512usize {
+            let e = Self::entry(self.pml4_pa, pml4i);
+            if e & pte::PTE_P != 0 {
+                Self::set_entry(child_pml4, pml4i, e);
+            }
+        }
+
+        // ── pass 2: demote the parent (cannot fail) ───────────────
+        for pml4i in 0..256usize {
+            let pml4e = Self::entry(self.pml4_pa, pml4i);
+            if pml4e & pte::PTE_P == 0 {
+                continue;
+            }
+            for pdpti in 0..512usize {
+                let pdpte = Self::entry(pml4e & ADDR_MASK, pdpti);
+                if pdpte & pte::PTE_P == 0 {
+                    continue;
+                }
+                for pdi in 0..512usize {
+                    let pde = Self::entry(pdpte & ADDR_MASK, pdi);
+                    if pde & pte::PTE_P == 0 {
+                        continue;
+                    }
+                    for pti in 0..512usize {
+                        let pt_pa = pde & ADDR_MASK;
+                        let pte_v = Self::entry(pt_pa, pti);
+                        if pte_v & pte::PTE_P == 0 || pte_v & pte::PTE_U == 0 {
+                            continue;
+                        }
+                        if pte_v & pte::PTE_W != 0 {
+                            let pa = pte_v & ADDR_MASK;
+                            let flags = pte_v & !ADDR_MASK;
+                            Self::set_entry(pt_pa, pti, pa | (flags & !pte::PTE_W));
+                            let va = ((pml4i as u64) << 39)
+                                | ((pdpti as u64) << 30)
+                                | ((pdi as u64) << 21)
+                                | ((pti as u64) << 12);
+                            #[cfg(not(test))]
+                            pte::flush_tlb_page(va);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(PageTables {
+            pml4_pa: child_pml4,
+        })
+    }
+
+    /// ADR-0024 D2: repoint the present leaf at `va` at `new_pa`,
+    /// forcing the writable bit to `writable` — the CoW copy path's
+    /// remap. `false` when the walk finds no present leaf (the caller
+    /// treats that as not-ours).
+    pub fn replace_leaf(&mut self, va: u64, new_pa: u64, writable: bool) -> bool {
+        let Some(pt) = self.pt_of(va) else {
+            return false;
+        };
+        let (_, _, _, pti) = Self::indices(va);
+        let old = Self::entry(pt, pti);
+        if old & pte::PTE_P == 0 {
+            return false;
+        }
+        let mut flags = old & !ADDR_MASK;
+        if writable {
+            flags |= pte::PTE_W;
+        } else {
+            flags &= !pte::PTE_W;
+        }
+        Self::set_entry(pt, pti, new_pa | flags);
+        true
+    }
+
     /// The raw leaf PTE at `va` (flags included), or `None` when absent.
     #[must_use]
     pub fn pte_of(&self, va: u64) -> Option<u64> {

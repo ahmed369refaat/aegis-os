@@ -94,4 +94,10 @@
 # 116 -> ADR-0024 D1: +2 — the POOL context slot (set_pool/pool_mut,
 #      the KERNEL-pointer pattern mirrored for the frame pool; the
 #      mmap/munmap dispatch paths reach it at syscall time).
-116
+
+# 120 -> ADR-0024 (M3 Phase 3): +4 — the SHARES kernel slot
+#      (context::shares_mut), the PARK_CHAIN slot (the nested
+#      dispatcher's unwind), the five USER_RBP/R12-R15 stub slots
+#      (user_callee_saved), and the diagnostic register reads
+#      (current_rsp/current_r12) that hunted the SysV lesson.
+120

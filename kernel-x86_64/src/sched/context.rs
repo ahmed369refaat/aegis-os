@@ -407,6 +407,32 @@ mod entry {
         r15: u64,
     }
 
+    /// ADR-0024 D2: the NESTED dispatcher's saved outer chain — the
+    /// same storage discipline as RESUME_RIP/PARK_* (one slot, single
+    /// CPU, written before the first nested resume, consumed at the
+    /// unwind). A plain Option beside its proven neighbors: the
+    /// array-of-one shape at the park module level came out of the
+    /// linker EIGHT TIMES (SAVED_CHAIN.1-.8 — each CGU its own copy,
+    /// state divergence and all); this shape has been single since
+    /// M2-W2.
+    static mut PARK_CHAIN: Option<ResumeChain> = None;
+
+    /// Save the current chain as the nested dispatcher's outer point.
+    ///
+    /// SAFETY: single CPU, IF=0 on the caller's path.
+    pub fn park_chain_save(chain: ResumeChain) {
+        // SAFETY: see the static's doc.
+        unsafe { PARK_CHAIN = Some(chain) }
+    }
+
+    /// Take the saved outer chain (the unwind consumes it).
+    ///
+    /// SAFETY: single CPU, IF=0 on the caller's path.
+    pub fn park_chain_take() -> Option<ResumeChain> {
+        // SAFETY: see the static's doc.
+        unsafe { PARK_CHAIN.take() }
+    }
+
     /// Snapshot the current resume chain (see `ResumeChain`).
     ///
     /// SAFETY: single CPU; plain reads of the eight statics.
@@ -513,6 +539,21 @@ mod entry {
         // that outlives every ring-3 run (kmain owns it for the whole
         // boot); single CPU, no concurrent access.
         unsafe { POOL.map(|p| &mut *p) }
+    }
+
+    /// ADR-0024 D2: the frame-share table — kernel-global (single
+    /// CPU, one pool), born empty, never reset. Holds a refcount per
+    /// frame mapped by more than one address space; private frames
+    /// never enter it.
+    static mut SHARES: aegis_os::frame_share::FrameShares =
+        aegis_os::frame_share::FrameShares::new();
+
+    /// The live share table (fork, munmap, teardown, the CoW fault).
+    pub fn shares_mut() -> &'static mut aegis_os::frame_share::FrameShares {
+        // SAFETY: single CPU; every caller runs at IF=0 on the one
+        // kernel stack (syscall/fault paths) or from kmain between
+        // runs — no concurrent access exists to exclude.
+        unsafe { &mut *core::ptr::addr_of_mut!(SHARES) }
     }
 
     /// N2: the live kernel, when installed (host tests never install
@@ -914,7 +955,10 @@ mod entry {
 /// point around its resume_parked calls). Boot-only like the module
 /// it re-exports.
 #[cfg(not(test))]
-pub use entry::{pool_mut, restore_resume_chain, save_resume_chain, set_pool, ResumeChain};
+pub use entry::{
+    park_chain_save, park_chain_take, pool_mut, restore_resume_chain, save_resume_chain, set_pool,
+    shares_mut, ResumeChain,
+};
 
 #[cfg(not(test))]
 pub use entry::{

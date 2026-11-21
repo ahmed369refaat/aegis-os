@@ -11,25 +11,39 @@ use aegis_os::memory::AddressSpace;
 fn refcounts_acquire_release_and_report_sharing() {
     let mut s = FrameShares::new();
     assert_eq!(s.refs(0x5000), None, "absent frames carry no count");
-    s.acquire(0x5000).unwrap();
-    s.acquire(0x5000).unwrap();
+    // One acquire = the private holder + this new sharer (insertion
+    // counts the original mapping — the fork shape).
+    s.acquire(0x5000, 7).unwrap();
+    assert_eq!(s.refs(0x5000), Some(2));
+    s.acquire(0x5000, 9).unwrap(); // any holder; the FIRST owner sticks
+    assert_eq!(s.refs(0x5000), Some(3));
+    assert!(s.is_shared(0x5000));
+    // Releases that are not the last keep the frame.
+    assert_eq!(s.release(0x5000), Ok(false));
     assert_eq!(s.refs(0x5000), Some(2));
     assert!(s.is_shared(0x5000));
-    // A release that is not the last keeps the frame.
     assert_eq!(s.release(0x5000), Ok(false));
-    assert_eq!(s.refs(0x5000), Some(1));
-    assert!(!s.is_shared(0x5000), "a lone ref is private");
-    // The last release answers true: the CALLER frees the frame.
+    assert_eq!(
+        s.refs(0x5000),
+        Some(1),
+        "the lone original holder still counts"
+    );
+    // The last release answers true: the CALLER frees the frame —
+    // under the ORIGINAL owner's tag, which the table remembered.
+    assert_eq!(s.owner_of(0x5000), Some(7));
     assert_eq!(s.release(0x5000), Ok(true));
     assert_eq!(s.refs(0x5000), None, "released-to-zero leaves the table");
+    assert_eq!(s.owner_of(0x5000), None);
 }
 
 #[test]
 fn releasing_an_absent_frame_is_a_typed_error_never_a_wraparound() {
     let mut s = FrameShares::new();
     assert_eq!(s.release(0x7000), Err(ShareError::NotHeld(0x7000)));
-    // acquire + double release: the second is the error, not 0-1.
-    s.acquire(0x7000).unwrap();
+    // acquire + releases down to the last: the insertion counts the
+    // original holder, so ONE acquire holds TWO references.
+    s.acquire(0x7000, 7).unwrap();
+    assert_eq!(s.release(0x7000), Ok(false));
     assert_eq!(s.release(0x7000), Ok(true));
     assert_eq!(s.release(0x7000), Err(ShareError::NotHeld(0x7000)));
 }
@@ -38,11 +52,11 @@ fn releasing_an_absent_frame_is_a_typed_error_never_a_wraparound() {
 fn the_table_is_bounded_and_refuses_loudly() {
     let mut s = FrameShares::new();
     for i in 0..aegis_os::frame_share::MAX_SHARED {
-        s.acquire((0x9000 + i * 0x1000) as u64).unwrap();
+        s.acquire((0x9000 + i * 0x1000) as u64, 7).unwrap();
     }
-    assert_eq!(s.acquire(0xF000_0000), Err(ShareError::TableFull));
+    assert_eq!(s.acquire(0xF000_0000, 7), Err(ShareError::TableFull));
     // Existing entries still work after the refusal.
-    assert_eq!(s.refs(0x9000), Some(1));
+    assert_eq!(s.refs(0x9000), Some(2));
 }
 
 // ── the CoW decision ────────────────────────────────────────────────
