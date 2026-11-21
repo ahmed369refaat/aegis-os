@@ -569,6 +569,7 @@ pub(crate) fn net_step<const N: usize>(
 /// none), so the step queues one fresh TX first; the ring geometry
 /// rides in (the frames belong to the caller's session).
 #[cfg(not(test))]
+#[allow(clippy::too_many_arguments)] // ring geometry rides in; a struct refactor is the ADR-0019 follow-up
 fn msix_irq_step<const N: usize>(
     out: &mut dyn FnMut(&str),
     dev: &crate::pci::PciDev,

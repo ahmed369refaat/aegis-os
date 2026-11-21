@@ -79,7 +79,7 @@ static SYSCALL_RSP: AtomicU64 = AtomicU64::new(0);
 /// by the stub BEFORE the stack switch (the only moment the value
 /// exists in a register), read back right before SYSRETQ. Single CPU
 /// + IF=0 through the whole kernel side: exactly one excursion is ever
-/// in flight, the same lifetime discipline as SYSCALL_RSP itself.
+///   in flight, the same lifetime discipline as SYSCALL_RSP itself.
 static USER_RSP_SAVE: AtomicU64 = AtomicU64::new(0);
 
 fn percpu_kstack_top() -> u64 {

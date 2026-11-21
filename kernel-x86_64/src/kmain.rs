@@ -1117,16 +1117,15 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let supervisor_ok = matches!(
         k.create_domain_with(13, aegis_os::profile::service_profile(), 0, 0, 0),
         Ok(())
-    ) && matches!(
-        k.syscall(
+    ) && k
+        .syscall(
             13,
             aegis_os::sys::SysRequest::Mkdir {
                 path: "/pub",
                 mode: aegis_os::vfs::Mode(0o777),
-            }
-        ),
-        Ok(_)
-    );
+            },
+        )
+        .is_ok();
     let _ = k.destroy_domain(13);
     if !supervisor_ok {
         line(

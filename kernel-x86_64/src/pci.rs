@@ -266,8 +266,8 @@ impl Inventory {
 
     /// ADR-0018 + round I: record a claimed device's domain by vendor
     /// + DEVICE id — the virtio family's class codes are ambiguous
-    /// (rng/console/balloon share "uncategorized"), so their claims
-    /// match the id. Returns false when no such device is held.
+    ///   (rng/console/balloon share "uncategorized"), so their claims
+    ///   match the id. Returns false when no such device is held.
     pub fn set_dom_dev(&mut self, vendor: u16, device: u16, dom: u32) -> bool {
         match self.devices[..self.count]
             .iter()

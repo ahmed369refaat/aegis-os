@@ -159,7 +159,7 @@ pub fn read_user_cstr(
 ) -> Result<usize, CstrError> {
     debug_assert!(out.len() >= max, "out must hold the max bound");
     let mut last_page = u64::MAX;
-    for i in 0..max {
+    for (i, slot) in out.iter_mut().enumerate().take(max) {
         let va = match buf.checked_add(i as u64) {
             Some(va) => va,
             None => return Err(CstrError::Fault),
@@ -178,7 +178,7 @@ pub fn read_user_cstr(
         if b == 0 {
             return Ok(i);
         }
-        out[i] = b;
+        *slot = b;
     }
     Err(CstrError::TooLong)
 }

@@ -37,14 +37,18 @@ pub const TCO_OFFSET: u32 = 0x60;
 
 /// TCO register offsets from PMBASE+0x60.
 pub const TCO_RLD: u16 = 0x00;
+#[allow(dead_code)] // register map pinned against QEMU sources; the slice that reads it is next
 pub const TCO1_STS: u16 = 0x04;
 pub const TCO2_STS: u16 = 0x06;
 pub const TCO1_CNT: u16 = 0x08;
+#[allow(dead_code)] // register map pinned against QEMU sources; the slice that reads it is next
 pub const TCO2_CNT: u16 = 0x0A;
+#[allow(dead_code)] // register map pinned against QEMU sources; the slice that reads it is next
 pub const TCO_WDCNT: u16 = 0x0E;
 pub const TCO_TMR: u16 = 0x12;
 
 /// TCO1_STS bits: a timeout happened (W1C).
+#[allow(dead_code)] // register map pinned against QEMU sources; the slice that reads it is next
 pub const TCO_TIMEOUT: u16 = 1 << 3;
 /// TCO1_CNT bit 11: halt the timer.
 pub const TCO_TMR_HLT: u16 = 1 << 11;
@@ -52,6 +56,7 @@ pub const TCO_TMR_HLT: u16 = 1 << 11;
 pub const TCO_LOCK: u16 = 1 << 12;
 /// TCO2_STS bits: the second-stage timeout / boot-status records.
 pub const TCO_SECOND_TO_STS: u16 = 1 << 1;
+#[allow(dead_code)] // register map pinned against QEMU sources; the slice that reads it is next
 pub const TCO_BOOT_STS: u16 = 1 << 2;
 /// The timer field's width.
 pub const TCO_TMR_MASK: u16 = 0x3FF;
@@ -123,6 +128,7 @@ pub const ESB_DEVICE: u16 = 0x25AB;
 pub const ESB_CONFIG_REG: u8 = 0x60;
 /// PCI config: the lock register (8-bit decoded; bookkeeping only in
 /// QEMU's model — the REAL unlock lives on the MMIO reload register).
+#[allow(dead_code)] // register map pinned against QEMU sources; the slice that reads it is next
 pub const ESB_LOCK_REG: u8 = 0x68;
 /// MMIO (BAR0): timer 1 (stage 1 preload) — write-only.
 pub const ESB_TIMER1: u64 = 0x00;

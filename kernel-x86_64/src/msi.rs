@@ -91,7 +91,7 @@ pub const MSI_ADDR_BASE: u64 = 0xFEE0_0000;
 /// the 8-bit APIC ID in bits 19:12 (dest 0 = the BSP).
 #[must_use]
 pub const fn msi_addr(dest_apic_id: u8) -> u64 {
-    MSI_ADDR_BASE | (((dest_apic_id & 0xFF) as u64) << 12)
+    MSI_ADDR_BASE | ((dest_apic_id as u64) << 12)
 }
 
 /// The MSI data word: the vector in bits 7:0, delivery FIXED and
@@ -99,7 +99,7 @@ pub const fn msi_addr(dest_apic_id: u8) -> u64 {
 /// IOAPIC edge RTE.
 #[must_use]
 pub const fn msi_data(vector: u8) -> u32 {
-    (vector & 0xFF) as u32
+    vector as u32
 }
 
 // ── pure bounds: the entry's physical address inside the BAR ──

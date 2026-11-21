@@ -54,7 +54,7 @@ impl MadtIrq {
     /// exactly one; more is future work).
     pub(crate) fn primary_ioapic(&self) -> Option<u64> {
         self.ioapics
-            .get(0)
+            .first()
             .filter(|(_, g)| *g == 0)
             .map(|(a, _)| *a)
     }
@@ -288,9 +288,8 @@ pub(crate) fn ecam_window(dir_pa: u64) -> Option<(u64, u16, u8, u8)> {
         }
         crate::arch::acpi::read_bytes(entry_pa, &mut sig);
         if &sig[..4] == b"MCFG" {
-            if crate::arch::acpi::table_ok(entry_pa, b"MCFG", &mut scratch).is_none() {
-                return None; // present but corrupt: the legacy pair it is
-            }
+            // present but corrupt: the legacy pair it is
+            crate::arch::acpi::table_ok(entry_pa, b"MCFG", &mut scratch)?;
             return decode_mcfg(entry_pa);
         }
     }

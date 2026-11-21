@@ -38,6 +38,12 @@ pub struct Pool {
     last: AtomicU64,
 }
 
+impl Default for Pool {
+    fn default() -> Pool {
+        Pool::new()
+    }
+}
+
 impl Pool {
     /// The unmixed pool: state 0 (nothing trusted yet), zero counters.
     #[must_use]
