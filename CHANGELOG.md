@@ -4,6 +4,28 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Fixed — driver-stack review round 4, Phase 5 (F12): ACPI firmware-table validation
+
+- **`read_table` (the DMAR/RSDT path) now verifies the ACPI
+  checksum** — every byte of the declared length must sum to zero. A
+  bit-flipped table was previously a parsed table (length was the
+  only check). Red-proven by `read_table_rejects_checksum_corruption`
+  on the pre-fix code.
+- **`table_ok(pa, sig, scratch)` — the validation gate for the
+  directory walk's target tables**: signature, declared length
+  (36..=scratch), and checksum before the HPET/MADT/MCFG walks trust
+  a pointer they found in the RSDT/XSDT. The directory itself is
+  validated first (sig + length + checksum — the old walk trusted a
+  raw header length), and each target table is gated before any
+  field read; a corrupted table prints an explicit refusal marker
+  instead of walking hostile bytes. Host tests pin the gate from
+  every side: valid table accepted with its length, broken checksum
+  refused, wrong signature refused, hostile lengths (0, 35, 1025,
+  u32::MAX) refused, and the minimum legal 36-byte table accepted.
+- The lane markers are unchanged on healthy firmware (all three
+  lanes PASS); the q35 lane caught a byte-1 sig heuristic bug
+  (R**S**DT vs X**S**DT share byte 1) before it shipped.
+
 ### Fixed — driver-stack review round 4, Phase 5 (F11): the NVMe data path — SOLVED
 
 Two compounding layout quirks of this QEMU's nvme plus one lane
