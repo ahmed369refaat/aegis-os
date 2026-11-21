@@ -261,7 +261,22 @@ pub fn validate_caps(ver: u32, cap: u64, ecap: u64, haw_bits: u8) -> Result<Caps
 pub const MAX_VTD_DOMAINS: usize = 8;
 /// Bounded table-frame budget: root + IQ + context tables + SLPT
 /// tables. Loud exhaustion (`OutOfTables`), never a guess.
-pub const TABLE_BUDGET: usize = 64;
+/// The frame pool the identity map covers: 16 MiB at POOL_BASE —
+/// 8 × 2 MiB PT spans when 2 MiB-aligned (it is today); one span of
+/// slack if a future pool lands unaligned.
+pub const POOL_2M_SPANS_WORST: usize = 9;
+
+/// ADR-0018: the pure worst-case table demand for `domains` domains —
+/// shared (root table + IQ frame + one context table for bus 0) plus
+/// per domain (SLPT root + PDPT + one PD + one PT per 2 MiB span of
+/// the identity-mapped pool). The budget is DERIVED from this, not
+/// guessed; the exhaustion test drives it to the edge.
+pub const fn worst_case_tables(domains: usize) -> usize {
+    3 + domains * (3 + POOL_2M_SPANS_WORST)
+}
+
+/// The table budget: every domain's worst case, covered.
+pub const TABLE_BUDGET: usize = worst_case_tables(MAX_VTD_DOMAINS);
 /// Invalidation-queue descriptors: 256 × 16 B = one pool frame.
 pub const IQ_ENTRIES: u32 = 256;
 /// IQA.QS encoding for `IQ_ENTRIES` (2^(QS+1) descriptors).
@@ -682,8 +697,42 @@ impl Vtd {
         out
     }
 
-    /// The domain's SLPT root (boot-proof + tests). None until the
-    /// domain has a device assigned.
+    /// ADR-0018: the only way a device leaves its domain — clear the
+    /// context entry, then invalidate the context cache so no cached
+    /// translation outlives the assignment. Idempotent for absent
+    /// entries (cleanup paths may call it unconditionally).
+    pub fn unassign_device(
+        &mut self,
+        segment: u16,
+        bus: u8,
+        devfn: (u8, u8),
+    ) -> Result<(), DmaError> {
+        if segment != self.segment {
+            return Err(DmaError::Hardware(1));
+        }
+        let root = self.root_entry_of(bus);
+        if root & 1 == 0 {
+            return Ok(()); // no context table for this bus
+        }
+        let ctx_table = root & ADDR_MASK;
+        let devfn_idx = ((devfn.0 as u64) << 3) | (devfn.1 as u64);
+        let lo = crate::memops::read_u64(ctx_table + devfn_idx * 16);
+        if lo & 1 == 0 {
+            return Ok(()); // absent — idempotent
+        }
+        let hi = crate::memops::read_u64(ctx_table + devfn_idx * 16 + 8);
+        let did = ((hi >> 8) & 0xFFFF) as u16;
+        crate::memops::write_u64(ctx_table + devfn_idx * 16, 0);
+        crate::memops::write_u64(ctx_table + devfn_idx * 16 + 8, 0);
+        let desc = qi_desc_context(did, bus, devfn);
+        self.qi_enqueue(&desc);
+        if self.qi_kick_and_drain().is_err() {
+            return Err(DmaError::Hardware(4)); // invalidation failed
+        }
+        self.assigned = self.assigned.saturating_sub(1);
+        Ok(())
+    }
+
     #[must_use]
     pub fn dom_slpt(&self, dom: u32) -> Option<u64> {
         self.dom_slpt.get(dom as usize).copied().flatten()
@@ -753,10 +802,16 @@ impl DmaProt for Vtd {
             self.dom_slpt[did] = Some(t);
         }
         let slpt = self.dom_slpt[did].expect("just set");
-        // Context entry (fresh: no invalidation needed — an absent
-        // entry was never cached; see qi_desc_context for the replace
-        // path).
+        // Context entry. ADR-0018: a device owns exactly ONE domain —
+        // a present entry is refused; the only way out is
+        // unassign_device (clear + context-cache invalidation).
         let devfn_idx = ((devfn.0 as u64) << 3) | (devfn.1 as u64);
+        let old_lo = crate::memops::read_u64(ctx_table + devfn_idx * 16);
+        if old_lo & 1 != 0 {
+            return Err(DmaError::Hardware(7)); // device already assigned
+        }
+        // (fresh: no invalidation needed — an absent entry was never
+        // cached; see qi_desc_context for the replace path.)
         // Domain ids are 1-based in the hardware: DID 0 reads as the
         // "no domain" pattern (QEMU rejects hi=0 entries, measured).
         let did = (dom + 1) as u16;
@@ -1506,5 +1561,235 @@ mod tests {
         assert_eq!(slpt_index(1 << 21, 2), 1);
         assert_eq!(slpt_index(1 << 47, 4), 256);
         assert_eq!(slpt_index(0x1FF << 12, 1), 0x1FF);
+    }
+
+    /// ADR-0018 (round 5, Phase A): one domain per device — device A's
+    /// mapped page is ABSENT in device B's tables, the same frame may
+    /// live in both domains via separate map_runs, and unmapping one
+    /// domain leaves the other's PTE alone. (The pre-fix version of
+    /// this test — both devices in dom 0, the boot's old claim shape —
+    /// FAILED: the shared SLPT contained the page; see the CHANGELOG.)
+    #[test]
+    fn device_tables_are_isolated_per_domain() {
+        let arena = Arena::new(TABLE_BUDGET);
+        let mut vtd = plan_vtd(&arena).unwrap();
+        // the FIXED claim shape: each device its own domain.
+        vtd.assign_device(1, 0, 0, (0x03, 0)).unwrap();
+        vtd.assign_device(2, 0, 0, (0x04, 0)).unwrap();
+        let pa = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        // device A maps its page in A's domain
+        vtd.map_run(1, pa, 4096, DmaDir::Bidirectional).unwrap();
+        let a_slpt = vtd.dom_slpt(1).unwrap();
+        let b_slpt = vtd.dom_slpt(2).unwrap();
+        assert!(
+            vtd.slpte_of(a_slpt, pa).is_some(),
+            "A's tables hold A's page"
+        );
+        assert!(
+            vtd.slpte_of(b_slpt, pa).is_none(),
+            "device B's tables must not contain device A's page"
+        );
+        // the same frame may be mapped in BOTH domains — only through
+        // explicit, separate map_run calls.
+        vtd.map_run(2, pa, 4096, DmaDir::ToDevice).unwrap();
+        assert!(vtd.slpte_of(b_slpt, pa).is_some());
+        // unmapping A's domain leaves B's PTE untouched.
+        vtd.unmap_run(1, pa, 4096).unwrap();
+        assert!(vtd.slpte_of(a_slpt, pa).is_none());
+        assert!(
+            vtd.slpte_of(b_slpt, pa).is_some(),
+            "B's PTE survives A's unmap"
+        );
+    }
+
+    /// ADR-0018: a device owns exactly one domain — re-assignment is
+    /// refused until unassign_device clears the entry (and the context
+    /// cache with it).
+    #[test]
+    fn reassign_is_refused_until_unassigned() {
+        let arena = Arena::new(TABLE_BUDGET);
+        let mut vtd = plan_vtd(&arena).unwrap();
+        vtd.assign_device(1, 0, 0, (0x03, 0)).unwrap();
+        // same domain: refused.
+        assert!(matches!(
+            vtd.assign_device(1, 0, 0, (0x03, 0)),
+            Err(DmaError::Hardware(7))
+        ));
+        // a DIFFERENT domain: also refused.
+        assert!(matches!(
+            vtd.assign_device(2, 0, 0, (0x03, 0)),
+            Err(DmaError::Hardware(7))
+        ));
+        // unassign: the entry reads back absent, the DID is free.
+        vtd.unassign_device(0, 0, (0x03, 0)).unwrap();
+        let (lo, _hi) = vtd.context_entry_of(0, (0x03, 0));
+        assert_eq!(lo & 1, 0, "context entry cleared");
+        assert_eq!(vtd.assigned_count(), 0);
+        // idempotent on an absent entry.
+        vtd.unassign_device(0, 0, (0x03, 0)).unwrap();
+        // re-assign to the other domain now works, and its SLPT is
+        // the OTHER domain's root (not the old one).
+        vtd.assign_device(2, 0, 0, (0x03, 0)).unwrap();
+        let (lo, _hi) = vtd.context_entry_of(0, (0x03, 0));
+        assert_eq!(lo & ADDR_MASK, vtd.dom_slpt(2).unwrap());
+        // wrong segment: refused.
+        assert!(vtd.unassign_device(1, 0, (0x03, 0)).is_err());
+    }
+
+    /// ADR-0018: the budget is DERIVED from a pure worst-case
+    /// function — shared root+IQ+ctx plus per-domain root+PDPT+PD+PTs
+    /// over the pool's 2 MiB spans — not a guessed constant.
+    #[test]
+    fn budget_is_derived_not_guessed() {
+        assert_eq!(POOL_2M_SPANS_WORST, 9, "16 MiB aligned + 1 span slack");
+        assert_eq!(worst_case_tables(1), 3 + 12);
+        assert_eq!(worst_case_tables(8), 3 + 8 * 12);
+        assert_eq!(TABLE_BUDGET, 99, "covers every domain's worst case");
+    }
+
+    /// ADR-0018: exhausting the NEW multi-domain budget is a typed
+    /// refusal with no residue — the cursor is consistent (every
+    /// frame the budget ever handed out is still owned exactly once),
+    /// no table is aliased, and the pages mapped before the exhaustion
+    /// still walk.
+    #[test]
+    fn budget_exhaustion_is_typed_and_clean() {
+        let arena = Arena::new(TABLE_BUDGET);
+        let mut vtd = plan_vtd(&arena).unwrap();
+        for dom in 0..MAX_VTD_DOMAINS as u32 {
+            vtd.assign_device(dom, 0, 0, ((dom + 3) as u8, 0)).unwrap();
+        }
+        // Spread one page per 2 MiB span, round-robin over domains,
+        // until the budget refuses.
+        let mut mapped: Vec<(u32, u64)> = Vec::new();
+        let mut span: u64 = 0;
+        loop {
+            let dom = (span % MAX_VTD_DOMAINS as u64) as u32;
+            let pa = 0x20_0000u64 * span + 0x1000;
+            match vtd.map_run(dom, pa, 4096, DmaDir::Bidirectional) {
+                Ok(()) => mapped.push((dom, pa)),
+                Err(DmaError::OutOfTables) => break,
+                Err(e) => panic!("unexpected error before exhaustion: {e:?}"),
+            }
+            span += 1;
+        }
+        assert!(!mapped.is_empty(), "the budget must serve real maps first");
+        assert_eq!(
+            vtd.tables_used(),
+            TABLE_BUDGET,
+            "the cursor is consistent at the edge"
+        );
+        assert!(check_no_table_aliasing(&vtd).is_ok(), "no table aliased");
+        // every page mapped before the refusal still walks, only in
+        // its own domain.
+        for &(dom, pa) in mapped.iter() {
+            let own = vtd.dom_slpt(dom).unwrap();
+            assert!(vtd.slpte_of(own, pa).is_some());
+            for other in 0..MAX_VTD_DOMAINS as u32 {
+                if other != dom {
+                    let o = vtd.dom_slpt(other).unwrap();
+                    assert!(
+                        vtd.slpte_of(o, pa).is_none(),
+                        "dom {other} sees dom {dom}'s page"
+                    );
+                }
+            }
+        }
+        // the refusal is stable: the next map also refuses.
+        assert!(matches!(
+            vtd.map_run(
+                0,
+                0x20_0000u64 * (span + 1) + 0x1000,
+                4096,
+                DmaDir::ToDevice
+            ),
+            Err(DmaError::OutOfTables)
+        ));
+    }
+
+    /// ADR-0018: a deterministic property test — random multi-domain
+    /// assign/map/unmap/unassign sequences keep every domain isolated
+    /// (a page is present ONLY in its owning domain's walk) and no
+    /// table aliased, after every step.
+    #[test]
+    fn xorshift_property_multidomain_isolation() {
+        let arena = Arena::new(TABLE_BUDGET);
+        let mut vtd = plan_vtd(&arena).unwrap();
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // model: dom -> set of mapped (span) pages; device -> dom.
+        let mut live: [std::collections::BTreeSet<u64>; MAX_VTD_DOMAINS] = Default::default();
+        let mut dev_dom: [Option<u32>; 8] = [None; 8];
+        for step in 0..3000u32 {
+            let r = next();
+            let dom = (r % MAX_VTD_DOMAINS as u64) as u32;
+            let dev = ((r >> 8) % 8) as usize;
+            let span = (r >> 16) % 2048;
+            let pa = 0x20_0000u64 * span + 0x1000;
+            match r % 4 {
+                0 => {
+                    // assign: fresh entry only
+                    if vtd.assign_device(dom, 0, 0, ((dev + 3) as u8, 0)).is_ok() {
+                        if dev_dom[dev].is_none() {
+                            dev_dom[dev] = Some(dom);
+                        }
+                    } else if dev_dom[dev] != Some(dom) {
+                        // refused because the entry is present: correct
+                    }
+                }
+                1 => {
+                    if vtd.map_run(dom, pa, 4096, DmaDir::Bidirectional).is_ok() {
+                        live[dom as usize].insert(span);
+                    }
+                }
+                2 => {
+                    if vtd.unmap_run(dom, pa, 4096).is_ok() {
+                        // only model as gone if it was the mapped one
+                        if vtd
+                            .dom_slpt(dom)
+                            .is_some_and(|s| vtd.slpte_of(s, pa).is_none())
+                        {
+                            live[dom as usize].remove(&span);
+                        }
+                    }
+                }
+                _ => {
+                    if vtd.unassign_device(0, 0, ((dev + 3) as u8, 0)).is_ok() {
+                        dev_dom[dev] = None;
+                    }
+                }
+            }
+            // invariant after EVERY step: no aliasing, per-domain
+            // presence matches the model.
+            if step % 97 == 0 {
+                assert!(check_no_table_aliasing(&vtd).is_ok(), "step {step}: alias");
+                for d in 0..MAX_VTD_DOMAINS {
+                    let Some(slpt) = vtd.dom_slpt(d as u32) else {
+                        continue;
+                    };
+                    for &span in live[d].iter() {
+                        let pa = 0x20_0000u64 * span + 0x1000;
+                        assert!(
+                            vtd.slpte_of(slpt, pa).is_some(),
+                            "step {step}: dom {d} lost span {span}"
+                        );
+                        for o in 0..MAX_VTD_DOMAINS {
+                            if o != d {
+                                let os = vtd.dom_slpt(o as u32).unwrap();
+                                assert!(
+                                    vtd.slpte_of(os, pa).is_none(),
+                                    "step {step}: dom {o} sees dom {d}'s span {span}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

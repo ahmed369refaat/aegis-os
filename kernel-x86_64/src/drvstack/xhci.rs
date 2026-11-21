@@ -131,8 +131,9 @@ pub(crate) fn xhci_step<const N: usize>(
         broker,
         Some(dev),
         XHCI_OWNER,
+        dev.dom,
         false,
-        "[XHCI] teardown: revoke_all(0) → ",
+        "[XHCI] teardown",
         "",
     );
     let mut frames = [0u64; 2];
@@ -326,8 +327,9 @@ pub(crate) fn xhci_cmdring_step<const N: usize>(
         broker,
         Some(dev),
         XHCI_OWNER,
+        dev.dom,
         false,
-        "[XTRB] teardown: revoke_all(0) → ",
+        "[XTRB] teardown",
         "",
     );
     // Frames: DCBAA, command ring, event ring, ERST (segment table).

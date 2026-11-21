@@ -942,6 +942,7 @@ mod tests {
             cap_ids: [0; crate::pci::MAX_CAPS],
             cap_ptrs: [0; crate::pci::MAX_CAPS],
             cap_count: 0,
+            dom: 0,
         }
     }
 

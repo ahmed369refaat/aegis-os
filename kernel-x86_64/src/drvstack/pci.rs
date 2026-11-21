@@ -16,10 +16,11 @@ pub(crate) fn pci_step(
     out: &mut dyn FnMut(&str),
     dmar: &Dmar,
     broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
+    domains: &mut crate::session::DomainIds,
 ) -> crate::pci::Inventory {
     use crate::pci;
 
-    let inv = pci::enumerate_bus0();
+    let mut inv = pci::enumerate_bus0();
     let mut n = [0u8; 20];
     line(
         out,
@@ -138,30 +139,47 @@ pub(crate) fn pci_step(
                         ],
                     );
                 }
-                Ok(()) => match broker.assign_device(0, 0, dev.bus, (dev.dev, dev.func)) {
-                    Ok(()) => {
-                        line(
-                            out,
-                            &[
-                                "[PCI ] claim: bus=0 dev=",
-                                strutil::dec(u64::from(dev.dev), &mut bd),
-                                " fn=",
-                                strutil::dec(u64::from(dev.func), &mut bf),
-                                " (virtio-blk) → dom 0 ok (broker assigned)",
-                            ],
-                        );
+                Ok(()) => {
+                    let (bus, d, f) = (dev.bus, dev.dev, dev.func);
+                    match domains
+                        .alloc()
+                        .map(|dom| (dom, broker.assign_device(dom, 0, bus, (d, f))))
+                    {
+                        None => {
+                            line(
+                                out,
+                                &["[PCI ] claim: virtio-blk REFUSED (no free IOMMU domain — ADR-0018)"],
+                            );
+                        }
+                        Some((dom, Ok(()))) => {
+                            inv.set_dom(0x1AF4, 0x01, dom);
+                            let mut db = [0u8; 20];
+                            line(
+                                out,
+                                &[
+                                    "[PCI ] claim: bus=0 dev=",
+                                    strutil::dec(u64::from(d), &mut bd),
+                                    " fn=",
+                                    strutil::dec(u64::from(f), &mut bf),
+                                    " (virtio-blk) → dom ",
+                                    strutil::dec(u64::from(dom), &mut db),
+                                    " ok (broker assigned, ADR-0018)",
+                                ],
+                            );
+                        }
+                        Some((dom, Err(e))) => {
+                            domains.release(dom);
+                            line(
+                                out,
+                                &[
+                                    "[PCI ] claim: broker refused the assignment (",
+                                    hw_code(&e),
+                                    ")",
+                                ],
+                            );
+                        }
                     }
-                    Err(e) => {
-                        line(
-                            out,
-                            &[
-                                "[PCI ] claim: broker refused the assignment (",
-                                hw_code(&e),
-                                ")",
-                            ],
-                        );
-                    }
-                },
+                }
             }
         }
     };
@@ -185,24 +203,43 @@ pub(crate) fn pci_step(
                         ],
                     );
                 }
-                Ok(()) => match broker.assign_device(0, 0, dev.bus, (dev.dev, dev.func)) {
-                    Ok(()) => {
-                        line(
-                            out,
-                            &["[PCI ] claim: virtio-net → dom 0 ok (broker assigned)"],
-                        );
+                Ok(()) => {
+                    let (bus, d, f) = (dev.bus, dev.dev, dev.func);
+                    match domains
+                        .alloc()
+                        .map(|dom| (dom, broker.assign_device(dom, 0, bus, (d, f))))
+                    {
+                        None => {
+                            line(
+                                out,
+                                &["[PCI ] claim: virtio-net REFUSED (no free IOMMU domain — ADR-0018)"],
+                            );
+                        }
+                        Some((dom, Ok(()))) => {
+                            inv.set_dom(0x1AF4, 0x02, dom);
+                            let mut db = [0u8; 20];
+                            line(
+                                out,
+                                &[
+                                    "[PCI ] claim: virtio-net → dom ",
+                                    strutil::dec(u64::from(dom), &mut db),
+                                    " ok (broker assigned, ADR-0018)",
+                                ],
+                            );
+                        }
+                        Some((dom, Err(e))) => {
+                            domains.release(dom);
+                            line(
+                                out,
+                                &[
+                                    "[PCI ] claim: broker refused the net assignment (",
+                                    hw_code(&e),
+                                    ")",
+                                ],
+                            );
+                        }
                     }
-                    Err(e) => {
-                        line(
-                            out,
-                            &[
-                                "[PCI ] claim: broker refused the net assignment (",
-                                hw_code(&e),
-                                ")",
-                            ],
-                        );
-                    }
-                },
+                }
             }
         }
     };
@@ -221,21 +258,43 @@ pub(crate) fn pci_step(
                     ],
                 );
             }
-            Ok(()) => match broker.assign_device(0, 0, dev.bus, (dev.dev, dev.func)) {
-                Ok(()) => {
-                    line(out, &["[PCI ] claim: e1000 → dom 0 ok (broker assigned)"]);
+            Ok(()) => {
+                let (bus, d, f) = (dev.bus, dev.dev, dev.func);
+                match domains
+                    .alloc()
+                    .map(|dom| (dom, broker.assign_device(dom, 0, bus, (d, f))))
+                {
+                    None => {
+                        line(
+                            out,
+                            &["[PCI ] claim: e1000 REFUSED (no free IOMMU domain — ADR-0018)"],
+                        );
+                    }
+                    Some((dom, Ok(()))) => {
+                        inv.set_dom(0x8086, 0x02, dom);
+                        let mut db = [0u8; 20];
+                        line(
+                            out,
+                            &[
+                                "[PCI ] claim: e1000 → dom ",
+                                strutil::dec(u64::from(dom), &mut db),
+                                " ok (broker assigned, ADR-0018)",
+                            ],
+                        );
+                    }
+                    Some((dom, Err(e))) => {
+                        domains.release(dom);
+                        line(
+                            out,
+                            &[
+                                "[PCI ] claim: broker refused the e1000 assignment (",
+                                hw_code(&e),
+                                ")",
+                            ],
+                        );
+                    }
                 }
-                Err(e) => {
-                    line(
-                        out,
-                        &[
-                            "[PCI ] claim: broker refused the e1000 assignment (",
-                            hw_code(&e),
-                            ")",
-                        ],
-                    );
-                }
-            },
+            }
         }
     }
 
@@ -250,21 +309,43 @@ pub(crate) fn pci_step(
                     &["[PCI ] claim: nvme REFUSED (", describe_claim_error(e), ")"],
                 );
             }
-            Ok(()) => match broker.assign_device(0, 0, dev.bus, (dev.dev, dev.func)) {
-                Ok(()) => {
-                    line(out, &["[PCI ] claim: nvme → dom 0 ok (broker assigned)"]);
+            Ok(()) => {
+                let (bus, d, f) = (dev.bus, dev.dev, dev.func);
+                match domains
+                    .alloc()
+                    .map(|dom| (dom, broker.assign_device(dom, 0, bus, (d, f))))
+                {
+                    None => {
+                        line(
+                            out,
+                            &["[PCI ] claim: nvme REFUSED (no free IOMMU domain — ADR-0018)"],
+                        );
+                    }
+                    Some((dom, Ok(()))) => {
+                        inv.set_dom(0x1B36, 0x01, dom);
+                        let mut db = [0u8; 20];
+                        line(
+                            out,
+                            &[
+                                "[PCI ] claim: nvme → dom ",
+                                strutil::dec(u64::from(dom), &mut db),
+                                " ok (broker assigned, ADR-0018)",
+                            ],
+                        );
+                    }
+                    Some((dom, Err(e))) => {
+                        domains.release(dom);
+                        line(
+                            out,
+                            &[
+                                "[PCI ] claim: broker refused the nvme assignment (",
+                                hw_code(&e),
+                                ")",
+                            ],
+                        );
+                    }
                 }
-                Err(e) => {
-                    line(
-                        out,
-                        &[
-                            "[PCI ] claim: broker refused the nvme assignment (",
-                            hw_code(&e),
-                            ")",
-                        ],
-                    );
-                }
-            },
+            }
         }
     }
 
@@ -286,26 +367,51 @@ pub(crate) fn pci_step(
                         ],
                     );
                 }
-                Ok(()) => match broker.assign_device(0, 0, dev.bus, (dev.dev, dev.func)) {
-                    Ok(()) => {
-                        line(
-                            out,
-                            &["[PCI ] claim: ", label, " → dom 0 ok (broker assigned)"],
-                        );
+                Ok(()) => {
+                    let (bus, d, f) = (dev.bus, dev.dev, dev.func);
+                    match domains
+                        .alloc()
+                        .map(|dom| (dom, broker.assign_device(dom, 0, bus, (d, f))))
+                    {
+                        None => {
+                            line(
+                                out,
+                                &[
+                                    "[PCI ] claim: ",
+                                    label,
+                                    " REFUSED (no free IOMMU domain — ADR-0018)",
+                                ],
+                            );
+                        }
+                        Some((dom, Ok(()))) => {
+                            inv.set_dom(vendor, class_hi, dom);
+                            let mut db = [0u8; 20];
+                            line(
+                                out,
+                                &[
+                                    "[PCI ] claim: ",
+                                    label,
+                                    " → dom ",
+                                    strutil::dec(u64::from(dom), &mut db),
+                                    " ok (broker assigned, ADR-0018)",
+                                ],
+                            );
+                        }
+                        Some((dom, Err(e))) => {
+                            domains.release(dom);
+                            line(
+                                out,
+                                &[
+                                    "[PCI ] claim: broker refused the ",
+                                    label,
+                                    " assignment (",
+                                    hw_code(&e),
+                                    ")",
+                                ],
+                            );
+                        }
                     }
-                    Err(e) => {
-                        line(
-                            out,
-                            &[
-                                "[PCI ] claim: broker refused the ",
-                                label,
-                                " assignment (",
-                                hw_code(&e),
-                                ")",
-                            ],
-                        );
-                    }
-                },
+                }
             }
         }
     }

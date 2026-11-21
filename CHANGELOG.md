@@ -4,6 +4,51 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Changed — review round 5, Phase A (ADR-0018): one IOMMU domain per device
+
+The main remaining isolation gap: every device sat in IOMMU domain 0
+(one shared second-level table — any device could DMA into any
+other's buffers; one driver's revoke_all(0) tore down every driver's
+mappings; ADR-0015's domain-scoped cookies had no second domain to
+be wrong in). Red test first: `device_tables_are_isolated_per_domain`
+FAILED on the old claim shape (both devices in dom 0 share one SLPT).
+
+- **ADR-0018**: domain 0 is the kernel's own (the hw-proof + broker
+  demo); every claimed device draws its own id from the kernel-side
+  `DomainIds` allocator (never device-supplied; exhaustion = typed
+  None; release is explicit and double-release refused). The hardware
+  proof now UNASSIGNS its probe device (context clear + QI
+  context-cache invalidation — the only way a device changes
+  domains); `assign_device` refuses an already-assigned device.
+- **DriverSession carries the domain** (from PciDev.dom, set at
+  claim time): map/complete/unmap/revoke_all all scoped — one
+  session's teardown provably leaves every other's mappings alone.
+- **The table budget is derived, not guessed**: a pure
+  `worst_case_tables(domains)` (shared root+IQ+ctx + per-domain
+  root+PDPT+PD+9 PT spans) sizes TABLE_BUDGET to 99 (was 64 — 6-8
+  devices × per-domain trees would have exhausted it). The exhaustion
+  test drives the new sizing to its edge: typed refusal, cursor
+  consistent, no table aliasing.
+- **Live negative probe on the q35 lane**: the e1000 (its own domain)
+  DMAs at a page mapped ONLY in the virtio-net's domain — it MUST
+  fault; the lane grep requires "cross-device DMA FAULTED
+  (FSTS.PPF set)" and --verify-q35 FAILS without it. Measured: it
+  faults.
+- **Truthful teardown markers**: `revoke_or_quarantine` now reports
+  revoked/freed/quarantined/poisoned counts per domain and never
+  claims "frames return scrubbed" when any region was poisoned. The
+  claim markers carry the real domain id ("→ dom 3 ok"); the lane
+  greps were updated in the same commit (dom-number-agnostic
+  prefixes).
+- Host tests: per-domain isolation (A's page absent in B's walk; the
+  same frame in both domains only via separate map_runs; unmap
+  scoping), reassign-until-unassigned, budget math, multi-domain
+  exhaustion, a 3000-step xorshift property test over random
+  assign/map/unmap/unassign sequences (no aliasing, per-domain
+  presence matches the model after every sampled step), and the
+  DomainIds allocator (kernel-domain reservation, exhaustion,
+  release rules).
+
 ### Docs — review round 4, Phase 6: ADR-0017 — ring-3 driver domains
 
 The architecture ADR-0016 built its seams for: drivers become ring-3

@@ -36,3 +36,4 @@ it does not merge.
 | [0015](0015-map-run-atomicity-poison-quarantine.md) | map_run atomicity, poison quarantine, domain-scoped cookies | Accepted (F1–F3 in d7a1ca9; the one-close() unification is ADR-0016/F10) |
 | [0016](0016-driver-stack-modules-mmio-bus-driver-session.md) | Driver-stack modules, MmioBus windows, one-close() DriverSession | Accepted (review round 4, Phase 4) |
 | [0017](0017-ring3-driver-domains.md) | Ring-3 driver domains: drivers as monitored, brokered clients | Proposed (design accepted; first slice = the IpcMmio channel) |
+| [0018](0018-one-iommu-domain-per-device.md) | One IOMMU domain per device: kernel-allocated ids, scoped sessions, sized table budget | Accepted (review round 5, Phase A) |

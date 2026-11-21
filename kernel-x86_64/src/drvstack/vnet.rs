@@ -189,8 +189,9 @@ pub(crate) fn net_step<const N: usize>(
         broker,
         Some(dev),
         VNET_OWNER,
+        dev.dom,
         false,
-        "[VNET] teardown: revoke_all(0) → ",
+        "[VNET] teardown",
         "",
     );
     let mut frames = [0u64; 8];

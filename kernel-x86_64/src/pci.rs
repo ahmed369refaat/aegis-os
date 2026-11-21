@@ -180,6 +180,10 @@ pub struct PciDev {
     pub class: u16,
     pub header: u8,
     pub bars: [Option<Bar>; 6],
+    /// ADR-0018: this device's own IOMMU domain (set at claim time by
+    /// the kernel's DomainIds allocator; 0 until claimed — domain 0
+    /// is the kernel's own and never a device's).
+    pub dom: u32,
     pub bar_count: usize,
     /// Capability ids in walk order (MSI 0x05, MSI-X 0x11, virtio 0x09).
     pub cap_ids: [u8; MAX_CAPS],
@@ -250,6 +254,20 @@ impl Inventory {
             .iter()
             .find(|d| d.vendor == vendor && (d.class >> 8) as u8 == class_hi)
     }
+
+    /// ADR-0018: record the claimed device's IOMMU domain.
+    pub fn set_dom(&mut self, vendor: u16, class_hi: u8, dom: u32) -> bool {
+        match self.devices[..self.count]
+            .iter()
+            .position(|d| d.vendor == vendor && (d.class >> 8) as u8 == class_hi)
+        {
+            Some(i) => {
+                self.devices[i].dom = dom;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 const EMPTY_DEV: PciDev = PciDev {
@@ -265,6 +283,7 @@ const EMPTY_DEV: PciDev = PciDev {
     cap_ids: [0; MAX_CAPS],
     cap_ptrs: [0; MAX_CAPS],
     cap_count: 0,
+    dom: 0,
 };
 
 // ── enumeration, generic over the config-space accessors ──

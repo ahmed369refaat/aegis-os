@@ -105,8 +105,9 @@ pub(crate) fn ahci_step<const N: usize>(
         broker,
         Some(dev),
         AHCI_OWNER,
+        dev.dom,
         identity,
-        "[AHCI] teardown: revoke_all(0) → ",
+        "[AHCI] teardown",
         "[AHCI] teardown (identity): frames freed, no broker regions",
     );
     let mut frames = [0u64; 4];
