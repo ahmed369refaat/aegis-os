@@ -19,7 +19,9 @@ pub mod gdt;
 pub mod idt;
 #[cfg(not(test))]
 pub mod image_map;
+pub mod ioapic;
 pub mod lapic;
+pub mod pwr;
 pub mod vtd;
 
 #[cfg(not(test))]

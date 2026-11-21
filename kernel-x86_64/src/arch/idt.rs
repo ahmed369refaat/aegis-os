@@ -132,16 +132,19 @@ mod load {
     /// `arch::init()`. Wired: 0..=31 (exceptions), 32..=47 (the legacy
     /// IRQ catch-alls — ADR-0010: a stray line must be a NAMED halt,
     /// never a #DF with a shifted frame), 48 (the LAPIC timer —
-    /// ADR-0012), and 255 (the LAPIC spurious vector from SVR, a named
+    /// ADR-0012), 49..=112 (the broker-owned device vectors —
+    /// ADR-0019: the gates exist from boot; the broker decides who
+    /// owns a vector, and an unowned delivery is a named halt in the
+    /// dispatch), and 255 (the LAPIC spurious vector from SVR, a named
     /// no-op). Everything else stays absent: nothing on this machine
-    /// delivers on an unwired vector until MSI exists.
+    /// delivers on an unwired vector.
     pub fn load() {
         // SAFETY: single-CPU bring-up: the table is filled once, before
         // lidt publishes it to the CPU, and is never written again.
         unsafe {
             let i = &raw mut IDT;
             let idtr = &raw mut IDTR;
-            for vector in 0u8..=48 {
+            for vector in 0u8..=crate::irq::DEVICE_VECTOR_MAX {
                 let (handler, ist) = crate::arch::stubs::vector_handler(vector);
                 (*i).entries[vector as usize] =
                     Entry::encode(handler, crate::arch::gdt::KERNEL_CODE, ist, 0);

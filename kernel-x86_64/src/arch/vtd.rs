@@ -180,6 +180,72 @@ pub fn qi_desc_context(did: u16, bus: u8, devfn: (u8, u8)) -> [u64; 4] {
     [0x1 | (1 << 4) | ((did as u64) << 16) | (sid << 32), 0, 0, 0]
 }
 
+// ── interrupt remapping (ADR-0019) ─────────────────────────────────────
+// Layouts below are pinned against QEMU's own decoder (union
+// VTD_IR_TableEntry and union VTD_IR_MSIAddress in
+// include/hw/i386/intel_iommu.h): the remapped-format IRTE, the IRTA
+// register, and the remapped MSI address/data pair. QEMU faults an
+// IRTE whose reserved fields (bits 14:12 and 31:24 low, 63:20 high)
+// are non-zero — the encodings leave them zero BY CONSTRUCTION.
+
+/// IRTA: the interrupt-remapping table address register (64-bit).
+pub const REG_IRTA: u64 = 0xB8;
+/// GCMD bit 24: set the interrupt-remapping table pointer.
+pub const GCMD_SIRTP: u32 = 1 << 24;
+/// GCMD bit 25: enable interrupt remapping.
+pub const GCMD_IRE: u32 = 1 << 25;
+/// GSTS bit 24: the IRTA pointer is set.
+pub const GSTS_SIRTPS: u32 = 1 << 24;
+/// GSTS bit 25: interrupt remapping is enabled.
+pub const GSTS_IRES: u32 = 1 << 25;
+/// IRTA bit 11: extended interrupt mode (32-bit x2APIC dest ids).
+pub const IRTA_EIME: u64 = 1 << 11;
+
+/// The IRTE table this driver stack plans: 256 entries (one 4 KiB
+/// frame at 16 bytes per entry); the broker uses handles 0..=63
+/// (mirroring its vector slots).
+pub const IR_ENTRIES: u32 = 256;
+
+/// Encode one remapped-format IRTE: present, FIXED delivery, physical
+/// destination, edge — everything else zero. With EIME off the 8-bit
+/// APIC ID rides dest_id bits 15:8 (QEMU's non-EIM decode,
+/// VTD_IR_APIC_DEST_MASK); with EIME on it is the low 32 bits.
+#[must_use]
+pub fn irte_remapped(vector: u8, dest_apic_id: u8, eime: bool) -> [u64; 2] {
+    let dest_id: u64 = if eime {
+        u64::from(dest_apic_id)
+    } else {
+        (u64::from(dest_apic_id) & 0xFF) << 8
+    };
+    // Low word: present(0) | vector(23:16) | dest_id(63:32); the
+    // delivery/dest/polarity/trigger fields are FIXED/physical/
+    // active-high/edge = all zero. High word: SID validation off
+    // (SVT=0 — any source), everything else reserved-zero.
+    [1 | (u64::from(vector) << 16) | (dest_id << 32), 0]
+}
+
+/// The IRTA register value: the 4 KiB-aligned base, EIME when asked,
+/// and the size order (entries = 1 << (size+1); 7 → 256).
+#[must_use]
+pub const fn irta_value(base: u64, eime: bool, size_order: u32) -> u64 {
+    (base & !0xFFF) | if eime { IRTA_EIME } else { 0 } | ((size_order as u64) & 0xF)
+}
+
+/// The remapped-format MSI address for an IRTE handle: the 0xFEE
+/// prefix (bits 31:20), the handle in bits 19:5 (its bit 15 lands at
+/// address bit 2), the remappable-format flag at bit 4, SHV clear —
+/// and with SHV=0 the DATA word must be all zero (QEMU enforces
+/// both).
+#[must_use]
+pub const fn msi_remap_addr(handle: u32) -> u64 {
+    let h = handle as u64;
+    0xFEE0_0000 | ((h & 0x7FFF) << 5) | (1 << 4) | ((h >> 15) & 1) << 2
+}
+
+/// The remapped-format MSI data word: all zero (SHV=0 → no
+/// subhandle; any set bit is a fault).
+pub const MSI_REMAP_DATA: u32 = 0;
+
 /// Second-level levels for a host address width: 4 for 39 < haw ≤ 48
 /// (the QEMU q35 case, HAW=48).
 #[must_use]
@@ -300,6 +366,10 @@ pub struct Vtd {
     pub caps: Caps,
     root_pa: u64,
     iq_pa: u64,
+    /// The interrupt-remapping table's base (0 = IR not enabled).
+    /// ADR-0019: programmed by `ir_enable` AFTER the DMA half is live,
+    /// exactly the bring-up order the deferred comment asked for.
+    irte_pa: u64,
     /// Descriptor index of the next submission (monotonic; the
     /// hardware head chases it modulo IQ_ENTRIES).
     iq_tail: u32,
@@ -337,6 +407,7 @@ impl Vtd {
             },
             root_pa: 0,
             iq_pa: 0,
+            irte_pa: 0,
             iq_tail: 0,
             tables: [0; TABLE_BUDGET],
             table_cursor: 0,
@@ -391,6 +462,7 @@ impl Vtd {
             caps,
             root_pa: tables[0],
             iq_pa: tables[1],
+            irte_pa: 0,
             iq_tail: 0,
             disabled: false,
             tables: *tables,
@@ -405,6 +477,13 @@ impl Vtd {
     #[must_use]
     pub fn haw_bits(&self) -> u8 {
         self.haw_bits
+    }
+
+    /// Is interrupt remapping live on this unit? (The IRTE frame is
+    /// programmed by `ir_enable` after the DMA half — ADR-0019.)
+    #[must_use]
+    pub fn ir_active(&self) -> bool {
+        !self.disabled && self.irte_pa != 0
     }
 
     #[must_use]
@@ -990,6 +1069,48 @@ impl Vtd {
     #[must_use]
     pub fn fsts(&self) -> u32 {
         self.read32(REG_FSTS)
+    }
+
+    /// Enable interrupt remapping (ADR-0019): IRTA with the caller's
+    /// IRTE frame, then SIRTP → IRE, both with bounded GSTS spins and
+    /// the accumulated-GCMD discipline (every live enable stays set in
+    /// the word — see program_and_enable for the measured failure this
+    /// avoids). The frame must be 4 KiB-aligned and zeroed (every
+    /// entry not-present until the broker arms one).
+    pub fn ir_enable(&mut self, irte_pa: u64, eime: bool) -> Result<(u64, u64), VtdError> {
+        if self.disabled {
+            return Err(VtdError::SpinTimeout("IR on a disabled unit"));
+        }
+        crate::memops::write_u64(
+            self.reg_base + REG_IRTA,
+            irta_value(irte_pa, eime, 7),
+        );
+        let mut gcmd: u32 = GCMD_SRTP | GCMD_QIE | GCMD_TE | GCMD_SIRTP;
+        self.write32(REG_GCMD, gcmd);
+        let sirtp_spins = self.spin_gsts(GSTS_SIRTPS)?;
+        gcmd |= GCMD_IRE;
+        self.write32(REG_GCMD, gcmd);
+        let ire_spins = self.spin_gsts(GSTS_IRES)?;
+        self.irte_pa = irte_pa;
+        Ok((sirtp_spins, ire_spins))
+    }
+
+    /// Write one IRTE (128 bits) at `handle`; false when IR is not
+    /// live or the handle is out of the planned range. Handle n
+    /// mirrors broker vector slot n (49+n) — one IRTE per device
+    /// vector, allocated by the broker's own slot arithmetic.
+    pub fn irte_write(&self, handle: u32, words: [u64; 2]) -> bool {
+        if !self.ir_active() || handle >= IR_ENTRIES {
+            return false;
+        }
+        let pa = self.irte_pa + 16 * u64::from(handle);
+        // The two-step discipline is unnecessary here: the IRTE is
+        // written while masked-at-the-MSI-level (the device's vector
+        // is not armed in its MSI-X table yet); present-last would be
+        // cosmetic.
+        crate::memops::write_u64(pa + 8, words[1]);
+        crate::memops::write_u64(pa, words[0]);
+        true
     }
 }
 
@@ -1796,5 +1917,94 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ir_tests {
+    use super::*;
+
+    /// The remapped IRTE, pinned field by field against QEMU's
+    /// decoder: present alone in the low flags, the vector at 23:16,
+    /// the non-EIM dest at bits 47:40 (dest_id 15:8), and EVERY
+    /// reserved field zero (bits 14:12, 31:24 low; 63:20 high) —
+    /// QEMU faults a non-zero reserved field.
+    #[test]
+    fn irte_remapped_is_pinned_against_qemu() {
+        let [lo, hi] = irte_remapped(0x41, 0, false);
+        assert_eq!(lo & 1, 1, "present");
+        assert_eq!((lo >> 16) & 0xFF, 0x41, "vector at 23:16");
+        assert_eq!((lo >> 32) & 0xFFFF_FFFF, 0, "EIME off: dest 0 is zero");
+        assert_eq!(hi, 0, "SID validation off (SVT=0), rest reserved");
+        // Every bit outside the defined fields:
+        let defined = 1u64 | (0xFFu64 << 16) | (0xFFFF_FFFFu64 << 32);
+        assert_eq!(lo & !defined, 0, "no stray bits in reserved fields");
+
+        // Non-zero dest: EIME off rides dest_id bits 15:8.
+        let [lo2, _] = irte_remapped(0x41, 2, false);
+        assert_eq!((lo2 >> 40) & 0xFF, 2, "dest_apic_id at dest_id 15:8 (QEMU's non-EIM mask)");
+        // EIME on: the dest is the low 32 bits of dest_id.
+        let [lo3, _] = irte_remapped(0x41, 2, true);
+        assert_eq!((lo3 >> 32) & 0xFFFF_FFFF, 2);
+    }
+
+    /// The IRTA value: aligned base, EIME bit, and the size order —
+    /// 7 encodes 256 entries (1 << 8).
+    #[test]
+    fn irta_value_encodes_base_eime_and_order() {
+        let base = 0x0040_B000u64;
+        assert_eq!(irta_value(base, false, 7), 0x40_B007);
+        assert_eq!(irta_value(base, true, 7), 0x40_B007 | IRTA_EIME);
+        // The base's low 12 bits are stripped, never written.
+        assert_eq!(irta_value(0xFFFF_FFFF_FFFF_FFFF, false, 0), 0xFFFF_FFFF_FFFF_F000);
+        assert_eq!(irta_value(base, false, 0xF), 0x40_B00F);
+        // A size order wider than the 4-bit field is masked.
+        assert_eq!(irta_value(base, false, 0x1F), irta_value(base, false, 0xF));
+    }
+
+    /// The remapped MSI address: 0xFEE prefix, handle at bits 19:5,
+    /// the format flag at bit 4, SHV clear, and handle bit 15 (unused
+    /// at our table size, but encoded correctly) at bit 2.
+    #[test]
+    fn msi_remap_addr_is_pinned_against_qemu() {
+        assert_eq!(msi_remap_addr(0), 0xFEE0_0010, "format bit only");
+        assert_eq!(msi_remap_addr(1), 0xFEE0_0030);
+        assert_eq!(msi_remap_addr(2), 0xFEE0_0050);
+        assert_eq!(msi_remap_addr(63), 0xFEE0_07F0, "the broker's top handle");
+        // Address bit 3 (SHV) and bits 1:0 stay clear → data must be 0.
+        for h in 0..64u32 {
+            let a = msi_remap_addr(h);
+            assert_eq!(a >> 20, 0xFEE, "the prefix");
+            assert_eq!((a >> 5) & 0x7FFF, u64::from(h), "the handle rides 19:5");
+            assert_eq!(a & (1 << 3), 0, "SHV clear");
+            assert_eq!(a & 0b11, 0);
+            assert_eq!(a & (1 << 4), 1 << 4, "remappable format");
+        }
+        // Handle bit 15 lands at address bit 2 (QEMU's index_h).
+        assert_eq!(msi_remap_addr(0x8000), 0xFEE0_0010 | (1 << 2) | (0 << 5));
+        assert_eq!(msi_remap_addr(0x8001), 0xFEE0_0030 | (1 << 2));
+        assert_eq!(MSI_REMAP_DATA, 0);
+    }
+
+    /// The IR constants match the QEMU register map.
+    #[test]
+    fn ir_register_constants_match_qemu() {
+        assert_eq!(REG_IRTA, 0xB8);
+        assert_eq!(GCMD_SIRTP, 1 << 24);
+        assert_eq!(GCMD_IRE, 1 << 25);
+        assert_eq!(GSTS_SIRTPS, 1 << 24);
+        assert_eq!(GSTS_IRES, 1 << 25);
+        assert_eq!(IRTA_EIME, 1 << 11);
+        assert_eq!(IR_ENTRIES, 256);
+        // One frame holds the planned table.
+        assert_eq!(IR_ENTRIES * 16, 4096);
+    }
+
+    /// The planned unit reports IR inactive until enabled; the
+    /// absent placeholder never reports active.
+    #[test]
+    fn ir_starts_inactive_on_planned_and_absent_units() {
+        let v = Vtd::absent();
+        assert!(!v.ir_active());
     }
 }

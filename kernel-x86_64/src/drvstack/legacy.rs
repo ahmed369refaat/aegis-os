@@ -163,7 +163,15 @@ pub(crate) fn ps2_step(out: &mut dyn FnMut(&str)) {
     // Enable the first port (the keyboard).
     crate::hw::outb(0x64, 0xAE);
 
-    line(out, &["[KBD] armed: polling for the host's QMP key"]);
+    line(out, &["[KBD] armed: waiting for the host's QMP key"]);
+    // ADR-0019: the wait IS the delivery window — the QMP driver fires
+    // the key at the marker above, the press arrives MID-WINDOW, and
+    // its IRQ1 delivers through the IOAPIC → broker chain (MWAIT
+    // sleeps until the delivery's store wakes the armed line). The
+    // scancode itself waits in the 8042's output buffer, read after.
+    crate::drvstack::irq::keyboard_delivery_step(out);
+    // Then the scancode: a short bounded poll — the byte is buffered
+    // in the controller's output buffer the moment the IRQ fired.
     let budget = 150_000_000u64; // bounded: no infinite spin
     let mut spins = 0u64;
     let mut got: Option<u8> = None;

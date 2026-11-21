@@ -57,3 +57,10 @@
 # access width+address; the u32-RMW form silently corrupted virtio QUEUE_SEL
 # (queue selection stuck at 0 — measured on the net TX queue).
 93
+# 99 -> ADR-0019 (the interrupt chain): +6 — hw::sti/cli (the bounded
+# delivery window's IF pair: the ONE place the kernel opens interrupts
+# in CPL0, paired with cli microseconds later), monitor/mwait (the
+# idle pair, CPUID-gated), rdrand64/rdseed64 (the on-CPU entropy
+# sources — retry-able primitives whose carry-flag gate is
+# materialized with setc into a byte register).
+99

@@ -339,6 +339,88 @@ pub fn rdmsr(msr: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
+/// Enable interrupts (set IF). The kernel's convention is IF=0 in
+/// CPL0; the ONE deliberate exception is ADR-0019's bounded delivery
+/// window (`irq::wait_for_delivery`), which pairs this with `cli`
+/// microseconds later — every vector that can land in the window is
+/// one the IDT deliberately gates.
+///
+/// SAFETY: caller owns the window's extent: STI lets any unmasked
+/// interrupt (or NMI) through on the next instruction boundary.
+pub fn sti() {
+    // SAFETY: a single-instruction flag change; the pairing contract
+    // is documented above.
+    unsafe { asm!("sti", options(nostack)) }
+}
+
+/// Disable interrupts (clear IF).
+///
+/// SAFETY: none beyond the convention — the kernel's default state.
+pub fn cli() {
+    // SAFETY: see sti(); the default kernel state.
+    unsafe { asm!("cli", options(nostack, preserves_flags)) }
+}
+
+/// `monitor` — arm an address watch for the following `mwait`
+/// (CPUID.01H:ECX bit 3; decoded in arch/features).
+///
+/// SAFETY: no memory access of its own (it arms the line-sized
+/// region at `addr` for wake purposes); `addr` must be a normal
+/// writable virtual address.
+pub fn monitor(addr: u64, ext: u64) {
+    // SAFETY: single instruction; the arming is architectural.
+    unsafe {
+        asm!("monitor", in("rax") addr, in("rcx") ext, in("rdx") 0u64, options(nostack))
+    }
+}
+
+/// `mwait` — wait for the armed `monitor` line or an unmasked
+/// interrupt. The idle instruction the Stage-4 idle loop wants;
+/// ADR-0019's proof runs it once with a pending LAPIC deadline.
+///
+/// SAFETY: caller guarantees `monitor` was armed (an mwait without a
+/// preceding monitor is architecturally valid but wakes immediately —
+/// useless and confusing, so the caller owns the pairing).
+pub fn mwait(eax: u64, ecx: u64) {
+    // SAFETY: single instruction; the wake conditions are the
+    // caller's contract.
+    unsafe { asm!("mwait", in("rax") eax, in("rcx") ecx, options(nostack)) }
+}
+
+/// `rdrand` — the on-CPU entropy instruction (CPUID.01H:ECX bit 30).
+/// Returns None when the hardware reports RDRAND failure (it can —
+/// undersubscribed entropy is a documented state, not a bug); callers
+/// retry with a bounded loop and fall back to the pool.
+///
+/// SAFETY: no memory or register side effects beyond RAX and the
+/// carry flag (both declared).
+pub fn rdrand64() -> Option<u64> {
+    let v: u64;
+    let ok: u8;
+    // SAFETY: the ISA-defined retry-able primitive; the carry flag
+    // gates whether the value register is valid this attempt
+    // (`setc` materializes CF into a byte).
+    unsafe {
+        asm!("rdrand {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nostack))
+    }
+    if ok == 1 { Some(v) } else { None }
+}
+
+/// `rdseed` — the seed-quality entropy instruction (CPUID.07H:EBX
+/// bit 18). Slower and possibly absent where RDRAND exists; the pool
+/// prefers it when present.
+///
+/// SAFETY: as `rdrand64`.
+pub fn rdseed64() -> Option<u64> {
+    let v: u64;
+    let ok: u8;
+    // SAFETY: as rdrand64 — the carry flag gates RAX via `setc`.
+    unsafe {
+        asm!("rdseed {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nostack))
+    }
+    if ok == 1 { Some(v) } else { None }
+}
+
 /// Halt forever (interrupts disabled). Never returns.
 pub fn halt_forever() -> ! {
     loop {
