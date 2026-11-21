@@ -77,6 +77,20 @@ impl Preemptor {
         }
     }
 
+    /// ADR-0023 D3: `current` volunteered the rest of its slice
+    /// (`sched_yield`). The slice is charged IN FULL — volunteering
+    /// must not buy priority, that is the CFS contract (a
+    /// yield-loops-forever domain earns nothing but its own spin) —
+    /// then the fair pick decides: `Some(other)` = the kernel parks and
+    /// switches exactly as the tick path does; `None` = the caller is
+    /// still the fair pick (or solo) and simply returns.
+    pub fn on_yield(&self, sched: &mut Scheduler, current: u32) -> Option<u32> {
+        if sched.entity(current).is_some() {
+            let _ = sched.tick(current, self.slice_ticks);
+        }
+        sched.pick_next().filter(|next| *next != current)
+    }
+
     /// `exited` finished (SYS_EXIT or a fault). Unregister it from the
     /// scheduler and name the next domain to run, or `None` when the
     /// queue is empty. The caller destroys the exited domain's

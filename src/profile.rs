@@ -13,8 +13,9 @@
 use crate::capability::Rights;
 use crate::syscall::{
     SyscallMask, SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_IOCTL,
-    SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NET_RECV,
-    SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
+    SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP,
+    SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SCHED_YIELD, SYS_UNLINK,
+    SYS_WAIT, SYS_WRITE,
 };
 
 /// The surface a domain of this class keeps while *degraded* (the
@@ -70,6 +71,8 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_FORK)
                 | (1u64 << SYS_EXEC)
                 | (1u64 << SYS_WAIT)
+                | (1u64 << SYS_NANOSLEEP)
+                | (1u64 << SYS_SCHED_YIELD)
                 | (1u64 << SYS_EXIT),
         ),
         // Degraded service: existing local I/O and IPC stay; every path
@@ -215,6 +218,8 @@ pub const fn app_profile() -> DomainProfile {
                 | (1u64 << SYS_WAIT)
                 | (1u64 << SYS_MMAP)
                 | (1u64 << SYS_MUNMAP)
+                | (1u64 << SYS_NANOSLEEP)
+                | (1u64 << SYS_SCHED_YIELD)
                 | (1u64 << SYS_EXIT),
         ),
         // Degraded app: keep draining what is already open; the power

@@ -155,6 +155,10 @@ pub struct Kernel<const N: usize = { crate::buddy::FRAME_COUNT }> {
     /// ADR-0022 D5: init's exec policy table — the declared surface
     /// per executable path; unlisted = the app default (AuditOnly).
     pub exec_policy: proc::ExecPolicyTable,
+    /// ADR-0023 D2: the sleep table — (domain, wake_at) pairs in the
+    /// time base `tick` speaks (the core never learns the unit). One
+    /// entry per sleeping domain; bounded by MAX_DOMAINS.
+    pub(crate) sleepers: [Option<(u32, u64)>; MAX_DOMAINS],
 }
 
 impl Kernel<{ crate::buddy::FRAME_COUNT }> {
@@ -188,6 +192,7 @@ impl<const N: usize> Kernel<N> {
             last_window: 0,
             procs: proc::ProcTable::new(),
             exec_policy: proc::ExecPolicyTable::new(),
+            sleepers: [None; MAX_DOMAINS],
         }
     }
 
@@ -797,6 +802,13 @@ impl<const N: usize> Kernel<N> {
                 *b = None;
             }
         }
+        // ADR-0023: a dying domain's sleep entry dies with it (a wake
+        // later must not reference a dead id).
+        for slot in self.sleepers.iter_mut() {
+            if matches!(*slot, Some((d, _)) if d == id) {
+                *slot = None;
+            }
+        }
         // Unregister from the fair scheduler and free the slot.
         let _ = self.sched.unregister(id);
         self.domains[slot] = None;
@@ -914,6 +926,12 @@ impl<const N: usize> Kernel<N> {
     /// audit every live domain (the automatic slow path — `audit`
     /// remains the manual, single-domain API).
     pub fn tick(&mut self, now: u64) {
+        // ADR-0023 D2: the wake pass runs on EVERY tick — a sleeper
+        // whose deadline passed must wake even inside the same monitor
+        // window (audits stay window-gated, wakes are not). The count
+        // is intentionally discarded here: tick callers do not act on
+        // it (the scheduler state changed is the signal).
+        let _ = self.wake_due(now);
         let window = now / self.window_len;
         if window == self.last_window {
             return;
@@ -923,6 +941,106 @@ impl<const N: usize> Kernel<N> {
         for id in ids.iter().flatten() {
             let _ = self.audit(*id);
         }
+    }
+
+    /// ADR-0023 D2: park the caller until `now + cycles` (both in the
+    /// time base `tick` speaks). Zero cycles is a plain yield (no
+    /// entry, nothing scheduled). A second sleep for the same domain
+    /// REPLACES the first. Returns the wake deadline; a span whose
+    /// deadline would overflow refuses — a deadline that can never be
+    /// reached would be a lost wakeup.
+    pub(crate) fn sleep_until(
+        &mut self,
+        domain: u32,
+        now: u64,
+        cycles: u64,
+    ) -> Result<u64, crate::sys::SysError> {
+        use crate::sys::SysError;
+        if self.domain(domain).is_none() {
+            return Err(SysError::UnknownDomain(domain));
+        }
+        if cycles == 0 {
+            return Ok(now);
+        }
+        let wake = now
+            .checked_add(cycles)
+            .ok_or(SysError::InvalidArgument(cycles))?;
+        let mut placed = false;
+        for slot in self.sleepers.iter_mut() {
+            if matches!(*slot, Some((d, _)) if d == domain) {
+                *slot = Some((domain, wake));
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            for slot in self.sleepers.iter_mut() {
+                if slot.is_none() {
+                    *slot = Some((domain, wake));
+                    placed = true;
+                    break;
+                }
+            }
+        }
+        if !placed {
+            // Unreachable while sleepers are bounded by live domains,
+            // but a lost sleep is worse than a typed refusal.
+            return Err(SysError::TooManyDomains);
+        }
+        let _ = self.sched.set_runnable(domain, false);
+        Ok(wake)
+    }
+
+    /// ADR-0023 D2: wake every sleeper whose deadline has passed,
+    /// through the scheduler's wake path (the min_vruntime floor — a
+    /// long sleep buys no priority). Returns how many woke.
+    #[must_use]
+    pub fn wake_due(&mut self, now: u64) -> u32 {
+        let mut due: [Option<u32>; MAX_DOMAINS] = [None; MAX_DOMAINS];
+        let mut n = 0usize;
+        for slot in self.sleepers.iter_mut() {
+            if let Some((d, at)) = *slot {
+                if at <= now && n < due.len() {
+                    *slot = None;
+                    due[n] = Some(d);
+                    n += 1;
+                }
+            }
+        }
+        let mut woke = 0u32;
+        for &d in due[..n].iter().flatten() {
+            // Only a still-live, still-registered domain wakes
+            // (teardown cancels entries; this is the belt).
+            if self.domain(d).is_some() && self.sched.entity(d).is_some() {
+                let _ = self.sched.set_runnable(d, true);
+                woke += 1;
+            }
+        }
+        woke
+    }
+
+    /// ADR-0023 D7: the earliest FUTURE wake deadline — the idle loop's
+    /// "how long may I sleep" answer. Callers must `tick(now)` first
+    /// (due entries leave the table there); `None` = nothing sleeps.
+    #[must_use]
+    pub fn sleepers_due(&self, now: u64) -> Option<u64> {
+        self.sleepers
+            .iter()
+            .flatten()
+            .map(|&(_, at)| at)
+            .filter(|at| *at > now)
+            .min()
+    }
+
+    /// ADR-0023: the wake deadline a domain sleeps toward, if any
+    /// (test/procfs visibility).
+    #[must_use]
+    pub fn sleeping(&self, domain: u32) -> Option<u64> {
+        self.sleepers
+            .iter()
+            .flatten()
+            .find(|&&(d, _)| d == domain)
+            .map(|&(_, at)| at)
     }
 
     fn domain_ids(&self) -> [Option<u32>; MAX_DOMAINS] {

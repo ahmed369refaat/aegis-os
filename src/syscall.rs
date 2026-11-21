@@ -54,6 +54,11 @@ pub const SYS_FORK: u8 = 18;
 pub const SYS_EXEC: u8 = 19;
 /// Wait for a child and reap its exit status (wait4(2)-like).
 pub const SYS_WAIT: u8 = 20;
+/// Sleep for a span of core time units (nanosleep(2)-like; ADR-0023 —
+/// the ABI layer converts ns to the kernel's time base).
+pub const SYS_NANOSLEEP: u8 = 21;
+/// Volunteer the rest of the current slice (sched_yield(2)-like).
+pub const SYS_SCHED_YIELD: u8 = 22;
 /// Reserved: domain exit. Always reachable; a mask without it is rejected
 /// by convention (see `profile` tests).
 pub const SYS_EXIT: u8 = 63;

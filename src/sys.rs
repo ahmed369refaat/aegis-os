@@ -25,8 +25,8 @@ use crate::vfs::{Access, InodeKind, Mode, VfsError};
 use crate::{
     syscall::{
         SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR,
-        SYS_MMAP, SYS_MUNMAP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SPAWN,
-        SYS_UNLINK, SYS_WRITE,
+        SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE,
+        SYS_READ, SYS_SCHED_YIELD, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
     },
     Kernel, KernelError,
 };
@@ -72,6 +72,18 @@ pub enum SysRequest<'a> {
         target: u32,
         sig: u8,
     },
+    /// nanosleep(now, cycles) — ADR-0023: park the caller until
+    /// `now + cycles`, both in the core's unit-agnostic time base (the
+    /// ABI layer converts ns to the kernel's). Returns the wake
+    /// deadline. Zero cycles is a plain yield.
+    Nanosleep {
+        now: u64,
+        cycles: u64,
+    },
+    /// sched_yield() — ADR-0023: volunteer the rest of the slice. The
+    /// core records the call; the SWITCH decision is the kernel's
+    /// (`Preemptor::on_yield`) because only it can park the run.
+    SchedYield,
     /// chroot(path) — confinement change; unlike Linux, the cwd moves with
     /// the root (closes the historical chroot+cwd escape).
     Chroot {
@@ -174,6 +186,9 @@ pub enum SysError {
     Buddy(BuddyError),
     /// kill() denied: sender is not uid 0 and not the same uid.
     PermissionDenied,
+    /// ADR-0023: an argument value the core refuses outright (a sleep
+    /// span whose deadline overflows, for one) — EINVAL at the ABI.
+    InvalidArgument(u64),
 }
 
 /// F14: the two failure modes of `net_open`, kept distinct.
@@ -556,6 +571,11 @@ impl<const N: usize> Kernel<N> {
                 victim.signals.send(sig).map_err(SysError::Signal)?;
                 Ok(SysValue::Unit)
             }
+            SysRequest::Nanosleep { now, cycles } => {
+                let wake = self.sleep_until(domain_id, now, cycles)?;
+                Ok(SysValue::Count(wake as usize))
+            }
+            SysRequest::SchedYield => Ok(SysValue::Unit),
             SysRequest::Chroot { path } => {
                 // Resolve against the *current* root, then re-root.
                 let id = self
@@ -927,6 +947,8 @@ fn syscall_nr(req: &SysRequest<'_>) -> u8 {
         SysRequest::Pipe => SYS_PIPE,
         SysRequest::Dup { .. } => SYS_DUP,
         SysRequest::Kill { .. } => SYS_KILL,
+        SysRequest::Nanosleep { .. } => SYS_NANOSLEEP,
+        SysRequest::SchedYield => SYS_SCHED_YIELD,
         SysRequest::Chroot { .. } => SYS_CHROOT,
         SysRequest::Mkdir { .. } => SYS_MKDIR,
         SysRequest::Unlink { .. } => SYS_UNLINK,

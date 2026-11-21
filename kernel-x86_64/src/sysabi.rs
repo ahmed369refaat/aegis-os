@@ -149,6 +149,9 @@ pub fn errno_of(e: &SysError) -> i64 {
         },
         SysError::Buddy(_) => -ENOMEM,
         SysError::PermissionDenied => -EACCES,
+        // ADR-0023: a refused argument value (an overflowing sleep
+        // span) is EINVAL.
+        SysError::InvalidArgument(_) => -EINVAL,
     }
 }
 
