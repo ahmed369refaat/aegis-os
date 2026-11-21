@@ -86,4 +86,8 @@
 #      completed-mailbox static-mut borrows (sched/park.rs), and the
 #      OFF_* frame-read closure. All single-CPU IF=0 statics with
 #      per-item SAFETY notes.
-110
+# 114 -> ADR-0023 (M3 Phase 2, the signal slice's follow-up): +4 —
+#      the SAVED_CHAIN static borrows (the shared-stack lesson: state
+#      that must survive excursions lives in .bss, and static-mut
+#      access is an unsafe act), and the unpark-delivery page walk.
+114

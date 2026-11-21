@@ -254,8 +254,8 @@ mod boot {
         // tables (page-walk validation, CR3-independent).
         let stack_ok = {
             let page = new_rsp & !(crate::mm::pte::PAGE_SIZE_U64 - 1);
-            let end_page = ((new_rsp + sigframe::SIGFRAME_BYTES as u64 - 1)
-                & !(crate::mm::pte::PAGE_SIZE_U64 - 1));
+            let end_page = (new_rsp + sigframe::SIGFRAME_BYTES as u64 - 1)
+                & !(crate::mm::pte::PAGE_SIZE_U64 - 1);
             let mut ok = true;
             let mut p = page;
             while p <= end_page {
@@ -396,10 +396,9 @@ mod boot {
             }
             // Nothing runnable, nothing sleeping: the run set is empty
             // — unwind to the outer launch point.
-            if let Some(chain) = {
-                // SAFETY: see the save site.
-                unsafe { *core::ptr::addr_of!(SAVED_CHAIN[0]) }
-            } {
+            // SAFETY: see the save site.
+            let chain = unsafe { *core::ptr::addr_of!(SAVED_CHAIN[0]) };
+            if let Some(chain) = chain {
                 context::restore_resume_chain(&chain);
                 context::resume_kernel();
             }

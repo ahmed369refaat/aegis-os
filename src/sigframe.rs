@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_rflags_bits_are_stripped_not_trusted() {
+    fn forged_rflags_bits_are_stripped_not_trusted() {
         let mut base = img();
         // A forged frame tries to keep IOPL=3, NT, VM, RF and set TF.
         base.rflags = 0x202 | (3 << 12) | (1 << 14) | (1 << 16) | (1 << 17) | (1 << 8);
