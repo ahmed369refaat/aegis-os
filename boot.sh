@@ -102,9 +102,9 @@ case "${1:-}" in
       "[NVME] Identify: serial=\"AEGISN1 \""  # F11: the identify data page arrives (not PA 0)
       "[NVME] I/O qpair QID1 created (CQ+SQ)"  # F11: entry sizes + PRP both accepted
       "[NVME] read LBA0:"  # F11: a 512-byte read through the IOMMU
-      "[NVME] teardown: revoke_all(0) →"  # count varies with how far the ext2 helper mapped
+      "[NVME] teardown dom"  # ADR-0018: scoped, truthful counts (count varies with how far the ext2 helper mapped)
       "[AHCI] ABAR live:"  # port + signature proven
-      "[AHCI] teardown: revoke_all(0) →"  # same
+      "[AHCI] teardown dom"  # same, ADR-0018
       "[XHCI] "  # bring-up + port detection (register-only, fully live)
       "[XTRB] No-Op command:"  # the TRB machinery (command ring + event ring)
       "[ACPI] directory walk"  # HPET/MADT/MCFG located
@@ -114,10 +114,11 @@ case "${1:-}" in
       "[KBD2] negotiated scancode set 2, ack="  # the real 0xF0/0x02 exchange
       "[KBD2] scancode"  # the QMP round trip
       "[EXT2] hello.txt (inode 12, 17 bytes): \"HELLO-AEGIS-EXT2.\" ← read-only ext2 over AHCI"  # the mount LIVE (ADR-0014: the stale FIS was three driver bugs)
-      "[E1K] teardown: revoke_all(0) →"
+      "[E1K] teardown dom"  # ADR-0018
       "[GFX] VBE 640x480x32 linear"  # the mode engaged
       "[RTC] 2026-"  # the MC146818 read the host clock
-      "[VNET] teardown: revoke_all(0) →"
+      "[VNET] teardown dom"  # ADR-0018
+      "cross-device DMA FAULTED (FSTS.PPF set)"  # ADR-0018: the negative probe — the lane FAILS if cross-device DMA does not fault
     )
     ;;
   --verify-q35-noiommu)
@@ -280,7 +281,7 @@ if [ "$MODE" = "verify" ]; then
       grep -qF "[IOMMU] dma-drivers=1 (broker live over VT-d)" "$LOG" || { echo "VERIFY FAIL: dma-drivers verdict must be 1 on the IOMMU lane"; ok=0; }
       grep -qF "[PCI ] scan bus 0: " "$LOG" || { echo "VERIFY FAIL: PCI inventory marker missing"; ok=0; }
       grep -qF "0x1af4" "$LOG" || { echo "VERIFY FAIL: the virtio-blk must be in the inventory"; ok=0; }
-grep -qF "(virtio-blk) → dom 0 ok (broker assigned)" "$LOG" || { echo "VERIFY FAIL: the virtio-blk claim must go through the broker"; ok=0; }
+grep -qF "(virtio-blk) → dom" "$LOG" || { echo "VERIFY FAIL: the virtio-blk claim must go through the broker (ADR-0018: its own domain)"; ok=0; }
       # ── ADR-0014: translation is REAL or the lane fails ──
       # (a) No device may take the pass-through fast path. Under the
       #     old TT=0b10 this fired 8x for six devices.

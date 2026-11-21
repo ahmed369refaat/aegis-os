@@ -249,6 +249,25 @@ pub(crate) fn proof_step<const N: usize>(
     );
     // The proof page goes back to the pool (scrubbed on free).
     let _ = pool.free(&mut k.frames, page_pa, VTD_TABLE_OWNER);
+    // ADR-0018: the probe assignment is released — the context entry
+    // is cleared and the context cache invalidated, so the per-device
+    // claims that follow start from a clean table (a device owns
+    // exactly one domain, and this one was only ever the proof's).
+    if let Err(e) = unit.unassign_device(0, bus, (dev, func)) {
+        line(
+            out,
+            &[
+                "[IOMMU] vtd: hw-proof: unassign refused (",
+                hw_code(&e),
+                ")",
+            ],
+        );
+        return;
+    }
+    line(
+        out,
+        &["[IOMMU] vtd: hw-proof: probe assignment released (ctx cleared + cache invalidated, ADR-0018)"],
+    );
 }
 
 /// One honest line per VT-d failure class.

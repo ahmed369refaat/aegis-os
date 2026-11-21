@@ -179,8 +179,9 @@ pub(crate) fn e1k_step<const N: usize>(
         broker,
         Some(dev),
         E1K_OWNER,
+        dev.dom,
         identity,
-        "[E1K] teardown: revoke_all(0) → ",
+        "[E1K] teardown",
         "[E1K] teardown (identity): frames freed, no broker regions",
     );
     let mut frames = [0u64; 4];
@@ -432,3 +433,215 @@ pub(crate) fn e1k_step<const N: usize>(
 // ── NVMe (checklist item 6): admin + I/O queue pairs, IDENTIFY, a
 // sector read — the same broker discipline; every ring and data
 // frame is an IOMMU-mapped pool frame before the device sees it ──
+
+/// ADR-0018's live negative probe (round 5, Phase A.5): the e1000 —
+/// in ITS per-device domain — attempts a TX buffer read of a page
+/// mapped ONLY in a different, probe-owned domain. The IOMMU must
+/// fault it: FSTS.PPF sets, the TX never completes, and the lane's
+/// grep requires the fault marker (a silent success would mean
+/// devices are NOT isolated). Runs after `e1k_step` (the device is
+/// idle, BME off, its rings freed and scrubbed).
+#[cfg(not(test))]
+pub(crate) fn e1k_cross_device_probe_step<const N: usize>(
+    k: &mut aegis_os::Kernel<N>,
+    pool: &mut FramePool<N>,
+    out: &mut dyn FnMut(&str),
+    broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
+    inv: &crate::pci::Inventory,
+) {
+    use aegis_os::dma::DmaVerdict;
+
+    let Some(dev) = inv.find_by(0x8086, 0x02) else {
+        line(
+            out,
+            &["[IOMMU] cross-device probe: no e1000 on this machine — skipped"],
+        );
+        return;
+    };
+    if matches!(broker.verdict(), DmaVerdict::Absent { .. }) {
+        line(
+            out,
+            &["[IOMMU] cross-device probe: no IOMMU on this lane — skipped"],
+        );
+        return;
+    }
+    let e_dom = dev.dom;
+    if e_dom == 0 {
+        // ADR-0018: a device is never in the kernel's domain; if the
+        // claim path did not run, there is nothing to prove here.
+        line(
+            out,
+            &["[IOMMU] cross-device probe: e1000 has no per-device domain — skipped"],
+        );
+        return;
+    }
+    // The victim's domain: ANOTHER REAL DEVICE'S — the virtio-net's
+    // own per-device domain (its step ran and revoked; the domain's
+    // tables persist). A probe-owned domain would have no device and
+    // therefore no SLPT root; using the vnet's domain is exactly the
+    // finding's scenario: device X DMAs at a page mapped ONLY in
+    // device Y's domain.
+    let Some(vdev) = inv.find_by(0x1AF4, 0x02) else {
+        line(
+            out,
+            &["[IOMMU] cross-device probe: no virtio-net whose domain can host the victim — skipped"],
+        );
+        return;
+    };
+    let v_dom = vdev.dom;
+    if v_dom == 0 || v_dom == e_dom {
+        line(
+            out,
+            &["[IOMMU] cross-device probe: no distinct per-device domains — skipped"],
+        );
+        return;
+    }
+    // The victim: one scrubbed pool page, mapped ONLY in the vnet's
+    // domain — the e1000's domain cannot see it.
+    let Ok(victim) = pool.alloc_for(&mut k.frames, crate::drvstack::VTD_TABLE_OWNER) else {
+        line(
+            out,
+            &["[IOMMU] cross-device probe: pool exhausted — skipped"],
+        );
+        return;
+    };
+    let view = broker.map_region(v_dom, victim, 4096, aegis_os::dma::DmaDir::Bidirectional);
+    let Ok(view) = view else {
+        let _ = pool.free(&mut k.frames, victim, crate::drvstack::VTD_TABLE_OWNER);
+        line(
+            out,
+            &["[IOMMU] cross-device probe: broker refused the victim map — skipped"],
+        );
+        return;
+    };
+    // The e1000 side: window + one TX ring frame in ITS OWN domain.
+    let Some(bar) = crate::pci::mem_bar(dev, 0) else {
+        let _ = broker.unmap_region(v_dom, view.cookie);
+        let _ = pool.free(&mut k.frames, victim, crate::drvstack::VTD_TABLE_OWNER);
+        line(
+            out,
+            &["[IOMMU] cross-device probe: e1000 BAR0 unresolved — skipped"],
+        );
+        return;
+    };
+    let Some(bus) = crate::mmio::BarMmio::new(bar.base, bar.size) else {
+        let _ = broker.unmap_region(v_dom, view.cookie);
+        let _ = pool.free(&mut k.frames, victim, crate::drvstack::VTD_TABLE_OWNER);
+        line(
+            out,
+            &["[IOMMU] cross-device probe: e1000 BAR0 window malformed — skipped"],
+        );
+        return;
+    };
+    if bus.window().len() < E1K_TDT + 4 {
+        let _ = broker.unmap_region(v_dom, view.cookie);
+        let _ = pool.free(&mut k.frames, victim, crate::drvstack::VTD_TABLE_OWNER);
+        line(
+            out,
+            &["[IOMMU] cross-device probe: e1000 window too small — skipped"],
+        );
+        return;
+    }
+    'probe: {
+        let mut session = crate::session::DriverSession::new(
+            k,
+            pool,
+            broker,
+            Some(dev),
+            E1K_OWNER,
+            e_dom,
+            false,
+            "[E1K-PROBE] teardown",
+            "",
+        );
+        let Some(ring) = session.frame() else {
+            line(
+                out,
+                &["[IOMMU] cross-device probe: pool exhausted — skipped"],
+            );
+            session.close(out);
+            break 'probe;
+        };
+        if session.map(ring).is_none() {
+            line(
+                out,
+                &["[IOMMU] cross-device probe: broker refused the ring — skipped"],
+            );
+            session.close(out);
+            break 'probe;
+        }
+        // One legacy TX descriptor: its buffer_addr is the VICTIM — a
+        // page the e1000's domain cannot see.
+        crate::memops::write_u64(ring, victim);
+        crate::memops::write_u16(ring + 8, 64); // length
+        netutil::put8(ring + 11, 0x0B); // cmd: EOP | IFCS | RS
+                                        // Program + kick (window-checked; the ring is mapped, so a
+                                        // refused write is a full teardown).
+        let prog = [
+            (E1K_TDBAL, ring as u32),
+            (E1K_TDBAL + 4, 0),
+            (E1K_TDLEN, 16),
+            (E1K_TDH, 0),
+            (E1K_TDT, 0),
+            (E1K_TCTL, 0x2 /* EN */),
+        ];
+        for &(off, v) in prog.iter() {
+            if !bus.write32(off, v) {
+                line(
+                    out,
+                    &["[IOMMU] cross-device probe: register window refused a write — skipped"],
+                );
+                session.close(out);
+                break 'probe;
+            }
+        }
+        // The ring is broker-mapped in the e1000's domain — DMA may start.
+        crate::pci::enable_bus_master(dev);
+        if !bus.write32(E1K_TDT, 1) {
+            line(
+                out,
+                &["[IOMMU] cross-device probe: the TX tail write was refused — skipped"],
+            );
+            session.close(out);
+            break 'probe;
+        }
+        // Bounded wait: the TX cannot complete (its buffer read
+        // faults), but the IOMMU records the fault.
+        let mut spins = 0u64;
+        while spins < 4_000_000 {
+            spins += 1;
+        }
+        let fsts = session.with_prot(|p| p.fsts());
+        let ppf = fsts & crate::arch::vtd::FSTS_PPF != 0;
+        let mut he = [0u8; 20];
+        let mut hp = [0u8; 20];
+        let mut hf = [0u8; 18];
+        if ppf {
+            line(
+                out,
+                &[
+                    "[IOMMU] cross-device probe: e1000 (dom ",
+                    strutil::dec(u64::from(e_dom), &mut he),
+                    ") DMA to a page mapped only in the virtio-net's dom ",
+                    strutil::dec(u64::from(v_dom), &mut hp),
+                    " → cross-device DMA FAULTED (FSTS.PPF set) — devices are isolated (ADR-0018)",
+                ],
+            );
+        } else {
+            line(
+                out,
+                &[
+                    "[IOMMU] cross-device probe: FAILED — the cross-device DMA did NOT fault (fsts=0x",
+                    strutil::hex(u64::from(fsts), &mut hf),
+                    ") — isolation NOT proven",
+                ],
+            );
+        }
+        session.close(out);
+    }
+    // Fail-closed cleanup (unconditional, after the session's borrows
+    // end): the victim's region unmapped, the page home scrubbed, the
+    // probe domain released.
+    let _ = broker.unmap_region(v_dom, view.cookie);
+    let _ = pool.free(&mut k.frames, victim, crate::drvstack::VTD_TABLE_OWNER);
+}

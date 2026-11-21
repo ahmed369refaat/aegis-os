@@ -37,6 +37,7 @@ pub(crate) fn revoke_or_quarantine<const N: usize, P: DmaProt>(
     out: &mut dyn FnMut(&str),
     broker: &mut aegis_os::dma::DmaBroker<P>,
     owner: u32,
+    dom: u32,
     frames: &[u64],
     dev: Option<&crate::pci::PciDev>,
     marker: &str,
@@ -48,14 +49,56 @@ pub(crate) fn revoke_or_quarantine<const N: usize, P: DmaProt>(
     if let Some(d) = dev {
         crate::pci::disable_bus_master(d);
     }
-    let outcome = broker.revoke_all(0);
+    let outcome = broker.revoke_all(dom);
+    // ADR-0018: the teardown line reports the REAL counts — revoked,
+    // freed, quarantined, poisoned — and never claims "scrubbed" for
+    // frames that were quarantined instead of freed.
     let mut nr = [0u8; 20];
+    let mut nf = [0u8; 20];
+    let mut nq = [0u8; 20];
+    let mut dom_b = [0u8; 20];
+
+    let mut freed: u64 = 0;
+    let mut quarantined: u64 = 0;
+    if outcome.poisoned > 0 {
+        for &pa in frames {
+            let hit = broker
+                .poisoned_regions()
+                .any(|p| pa >= p.base && pa + 4096 <= p.base + p.len);
+            if hit {
+                quarantined += 1;
+            } else {
+                freed += 1;
+            }
+        }
+    } else {
+        freed = frames.len() as u64;
+    }
     line(
         out,
         &[
             marker,
+            " dom ",
+            strutil::dec(u64::from(dom), &mut dom_b),
+            " revoke_all: revoked ",
             strutil::dec(outcome.revoked as u64, &mut nr),
-            " region(s) unmapped; frames return scrubbed",
+            ", freed ",
+            strutil::dec(freed, &mut nf),
+            if outcome.poisoned > 0 {
+                ", quarantined "
+            } else {
+                ""
+            },
+            if outcome.poisoned > 0 {
+                strutil::dec(quarantined, &mut nq)
+            } else {
+                ""
+            },
+            if outcome.poisoned > 0 {
+                " — frames QUARANTINED, not freed (ADR-0015 F2)"
+            } else {
+                " (frames scrubbed home)"
+            },
         ],
     );
     if outcome.poisoned > 0 {
@@ -68,9 +111,11 @@ pub(crate) fn revoke_or_quarantine<const N: usize, P: DmaProt>(
             out,
             &[
                 marker,
+                " dom ",
+                strutil::dec(u64::from(dom), &mut dom_b),
                 " POISON: ",
                 strutil::dec(outcome.poisoned as u64, &mut np),
-                " region(s) still mapped in hardware — bus mastering off, frames QUARANTINED (ADR-0015 F2)",
+                " region(s) still mapped in hardware — bus mastering off (ADR-0015 F2)",
             ],
         );
         for &pa in frames {
@@ -94,12 +139,62 @@ pub(crate) fn revoke_or_quarantine<const N: usize, P: DmaProt>(
 /// The broker's own region budget is 16; no driver may hold more.
 pub(crate) const MAX_SESSION_FRAMES: usize = 16;
 
+/// ADR-0018: the kernel-side IOMMU domain-id allocator. Domain 0 is
+/// the kernel's own (the ADR-0013 hardware proof, the broker demo) —
+/// a device is NEVER assigned to it. Device domains are 1.. and are
+/// handed out here, never chosen by a device or driver; exhaustion
+/// is a typed `None` (the caller claims later or refuses the step).
+pub(crate) struct DomainIds {
+    used: [bool; crate::arch::vtd::MAX_VTD_DOMAINS],
+}
+
+impl DomainIds {
+    /// Domain 0 pre-reserved for the kernel.
+    pub(crate) fn new() -> Self {
+        let mut used = [false; crate::arch::vtd::MAX_VTD_DOMAINS];
+        used[0] = true;
+        DomainIds { used }
+    }
+
+    /// Draw the next free domain id.
+    pub(crate) fn alloc(&mut self) -> Option<u32> {
+        for (i, u) in self.used.iter_mut().enumerate() {
+            if !*u {
+                *u = true;
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    /// Release a domain id. Double-release and out-of-range are
+    /// refused (a released id is only reusable after the device's
+    /// context entry was cleared — `Vtd::unassign_device`).
+    pub(crate) fn release(&mut self, dom: u32) -> bool {
+        match self.used.get_mut(dom as usize) {
+            Some(true) if dom != 0 => {
+                self.used[dom as usize] = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_use(&self, dom: u32) -> bool {
+        self.used.get(dom as usize).copied().unwrap_or(false)
+    }
+}
+
 pub(crate) struct DriverSession<'a, const N: usize, P: DmaProt> {
     k: &'a mut aegis_os::Kernel<N>,
     pool: &'a mut FramePool<N>,
     broker: &'a mut aegis_os::dma::DmaBroker<P>,
     dev: Option<&'a PciDev>,
     owner: u32,
+    /// ADR-0018: the device's own IOMMU domain — every broker call
+    /// this session makes is scoped by it.
+    dom: u32,
     identity: bool,
     /// The broker-path teardown marker, verbatim (lane-grepped).
     marker: &'static str,
@@ -120,6 +215,7 @@ impl<'a, const N: usize, P: DmaProt> DriverSession<'a, N, P> {
         broker: &'a mut aegis_os::dma::DmaBroker<P>,
         dev: Option<&'a PciDev>,
         owner: u32,
+        dom: u32,
         identity: bool,
         marker: &'static str,
         identity_marker: &'static str,
@@ -130,6 +226,7 @@ impl<'a, const N: usize, P: DmaProt> DriverSession<'a, N, P> {
             broker,
             dev,
             owner,
+            dom,
             identity,
             marker,
             identity_marker,
@@ -158,7 +255,7 @@ impl<'a, const N: usize, P: DmaProt> DriverSession<'a, N, P> {
     pub(crate) fn map(&mut self, pa: u64) -> Option<u64> {
         let view = self
             .broker
-            .map_region(0, pa, 4096, aegis_os::dma::DmaDir::Bidirectional)
+            .map_region(self.dom, pa, 4096, aegis_os::dma::DmaDir::Bidirectional)
             .ok()?;
         Some(view.cookie)
     }
@@ -166,14 +263,10 @@ impl<'a, const N: usize, P: DmaProt> DriverSession<'a, N, P> {
     /// Complete an in-flight region (the AbortRequired handshake) and
     /// unmap it — vblk's enforcement proof unmapped the data page
     /// through exactly this sequence before asking the device to DMA
-    /// at it again.
-    pub(crate) fn complete_unmap(
-        &mut self,
-        dom: u32,
-        cookie: u64,
-    ) -> Result<(), aegis_os::dma::DmaError> {
-        self.broker.region_complete(dom, cookie)?;
-        self.broker.unmap_region(dom, cookie)
+    /// at it again. Scoped to the session's own domain (ADR-0018).
+    pub(crate) fn complete_unmap(&mut self, cookie: u64) -> Result<(), aegis_os::dma::DmaError> {
+        self.broker.region_complete(self.dom, cookie)?;
+        self.broker.unmap_region(self.dom, cookie)
     }
 
     /// Read-only access to the hardware translation state (the
@@ -224,6 +317,7 @@ impl<'a, const N: usize, P: DmaProt> DriverSession<'a, N, P> {
             out.unwrap_or(&mut |_s: &str| {}),
             self.broker,
             self.owner,
+            self.dom,
             &self.frames[..self.nframes],
             self.dev,
             self.marker,
@@ -346,8 +440,9 @@ mod tests {
             &mut broker,
             None,
             TEST_OWNER,
+            1,
             false,
-            "[T] teardown: revoke_all(0) → ",
+            "[T] teardown",
             "",
         );
         let mut got = [0u64; 3];
@@ -380,8 +475,9 @@ mod tests {
                 &mut broker,
                 None,
                 TEST_OWNER,
+                1,
                 false,
-                "[T] teardown: revoke_all(0) → ",
+                "[T] teardown",
                 "",
             );
             let a = session.frame().expect("frame");
@@ -395,7 +491,9 @@ mod tests {
         assert_eq!(broker.live_regions(0), 0);
         let joined = sink.concat();
         assert!(
-            joined.contains("[T] teardown: revoke_all(0) → 2 region(s) unmapped"),
+            joined.contains(
+                "[T] teardown dom 1 revoke_all: revoked 2, freed 2 (frames scrubbed home)"
+            ),
             "the lane marker must be verbatim, got: {joined}"
         );
         drop(phys);
@@ -412,8 +510,9 @@ mod tests {
                 &mut broker,
                 None,
                 TEST_OWNER,
+                1,
                 false,
-                "[T] teardown: revoke_all(0) → ",
+                "[T] teardown",
                 "",
             );
             for _ in 0..4 {
@@ -440,8 +539,9 @@ mod tests {
                 &mut broker,
                 None,
                 TEST_OWNER,
+                1,
                 true,
-                "[T] teardown: revoke_all(0) → ",
+                "[T] teardown",
                 "[T] teardown (identity): frames freed, no broker regions",
             );
             let _ = session.frame().expect("frame");
@@ -451,5 +551,27 @@ mod tests {
         let joined = sink.concat();
         assert!(joined.contains("teardown (identity): frames freed"));
         drop(phys);
+    }
+
+    // ── ADR-0018: the kernel-side domain-id allocator ──
+
+    #[test]
+    fn domain_ids_reserve_kernel_domain_and_exhaust() {
+        let mut d = DomainIds::new();
+        assert!(d.in_use(0), "domain 0 is the kernel's own, pre-reserved");
+        // 7 device domains left (MAX_VTD_DOMAINS = 8).
+        let mut drawn = Vec::new();
+        while let Some(dom) = d.alloc() {
+            assert!(dom >= 1, "a device is never assigned domain 0");
+            drawn.push(dom);
+        }
+        assert_eq!(drawn.len(), crate::arch::vtd::MAX_VTD_DOMAINS - 1);
+        assert_eq!(d.alloc(), None, "exhaustion is a typed None");
+        // release + redraw works; double-release refused; 0 never allocatable.
+        assert!(d.release(drawn[0]));
+        assert!(!d.release(drawn[0]), "double release refused");
+        assert!(!d.release(0), "the kernel domain is never releasable");
+        assert!(!d.release(99), "out of range refused");
+        assert_eq!(d.alloc(), Some(drawn[0]));
     }
 }

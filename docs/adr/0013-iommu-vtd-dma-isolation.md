@@ -1,6 +1,7 @@
 # ADR-0013: IOMMU/VT-d — Kernel-Brokered DMA Isolation for Driver Domains
 
 - **Status:** Proposed (Phase-0 GO given 2026-11-20; implementing PRs
+- **Amended by:** [ADR-0018](0018-one-iommu-domain-per-device.md) — the between-devices isolation this ADR claimed is now real: one IOMMU domain per device (round 5, Phase A; until then every device sat in domain 0).
   0.2–0.5 follow — becomes Accepted when they merge, per the ADR
   process in `README.md`)
 - **Stage:** M2 driver stack, Phase 0. Fills the reserved `DmaProt` row

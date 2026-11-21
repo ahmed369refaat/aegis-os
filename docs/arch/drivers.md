@@ -87,6 +87,7 @@ comments and tests:
 | AHCI/SATA (ich9, q35) | **LIVE incl. ext2 mount** | ABAR/GHC/PI read, port-0 SIG=0x101, IDENTIFY with the REAL serial (QM000001), **the ext2 mount runs: superblock → root dir → hello.txt read through the IOMMU (ADR-0014)** |
 | virtio-net | **complete** | handshake, MAC/link, both queues, 8 broker frames, **full DHCP DISCOVER→slirp→OFFER round trip through the IOMMU (ADR-0014)**, teardown |
 | e1000 | **complete** | rings programmed, **full DHCP round trip through the IOMMU** AND in identity mode on the control lane, teardown |
+| IOMMU isolation | **per-device (ADR-0018), proven live** | the e1000's cross-device DMA to a vnet-only page faults on the lane |
 | NVMe | **fully live (F11): identify + I/O qpair + LBA read through the IOMMU** | CAP/version/RDY, identify data lands, CreateIoCq/SQ pass, read LBA0 completes |
 | USB xHCI | **bring-up FULLY LIVE** (item 12 first slice) | caps (v0 read as 0? HCSPARAMS MaxSlots=64 MaxPorts=8), halt→reset→DCBAAP+MaxSlotsEn+CRCR→RUN (HCH cleared), **port 0 device attached speed=4 (the usb-storage)** — register-only path, no device DMA needed |
 | screen/GPU (VBE) | **pixel-proven** | 7/7 sampled pixels in the QMP screendump |

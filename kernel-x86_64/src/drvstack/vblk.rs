@@ -215,8 +215,9 @@ pub(crate) fn virtio_step<const N: usize>(
         broker,
         Some(dev),
         VBLK_OWNER,
+        dev.dom,
         false,
-        "[VBLK] teardown: revoke_all(0) → ",
+        "[VBLK] teardown",
         "",
     );
     let mut frames = [0u64; 5];
@@ -419,7 +420,7 @@ pub(crate) fn virtio_step<const N: usize>(
     // SLPTE reads back absent (P=0) AND FSTS.PPF sets: the IOMMU
     // faulted the access to a page the broker unmapped.
     session
-        .complete_unmap(0, cookies[4])
+        .complete_unmap(cookies[4])
         .expect("data region live + abort handshake done");
     session.hand_back(data_pa);
     // The tables' own verdict, read back from the walk the device must

@@ -50,7 +50,19 @@ against the ratchet baseline of 89.
    nothing. Proof: seeded byte-stream fuzz (never panic, never OOB,
    never hang) + `dmar_header_is_48_bytes_drhd_is_type_0` pinning the
    measured QEMU-10 layout + per-truncation case tests.
-3. **Only granted frames are mapped.** A domain's second-level tables
+3. **One IOMMU domain per device (ADR-0018).** Domain 0 is the
+   kernel's own (the hardware proof, the broker demo); every claimed
+   device draws its own domain id from the kernel-side `DomainIds`
+   allocator (never device- or driver-supplied), `assign_device`
+   refuses a device already assigned, and `unassign_device` (context
+   clear + QI context-cache invalidation) is the only way out. The
+   isolation between devices is proven LIVE on the q35 lane: the
+   e1000's cross-device DMA to a page mapped only in the virtio-net's
+   domain faults (FSTS.PPF), and the lane FAILS if it does not. The
+   table budget is DERIVED from a pure worst-case function (99 frames
+   at 8 domains: shared root+IQ+ctx plus per-domain root+PDPT+PD+9
+   PT spans) instead of the old guess of 64.
+3b. **Only granted frames are mapped.** A domain's second-level tables
    contain exactly the frames the broker granted; the boot self-check
    walks them back and compares. Proof: `map_covers_only_granted_
    frames`; marker `[IOMMU] map: ... → walk-back ok`.

@@ -29,7 +29,11 @@ rewriting the drivers:
 3. **ADR-0013/0015's broker**: DMA is already domain-scoped,
    cookie-addressed, quota'd, and poison-aware. A ring-3 driver
    cannot name a physical address even if it wants to.
-4. **ADR-0010's ring-3 machinery + ADR-0004's IPC + the monitor**:
+4. **ADR-0018's per-device domains**: a ring-3 driver domain will
+   own exactly one of the per-device IOMMU domains — the allocation,
+   release and re-assignment rules are already written for that
+   owner.
+5. **ADR-0010's ring-3 machinery + ADR-0004's IPC + the monitor**:
    launch/resume, capability-gated endpoints, and organic-signal
    scoring all exist and are boot-proven.
 

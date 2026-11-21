@@ -44,6 +44,9 @@ fn hw_code(e: &aegis_os::dma::DmaError) -> &'static str {
         aegis_os::dma::DmaError::Hardware(4) => "invalidation failed",
         aegis_os::dma::DmaError::Hardware(5) => "domain not assigned",
         aegis_os::dma::DmaError::Hardware(6) => "domain out of range",
+        aegis_os::dma::DmaError::Hardware(7) => {
+            "device already assigned (ADR-0018: unassign first)"
+        }
         aegis_os::dma::DmaError::Hardware(_) => "arch refusal",
         _ => "policy refusal",
     }
@@ -94,10 +97,14 @@ pub fn driver_stack_step<const N: usize>(
             if let Some(mut unit) = vtd::vtd_step(k, pool, out, &dmar) {
                 vtd::proof_step(k, pool, out, &dmar, &mut unit);
                 let mut broker = broker::broker_step(k, pool, out, unit);
-                let inv = pci::pci_step(out, &dmar, &mut broker);
+                // ADR-0018: kernel-allocated, one IOMMU domain per
+                // device (domain 0 stays the kernel's own).
+                let mut domains = crate::session::DomainIds::new();
+                let inv = pci::pci_step(out, &dmar, &mut broker, &mut domains);
                 vblk::virtio_step(k, pool, out, &mut broker, &inv);
                 vnet::net_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_step(k, pool, out, &mut broker, &inv);
+                e1k::e1k_cross_device_probe_step(k, pool, out, &mut broker, &inv);
                 nvme::nvme_step(k, pool, out, &mut broker, &inv);
                 ahci::ahci_step(k, pool, out, &mut broker, &inv);
                 xhci::xhci_step(k, pool, out, &mut broker, &inv);
@@ -140,7 +147,13 @@ pub fn driver_stack_step<const N: usize>(
                 },
             );
             let mut broker = broker;
-            let inv = pci::pci_step(out, &aegis_os::dmar::Dmar::absent_stub(), &mut broker);
+            let mut domains = crate::session::DomainIds::new();
+            let inv = pci::pci_step(
+                out,
+                &aegis_os::dmar::Dmar::absent_stub(),
+                &mut broker,
+                &mut domains,
+            );
             e1k::e1k_step(k, pool, out, &mut broker, &inv);
             // ADR-0014 step 5: the stale-FIS control lane — the SAME
             // AHCI two-command sequence without the vIOMMU.

@@ -191,8 +191,9 @@ pub(crate) fn nvme_step<const N: usize>(
         broker,
         Some(dev),
         NVME_OWNER,
+        dev.dom,
         false,
-        "[NVME] teardown: revoke_all(0) → ",
+        "[NVME] teardown",
         "",
     );
     let mut frames = [0u64; 6];
