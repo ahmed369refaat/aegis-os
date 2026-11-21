@@ -46,6 +46,14 @@ pub const SYS_CHROOT: u8 = 15;
 pub const SYS_MKDIR: u8 = 16;
 /// Remove a file / empty directory (unlink(2) + rmdir(2)).
 pub const SYS_UNLINK: u8 = 17;
+/// Create a child process as a copy of the caller (fork(2)-like;
+/// ADR-0022 — the child is born a subset of the parent's live state).
+pub const SYS_FORK: u8 = 18;
+/// Replace the caller's image (execve(2)-like; ADR-0022 — the live
+/// surface only ever INTERSECTS with the declared one).
+pub const SYS_EXEC: u8 = 19;
+/// Wait for a child and reap its exit status (wait4(2)-like).
+pub const SYS_WAIT: u8 = 20;
 /// Reserved: domain exit. Always reachable; a mask without it is rejected
 /// by convention (see `profile` tests).
 pub const SYS_EXIT: u8 = 63;

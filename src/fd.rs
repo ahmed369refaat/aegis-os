@@ -34,6 +34,10 @@ pub struct FdEntry {
     pub target: FdTarget,
     /// Read/write cursor for file targets (ignored for pipes).
     pub pos: u32,
+    /// ADR-0022 D6: close-on-exec. False everywhere today (fcntl
+    /// F_SETFD lands with the Phase-5 ABI); fork copies it, exec
+    /// closes flagged descriptors, spawn's fd_map installs clear.
+    pub cloexec: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +63,11 @@ impl FdTable {
     pub fn alloc(&mut self, target: FdTarget) -> Result<u8, FdError> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(FdEntry { target, pos: 0 });
+                *slot = Some(FdEntry {
+                    target,
+                    pos: 0,
+                    cloexec: false,
+                });
                 return Ok(i as u8);
             }
         }
@@ -68,13 +76,31 @@ impl FdTable {
 
     /// dup2 semantics: install `target` at exactly `fd`, closing any
     /// descriptor currently there. Returns the old entry if one existed.
+    /// The installed entry's `cloexec` starts CLEAR (FD_CLOEXEC is
+    /// per-descriptor and does not propagate across dup, POSIX).
     pub fn replace_at(&mut self, fd: u8, target: FdTarget) -> Result<Option<FdEntry>, FdError> {
         if fd as usize >= MAX_FDS {
             return Err(FdError::OutOfRange(fd));
         }
         let old = self.slots[fd as usize].take();
-        self.slots[fd as usize] = Some(FdEntry { target, pos: 0 });
+        self.slots[fd as usize] = Some(FdEntry {
+            target,
+            pos: 0,
+            cloexec: false,
+        });
         Ok(old)
+    }
+
+    /// ADR-0022 D6: set/clear the close-on-exec flag (the core
+    /// primitive behind fcntl F_SETFD). EBADF → false.
+    pub fn set_cloexec(&mut self, fd: u8, on: bool) -> bool {
+        match self.get_mut(fd) {
+            Some(e) => {
+                e.cloexec = on;
+                true
+            }
+            None => false,
+        }
     }
 
     #[must_use]

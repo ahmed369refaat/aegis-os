@@ -12,9 +12,9 @@
 
 use crate::capability::Rights;
 use crate::syscall::{
-    SyscallMask, SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND,
-    SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE,
-    SYS_READ, SYS_UNLINK, SYS_WRITE,
+    SyscallMask, SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_IOCTL,
+    SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NET_RECV,
+    SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
 };
 
 /// The surface a domain of this class keeps while *degraded* (the
@@ -41,6 +41,10 @@ pub struct DomainProfile {
     /// The Tighten-tier surface (F8): a strict subset of `syscalls`,
     /// always keeping SYS_EXIT and the profile's core function.
     pub degraded_syscalls: SyscallMask,
+    /// ADR-0022: how many live+ zombie children this class of process
+    /// may hold at once (the fork/spawn limit; checked at every
+    /// spawn/fork against the PARENT's profile).
+    pub max_children: u16,
 }
 
 /// Long-running local service (vfsd-style): full file I/O + IPC + the
@@ -61,6 +65,11 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_CHROOT)
                 | (1u64 << SYS_MKDIR)
                 | (1u64 << SYS_UNLINK)
+                | (1u64 << SYS_MMAP)
+                | (1u64 << SYS_MUNMAP)
+                | (1u64 << SYS_FORK)
+                | (1u64 << SYS_EXEC)
+                | (1u64 << SYS_WAIT)
                 | (1u64 << SYS_EXIT),
         ),
         // Degraded service: existing local I/O and IPC stay; every path
@@ -74,11 +83,13 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_IPC_RECV)
                 | (1u64 << SYS_PIPE)
                 | (1u64 << SYS_DUP)
+                | (1u64 << SYS_WAIT)
                 | (1u64 << SYS_EXIT),
         ),
         quota_pages: 256,
         base_rights: Rights::READ.union(Rights::WRITE),
         sensitivity: 40,
+        max_children: 8,
     }
 }
 
@@ -101,6 +112,7 @@ pub const fn parser_profile() -> DomainProfile {
         quota_pages: 64,
         base_rights: Rights::READ,
         sensitivity: 70,
+        max_children: 2,
     }
 }
 
@@ -124,6 +136,7 @@ pub const fn driver_profile() -> DomainProfile {
         quota_pages: 128,
         base_rights: Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
         sensitivity: 50,
+        max_children: 2,
     }
 }
 
@@ -145,6 +158,7 @@ pub const fn plugin_profile() -> DomainProfile {
         quota_pages: 32,
         base_rights: Rights::READ,
         sensitivity: 80,
+        max_children: 2,
     }
 }
 
@@ -177,6 +191,45 @@ pub const fn netd_profile() -> DomainProfile {
         quota_pages: 128,
         base_rights: Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
         sensitivity: 30,
+        max_children: 4,
+    }
+}
+
+/// ADR-0022: the default profile for spawned processes and for any
+/// executable the exec policy table does not list — "app". File I/O +
+/// pipes + the process family (fork/exec/wait); NO kill, NO chroot,
+/// NO mkdir/unlink, NO net, NO IPC. Monitoring starts AuditOnly
+/// (the exec policy may mark a binary Enforce explicitly).
+pub const fn app_profile() -> DomainProfile {
+    DomainProfile {
+        name: "app",
+        syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ)
+                | (1u64 << SYS_WRITE)
+                | (1u64 << SYS_OPEN)
+                | (1u64 << SYS_CLOSE)
+                | (1u64 << SYS_PIPE)
+                | (1u64 << SYS_DUP)
+                | (1u64 << SYS_FORK)
+                | (1u64 << SYS_EXEC)
+                | (1u64 << SYS_WAIT)
+                | (1u64 << SYS_MMAP)
+                | (1u64 << SYS_MUNMAP)
+                | (1u64 << SYS_EXIT),
+        ),
+        // Degraded app: keep draining what is already open; the power
+        // to start anything new (fork/exec/open) drops.
+        degraded_syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ)
+                | (1u64 << SYS_WRITE)
+                | (1u64 << SYS_CLOSE)
+                | (1u64 << SYS_WAIT)
+                | (1u64 << SYS_EXIT),
+        ),
+        quota_pages: 64,
+        base_rights: Rights::READ.union(Rights::WRITE),
+        sensitivity: 60,
+        max_children: 8,
     }
 }
 

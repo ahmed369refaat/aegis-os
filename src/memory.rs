@@ -76,6 +76,7 @@ pub enum MemError {
     NotFound,
 }
 
+#[derive(Clone)]
 pub struct AddressSpace {
     regions: [Option<Region>; MAX_REGIONS],
     quota_pages: usize,
@@ -168,6 +169,14 @@ impl AddressSpace {
             }
         }
         Err(MemError::NotFound)
+    }
+
+    /// ADR-0022 D4: exec resets the region ledger — the new image
+    /// maps fresh. Freed pages count as scrubbed; the quota survives.
+    pub fn clear_for_exec(&mut self) {
+        self.scrubbed_pages = self.scrubbed_pages.saturating_add(self.used_pages);
+        self.used_pages = 0;
+        self.regions = [None; MAX_REGIONS];
     }
 
     #[must_use]

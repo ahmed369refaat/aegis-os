@@ -8,7 +8,7 @@
 //! path (the behavior monitor) reads asynchronously.
 
 use crate::capability::CapabilityTable;
-use crate::capability::{Capability, Resource, Rights};
+use crate::capability::{CapHandle, Capability, Resource, Rights};
 use crate::fd::FdTable;
 use crate::memory::AddressSpace;
 use crate::monitor::DomainStats;
@@ -38,6 +38,7 @@ pub enum Decision {
     BadSyscall(u8),
 }
 
+#[derive(Clone)]
 pub struct Domain {
     pub id: u32,
     pub profile: DomainProfile,
@@ -62,6 +63,11 @@ pub struct Domain {
     pub fds: FdTable,
     /// Pending/blocked POSIX-style signals.
     pub signals: SignalState,
+    /// ADR-0022 D5: per-process monitor-mode override. `None` = follow
+    /// the kernel-global `MonitorMode`; `Some(false)` = AuditOnly for
+    /// this process alone (the app-profile default, so Enforce stays
+    /// opt-in per binary); `Some(true)` = Enforce explicitly.
+    pub monitor_enforce: Option<bool>,
 }
 
 impl Domain {
@@ -85,6 +91,7 @@ impl Domain {
             chroot_root: ROOT_REF,
             fds: FdTable::new(),
             signals: SignalState::new(),
+            monitor_enforce: None,
         };
         // F18 (ADR-0009): the base_rights mint the initial
         // capabilities — FsNode(ROOT_REF) (covers the whole VFS tree,
@@ -116,6 +123,114 @@ impl Domain {
             uid: self.uid,
             gid: self.gid,
         }
+    }
+
+    /// ADR-0022 D2: build a SPAWNED process's domain. Unlike `new`
+    /// (the supervisor path), NO ambient capabilities are minted —
+    /// no FsNode(ROOT), no Device(0): the caller confers attenuated
+    /// copies of the parent's capabilities explicitly. The child
+    /// starts with only its own self-signal capability.
+    pub fn spawned(
+        id: u32,
+        profile: DomainProfile,
+        uid: u16,
+        gid: u16,
+        cwd: InodeRef,
+        chroot: InodeRef,
+    ) -> Self {
+        let mut d = Domain {
+            id,
+            space: AddressSpace::new(profile.quota_pages),
+            profile,
+            state: DomainState::Running,
+            mask: profile.syscalls,
+            caps: CapabilityTable::new(),
+            stats: DomainStats::default(),
+            violations: 0,
+            uid,
+            gid,
+            cwd,
+            chroot_root: chroot,
+            fds: FdTable::new(),
+            signals: SignalState::new(),
+            monitor_enforce: None,
+        };
+        let _ = d.caps.insert(Capability {
+            resource: Resource::Domain(id),
+            rights: Rights::WRITE,
+            generation: 0,
+        });
+        d
+    }
+
+    /// ADR-0022 D3: build a FORKED copy of `parent` under a new id.
+    /// The LIVE mask, capability table (minus the parent's self-signal
+    /// capability — a child cannot signal its parent, deliberately
+    /// stricter than Unix same-uid rules), address-space ledger,
+    /// credentials, directories and fd table (positions and cloexec
+    /// flags included) all copy. Pending signals and behavioral
+    /// accounting start clean — the physical page COW is the
+    /// page-table layer's job (ADR-0024), this is the policy ledger.
+    pub fn forked(id: u32, parent: &Domain) -> Self {
+        let mut caps = parent.caps.clone();
+        // Drop every capability aimed at the parent itself (the child
+        // cannot signal or otherwise reach its parent). Fixed buffer —
+        // the core is no_std, no heap.
+        let mut aimed: [Option<CapHandle>; crate::capability::MAX_CAPABILITIES] =
+            [None; crate::capability::MAX_CAPABILITIES];
+        let mut n = 0usize;
+        for h in caps.handles() {
+            if matches!(
+                caps.lookup(h),
+                Ok(Capability { resource: Resource::Domain(d), .. }) if d == parent.id
+            ) && n < aimed.len()
+            {
+                aimed[n] = Some(h);
+                n += 1;
+            }
+        }
+        for h in aimed.iter().flatten() {
+            let _ = caps.revoke(*h);
+        }
+        let mut d = Domain {
+            id,
+            space: parent.space.clone(),
+            profile: parent.profile,
+            state: parent.state,
+            mask: parent.mask,
+            caps,
+            stats: DomainStats::default(),
+            violations: 0,
+            uid: parent.uid,
+            gid: parent.gid,
+            cwd: parent.cwd,
+            chroot_root: parent.chroot_root,
+            fds: parent.fds,
+            signals: SignalState::new(),
+            monitor_enforce: parent.monitor_enforce,
+        };
+        // The child's own self-signal capability (fresh handle).
+        let _ = d.caps.insert(Capability {
+            resource: Resource::Domain(id),
+            rights: Rights::WRITE,
+            generation: 0,
+        });
+        d
+    }
+
+    /// ADR-0022 D4: the exec surface transition. Intersect the LIVE
+    /// mask with the executable's declared surface; EXIT is
+    /// unalienable (a program cannot strand itself unable to exit),
+    /// matching the convention every mask keeps SYS_EXIT reachable.
+    /// Never widens: intersection with the live mask only.
+    pub fn exec_intersect(&mut self, declared: &SyscallMask) -> SyscallMask {
+        self.mask = self.mask.attenuate(declared);
+        self.mask = SyscallMask::from_bits(self.mask.bits() | (1u64 << SYS_EXIT));
+        if self.state == DomainState::Running {
+            // An intersected surface is a narrowed surface.
+            self.state = DomainState::Tightened;
+        }
+        self.mask
     }
 
     #[must_use]

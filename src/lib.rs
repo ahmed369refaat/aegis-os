@@ -55,6 +55,8 @@ pub mod net;
 pub mod part;
 pub mod pipe;
 pub mod preempt;
+/// ADR-0022: the process table — pids, zombies, wait, exec policy.
+pub mod proc;
 pub mod profile;
 pub mod response;
 pub mod ringbuf;
@@ -82,8 +84,12 @@ use crate::sched::Scheduler;
 use crate::syscall::SyscallMask;
 use crate::vfs::Vfs;
 
-/// Maximum simultaneously resident domains in this sample kernel.
-pub const MAX_DOMAINS: usize = 4;
+/// Maximum simultaneously resident domains. ADR-0022 D1 raised this
+/// 4 -> 32 (the scale-reality row): a shell with a pipeline needs
+/// headroom and the fork-bomb guard needs something to guard. The
+/// process meta table and the scheduler grow with it; the capacity
+/// self-test pins the fill/refuse/drain/reuse behavior.
+pub const MAX_DOMAINS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelError {
@@ -122,7 +128,7 @@ pub struct Kernel<const N: usize = { crate::buddy::FRAME_COUNT }> {
     /// Global filesystem with Unix permissions.
     pub(crate) vfs: Vfs,
     /// Anonymous pipes shared between domains via fds.
-    pub(crate) pipes: PipeTable,
+    pub pipes: PipeTable,
     /// Brokered sockets (owned by domains, rate-limited per domain).
     pub(crate) sockets: SocketTable,
     /// ADR-0004 endpoints: per-domain queues behind capability gates.
@@ -143,6 +149,12 @@ pub struct Kernel<const N: usize = { crate::buddy::FRAME_COUNT }> {
     window_len: u64,
     /// Index of the last audited window (`tick` audits on change).
     last_window: u64,
+    /// ADR-0022: the process table (pid allocator + metas; a meta
+    /// slot exists for every process, living or zombie).
+    pub procs: proc::ProcTable,
+    /// ADR-0022 D5: init's exec policy table — the declared surface
+    /// per executable path; unlisted = the app default (AuditOnly).
+    pub exec_policy: proc::ExecPolicyTable,
 }
 
 impl Kernel<{ crate::buddy::FRAME_COUNT }> {
@@ -174,6 +186,8 @@ impl<const N: usize> Kernel<N> {
             monitor_mode: MonitorMode::default(),
             window_len: 100,
             last_window: 0,
+            procs: proc::ProcTable::new(),
+            exec_policy: proc::ExecPolicyTable::new(),
         }
     }
 
@@ -207,6 +221,12 @@ impl<const N: usize> Kernel<N> {
         if self.domains.iter().flatten().any(|d| d.id == id) {
             return Err(KernelError::DuplicateDomain(id));
         }
+        // ADR-0022: every domain carries a process meta; metas are
+        // bounded like domain slots, and zombies hold theirs until
+        // reaped — a full meta table refuses new domains honestly.
+        if self.procs.count() >= proc::MAX_PROCS {
+            return Err(KernelError::TooManyDomains);
+        }
         let slot = self
             .domains
             .iter_mut()
@@ -219,6 +239,15 @@ impl<const N: usize> Kernel<N> {
         d.cwd = crate::vfs::ROOT_REF;
         d.chroot_root = crate::vfs::ROOT_REF;
         *slot = Some(d);
+        // ADR-0022: supervisor creations are PARENTLESS (kernel-managed
+        // domains are not part of init's wait tree); the process tree
+        // starts at init. A parentless exit is adopted by a living init
+        // (the reaper of last resort), so no status is ever lost.
+        let _ = self.procs.insert(proc::ProcMeta {
+            pid: id,
+            parent: 0,
+            exit: None,
+        });
         // Register with the fair scheduler (idempotent).
         let _ = self.sched.register(id, nice);
         Ok(())
@@ -259,18 +288,478 @@ impl<const N: usize> Kernel<N> {
             .ok_or(KernelError::UnknownDomain(id))
     }
 
+    /// ADR-0022: read-only access to a domain (procfs, tests, and the
+    /// kernel runtime all observe; mutation stays behind the named
+    /// APIs).
+    #[must_use]
+    pub fn domain(&self, id: u32) -> Option<&Domain> {
+        self.domains.iter().flatten().find(|d| d.id == id)
+    }
+
+    /// ADR-0022: how many domains are live (the capacity self-test's
+    /// heartbeat).
+    #[must_use]
+    pub fn live_domain_count(&self) -> usize {
+        self.domains.iter().flatten().count()
+    }
+
+    #[must_use]
+    pub fn proc_meta(&self, pid: u32) -> Option<proc::ProcMeta> {
+        self.procs.get(pid)
+    }
+
+    #[must_use]
+    pub fn proc_meta_count(&self) -> usize {
+        self.procs.count()
+    }
+
+    /// ADR-0022 D2 — the native spawn primitive: a fresh process from
+    /// an executable with EXPLICIT inheritance. `fd_map` is the ONLY
+    /// thing the child receives (no ambient fds, no ambient caps: the
+    /// child starts with just its self-signal capability plus
+    /// attenuated copies of the parent's caps at
+    /// `parent_cap ∩ request.base_rights`). The request's syscall
+    /// surface must be a subset of the parent's CURRENT (live) mask
+    /// and its quota no larger — anything wider is refused, fail
+    /// closed, and counted as an escalation attempt.
+    pub fn spawn_process(
+        &mut self,
+        parent_id: u32,
+        profile_request: DomainProfile,
+        fd_map: &[(u8, u8)],
+    ) -> Result<u32, proc::ProcError> {
+        use proc::ProcError as PE;
+
+        // ── Phase 1: read the parent, validate everything. No mutation.
+        let parent = self
+            .domains
+            .iter()
+            .flatten()
+            .find(|d| d.id == parent_id)
+            .ok_or(PE::UnknownProcess(parent_id))?;
+        if parent.state == DomainState::Quarantined {
+            return Err(PE::Quarantined(parent_id));
+        }
+        let live_mask = parent.mask();
+        let parent_quota = parent.space.quota_pages();
+        let limit = parent.profile.max_children;
+        let base_rights = profile_request.base_rights;
+        let (uid, gid) = (parent.uid, parent.gid);
+        let (cwd, chroot) = (parent.cwd, parent.chroot_root);
+        let parent_caps = parent.caps.clone();
+        let parent_fds = parent.fds;
+        let nice = self.sched.entity(parent_id).map(|e| e.nice).unwrap_or(0);
+
+        if self.procs.children_count(parent_id) >= usize::from(limit) {
+            return Err(PE::TooManyChildren { limit });
+        }
+        if !profile_request.syscalls.is_subset_of(&live_mask)
+            || profile_request.quota_pages > parent_quota
+        {
+            if let Ok(pd) = self.domain_mut(parent_id) {
+                pd.record_escalation_attempt();
+            }
+            return Err(PE::ProfileEscalation);
+        }
+        for (pfd, cfd) in fd_map {
+            if usize::from(*cfd) >= MAX_FDS {
+                return Err(PE::FdMapInvalid { fd: *cfd });
+            }
+            if parent_fds.get(*pfd).is_none() {
+                return Err(PE::FdNotOpen(*pfd));
+            }
+        }
+        for i in 0..fd_map.len() {
+            for j in (i + 1)..fd_map.len() {
+                if fd_map[i].1 == fd_map[j].1 {
+                    return Err(PE::FdMapInvalid { fd: fd_map[i].1 });
+                }
+            }
+        }
+        if self.domains.iter().all(|s| s.is_some()) || self.procs.count() >= proc::MAX_PROCS {
+            return Err(PE::TooManyProcesses);
+        }
+        // ── Phase 2: commit. Every fallible decision ran above; the
+        // only remaining error is pid exhaustion, which touches
+        // nothing else (the counter only moves on success).
+        let pid = self.procs.alloc_pid()?;
+        self.procs.insert(proc::ProcMeta {
+            pid,
+            parent: parent_id,
+            exit: None,
+        })?;
+        let mut child = Domain::spawned(pid, profile_request, uid, gid, cwd, chroot);
+        // Attenuated copies of the parent's caps (rights ∩ base_rights;
+        // a lying request still yields a subset), EXCLUDING caps aimed
+        // at the parent itself — a spawned child cannot signal its
+        // parent (the same discipline as fork). Best-effort bounded:
+        // a full child table drops further copies — less authority,
+        // never more.
+        for cap in parent_caps.iter() {
+            if matches!(cap.resource, crate::capability::Resource::Domain(d) if d == parent_id) {
+                continue;
+            }
+            let _ = child.caps.insert(crate::capability::Capability {
+                resource: cap.resource,
+                rights: cap.rights.intersect(base_rights),
+                generation: 0,
+            });
+        }
+        // The explicit fd inheritance: positions snapshot, cloexec
+        // starts clear, pipe ends acquire one reference each.
+        for (pfd, cfd) in fd_map {
+            if let Some(entry) = parent_fds.get(*pfd) {
+                match entry.target {
+                    FdTarget::PipeRead(pipe) => {
+                        let _ = self.pipes.acquire_read(pipe);
+                    }
+                    FdTarget::PipeWrite(pipe) => {
+                        let _ = self.pipes.acquire_write(pipe);
+                    }
+                    _ => {}
+                }
+                let _ = child.fds.replace_at(*cfd, entry.target);
+                if let Some(e) = child.fds.get_mut(*cfd) {
+                    e.pos = entry.pos;
+                }
+            }
+        }
+        if let Some(slot) = self.domains.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(child);
+        }
+        // The parent's signal capability over the child — best-effort:
+        // the self-cap is STRUCTURAL (like SYS_EXIT, every process
+        // holds its own), so a full parent table only loses kill(child),
+        // never an invariant. wait() needs no capability.
+        if let Ok(pd) = self.domain_mut(parent_id) {
+            let _ = pd.caps.insert(crate::capability::Capability {
+                resource: crate::capability::Resource::Domain(pid),
+                rights: crate::capability::Rights::WRITE,
+                generation: 0,
+            });
+        }
+        let _ = self.sched.register(pid, nice);
+        Ok(pid)
+    }
+
+    /// ADR-0022 D3 — fork: the child is a copy of the parent's CURRENT
+    /// state and can only shrink from here. The live mask, caps (minus
+    /// the parent's self-signal capability — a child cannot signal its
+    /// parent), address-space ledger, credentials, directories and
+    /// every fd (positions and cloexec flags, POSIX fd numbering) copy;
+    /// pending signals and behavioral accounting start clean; the
+    /// parent best-effort gains a `Domain(child)` capability (a full
+    /// parent table skips it — wait needs no cap). The physical COW is
+    /// the page-table layer's job (ADR-0024).
+    pub fn fork_process(&mut self, parent_id: u32) -> Result<u32, proc::ProcError> {
+        use proc::ProcError as PE;
+
+        let parent = self
+            .domains
+            .iter()
+            .flatten()
+            .find(|d| d.id == parent_id)
+            .ok_or(PE::UnknownProcess(parent_id))?;
+        if parent.state == DomainState::Quarantined {
+            return Err(PE::Quarantined(parent_id));
+        }
+        let limit = parent.profile.max_children;
+        let template = parent.clone();
+        let nice = self.sched.entity(parent_id).map(|e| e.nice).unwrap_or(0);
+
+        if self.procs.children_count(parent_id) >= usize::from(limit) {
+            return Err(PE::TooManyChildren { limit });
+        }
+        if self.domains.iter().all(|s| s.is_some()) || self.procs.count() >= proc::MAX_PROCS {
+            return Err(PE::TooManyProcesses);
+        }
+        let pid = self.procs.alloc_pid()?;
+        self.procs.insert(proc::ProcMeta {
+            pid,
+            parent: parent_id,
+            exit: None,
+        })?;
+        let child = Domain::forked(pid, &template);
+        // Every pipe end in the copied table gains one reference.
+        for fd in 0..MAX_FDS {
+            if let Some(entry) = template.fds.get(fd as u8) {
+                match entry.target {
+                    FdTarget::PipeRead(pipe) => {
+                        let _ = self.pipes.acquire_read(pipe);
+                    }
+                    FdTarget::PipeWrite(pipe) => {
+                        let _ = self.pipes.acquire_write(pipe);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // The parent's signal capability over the child — best-effort
+        // (the self-cap is structural; see spawn_process).
+        if let Ok(pd) = self.domain_mut(parent_id) {
+            let _ = pd.caps.insert(crate::capability::Capability {
+                resource: crate::capability::Resource::Domain(pid),
+                rights: crate::capability::Rights::WRITE,
+                generation: 0,
+            });
+        }
+        if let Some(slot) = self.domains.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(child);
+        }
+        let _ = self.sched.register(pid, nice);
+        Ok(pid)
+    }
+
+    /// ADR-0022 D4 — the exec bookkeeping (the loader validates the
+    /// image, ADR-0025, then calls this): the live mask INTERSECTS with
+    /// the declared surface (EXIT is unalienable), `cloexec` fds close
+    /// with their pipe references released, the region ledger resets
+    /// (the new image maps fresh; the quota survives), and the
+    /// per-process monitor mode adopts the policy's decision. Never
+    /// widens: intersection with the LIVE mask.
+    pub fn exec_replace(
+        &mut self,
+        pid: u32,
+        declared: &SyscallMask,
+        monitor_enforce: Option<bool>,
+    ) -> Result<(), proc::ProcError> {
+        let d = self
+            .domain_mut(pid)
+            .map_err(|_| proc::ProcError::UnknownProcess(pid))?;
+        d.exec_intersect(declared);
+        d.monitor_enforce = monitor_enforce;
+        d.space.clear_for_exec();
+        // Close cloexec fds, buffering the pipe releases: the domain
+        // borrow and the pipe-table borrow cannot be live together.
+        let mut released: [(bool, u32); MAX_FDS] = [(false, 0); MAX_FDS];
+        let mut rn = 0usize;
+        for fd in 0..MAX_FDS {
+            let flagged = matches!(d.fds.get(fd as u8), Some(e) if e.cloexec);
+            if flagged {
+                if let Some(closed) = d.fds.close(fd as u8) {
+                    match closed.target {
+                        FdTarget::PipeRead(pipe) if rn < released.len() => {
+                            released[rn] = (false, pipe);
+                            rn += 1;
+                        }
+                        FdTarget::PipeWrite(pipe) if rn < released.len() => {
+                            released[rn] = (true, pipe);
+                            rn += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for &(is_write, pipe) in &released[..rn] {
+            if is_write {
+                let _ = self.pipes.release_write(pipe);
+            } else {
+                let _ = self.pipes.release_read(pipe);
+            }
+        }
+        Ok(())
+    }
+
+    /// ADR-0022 D7 — exit: teardown + status recording. The domain and
+    /// its resources go NOW (the kernel runtime frees frames/IOMMU
+    /// BEFORE calling this, the `destroy_user` contract); the meta
+    /// stays as a zombie until the parent (or init, the reaper of last
+    /// resort) waits. With no reaper alive anywhere the status is
+    /// DISCARDED, not leaked. The dead process's children — living and
+    /// zombie — reparent the same way.
+    pub fn exit_process(
+        &mut self,
+        pid: u32,
+        status: proc::ExitStatus,
+    ) -> Result<(), proc::ProcError> {
+        let meta = self
+            .procs
+            .get(pid)
+            .ok_or(proc::ProcError::UnknownProcess(pid))?;
+        let parent_can_reap = meta.parent != 0
+            && meta.parent != pid
+            && self.domains.iter().flatten().any(|d| d.id == meta.parent);
+        let init_adopts = pid != proc::INIT_PID
+            && self
+                .domains
+                .iter()
+                .flatten()
+                .any(|d| d.id == proc::INIT_PID);
+        self.teardown_domain(pid)
+            .map_err(|_| proc::ProcError::UnknownProcess(pid))?;
+        if parent_can_reap {
+            if let Some(m) = self.procs.get_mut(pid) {
+                m.exit = Some(status);
+            }
+        } else if init_adopts {
+            if let Some(m) = self.procs.get_mut(pid) {
+                m.parent = proc::INIT_PID;
+                m.exit = Some(status);
+            }
+        } else {
+            // No reaper exists: discard rather than leak a zombie.
+            self.procs.remove(pid);
+        }
+        self.reparent_children(pid);
+        Ok(())
+    }
+
+    /// ADR-0022 D7 — wait4: reap one child. `pid > 0` = that child,
+    /// `-1` or `0` = any child (process groups do not exist yet, so 0
+    /// reads as "any"); other negatives are refused. Reaping frees the
+    /// zombie's meta slot. The pure core never blocks: nothing-ready
+    /// is `WouldBlock` and the kernel runtime turns it into a block or
+    /// EAGAIN (WNOHANG) at the ABI.
+    pub fn wait_process(
+        &mut self,
+        parent_id: u32,
+        pid: i64,
+        _nohang: bool,
+    ) -> Result<(u32, proc::ExitStatus), proc::ProcError> {
+        use proc::ProcError as PE;
+        if self.domain(parent_id).is_none() {
+            return Err(PE::UnknownProcess(parent_id));
+        }
+        let target = if pid > 0 {
+            Some(pid as u32)
+        } else if pid == -1 || pid == 0 {
+            None
+        } else {
+            // Process-group waits: not modeled yet; fail closed.
+            return Err(PE::NotAChild(pid as u32));
+        };
+        if self.procs.children_count(parent_id) == 0 {
+            return Err(PE::NoChildren);
+        }
+        match target {
+            Some(t) => {
+                // The iterator borrow ends with the statement; the
+                // removal below runs on the released table.
+                let found: Option<proc::ProcMeta> =
+                    self.procs.children_of(parent_id).find(|m| m.pid == t);
+                match found {
+                    None => Err(PE::NotAChild(t)),
+                    Some(m) if m.exit.is_some() => {
+                        let st = m.exit.unwrap_or(proc::ExitStatus::normal(0));
+                        self.procs.remove(t);
+                        Ok((t, st))
+                    }
+                    Some(_) => Err(PE::WouldBlock),
+                }
+            }
+            None => {
+                let found: Option<proc::ProcMeta> =
+                    self.procs.children_of(parent_id).find(|m| m.exit.is_some());
+                match found {
+                    Some(m) => {
+                        let st = m.exit.unwrap_or(proc::ExitStatus::normal(0));
+                        self.procs.remove(m.pid);
+                        Ok((m.pid, st))
+                    }
+                    None => Err(PE::WouldBlock),
+                }
+            }
+        }
+    }
+
+    /// ADR-0022 D6: the core primitive behind fcntl(F_SETFD).
+    pub fn set_cloexec(&mut self, pid: u32, fd: u8, on: bool) -> Result<(), proc::ProcError> {
+        let d = self
+            .domain_mut(pid)
+            .map_err(|_| proc::ProcError::UnknownProcess(pid))?;
+        if d.fds.set_cloexec(fd, on) {
+            Ok(())
+        } else {
+            Err(proc::ProcError::FdNotOpen(fd))
+        }
+    }
+
+    /// ADR-0022 D5: declare an executable's surface in init's policy
+    /// table (supervisor API — never a child-held syscall).
+    pub fn exec_policy_declare(
+        &mut self,
+        path: &str,
+        mask: &SyscallMask,
+        enforce: Option<bool>,
+    ) -> Result<(), proc::ProcError> {
+        self.exec_policy.declare(path, *mask, enforce)
+    }
+
+    /// ADR-0022 D5: the declared surface for a path (unlisted = the
+    /// app default, AuditOnly).
+    #[must_use]
+    pub fn exec_policy_declared_for(&self, path: &str) -> (SyscallMask, Option<bool>) {
+        self.exec_policy.declared_for(path)
+    }
+
+    /// ADR-0022 D7: settle a dead process's children — living AND
+    /// zombie. A living init adopts; without one, zombie children are
+    /// reaped into nothing (their status is unobservable by anyone)
+    /// and living children detach (parent 0, discarded at their own
+    /// exit). Called by both `exit_process` and `destroy_domain`.
+    fn reparent_children(&mut self, dead: u32) {
+        let init_live = dead != proc::INIT_PID
+            && self
+                .domains
+                .iter()
+                .flatten()
+                .any(|d| d.id == proc::INIT_PID);
+        // Fixed buffer (no heap in the core): the pid list first, the
+        // mutations after — the iterator borrow must end before
+        // `get_mut`/`remove` run.
+        let mut pids = [0u32; proc::MAX_PROCS];
+        let mut n = 0usize;
+        for m in self.procs.children_of(dead) {
+            if n < pids.len() {
+                pids[n] = m.pid;
+                n += 1;
+            }
+        }
+        for &pid in &pids[..n] {
+            let is_zombie = self.procs.get(pid).is_some_and(|m| m.exit.is_some());
+            if init_live {
+                if let Some(x) = self.procs.get_mut(pid) {
+                    x.parent = proc::INIT_PID;
+                }
+            } else if is_zombie {
+                self.procs.remove(pid);
+            } else if let Some(x) = self.procs.get_mut(pid) {
+                x.parent = 0;
+            }
+        }
+    }
+
     /// Destroy a domain and release everything it holds:
     ///
     /// - pipe ends referenced by its open descriptors (dup-aware: an end
     ///   closes only when its last referencing descriptor goes away),
     /// - its brokered socket and rate bucket,
     /// - its scheduler registration,
+    /// - its process meta (no zombie: the wait protocol is opt-in via
+    ///   ADR-0022's `exit_process`; this is the supervisor removal path),
     /// - its table slot (immediately reusable).
     ///
     /// VFS inodes it created persist — files outlive their creators (Unix
     /// semantics). Works on quarantined domains too: this is the
     /// supervised-respawn removal path. Never widens anything anywhere.
     pub fn destroy_domain(&mut self, id: u32) -> Result<(), KernelError> {
+        self.teardown_domain(id)?;
+        // ADR-0022: the supervisor path removes the meta outright (no
+        // zombie — the supervisor opted out of the wait protocol) and
+        // the dead process's children reparent exactly as with exit.
+        self.procs.remove(id);
+        self.reparent_children(id);
+        Ok(())
+    }
+
+    /// The teardown half of `destroy_domain` (and of ADR-0022's
+    /// `exit_process`): monitor reset, dup-aware fd close with pipe
+    /// release, socket, bucket, scheduler unregister, slot free. The
+    /// CALLER settles the process-meta question (zombie vs removed vs
+    /// discarded) — kernel-side resources (frames, IOMMU) are the
+    /// caller's job BEFORE this, the same `destroy_user` contract.
+    fn teardown_domain(&mut self, id: u32) -> Result<(), KernelError> {
         let slot = self
             .domains
             .iter()
@@ -743,9 +1232,13 @@ pub mod prelude {
             BehaviorMonitor, DomainStats, MonitorConfig, MonitorWeights, Response, Verdict,
             MAX_MONITORED,
         },
+        proc::{
+            ExecPolicyEntry, ExecPolicyTable, ExitReason, ExitStatus, ProcError, ProcMeta,
+            ProcTable, FIRST_DYNAMIC_PID, INIT_PID, MAX_EXEC_ENTRIES, MAX_PROCS,
+        },
         profile::{
-            driver_profile, netd_profile, parser_profile, plugin_profile, service_profile,
-            DomainProfile,
+            app_profile, driver_profile, netd_profile, parser_profile, plugin_profile,
+            service_profile, DomainProfile,
         },
         response::{apply_response, EventAction, Outcome, SecurityEvent, TELEMETRY_CAPACITY},
     };
@@ -1286,12 +1779,13 @@ mod tests {
             k.create_domain(1, service_profile()),
             Err(KernelError::DuplicateDomain(1))
         ));
-        // Fill the table (MAX_DOMAINS=4) -> TooManyDomains surfaced.
-        k.create_domain(2, service_profile()).unwrap();
-        k.create_domain(3, service_profile()).unwrap();
-        k.create_domain(4, service_profile()).unwrap();
+        // Fill the table (MAX_DOMAINS=32 since ADR-0022; domain 1
+        // exists) -> TooManyDomains surfaced.
+        for id in 2..=MAX_DOMAINS as u32 {
+            k.create_domain(id, service_profile()).unwrap();
+        }
         assert!(matches!(
-            k.create_domain(5, service_profile()),
+            k.create_domain(MAX_DOMAINS as u32 + 1, service_profile()),
             Err(KernelError::TooManyDomains)
         ));
         // And a syscall on a domain that does not exist keeps the id.

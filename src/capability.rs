@@ -108,6 +108,7 @@ pub enum CapError {
     Escalation,
 }
 
+#[derive(Clone)]
 pub struct CapabilityTable {
     slots: [Option<Capability>; MAX_CAPABILITIES],
     gens: [u32; MAX_CAPABILITIES],
