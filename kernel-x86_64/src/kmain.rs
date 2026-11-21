@@ -1291,8 +1291,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // empties (the sleeper exited; its exit sits in the completed
         // mailbox — teardown stays the spawner's contract).
         hw::write_cr3(kernel_cr3);
-        crate::serial::write_str("[DBG ] kmain back after the sleeper pair
-");
+        crate::serial::write_str(
+            "[DBG ] kmain back after the sleeper pair
+",
+        );
         let mut clean_exit = false;
         let mut saw_exit = false;
         while let Some((dom, exit)) = crate::sched::park::completed_drain() {
@@ -1375,7 +1377,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         ) {
             Ok(sp) => sp,
             Err(_) => {
-                line(&mut out, &["[M3] signal: ERROR: victim spawn failed; halting"]);
+                line(
+                    &mut out,
+                    &["[M3] signal: ERROR: victim spawn failed; halting"],
+                );
                 hw::halt_forever();
             }
         };
@@ -1389,7 +1394,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         ) {
             Ok(sp) => sp,
             Err(_) => {
-                line(&mut out, &["[M3] signal: ERROR: killer spawn failed; halting"]);
+                line(
+                    &mut out,
+                    &["[M3] signal: ERROR: killer spawn failed; halting"],
+                );
                 hw::halt_forever();
             }
         };
@@ -1417,8 +1425,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // kmain resumes when the nested dispatcher empties: both runs
         // exited (the mailbox holds their exits).
         hw::write_cr3(kernel_cr3);
-        crate::serial::write_str("[DBG ] kmain back after the signal pair
-");
+        crate::serial::write_str(
+            "[DBG ] kmain back after the signal pair
+",
+        );
         let mut victim_ok = false;
         let mut killer_ok = false;
         while let Some((dom, exit)) = crate::sched::park::completed_drain() {
@@ -1451,7 +1461,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         ) {
             Ok(sp) => sp,
             Err(_) => {
-                line(&mut out, &["[M3] signal: ERROR: forger spawn failed; halting"]);
+                line(
+                    &mut out,
+                    &["[M3] signal: ERROR: forger spawn failed; halting"],
+                );
                 hw::halt_forever();
             }
         };

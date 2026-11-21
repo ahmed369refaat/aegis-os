@@ -598,10 +598,8 @@ impl<const N: usize> Kernel<N> {
                     return Err(SysError::InvalidArgument(u64::from(signum)));
                 }
                 let d = self.domain_mut(domain_id).map_err(into_sys)?;
-                d.sig_handlers[usize::from(signum)] = Some(crate::signal::SigHandler {
-                    handler,
-                    restorer,
-                });
+                d.sig_handlers[usize::from(signum)] =
+                    Some(crate::signal::SigHandler { handler, restorer });
                 Ok(SysValue::Unit)
             }
             SysRequest::Chroot { path } => {

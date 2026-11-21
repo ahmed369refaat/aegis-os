@@ -73,8 +73,8 @@ pub fn linux_to_core(nr: u64) -> u64 {
         // with the internal SYS_DUP the round-J blobs already speak —
         // the victim blob calls the internal 25 directly; the full
         // Linux renumbering is Phase 5's ABI-VERSION v0.4 table.)
-        15 => SYS_SIGRETURN as u64,      // rt_sigreturn(2)
-        62 => SYS_KILL as u64,           // kill(2)
+        15 => SYS_SIGRETURN as u64, // rt_sigreturn(2)
+        62 => SYS_KILL as u64,      // kill(2)
         n => n,
     }
 }
@@ -258,12 +258,12 @@ mod exec {
     /// exact frame address) rides the run; sigreturn refuses anything
     /// that does not match it.
     fn maybe_deliver_signal(run: &mut crate::sched::context::UserRun, result: u64) {
+        use crate::arch::syscall_entry::{frame_word, write_frame_word};
         use crate::arch::syscall_frame::{
             OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RAX, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
         };
-        use crate::arch::syscall_entry::{frame_word, write_frame_word};
-        use crate::mm::user_range::copy_out_bytes;
         use crate::mm::user_layout;
+        use crate::mm::user_range::copy_out_bytes;
         use aegis_os::sigframe::{self, InterruptedImage};
 
         let user_rsp = crate::arch::syscall_entry::user_rsp_save();

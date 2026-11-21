@@ -1046,16 +1046,11 @@ impl<const N: usize> Kernel<N> {
         let sig = {
             let d = self.domains.iter().flatten().find(|d| d.id == domain)?;
             let sig = d.signals.next_pending()?;
-            if d.sig_handlers[usize::from(sig)].is_none() {
-                return None; // pending but uncaught — not ours to deliver
-            }
+            // Pending but uncaught — not ours to deliver.
+            d.sig_handlers[usize::from(sig)].as_ref()?;
             sig
         };
-        let d = self
-            .domains
-            .iter_mut()
-            .flatten()
-            .find(|d| d.id == domain)?;
+        let d = self.domains.iter_mut().flatten().find(|d| d.id == domain)?;
         let _ = d.signals.deliver();
         let h = d.sig_handlers[usize::from(sig)]?;
         Some((sig, h.handler, h.restorer))

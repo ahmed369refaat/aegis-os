@@ -175,7 +175,9 @@ static mut SAVED_CHAIN: [Option<crate::sched::context::ResumeChain>; 1] = [const
 
 #[cfg(not(test))]
 mod boot {
-    use super::{live_callee_saved, parked_from_syscall, record_completed, SAVED_CHAIN, SyscallImage};
+    use super::{
+        live_callee_saved, parked_from_syscall, record_completed, SyscallImage, SAVED_CHAIN,
+    };
     use crate::arch::syscall_entry;
     use crate::arch::syscall_frame::{
         OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
@@ -307,7 +309,7 @@ mod boot {
         // RDI = signum; the interrupted image lives on in the frame.
         ctx.rip = handler;
         ctx.gprs[9] = u64::from(sig); // rdi
-        ctx.gprs[14] = 0;             // rax (undefined at entry)
+        ctx.gprs[14] = 0; // rax (undefined at entry)
         ctx.rsp = new_rsp;
         // The delivery record rides the run (sigreturn matches the
         // cookie and the exact frame address against it).

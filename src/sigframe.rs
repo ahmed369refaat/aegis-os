@@ -62,9 +62,9 @@ pub struct InterruptedImage {
     pub gprs: [u64; 8],
 }
 
-/// Build the 128 frame bytes: the handler's entry stack. The cookie
-/// is KERNEL-chosen per delivery (never derived from user data).
-#[must_use]
+/// Build the 128 frame bytes into `out` (the handler's entry stack).
+/// The cookie is KERNEL-chosen per delivery (never derived from user
+/// data). Unit-returning by design: `out` is the output.
 pub fn build(
     signum: u8,
     cookie: u64,
