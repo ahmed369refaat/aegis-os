@@ -25,6 +25,22 @@ fn err_name(e: &aegis_os::ext2::Ext2Error) -> &'static str {
     }
 }
 
+/// The partition layer's error names (the marker vocabulary).
+fn part_err_name(e: &aegis_os::part::PartError) -> &'static str {
+    match e {
+        aegis_os::part::PartError::Short => "short read",
+        aegis_os::part::PartError::BadMbrSignature => "bad MBR signature",
+        aegis_os::part::PartError::BadGptSignature => "bad GPT signature",
+        aegis_os::part::PartError::BadHeaderSize(_) => "bad header size",
+        aegis_os::part::PartError::BadHeaderCrc => "header CRC mismatch",
+        aegis_os::part::PartError::BadEntriesCrc => "entries CRC mismatch",
+        aegis_os::part::PartError::BadEntrySize(_) => "bad entry size",
+        aegis_os::part::PartError::TooManyEntries(_) => "too many entries",
+        aegis_os::part::PartError::BadGeometry => "bad geometry",
+        aegis_os::part::PartError::Overlap => "overlapping partitions",
+    }
+}
+
 /// ext2 first slice: mount the SATA disk's superblock, walk the root
 /// directory, read hello.txt through AHCI READ DMA.
 #[cfg(not(test))]
@@ -44,8 +60,9 @@ pub(crate) fn ext2_over_ahci(
     let mut h = [0u8; 18];
     // F13: the on-disk bytes are hostile until the policy core
     // validates them — the transport stays here, every structure and
-    // bound moves to aegis_os::ext2. One sector at a time is copied
-    // into a stack buffer the parser can slice.
+    // bound moves to aegis_os::ext2 (and aegis_os::part for the
+    // partition layer). One sector at a time is copied into a stack
+    // buffer the parser can slice.
     let mut sec = [0u8; 512];
     let load = |lba: u64, sec: &mut [u8; 512]| -> bool {
         if !super::ahci::ahci_read_dma(bus, clb, ctba, data, lba) {
@@ -56,8 +73,67 @@ pub(crate) fn ext2_over_ahci(
         }
         true
     };
-    // Superblock: LBA 2 (byte 1024, 1KiB blocks).
-    if !load(2, &mut sec) {
+
+    // ── the partition layer (G9): GPT first, the honest raw fallback ──
+    // The disk image carries a protective MBR + a GPT with one
+    // partition; the filesystem LBAs ride its base. A disk without a
+    // GPT degrades to base 0 — loudly marked, never silently.
+    let mut base = 0u64;
+    if load(0, &mut sec) && aegis_os::part::is_protective_mbr(&sec) {
+        // The header sector stays whole: the entries CRC lives at +88
+        // of IT, while the entry array is its own sector.
+        let mut hsec = [0u8; 512];
+        if load(1, &mut hsec) {
+            match aegis_os::part::parse_gpt_header(&hsec) {
+                Ok(hdr) => {
+                    let stored_crc = u32::from_le_bytes([
+                        hsec[88], hsec[89], hsec[90], hsec[91],
+                    ]);
+                    if load(hdr.entries_lba, &mut sec) {
+                        match aegis_os::part::parse_gpt_entries(&sec, &hdr, stored_crc) {
+                            Ok(gpt) if gpt.count >= 1 => {
+                                let p = gpt.parts[0].expect("count checked");
+                                base = p.first_lba;
+                                let mut b1 = [0u8; 20];
+                                let mut b2 = [0u8; 20];
+                                line(
+                                    out,
+                                    &[
+                                        "[GPT ] partition 1 '",
+                                        p.name_str(),
+                                        "' LBA ",
+                                        strutil::dec(p.first_lba, &mut b1),
+                                        "..",
+                                        strutil::dec(p.last_lba, &mut b2),
+                                        " — ext2 mounts at the partition base",
+                                    ],
+                                );
+                            }
+                            Ok(_) => {
+                                line(out, &["[GPT ] table valid but empty — ext2 at LBA 0 (raw fallback)"]);
+                            }
+                            Err(e) => {
+                                line(out, &["[GPT ] entries refused (hostile table): ", part_err_name(&e), " — ext2 at LBA 0 (raw fallback)"]);
+                            }
+                        }
+                    } else {
+                        line(out, &["[GPT ] entries sector did not read — ext2 at LBA 0 (raw fallback)"]);
+                    }
+                }
+                Err(e) => {
+                    line(out, &["[GPT ] header refused: ", part_err_name(&e), " — ext2 at LBA 0 (raw fallback)"]);
+                }
+            }
+        } else {
+            line(out, &["[GPT ] header sector did not read — ext2 at LBA 0 (raw fallback)"]);
+        }
+    } else {
+        line(out, &["[GPT ] no GPT on this disk — ext2 at LBA 0 (raw fallback)"]);
+    }
+
+    // Superblock: LBA 2 within the filesystem (byte 1024, 1KiB
+    // blocks), at the partition base.
+    if !load(base + 2, &mut sec) {
         line(out, &["[EXT2] superblock read did not complete — refusing"]);
         return;
     }
@@ -149,7 +225,7 @@ pub(crate) fn ext2_over_ahci(
         ],
     );
     // Group descriptor: LBA 4 (block 2), bg_inode_table u32 @+8.
-    if !load(4, &mut sec) {
+    if !load(base + 4, &mut sec) {
         line(out, &["[EXT2] group-descriptor read failed — refusing"]);
         return;
     }
@@ -168,7 +244,7 @@ pub(crate) fn ext2_over_ahci(
             return;
         }
     };
-    if !load(root_byte / 512, &mut sec) {
+    if !load(base + root_byte / 512, &mut sec) {
         line(out, &["[EXT2] root-inode read failed — refusing"]);
         return;
     }
@@ -197,7 +273,7 @@ pub(crate) fn ext2_over_ahci(
     // Directory block: walk dirents, find "hello.txt" (the policy
     // core validates every record — hostile rec_len/name_len is a
     // refusal, never a skipped record).
-    if root.block0 >= sb.blocks_count || !load(u64::from(root.block0) * 2, &mut sec) {
+    if root.block0 >= sb.blocks_count || !load(base + u64::from(root.block0) * 2, &mut sec) {
         line(
             out,
             &["[EXT2] root-dir read failed (or block out of range) — refusing"],
@@ -238,7 +314,7 @@ pub(crate) fn ext2_over_ahci(
             return;
         }
     };
-    if !load(f_byte / 512, &mut sec) {
+    if !load(base + f_byte / 512, &mut sec) {
         line(out, &["[EXT2] file-inode read failed — refusing"]);
         return;
     }
@@ -253,7 +329,7 @@ pub(crate) fn ext2_over_ahci(
         }
     };
     let fsize = fnode.size;
-    if fnode.block0 >= sb.blocks_count || !load(u64::from(fnode.block0) * 2, &mut sec) {
+    if fnode.block0 >= sb.blocks_count || !load(base + u64::from(fnode.block0) * 2, &mut sec) {
         line(
             out,
             &["[EXT2] file-data read failed (or block out of range) — refusing"],
