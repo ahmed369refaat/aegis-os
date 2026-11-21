@@ -102,8 +102,17 @@ pub struct VirtioCaps {
 /// the config dword at `off` (dword-aligned, first 256 bytes). The
 /// cap header layout: vndr(0) next(1) len(2) cfg_type(3) bar(4)
 /// pad(5..8) offset(8) length(12) [notify: multiplier(16)].
+///
+/// F4 (review round 4): the config space is HOSTILE INPUT. The old
+/// code computed `ptr + 4/8/12/16` on a `u8` — a capability pointer
+/// at 0xF4 overflows (release builds run `overflow-checks = true`:
+/// a kernel PANIC from a hostile config space). Every capability must
+/// now lie wholly inside the 256-byte space, carry `len >= 16`
+/// (`>= 20` for notify, whose multiplier dword is mandatory), name a
+/// legal BAR index (<= 5), and NEVER repeat a region type (a
+/// duplicate is an ambiguous device: rejected, not last-wins).
 pub fn parse_virtio_caps(read_cfg: &mut dyn FnMut(u8) -> u32) -> Option<VirtioCaps> {
-    let first = ((read_cfg(0x34)) & 0xFF) as u8 & 0xFC;
+    let first = (read_cfg(0x34) & 0xFF) as u8 & 0xFC;
     if !(0x40..=0xFC).contains(&first) {
         return None;
     }
@@ -112,9 +121,11 @@ pub fn parse_virtio_caps(read_cfg: &mut dyn FnMut(u8) -> u32) -> Option<VirtioCa
     let mut multiplier = 0u32;
     let mut isr = None;
     let mut device = None;
+    // Bit i set = cfg_type i+1 already seen (duplicates reject).
+    let mut types_seen = 0u8;
     // Lists interleave other caps (QEMU: msix first, then the virtio
     // caps, measured) — skip non-virtio entries, protect with a
-    // visited set.
+    // visited set and a hard iteration bound.
     let mut seen: [u8; 16] = [0; 16];
     let mut seen_count = 0usize;
     let mut ptr = first;
@@ -136,8 +147,26 @@ pub fn parse_virtio_caps(read_cfg: &mut dyn FnMut(u8) -> u32) -> Option<VirtioCa
         let next = ((w0 >> 8) & 0xFF) as u8 & 0xFC;
         let len = ((w0 >> 16) & 0xFF) as u8;
         let cfg_type = (w0 >> 24) as u8;
+        // The fixed 16-byte header must fit (arithmetic in u16 — the
+        // u8 form overflowed at ptr >= 0xF4); the declared cap length
+        // must cover it and fit the space too.
+        let hdr_end = u16::from(ptr) + 16;
+        if hdr_end > 256 || u16::from(len) < 16 || u16::from(ptr) + u16::from(len) > 256 {
+            return None;
+        }
+        if (1..=4).contains(&cfg_type) {
+            if types_seen & (1 << (cfg_type - 1)) != 0 {
+                return None; // duplicate region type: ambiguous device
+            }
+            types_seen |= 1 << (cfg_type - 1);
+        }
+        // An unknown virtio cap type: skip it, the four-required rule
+        // below governs acceptance.
         let w1 = read_cfg(ptr + 4);
         let bar = (w1 & 0xFF) as u8;
+        if bar > 5 {
+            return None; // no such BAR
+        }
         let offset = read_cfg(ptr + 8);
         let length = read_cfg(ptr + 12);
         let region = CapRegion {
@@ -148,10 +177,13 @@ pub fn parse_virtio_caps(read_cfg: &mut dyn FnMut(u8) -> u32) -> Option<VirtioCa
         match cfg_type {
             1 => common = Some(region),
             2 => {
-                notify = Some(region);
-                if len >= 20 {
-                    multiplier = read_cfg(ptr + 16);
+                // The multiplier dword at +16 is part of the notify
+                // cap by definition: len >= 20 or the cap is malformed.
+                if u16::from(len) < 20 || u16::from(ptr) + 20 > 256 {
+                    return None;
                 }
+                notify = Some(region);
+                multiplier = read_cfg(ptr + 16);
             }
             3 => isr = Some(region),
             4 => device = Some(region),
@@ -167,6 +199,179 @@ pub fn parse_virtio_caps(read_cfg: &mut dyn FnMut(u8) -> u32) -> Option<VirtioCa
         isr: isr?,
         device: device?,
     })
+}
+
+/// What can go wrong resolving capability regions against the BARs
+/// (F5). Device-supplied values are untrusted: every variant is a
+/// refusal, never a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapError {
+    /// The named BAR has no resolved memory region.
+    NoBar(u8),
+    /// `offset + length` exceeds the BAR's size.
+    BeyondBar { bar: u8, end: u64, size: u64 },
+    /// The region is below the register file's minimum length.
+    TooSmall { cfg_type: u8, have: u32, need: u32 },
+    /// The region offset is not 4-aligned (MMIO register access).
+    Misaligned { cfg_type: u8, offset: u32 },
+    /// The notify multiplier exceeds the sane band (QEMU uses 4;
+    /// anything beyond 8 cannot produce an in-region notify slot for
+    /// any real queue count).
+    BadMultiplier(u32),
+    /// The final physical address falls outside the pre-mapped MMIO
+    /// window — dereferencing it would fault the kernel.
+    OutsideWindow { pa: u64, len: u64 },
+}
+
+impl CapError {
+    /// One honest line per refusal class (the boot markers).
+    #[must_use]
+    pub fn describe(&self) -> &'static str {
+        match self {
+            CapError::NoBar(_) => "BAR unresolved",
+            CapError::BeyondBar { .. } => "region beyond the BAR size",
+            CapError::TooSmall { .. } => "region below the minimum length",
+            CapError::Misaligned { .. } => "region offset not 4-aligned",
+            CapError::BadMultiplier(_) => "notify multiplier out of the sane band",
+            CapError::OutsideWindow { .. } => "register block outside the mapped MMIO window",
+        }
+    }
+}
+
+/// The four register blocks resolved to CHECKED physical addresses
+/// (F5): every region fits its BAR, meets its minimum length, is
+/// aligned, and lands inside the mapped MMIO window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedCaps {
+    pub common_pa: u64,
+    pub notify_base_pa: u64,
+    pub notify_len: u32,
+    pub notify_multiplier: u32,
+    pub isr_pa: u64,
+    pub device_cfg_pa: u64,
+}
+
+impl VirtioCaps {
+    /// F5 (review round 4): resolve the capability regions against
+    /// the device's BARs with checked math. The device chose these
+    /// numbers; none of them is trusted: `offset + length <= size`
+    /// per region, minimum lengths (common >= 0x38 registers, isr >=
+    /// 1, device cfg >= 8, notify >= 2), 4-alignment, a sane
+    /// multiplier, and every final physical address inside the mapped
+    /// MMIO window — else refuse.
+    pub fn resolve(&self, dev: &crate::pci::PciDev) -> Result<ResolvedCaps, CapError> {
+        let resolve_region =
+            |region: &CapRegion, cfg_type: u8, need: u32| -> Result<u64, CapError> {
+                let bar =
+                    crate::pci::mem_bar(dev, region.bar).ok_or(CapError::NoBar(region.bar))?;
+                let off = u64::from(region.offset);
+                let len = u64::from(region.length);
+                // The common config carries u64 queue registers at
+                // +0x20..0x30: its base must be 8-aligned; the other
+                // blocks are u32/u16/u8 access — 4 suffices.
+                let align: u64 = if cfg_type == 1 { 8 } else { 4 };
+                if !off.is_multiple_of(align) {
+                    return Err(CapError::Misaligned {
+                        cfg_type,
+                        offset: region.offset,
+                    });
+                }
+                if region.length < need {
+                    return Err(CapError::TooSmall {
+                        cfg_type,
+                        have: region.length,
+                        need,
+                    });
+                }
+                let end = off.checked_add(len).ok_or(CapError::BeyondBar {
+                    bar: region.bar,
+                    end: u64::MAX,
+                    size: bar.size,
+                })?;
+                if end > bar.size {
+                    return Err(CapError::BeyondBar {
+                        bar: region.bar,
+                        end,
+                        size: bar.size,
+                    });
+                }
+                let pa = bar
+                    .base
+                    .checked_add(off)
+                    .ok_or(CapError::OutsideWindow { pa: u64::MAX, len })?;
+                if !crate::arch::lapic::mmio_in_window(pa, len) {
+                    return Err(CapError::OutsideWindow { pa, len });
+                }
+                Ok(pa)
+            };
+        let common_pa = resolve_region(&self.common, 1, 0x38)?;
+        let notify_base_pa = resolve_region(&self.notify, 2, 2)?;
+        let isr_pa = resolve_region(&self.isr, 3, 1)?;
+        let device_cfg_pa = resolve_region(&self.device, 4, 8)?;
+        if self.notify_multiplier > 8 {
+            return Err(CapError::BadMultiplier(self.notify_multiplier));
+        }
+        Ok(ResolvedCaps {
+            common_pa,
+            notify_base_pa,
+            notify_len: self.notify.length,
+            notify_multiplier: self.notify_multiplier,
+            isr_pa,
+            device_cfg_pa,
+        })
+    }
+}
+
+/// F6 (review round 4): the words the driver actually negotiates —
+/// `device & wanted`, refusing devices that do not offer VERSION_1
+/// (bit 32: the modern layout this driver speaks) or
+/// ACCESS_PLATFORM (bit 33: DMA goes through the IOMMU — the whole
+/// broker design assumes it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureWords {
+    pub low: u32,
+    pub high: u32,
+}
+
+/// Negotiate: driver = device & wanted, with VERSION_1 and
+/// ACCESS_PLATFORM REQUIRED to have been offered.
+pub fn negotiate_features(device_low: u32, device_high: u32) -> Result<FeatureWords, &'static str> {
+    if device_high & F1_VERSION_1 == 0 {
+        return Err("VIRTIO_F_VERSION_1 not offered — not a modern device");
+    }
+    if device_high & F1_ACCESS_PLATFORM == 0 {
+        return Err("VIRTIO_F_ACCESS_PLATFORM not offered — no IOMMU path");
+    }
+    Ok(FeatureWords {
+        low: device_low & DRIVER_FEATURES_LOW,
+        high: device_high & DRIVER_FEATURES_HIGH,
+    })
+}
+
+/// F7 (review round 4): validate one used-ring completion against
+/// what was actually submitted. The device wrote these fields; a
+/// completion that names an id beyond the queue, an id that is not
+/// the submitted head, or a length beyond the submitted buffer is a
+/// hostile device — the caller takes the poison path.
+pub fn validate_used(
+    used_pa: u64,
+    slot: u16,
+    qsize: u16,
+    want_head: u32,
+    max_len: u32,
+) -> Result<(u32, u32), &'static str> {
+    let id = used_entry_id(used_pa, slot);
+    let len = used_entry_len(used_pa, slot);
+    if id >= u32::from(qsize) {
+        return Err("completion id beyond the queue size");
+    }
+    if id != want_head {
+        return Err("completion id is not the submitted head");
+    }
+    if len > max_len {
+        return Err("completion length beyond the submitted buffer");
+    }
+    Ok((id, len))
 }
 
 // ── u16 access at (2-aligned) addresses, over aligned u32 RMW ──
@@ -319,6 +524,7 @@ pub const fn live_status() -> u8 {
 pub struct MmioVirtio {
     common_pa: u64,
     notify_base_pa: u64,
+    notify_len: u32,
     multiplier: u32,
     device_cfg_pa: u64,
     isr_pa: u64,
@@ -326,20 +532,20 @@ pub struct MmioVirtio {
 
 #[cfg(not(test))]
 impl MmioVirtio {
-    /// Resolve the capability regions against the device's BARs.
+    /// Build the live register blocks from CHECKED resolutions
+    /// (F5: `VirtioCaps::resolve` validated every device number —
+    /// the old `from_caps` added device-supplied offsets to BAR
+    /// bases with no checks at all).
     #[must_use]
-    pub fn from_caps(caps: &VirtioCaps, dev: &crate::pci::PciDev) -> Option<Self> {
-        let common_base = crate::pci::mem_bar_base(dev, caps.common.bar)?;
-        let notify_base = crate::pci::mem_bar_base(dev, caps.notify.bar)?;
-        let device_base = crate::pci::mem_bar_base(dev, caps.device.bar)?;
-        let isr_base = crate::pci::mem_bar_base(dev, caps.isr.bar)?;
-        Some(MmioVirtio {
-            common_pa: common_base + u64::from(caps.common.offset),
-            notify_base_pa: notify_base + u64::from(caps.notify.offset),
-            multiplier: caps.notify_multiplier,
-            device_cfg_pa: device_base + u64::from(caps.device.offset),
-            isr_pa: isr_base + u64::from(caps.isr.offset),
-        })
+    pub fn from_resolved(r: &ResolvedCaps) -> Self {
+        MmioVirtio {
+            common_pa: r.common_pa,
+            notify_base_pa: r.notify_base_pa,
+            notify_len: r.notify_len,
+            multiplier: r.notify_multiplier,
+            device_cfg_pa: r.device_cfg_pa,
+            isr_pa: r.isr_pa,
+        }
     }
 
     fn r32(&self, off: u64) -> u32 {
@@ -416,19 +622,36 @@ impl MmioVirtio {
     /// measured: a value of 0 always kicks queue 0, which hid the
     /// net TX queue behind the RX kick); the address is still the
     /// queue's own notify slot from QUEUE_NOTIFY_OFF × multiplier.
-    pub fn notify(&self, queue_index: u16, queue_notify_off: u16) {
-        let pa = notify_addr(self.notify_base_pa, queue_notify_off, self.multiplier);
+    pub fn notify(&self, queue_index: u16, queue_notify_off: u16) -> bool {
+        // F5 (review round 4): the device chose `queue_notify_off`
+        // and the multiplier — the computed slot must land inside the
+        // resolved notify region, or the write is REFUSED (no write,
+        // the caller takes the poison path).
+        let off = u64::from(queue_notify_off) * u64::from(self.multiplier);
+        let end = match off.checked_add(2) {
+            Some(e) => e,
+            None => return false,
+        };
+        if end > u64::from(self.notify_len) {
+            return false;
+        }
+        let pa = self.notify_base_pa + off;
         // EXACTLY Linux's kick: `iowrite16(index, notify_base +
         // off * multiplier)` — a 2-byte store at the queue's own
         // slot. A 4-byte store was measured to be split by QEMU into
         // two 2-byte dispatches (two queue_notify traces per kick);
         // the RMW lane is forbidden (notify reads are undefined).
         memops::write_u16(pa, queue_index);
+        true
     }
 
-    /// The disk capacity in 512-byte sectors (device config +0).
+    /// The disk capacity in 512-byte sectors (device config +0) —
+    /// two ALIGNED u32 reads (F5): resolve() guarantees a 4-aligned
+    /// block, and a single u64 read at a device-chosen address could
+    /// still be 4-but-not-8 aligned.
     pub fn capacity_sectors(&self) -> u64 {
-        memops::read_u64(self.device_cfg_pa)
+        u64::from(memops::read_u32(self.device_cfg_pa))
+            | (u64::from(memops::read_u32(self.device_cfg_pa + 4)) << 32)
     }
 
     /// The ISR register (bit 0 = queue-activity poke). Diagnostics
@@ -527,12 +750,16 @@ mod tests {
     /// A fake config space: dwords in a plain buffer, a virtio cap
     /// chain planted at 0x40.
     struct FakeCfg {
+        /// 64 dwords = the 256-byte config space, +4 slack dwords for
+        /// cap fields that START inside the space but would overflow
+        /// it (the parser must reject those caps without reading the
+        /// overflow — the slack exists so the FIXTURE never panics).
         d: Vec<u32>,
     }
 
     impl FakeCfg {
         fn new() -> Self {
-            FakeCfg { d: vec![0; 64] }
+            FakeCfg { d: vec![0; 68] }
         }
         fn read(&self, off: u8) -> u32 {
             self.d[(off / 4) as usize]
@@ -627,6 +854,338 @@ mod tests {
         c.d[13] = 0x40;
         c.cap(0x40, 0x40, 1, 4, 0, 0x38, None); // points at itself
         assert!(parse_virtio_caps(&mut |off| c.read(off)).is_none());
+    }
+
+    /// F4 (review round 4): a hostile config space must never panic —
+    /// the old code computed `ptr + 12` on a u8, and a capability at
+    /// 0xF4 overflowed it (release runs overflow-checks: a kernel
+    /// panic from device input). Every malformed shape fails closed.
+    #[test]
+    fn caps_hostile_config_fails_closed_never_panics() {
+        // A cap at 0xF4: its 16-byte header ends at 0x104 — beyond
+        // the 256-byte space. The u8 arithmetic overflowed HERE.
+        let mut c = FakeCfg::new();
+        c.d[13] = 0xF4;
+        c.cap(0xF4, 0x00, 1, 4, 0, 0x38, None);
+        assert!(
+            parse_virtio_caps(&mut |off| c.read(off)).is_none(),
+            "a cap must fit wholly inside the 256-byte space"
+        );
+        // Same for a cap at 0xFC whose header cannot fit either.
+        let mut c = FakeCfg::new();
+        c.d[13] = 0xFC;
+        c.cap(0xFC, 0x00, 1, 4, 0, 0x38, None);
+        assert!(parse_virtio_caps(&mut |off| c.read(off)).is_none());
+        // len < 16: the offset/length dwords would read past the cap.
+        let mut c = FakeCfg::new();
+        c.d[13] = 0x40;
+        c.d[(0x40 / 4) as usize] = 0x09 | (0x00 << 8) | (8 << 16) | (1 << 24); // len=8
+        assert!(
+            parse_virtio_caps(&mut |off| c.read(off)).is_none(),
+            "len < 16 refused"
+        );
+        // A notify cap without the multiplier dword (len 16..19).
+        let mut c = FakeCfg::new();
+        c.d[13] = 0x40;
+        c.d[(0x40 / 4) as usize] = 0x09 | (0x00 << 8) | (16 << 16) | (2 << 24); // notify, len=16
+        assert!(
+            parse_virtio_caps(&mut |off| c.read(off)).is_none(),
+            "notify needs len >= 20"
+        );
+        // A BAR index that does not exist.
+        let mut c = FakeCfg::new();
+        c.d[13] = 0x40;
+        c.cap(0x40, 0x00, 1, 7, 0, 0x38, None);
+        assert!(
+            parse_virtio_caps(&mut |off| c.read(off)).is_none(),
+            "bar > 5 refused"
+        );
+        // A duplicate region type: ambiguous device, rejected (the
+        // old code silently let the LAST one win).
+        let mut c = FakeCfg::new();
+        c.d[13] = 0x40;
+        c.cap(0x40, 0x60, 1, 4, 0x0000, 0x38, None); // common #1
+        c.cap(0x60, 0x80, 2, 4, 0x0040, 0x1000, Some(4));
+        c.cap(0x80, 0x90, 1, 4, 0x9000, 0x38, None); // common #2 — dup
+        c.cap(0x90, 0x00, 3, 4, 0x2040, 0x10, None);
+        assert!(
+            parse_virtio_caps(&mut |off| c.read(off)).is_none(),
+            "duplicate cfg_type rejected"
+        );
+    }
+
+    /// A minimal but complete PciDev with one memory BAR, for resolve.
+    fn test_dev(slot: u8, base: u64, size: u64) -> crate::pci::PciDev {
+        crate::pci::PciDev {
+            bus: 0,
+            dev: 3,
+            func: 0,
+            vendor: 0x1AF4,
+            device: 0x1042,
+            class: 0,
+            header: 0,
+            bars: [
+                Some(crate::pci::Bar {
+                    slot,
+                    kind: crate::pci::BarKind::Mem32,
+                    base,
+                    size,
+                    prefetchable: false,
+                }),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+            bar_count: 6,
+            cap_ids: [0; crate::pci::MAX_CAPS],
+            cap_ptrs: [0; crate::pci::MAX_CAPS],
+            cap_count: 0,
+        }
+    }
+
+    /// F5: resolve checks offset+length against the BAR size, the
+    /// minimum lengths, alignment, the multiplier band, and the MMIO
+    /// window — every refusal is typed, never a guess.
+    #[test]
+    fn resolve_checks_every_device_number() {
+        // The healthy shape: BAR 4 at the window base, 8 KiB.
+        let dev = test_dev(4, 0xE000_0000, 0x4000);
+        let caps = VirtioCaps {
+            common: CapRegion {
+                bar: 4,
+                offset: 0x0000,
+                length: 0x38,
+            },
+            notify: CapRegion {
+                bar: 4,
+                offset: 0x0040,
+                length: 0x1000,
+            },
+            notify_multiplier: 4,
+            isr: CapRegion {
+                bar: 4,
+                offset: 0x2040,
+                length: 0x10,
+            },
+            device: CapRegion {
+                bar: 4,
+                offset: 0x2050,
+                length: 0x20,
+            },
+        };
+        let r = caps.resolve(&dev).expect("the healthy shape resolves");
+        assert_eq!(r.common_pa, 0xE000_0000);
+        assert_eq!(r.notify_base_pa, 0xE000_0040);
+        assert_eq!(r.notify_len, 0x1000);
+        assert_eq!(r.notify_multiplier, 4);
+        assert_eq!(r.isr_pa, 0xE000_2040);
+        assert_eq!(r.device_cfg_pa, 0xE000_2050);
+
+        // Region beyond the BAR: offset + length > size.
+        let mut bad = caps;
+        bad.common = CapRegion {
+            bar: 4,
+            offset: 0x3FF0,
+            length: 0x38,
+        };
+        assert_eq!(
+            bad.resolve(&dev),
+            Err(CapError::BeyondBar {
+                bar: 4,
+                end: 0x4028,
+                size: 0x4000
+            })
+        );
+        // Below the minimum lengths (common needs 0x38).
+        let mut bad = caps;
+        bad.common = CapRegion {
+            bar: 4,
+            offset: 0,
+            length: 0x30,
+        };
+        assert_eq!(
+            bad.resolve(&dev),
+            Err(CapError::TooSmall {
+                cfg_type: 1,
+                have: 0x30,
+                need: 0x38
+            })
+        );
+        // Unaligned region offset.
+        let mut bad = caps;
+        bad.isr = CapRegion {
+            bar: 4,
+            offset: 0x2042,
+            length: 0x10,
+        };
+        assert_eq!(
+            bad.resolve(&dev),
+            Err(CapError::Misaligned {
+                cfg_type: 3,
+                offset: 0x2042
+            })
+        );
+        // An insane multiplier.
+        let mut bad = caps;
+        bad.notify_multiplier = 0x1000;
+        assert_eq!(bad.resolve(&dev), Err(CapError::BadMultiplier(0x1000)));
+        // A BAR base OUTSIDE the mapped MMIO window (host RAM): the
+        // final address must refuse, not fault.
+        let dev_low = test_dev(4, 0x0010_0000, 0x4000);
+        assert!(matches!(
+            caps.resolve(&dev_low),
+            Err(CapError::OutsideWindow { .. })
+        ));
+        // A BAR the device names but the enumeration never resolved.
+        let dev_none = test_dev(2, 0xE000_0000, 0x4000);
+        assert!(matches!(caps.resolve(&dev_none), Err(CapError::NoBar(4))));
+    }
+
+    /// F6: negotiation is device & wanted, with VERSION_1 and
+    /// ACCESS_PLATFORM required offerings.
+    #[test]
+    fn negotiation_intersects_and_requires_the_modern_bits() {
+        // A modern IOMMU device offering both required bits.
+        let n = negotiate_features(0, F1_VERSION_1 | F1_ACCESS_PLATFORM | (1 << 5))
+            .expect("modern device negotiates");
+        assert_eq!(n.low, 0);
+        assert_eq!(
+            n.high,
+            F1_VERSION_1 | F1_ACCESS_PLATFORM,
+            "unwanted bits dropped"
+        );
+        // No VERSION_1: not a modern device — refuse.
+        assert_eq!(
+            negotiate_features(0, F1_ACCESS_PLATFORM),
+            Err("VIRTIO_F_VERSION_1 not offered — not a modern device")
+        );
+        // No ACCESS_PLATFORM: no IOMMU path — refuse.
+        assert_eq!(
+            negotiate_features(0, F1_VERSION_1),
+            Err("VIRTIO_F_ACCESS_PLATFORM not offered — no IOMMU path")
+        );
+    }
+
+    /// F7: used-ring completions are validated against the submission.
+    #[test]
+    fn used_ring_completions_are_validated() {
+        let buf: &'static mut [u64; 8] = Box::leak(Box::new([0u64; 8]));
+        let used = buf.as_ptr() as u64;
+        // entry 0: id 0, len 512 — the honest completion.
+        memops::write_u32(used + 4, 0);
+        memops::write_u32(used + 8, 512);
+        assert_eq!(validate_used(used, 0, 256, 0, 529), Ok((0, 512)));
+        // id beyond the queue.
+        memops::write_u32(used + 4, 300);
+        assert_eq!(
+            validate_used(used, 0, 256, 0, 529),
+            Err("completion id beyond the queue size")
+        );
+        // id is not the submitted head.
+        memops::write_u32(used + 4, 1);
+        assert_eq!(
+            validate_used(used, 0, 256, 0, 529),
+            Err("completion id is not the submitted head")
+        );
+        // length beyond the submitted buffer.
+        memops::write_u32(used + 4, 0);
+        memops::write_u32(used + 8, 4096);
+        assert_eq!(
+            validate_used(used, 0, 256, 0, 529),
+            Err("completion length beyond the submitted buffer")
+        );
+    }
+
+    /// F8 (review round 4): deterministic fuzz — random 256-byte
+    /// config images and random BARs never panic the parser or the
+    /// resolver, and every ACCEPTED result satisfies the bounds it
+    /// was checked against.
+    #[test]
+    fn fuzz_caps_and_resolve_never_panic_oks_are_bounded() {
+        let mut state = 0xABCD_1234_F00D_BEEFu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut parsed = 0u32;
+        let mut resolved = 0u32;
+        for _ in 0..4000 {
+            let mut c = FakeCfg::new();
+            for w in c.d.iter_mut() {
+                *w = next() as u32;
+            }
+            // Half the rounds PLANT four virtio caps with random
+            // unvalidated fields (next pointers, offsets, lengths,
+            // bars, multiplier) so the parser's accept/reject paths
+            // and the resolver's math are actually exercised; the
+            // other half is pure noise (must never panic either).
+            if next() & 1 == 1 {
+                let bar = (next() % 8) as u8; // includes illegal > 5
+                c.d[13] = 0x40;
+                let offs = [0x40u8, 0x60, 0x80, 0x90];
+                let types = [1u8, 2, 3, 4];
+                for i in 0..4 {
+                    let next_ptr = if i == 3 { 0u8 } else { offs[i + 1] };
+                    // Small, 4-aligned offsets and sane-ish lengths so
+                    // the ACCEPT path is exercised too; the wild
+                    // values still appear (bar > 5, multiplier band,
+                    // occasional overflow) from the moduli.
+                    let region_off = ((next() % 64) * 4) as u32;
+                    let region_len = (8 + next() % 64) as u32;
+                    let mult = if types[i] == 2 {
+                        Some((next() % 16) as u32)
+                    } else {
+                        None
+                    };
+                    c.cap(
+                        offs[i], next_ptr, types[i], bar, region_off, region_len, mult,
+                    );
+                }
+            } else if next() & 1 == 1 {
+                c.d[13] = (next() & 0xFF) as u32;
+            }
+            let caps = parse_virtio_caps(&mut |off| c.read(off)); // never panics
+            let Some(caps) = caps else { continue };
+            parsed += 1;
+            // Random BARs; half the rounds inside the MMIO window so
+            // the Ok path is exercised, half anywhere in PA space.
+            let in_window = next() & 1 == 1;
+            let base = if in_window {
+                0xC000_0000 + (next() % 0x1000) * 4096
+            } else {
+                next() & 0x000F_FFFF_FFFF_F000
+            };
+            let size = 1 + (next() % 0x2000);
+            let dev = test_dev(4, base, size);
+            if let Ok(r) = caps.resolve(&dev) {
+                resolved += 1;
+                // Every accepted region lies inside its BAR and the
+                // window, and meets its minimum.
+                assert!(r.common_pa >= base);
+                assert!(r.common_pa + u64::from(caps.common.length) <= base + size);
+                assert!(crate::arch::lapic::mmio_in_window(
+                    r.common_pa,
+                    u64::from(caps.common.length)
+                ));
+                assert!(caps.common.length >= 0x38);
+                assert!(caps.isr.length >= 1);
+                assert!(caps.device.length >= 8);
+                assert!(caps.notify.length >= 2);
+                assert!(r.notify_multiplier <= 8);
+                assert!(crate::arch::lapic::mmio_in_window(r.isr_pa, 1));
+                assert!(crate::arch::lapic::mmio_in_window(r.device_cfg_pa, 8));
+            }
+        }
+        // The fuzz must exercise BOTH outcomes, not just refusals.
+        assert!(parsed > 0, "at least some images parse");
+        assert!(
+            resolved > 0,
+            "at least some resolutions succeed (window rounds)"
+        );
     }
 
     #[test]

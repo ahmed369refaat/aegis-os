@@ -1170,19 +1170,40 @@ fn submit(q: &VblkQueue, data_pa: u64, sector: u64, req_type: u32) -> u16 {
 /// Bounded poll for the used ring to reach `want` (the avail index we
 /// published). None on timeout — the caller decides what that means
 /// (the enforcement probe WANTS the timeout or the error completion).
+/// F7 (review round 4): the used ring is device-written memory. Every
+/// completion is validated against the submission — the index may
+/// never run past what was submitted nor jump by more than the queue
+/// depth, and the completion's id/length must match the request.
 #[cfg(not(test))]
-fn poll_used(q: &VblkQueue, want: u16) -> Option<u32> {
+enum UsedOutcome {
+    Completed,
+    Timeout,
+    Poisoned(&'static str),
+}
+
+#[cfg(not(test))]
+fn poll_used(q: &VblkQueue, want: u16) -> UsedOutcome {
     use crate::virtio as v;
     let budget = 20_000_000u64; // bounded: ADR-0013's no-infinite-spin rule
     let mut spins = 0u64;
+    let entry_used = v::used_idx(q.used_pa); // F7: advance since entry
     loop {
         let used = v::used_idx(q.used_pa);
+        if used.wrapping_sub(entry_used) > q.qsize {
+            return UsedOutcome::Poisoned("used.idx advanced beyond the queue size");
+        }
+        if used > want {
+            return UsedOutcome::Poisoned("used.idx ran past the submission");
+        }
         if used == want {
-            let id = v::used_entry_id(q.used_pa, want.wrapping_sub(1) % q.qsize);
-            return Some(id);
+            let slot = want.wrapping_sub(1) % q.qsize;
+            return match v::validate_used(q.used_pa, slot, q.qsize, 0, 529) {
+                Ok(_) => UsedOutcome::Completed,
+                Err(why) => UsedOutcome::Poisoned(why),
+            };
         }
         if spins >= budget {
-            return None;
+            return UsedOutcome::Timeout;
         }
         spins += 1;
     }
@@ -1228,13 +1249,23 @@ fn virtio_step<const N: usize>(
     // Bus master on (the cluster fix — see pci::enable_bus_master):
     // the device's DMA must actually reach memory before any ring.
     crate::pci::enable_bus_master(dev);
-    let Some(mmio) = v::MmioVirtio::from_caps(&caps, dev) else {
-        line(
-            out,
-            &["[VBLK] register blocks unresolved against the BARs — refusing"],
-        );
-        return;
+    // F5: every device-supplied number is checked before it becomes
+    // an address the kernel touches.
+    let resolved = match caps.resolve(dev) {
+        Ok(r) => r,
+        Err(e) => {
+            line(
+                out,
+                &[
+                    "[VBLK] capability regions refused (",
+                    e.describe(),
+                    ") — refusing",
+                ],
+            );
+            return;
+        }
     };
+    let mmio = v::MmioVirtio::from_resolved(&resolved);
 
     // ── the modern handshake ──
     mmio.set_status(0);
@@ -1243,8 +1274,21 @@ fn virtio_step<const N: usize>(
     // Spec order: ACK|DRIVER first — QEMU errors on feature writes
     // before DRIVER — then negotiate, then FEATURES_OK.
     mmio.set_status(v::STATUS_ACK | v::STATUS_DRIVER);
-    mmio.set_driver_features(0, v::DRIVER_FEATURES_LOW);
-    mmio.set_driver_features(1, v::DRIVER_FEATURES_HIGH);
+    // F6: negotiate device & wanted — refuse devices without
+    // VERSION_1 (the layout this driver speaks) or ACCESS_PLATFORM
+    // (the IOMMU path the broker design assumes).
+    let negotiated = match v::negotiate_features(feat_low, feat_high) {
+        Ok(n) => n,
+        Err(why) => {
+            line(
+                out,
+                &["[VBLK] feature negotiation refused: ", why, " — refusing"],
+            );
+            return;
+        }
+    };
+    mmio.set_driver_features(0, negotiated.low);
+    mmio.set_driver_features(1, negotiated.high);
     mmio.set_status(v::STATUS_ACK | v::STATUS_DRIVER | v::STATUS_FEATURES_OK);
     if mmio.status() & v::STATUS_FEATURES_OK == 0 {
         line(out, &["[VBLK] FEATURES_OK not accepted — refusing"]);
@@ -1360,13 +1404,26 @@ fn virtio_step<const N: usize>(
 
     // ── read sector 0 (device WRITES the data page through the IOMMU) ──
     let want = submit(&queue, data_pa, 0, v::BLK_T_IN);
-    mmio.notify(0, notify_off);
-    if poll_used(&queue, want).is_none() {
+    if !mmio.notify(0, notify_off) {
         line(
             out,
-            &["[VBLK] read sector 0: DID NOT COMPLETE — refusing to continue"],
+            &["[VBLK] notify slot outside the notify region — refusing (F5)"],
         );
         return;
+    }
+    match poll_used(&queue, want) {
+        UsedOutcome::Timeout => {
+            line(
+                out,
+                &["[VBLK] read sector 0: DID NOT COMPLETE — refusing to continue"],
+            );
+            return;
+        }
+        UsedOutcome::Poisoned(why) => {
+            line(out, &["[VBLK] used-ring POISON: ", why, " — refusing"]);
+            return;
+        }
+        UsedOutcome::Completed => {}
     }
     let st = v::read_u8_pa(ctrl_pa + 512);
     let data0 = crate::memops::read_u64(data_pa);
@@ -1390,25 +1447,51 @@ fn virtio_step<const N: usize>(
     // ── write + read-back round trip (device READS the data page too) ──
     crate::memops::write_u64(data_pa, 0x0BAD_C0DE_0BAD_C0DE);
     let want = submit(&queue, data_pa, 0, v::BLK_T_OUT);
-    mmio.notify(0, notify_off);
-    if poll_used(&queue, want).is_none() {
+    if !mmio.notify(0, notify_off) {
         line(
             out,
-            &["[VBLK] write: DID NOT COMPLETE — refusing to continue"],
+            &["[VBLK] notify slot outside the notify region — refusing (F5)"],
         );
         return;
+    }
+    match poll_used(&queue, want) {
+        UsedOutcome::Timeout => {
+            line(
+                out,
+                &["[VBLK] write: DID NOT COMPLETE — refusing to continue"],
+            );
+            return;
+        }
+        UsedOutcome::Poisoned(why) => {
+            line(out, &["[VBLK] used-ring POISON: ", why, " — refusing"]);
+            return;
+        }
+        UsedOutcome::Completed => {}
     }
     // Scrub the page (the broker discipline: the device's copy dies
     // with the region), then read the sector back fresh.
     crate::memops::scrub_frame(data_pa);
     let want = submit(&queue, data_pa, 0, v::BLK_T_IN);
-    mmio.notify(0, notify_off);
-    if poll_used(&queue, want).is_none() {
+    if !mmio.notify(0, notify_off) {
         line(
             out,
-            &["[VBLK] read-back: DID NOT COMPLETE — refusing to continue"],
+            &["[VBLK] notify slot outside the notify region — refusing (F5)"],
         );
         return;
+    }
+    match poll_used(&queue, want) {
+        UsedOutcome::Timeout => {
+            line(
+                out,
+                &["[VBLK] read-back: DID NOT COMPLETE — refusing to continue"],
+            );
+            return;
+        }
+        UsedOutcome::Poisoned(why) => {
+            line(out, &["[VBLK] used-ring POISON: ", why, " — refusing"]);
+            return;
+        }
+        UsedOutcome::Completed => {}
     }
     let back = crate::memops::read_u64(data_pa);
     if back == 0x0BAD_C0DE_0BAD_C0DE {
@@ -1452,7 +1535,15 @@ fn virtio_step<const N: usize>(
         None => false, // no SLPT root: the proof cannot even be attempted
     };
     let want = submit(&queue, data_pa, 0, v::BLK_T_IN); // the dead page
-    mmio.notify(0, notify_off);
+    if !mmio.notify(0, notify_off) {
+        // No request reached the device — the probe can claim
+        // nothing (the IOMMU was never asked).
+        line(
+            out,
+            &["[VBLK] enforcement: notify refused (outside the notify region) — INVESTIGATE (F5)"],
+        );
+        return;
+    }
     let completed = poll_used(&queue, want);
     let fsts = broker.prot().fsts();
     let ppf = fsts & crate::arch::vtd::FSTS_PPF != 0;
@@ -1473,13 +1564,13 @@ fn virtio_step<const N: usize>(
         ],
     );
     match (completed, ppf) {
-        (None, true) => {
+        (UsedOutcome::Timeout, true) => {
             line(
                 out,
                 &["[VBLK] enforcement: PPF=yes — the request to the unmapped page did NOT complete; the IOMMU faulted the access (ADR-0013 D1/D6 proven)"],
             );
         }
-        (Some(_), true) => {
+        (UsedOutcome::Completed, true) => {
             let st = v::read_u8_pa(ctrl_pa + 512);
             let mut ns = [0u8; 20];
             line(
@@ -1490,6 +1581,12 @@ fn virtio_step<const N: usize>(
                     ")",
                 ],
             );
+        }
+        (UsedOutcome::Poisoned(why), _) => {
+            // The device wrote a hostile completion against an
+            // unmapped page: report the poison, the PPF line above
+            // still carries the IOMMU's own verdict.
+            line(out, &["[VBLK] enforcement: used-ring POISON: ", why]);
         }
         (_, false) => {
             // The device reached (or stalled on) a page the broker
@@ -1618,16 +1715,39 @@ fn net_step<const N: usize>(
     // Bus master on (the cluster fix — see pci::enable_bus_master):
     // the device's DMA must actually reach memory before any ring.
     crate::pci::enable_bus_master(dev);
-    let Some(mmio) = v::MmioVirtio::from_caps(&caps, dev) else {
-        line(out, &["[VNET] register blocks unresolved — refusing"]);
-        return;
+    let resolved = match caps.resolve(dev) {
+        Ok(r) => r,
+        Err(e) => {
+            line(
+                out,
+                &[
+                    "[VNET] capability regions refused (",
+                    e.describe(),
+                    ") — refusing",
+                ],
+            );
+            return;
+        }
     };
+    let mmio = v::MmioVirtio::from_resolved(&resolved);
 
     // ── the modern handshake (identical discipline to virtio-blk) ──
     mmio.set_status(0);
+    let feat_low = mmio.device_features(0);
+    let feat_high = mmio.device_features(1);
     mmio.set_status(v::STATUS_ACK | v::STATUS_DRIVER);
-    mmio.set_driver_features(0, v::DRIVER_FEATURES_LOW);
-    mmio.set_driver_features(1, v::DRIVER_FEATURES_HIGH);
+    let negotiated = match v::negotiate_features(feat_low, feat_high) {
+        Ok(n) => n,
+        Err(why) => {
+            line(
+                out,
+                &["[VNET] feature negotiation refused: ", why, " — refusing"],
+            );
+            return;
+        }
+    };
+    mmio.set_driver_features(0, negotiated.low);
+    mmio.set_driver_features(1, negotiated.high);
     mmio.set_status(v::STATUS_ACK | v::STATUS_DRIVER | v::STATUS_FEATURES_OK);
     if mmio.status() & v::STATUS_FEATURES_OK == 0 {
         line(out, &["[VNET] FEATURES_OK not accepted — refusing"]);
@@ -1636,14 +1756,15 @@ fn net_step<const N: usize>(
 
     // ── device config: MAC (offset 0, 6 bytes) and status (+6) ──
     let cfg = mmio.device_cfg_pa();
-    let mac64 = crate::memops::read_u64(cfg);
+    // F5: byte reads — the device-cfg offset is 4-aligned, a u64
+    // read there could be 4-but-not-8 aligned and fault.
     let mac = [
-        (mac64 & 0xFF) as u8,
-        ((mac64 >> 8) & 0xFF) as u8,
-        ((mac64 >> 16) & 0xFF) as u8,
-        ((mac64 >> 24) & 0xFF) as u8,
-        ((mac64 >> 32) & 0xFF) as u8,
-        ((mac64 >> 40) & 0xFF) as u8,
+        v::read_u8_pa(cfg),
+        v::read_u8_pa(cfg + 1),
+        v::read_u8_pa(cfg + 2),
+        v::read_u8_pa(cfg + 3),
+        v::read_u8_pa(cfg + 4),
+        v::read_u8_pa(cfg + 5),
     ];
     let nstatus = v::read_u16_pa(cfg + 6);
     let link_up = nstatus & 1 != 0;
@@ -1801,7 +1922,13 @@ fn net_step<const N: usize>(
     v::write_net_header(rx_buf);
     v::write_desc(rx_desc, rx_buf, v::NET_HDR_LEN + 1514, v::DESC_F_WRITE, 0);
     net_publish(&rxq, 0);
-    mmio.notify(0, n0);
+    if !mmio.notify(0, n0) {
+        line(
+            out,
+            &["[VNET] notify slot outside the notify region — refusing (F5)"],
+        );
+        return;
+    }
 
     // ── build the DHCP DISCOVER at tx_buf + NET_HDR_LEN ──
     let p = tx_buf + u64::from(v::NET_HDR_LEN);
@@ -1871,16 +1998,44 @@ fn net_step<const N: usize>(
     v::write_net_header(tx_buf);
     v::write_desc(tx_desc, tx_buf, v::NET_HDR_LEN + 290, 0, 0);
     let want_tx = net_publish(&txq, 0);
-    mmio.notify(1, n1);
+    if !mmio.notify(1, n1) {
+        line(
+            out,
+            &["[VNET] notify slot outside the notify region — refusing (F5)"],
+        );
+        return;
+    }
     let mut spins = 0u64;
     while crate::virtio::used_idx(tx_used) != want_tx && spins < 20_000_000 {
+        // F7: the device may not run the used index past the one
+        // request we submitted.
+        if crate::virtio::used_idx(tx_used) > want_tx {
+            line(
+                out,
+                &["[VNET] used-ring POISON: used.idx ran past the submission"],
+            );
+            return;
+        }
         spins += 1;
     }
     // Re-kick once (QEMU's TX bottom-half re-enables notifications
     // when it finds the queue; a second kick re-triggers it).
     if crate::virtio::used_idx(tx_used) != want_tx {
-        mmio.notify(1, n1);
+        if !mmio.notify(1, n1) {
+            line(
+                out,
+                &["[VNET] notify slot outside the notify region — refusing (F5)"],
+            );
+            return;
+        }
         while crate::virtio::used_idx(tx_used) != want_tx && spins < 50_000_000 {
+            if crate::virtio::used_idx(tx_used) > want_tx {
+                line(
+                    out,
+                    &["[VNET] used-ring POISON: used.idx ran past the submission"],
+                );
+                return;
+            }
             spins += 1;
         }
     }

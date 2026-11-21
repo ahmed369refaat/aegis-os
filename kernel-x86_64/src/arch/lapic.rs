@@ -92,6 +92,17 @@ pub const PERIODIC_FALLBACK_COUNT: u32 = 500_000;
 /// PTE bits for the LAPIC window: present, writable, 1 GiB page size
 /// (bit 7), global, no-execute — kernel-only MMIO, same discipline as
 /// the direct map (ADR-0002: RW, never X).
+/// F5/F12 (review round 4): is `[pa, pa+len)` inside the pre-mapped
+/// MMIO window (the 4th GiB, PA 0xC000_0000..0x1_0000_0000)? Every
+/// device- or firmware-named physical address is checked against this
+/// BEFORE any memops access — a wrong address must refuse, not fault.
+#[must_use]
+pub fn mmio_in_window(pa: u64, len: u64) -> bool {
+    const BASE: u64 = 0xC000_0000;
+    const END: u64 = 0x1_0000_0000;
+    pa >= BASE && pa.checked_add(len).is_some_and(|e| e <= END)
+}
+
 pub const WINDOW_PTE: u64 =
     0xC000_0000 | pte::PTE_P | pte::PTE_W | PTE_PS | pte::PTE_G | pte::PTE_NX;
 /// Page-size bit 7: this PDPT entry maps a 1 GiB page (PA base

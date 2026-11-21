@@ -460,9 +460,17 @@ pub fn has_virtio_cap(dev: &PciDev) -> bool {
     dev.cap_ids[..dev.cap_count].contains(&0x09)
 }
 
-/// The physical base of memory BAR number `slot` (virtio capabilities
-/// name their register blocks this way). None for absent/IO BARs.
+/// The resolved memory BAR for `slot` (F5: resolve needs the SIZE,
+/// not just the base — offset+length is checked against it). None
+/// for absent/IO BARs.
 #[must_use]
+pub fn mem_bar(dev: &PciDev, slot: u8) -> Option<&Bar> {
+    dev.bars[..dev.bar_count]
+        .iter()
+        .flatten()
+        .find(|b| b.slot == slot && b.kind != BarKind::Io)
+}
+
 pub fn mem_bar_base(dev: &PciDev, slot: u8) -> Option<u64> {
     dev.bars[..dev.bar_count]
         .iter()
