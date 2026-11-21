@@ -144,7 +144,23 @@ pub(crate) fn revoke_or_quarantine<const N: usize, P: DmaProt>(
 }
 
 /// The broker's own region budget is 16; no driver may hold more.
+/// The proof, per driver (round 5, Phase D): vblk 5, vnet 8, e1k 4,
+/// nvme 6, ahci 4, xhci 2 + 4 — the largest set (vnet, 8) fits with
+/// the broker's region budget to spare. Exceeding THIS cap is a loud,
+/// typed refusal (`FrameError::Budget`), not a silent "pool
+/// exhausted" — a driver that grows past it gets a marker naming the
+/// budget, and the session still closes with everything conserved.
 pub(crate) const MAX_SESSION_FRAMES: usize = 16;
+
+/// Why `frame()` refused — the driver's marker names the real cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameError {
+    /// The pool is exhausted (a machine-size verdict, not a bug).
+    Pool,
+    /// This session holds MAX_SESSION_FRAMES already — the driver's
+    /// frame set grew past the proven budget (a driver bug).
+    Budget,
+}
 
 /// ADR-0018: the kernel-side IOMMU domain-id allocator. Domain 0 is
 /// the kernel's own (the ADR-0013 hardware proof, the broker demo) —
@@ -209,6 +225,8 @@ pub(crate) struct DriverSession<'a, const N: usize, P: DmaProt> {
     identity_marker: &'static str,
     frames: [u64; MAX_SESSION_FRAMES],
     nframes: usize,
+    /// The last frame refusal's cause (so `close` can name it).
+    last_frame_error: Option<FrameError>,
     closed: bool,
 }
 
@@ -239,6 +257,7 @@ impl<'a, const N: usize, P: DmaProt> DriverSession<'a, N, P> {
             identity_marker,
             frames: [0; MAX_SESSION_FRAMES],
             nframes: 0,
+            last_frame_error: None,
             closed: false,
         }
     }
@@ -246,14 +265,22 @@ impl<'a, const N: usize, P: DmaProt> DriverSession<'a, N, P> {
     /// Allocate one pool frame and record it. `None` = the pool
     /// refused; everything acquired so far is still owned by the
     /// session (the caller returns; `Drop` closes).
-    pub(crate) fn frame(&mut self) -> Option<u64> {
+    pub(crate) fn frame(&mut self) -> Result<u64, FrameError> {
         if self.nframes == MAX_SESSION_FRAMES {
-            return None;
+            self.last_frame_error = Some(FrameError::Budget);
+            return Err(FrameError::Budget);
         }
-        let pa = self.pool.alloc_for(&mut self.k.frames, self.owner).ok()?;
-        self.frames[self.nframes] = pa;
-        self.nframes += 1;
-        Some(pa)
+        match self.pool.alloc_for(&mut self.k.frames, self.owner) {
+            Ok(pa) => {
+                self.frames[self.nframes] = pa;
+                self.nframes += 1;
+                Ok(pa)
+            }
+            Err(_) => {
+                self.last_frame_error = Some(FrameError::Pool);
+                Err(FrameError::Pool)
+            }
+        }
     }
 
     /// Broker-map one acquired frame (Bidirectional, one page — every
@@ -333,6 +360,14 @@ impl<'a, const N: usize, P: DmaProt> DriverSession<'a, N, P> {
 
     /// The ONE explicit exit. Prints the lane markers verbatim.
     pub(crate) fn close(&mut self, out: &mut dyn FnMut(&str)) {
+        if let Some(FrameError::Budget) = self.last_frame_error {
+            line(
+                out,
+                &[
+                    "[SESSION] BUDGET EXCEEDED: the driver asked for more than MAX_SESSION_FRAMES (16) — the frame set grew past the proven budget (ADR-0016/F10); refusing and closing",
+                ],
+            );
+        }
         if self.identity {
             line(out, &[self.identity_marker]);
         }
@@ -580,5 +615,62 @@ mod tests {
         assert!(!d.release(0), "the kernel domain is never releasable");
         assert!(!d.release(99), "out of range refused");
         assert_eq!(d.alloc(), Some(drawn[0]));
+    }
+
+    /// ADR-0016/F10, Phase D: a driver that outgrows the proven
+    /// MAX_SESSION_FRAMES gets a LOUD typed refusal (not a silent
+    /// "pool exhausted"), and the session still closes with every
+    /// frame conserved.
+    #[test]
+    fn frame_budget_exceeded_is_loud_and_conserving() {
+        // A dedicated, larger FakePhys: the full 16-frame set needs
+        // 64 KiB of host-"physical" backing — world()'s 9-frame
+        // buffer would run off the end and corrupt the host heap.
+        let mem = vec![0u64; 4096 * 3];
+        let base = (mem.as_ptr() as u64 + 4095) & !4095u64;
+        let phys = crate::drvstack::testharness::FakePhys { mem, base };
+        let mut pool = FramePool::<256>::new(phys.base, crate::memops::scrub_frame);
+        let broker = aegis_os::dma::DmaBroker::new(
+            crate::drvstack::testharness::FakeProt {
+                live: Vec::new(),
+                budget: 64,
+            },
+            aegis_os::dma::DmaQuotas {
+                max_regions: 64,
+                max_bytes: 1024 * 1024,
+            },
+        );
+        let mut k = aegis_os::Kernel::<256>::new_over_arena();
+        let mut broker = broker;
+        let mut sink: Vec<String> = Vec::new();
+        {
+            let mut session = DriverSession::new(
+                &mut k,
+                &mut pool,
+                &mut broker,
+                None,
+                TEST_OWNER,
+                1,
+                false,
+                "[T] teardown",
+                "",
+            );
+            for i in 0..MAX_SESSION_FRAMES {
+                assert!(session.frame().is_ok(), "frame {i} fits the budget");
+            }
+            // the 17th: typed Budget, everything so far still owned.
+            assert_eq!(session.frame(), Err(FrameError::Budget));
+            session.close(&mut |s: &str| sink.push(String::from(s)));
+        }
+        let joined = sink.concat();
+        assert!(
+            joined.contains("BUDGET EXCEEDED"),
+            "the budget violation must be loud, got: {joined}"
+        );
+        // nothing stranded: all 16 frames home, no region left.
+        assert_eq!(k.frames.frames_in_use(), 0);
+        assert!(pool.is_clear());
+        assert_eq!(broker.live_regions(0), 0);
+        drop(phys);
     }
 }

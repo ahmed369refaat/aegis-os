@@ -180,8 +180,8 @@ pub(crate) fn ahci_step<const N: usize>(
     let mut frames = [0u64; 4];
     for slot in frames.iter_mut() {
         match session.frame() {
-            Some(pa) => *slot = pa,
-            None => {
+            Ok(pa) => *slot = pa,
+            Err(_) => {
                 line(out, &["[AHCI] pool exhausted — refusing"]);
                 return;
             }

@@ -208,8 +208,8 @@ pub(crate) fn nvme_step<const N: usize>(
     let mut frames = [0u64; 6];
     for slot in frames.iter_mut() {
         match session.frame() {
-            Some(pa) => *slot = pa,
-            None => {
+            Ok(pa) => *slot = pa,
+            Err(_) => {
                 line(out, &["[NVME] pool exhausted — refusing"]);
                 return;
             }

@@ -4,6 +4,28 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Changed — review round 5, Phase D: leftovers made loud
+
+- **MAX_SESSION_FRAMES is proven, and outgrowing it is LOUD**: the
+  per-driver frame sets are enumerated in the constant's doc (vblk 5,
+  vnet 8, e1k 4, nvme 6, ahci 4, xhci 2+4 — largest is 8 of 16);
+  `DriverSession::frame()` now returns a typed `FrameError::{Pool,
+  Budget}` instead of a bare Option, and a budget violation prints
+  "[SESSION] BUDGET EXCEEDED..." at close — never again a silent
+  "pool exhausted" for a driver bug. Host test
+  `frame_budget_exceeded_is_loud_and_conserving` pins it (16 frames
+  in, the 17th refused, everything conserved). Writing that test
+  caught a REAL harness hazard: world()'s 9-frame FakePhys buffer
+  corrupts the host heap when a test allocates past it — the budget
+  test uses a dedicated 192 KiB backing (documented in the test).
+- **Bridge topology**: already a loud refusal (the "[PCI ] bridge at
+  this slot — devices behind it are NOT driven (isolation boundary,
+  F9)" marker) with the claim gate host-tested (ClaimError::
+  BridgeClass/NotEndpoint, pci.rs's fake-config tests); the bus-0-only
+  limitation stays documented in the module header and the checklist
+  row. No code change needed — verified, not reimplemented.
+- Test counts regenerated (497 -> 498).
+
 ### Changed — review round 5, Phase C: history, secrets and repo guards (NO history changes)
 
 - **`scripts/check-history-clean.sh`**: scans every blob reachable
