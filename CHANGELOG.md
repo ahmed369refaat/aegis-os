@@ -4,6 +4,39 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Changed — review round 6, part 2 ("H"): the watchdogs, AMD-Vi's IVRS, and two more virtio devices
+
+- **The watchdogs** (`drvstack/wdt.rs`, register maps pinned against
+  QEMU's ich9_tco.h / ich9.h / wdt_i6300esb.c): **iTCO_wdt** — the
+  ICH9 LPC's TCO block probed through PMBASE (config 0x40, bits
+  15:7), its registers read live, and the timer reprogrammed with a
+  read-back proof — but ONLY after the chipset's NO_REBOOT gate (GCS
+  bit 5, read through the RCBA) says a timeout is inert (QEMU's
+  default; a clear gate refuses to reprogram, CI-safety stated).
+  **i6300esb** — the unlock×3 / max-preload / ping sequence on the
+  write-only MMIO registers, with reboot-on-timeout masked in config.
+  New `hw::inw` (the 16-bit I/O read TCO needs); unsafe ratchet
+  99 → 100.
+- **AMD-Vi's IVRS parsed** (`src/ivrs.rs`, policy core, layouts
+  pinned against Linux's actbl2.h): IVHD blocks (the IOMMU MMIO
+  bases, ids, flags) and the device-entry topology (selects, ranges,
+  aliases, specials — including the 8-byte types whose values EMBED
+  their length bits, a trap the tests pin), IVMD unity-map blocks
+  counted. Typed hostile refusals. The boot probe prints the honest
+  absence on QEMU (no AMD-Vi emulation); the register-engine slice
+  follows on real AMD machines.
+- **virtio-console** (`drvstack/vcon.rs`, 0x1043): port 0's transmit
+  queue driven — the [port-id header + payload] chain sent through
+  the broker, completion validated, and the HOST half of the round
+  trip asserted by the lane (the chardev file must contain the proof
+  string; the guest marker alone is not the claim).
+- **virtio-balloon** (`drvstack/vballoon.rs`, 0x1045): a REAL
+  one-page cycle — a fresh pool frame offered on the inflate queue,
+  the config's `actual` watched advancing to the checked target, the
+  SAME page deflated home, the frame returned to the pool. The stats
+  vq is not negotiated (stated scope).
+
+
 ### Changed — review round 6 ("G"): the interrupt chain, multi-bus PCI, and the platform slice (ADR-0019 + ADR-0020)
 
 - **The interrupt broker (ADR-0019)** — `kernel-x86_64/src/irq.rs`:
