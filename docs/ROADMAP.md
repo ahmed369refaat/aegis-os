@@ -46,14 +46,14 @@ stays) · POSIX ABI → Stage 5 · drivers → Stage 6 · hardening
 capability generations, ten-check memory policy, in-memory VFS + Unix DAC
 + chroot, pipes, signals, fd tables, CFS, buddy allocator, rate-limited
 brokered sockets, capability-endpoint async IPC, behavior monitor with
-graduated response) — 319 lib tests; a bootable two-stage x86_64 kernel
+graduated response) — 326 lib tests; a bootable two-stage x86_64 kernel
 (ELF32 multiboot stub → ELF64 kernel) with a real 4096-frame pool,
 scrub-on-free verified by read-back, per-domain page tables, SMEP/SMAP,
 kernel-image W^X, SYSCALL/SYSRET ring-3 entry, and the seven-run ring-3
-sequence asserted by the CI boot test — 249 kernel host tests; 568 total,
+sequence asserted by the CI boot test — 253 kernel host tests; 579 total,
 zero external dependencies, unsafe confined to the allowlist (arch/,
 boot/, hw.rs, memops.rs, sched/ — as defined in scripts/check_unsafe.sh,
-ratcheted at 78).
+ratcheted at 100).
 
 **Round 6 ("G", ADR-0019/0020):** the interrupt chain is live —
 the broker-owned device vectors (49..=112), the IOAPIC line path
@@ -64,6 +64,54 @@ VT-d interrupt remapping through broker-owned IRTEs (the
 power-off/reboot, HPET-calibrated TSC, live entropy sources
 (RDRAND/RDSEED + virtio-rng), MONITOR/MWAIT idle, and GPT partition
 parsing under the ext2 mount.
+
+**Round 7 ("I"):** the EFI System Partition mounts — read-only
+FAT32 (checklist item 16, the roadmap's sanctioned "later if
+wanted"), with the policy core owning every bound: BPB validation
+with the spec's own type determination (< 65525 clusters = refused
+as `NotFat32`), the cluster-chain walk and its structural
+termination proof (a loop-back re-reads a bounded cluster and still
+ends; short chains and volume-long files refuse), 8.3 dirents with
+hostile-refusal semantics — 7 host tests + a 2000-image fuzz.
+`mkfat32.py` grows the ext2 disk with an honest 65600-cluster ESP as
+GPT partition 2; the transport rides the LIVE AHCI port and reads
+HELLO.ESP head-to-tail across three clusters on BOTH lanes. En
+route, the hidden lane debt of rounds 6–H was paid: the CPUID RBX
+destruction (the "bulletproof" push/store/pop pattern destroyed the
+caller's callee-saved RBX — allocation luck decided when a release
+build faulted on it; `xchg` restores the register while extracting
+the word), the ECAM seam's missing third-GiB direct-map mapping (the
+first q35 config read #PF'd — `mm::map_gib_windows` fixes it, span
+math host-tested), the unclaimed-virtio DMA failure (rng/console/
+balloon drove with dom 0; an unclaimed device's DMA fails closed at
+the IOMMU — every completion timed out while claimed vblk/vnet
+beside them completed; the three now walk the claim gate), the `..=`
+GPT marker mismatch that kept every lane red since round 6 (and hid
+all of it), the G/H fmt debt (1407 lines), and the q35/IR lane
+timeouts (240s→600s: the M2 syscall audit alone emits ~390k lines
+before the driver stack starts).
+
+**The storage-modernization path (recorded here per the
+scope-explosion rule; nothing below is claimed until its lane
+proves it):** the block stack's stated direction is parity with the
+modern Linux storage stack, one honest slice at a time —
+(1) **ext4 read-only with extents** (the Linux default filesystem;
+the extent-tree parser joins `aegis_os::ext2` in the policy core,
+same fuzz discipline, rides the same AHCI port);
+(2) **NVMe I/O queues live** (the admin qpair is proven; the prp1
+anomaly — commands complete but identify lands at PA 0 — is the
+documented open item; fixing it unlocks the modern multi-queue
+interface the kernel already speaks at the admin level);
+(3) **TRIM/DEALLOC** (DSM on SATA, DEALLOCATE on NVMe, DISCARD on
+virtio-blk — the freed-page discipline the allocator's
+scrub-on-free already enforces in DRAM, extended to the medium);
+(4) **an async block interface** (submission/completion rings in
+the driver-domain style of ADR-0004 — the io_uring-class model,
+adapted to the capability-gated IPC the kernel already runs);
+(5) **xHCI enumeration** (Enable Slot → Address Device → the
+device descriptor, on the TRB machinery that is already proven).
+Each slice lands only with its host tests, its lane marker, and its
+honest-absence line on machines without the device.
 
 **Not present at all (each gets its stage below):** timer interrupts and
 preemption, SMP, demand paging/COW, the ELF loader, the full ring-3
