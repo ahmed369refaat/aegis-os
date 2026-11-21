@@ -161,7 +161,9 @@ fn read_rsdp(pa: u64, buf: &mut [u8]) -> Result<Rsdp, DmarError> {
 }
 
 /// Read a description table at `pa` into `buf` (header first for the
-/// declared length, then the whole table). Returns the table length.
+/// declared length, then the whole table). The ACPI checksum over the
+/// declared length must sum to zero — a bit-flipped table is a
+/// refusal, not a parsed table. Returns the table length.
 fn read_table(pa: u64, buf: &mut [u8]) -> Result<usize, DmarError> {
     read_bytes(pa, &mut buf[..36]);
     let length = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -169,7 +171,42 @@ fn read_table(pa: u64, buf: &mut [u8]) -> Result<usize, DmarError> {
         return Err(DmarError::BadLength(length));
     }
     read_bytes(pa, &mut buf[..length as usize]);
+    if !checksum_ok(&buf[..length as usize]) {
+        return Err(DmarError::BadChecksum);
+    }
     Ok(length as usize)
+}
+
+/// The ACPI checksum rule: every byte of the table, from the
+/// signature to the last byte of the declared length, sums to zero
+/// (mod 256). Pure — host-tested directly and through both callers.
+pub fn checksum_ok(bytes: &[u8]) -> bool {
+    bytes.iter().fold(0u8, |a, b| a.wrapping_add(*b)) == 0
+}
+
+/// F12: the directory-walk validation gate. Before the HPET/MADT/
+/// MCFG walks trust a table pointer they found in the RSDT/XSDT,
+/// verify the signature, the declared length (36..=scratch), and the
+/// checksum — a hostile or corrupted table is a refusal (`None`),
+/// never a parsed one. Returns the validated length.
+pub fn table_ok(pa: u64, want_sig: &[u8; 4], scratch: &mut [u8]) -> Option<u32> {
+    if scratch.len() < 36 {
+        return None;
+    }
+    read_bytes(pa, &mut scratch[..36]);
+    if &scratch[..4] != want_sig {
+        return None;
+    }
+    let length = u32::from_le_bytes([scratch[4], scratch[5], scratch[6], scratch[7]]);
+    if (length as usize) < 36 || (length as usize) > scratch.len() {
+        return None;
+    }
+    let len = length as usize;
+    read_bytes(pa, &mut scratch[..len]);
+    if !checksum_ok(&scratch[..len]) {
+        return None;
+    }
+    Some(length)
 }
 
 /// The full walk, parameterized over the two scan windows so the host
@@ -668,5 +705,92 @@ mod tests {
             read_table(pa, &mut buf),
             Err(DmarError::BadLength(8192))
         ));
+    }
+
+    // ── F12: the firmware-table validation gate ──
+
+    #[test]
+    fn checksum_ok_sums_to_zero() {
+        assert!(checksum_ok(&[]));
+        assert!(checksum_ok(&[0x41, 0x42, 0x43, 0x44, 0xF6])); // 0x10A + 0xF6 -> 0 (mod 256)
+        assert!(!checksum_ok(&[1]));
+        assert!(!checksum_ok(&[0x41, 0x42, 0x43, 0x44, 0xF7])); // one off
+                                                                // wrapping: 0xFF + 0x01 = 0 (mod 256)
+        assert!(checksum_ok(&[0xFF, 0x01]));
+    }
+
+    #[test]
+    fn table_ok_accepts_a_valid_table() {
+        let mut img = Image::new(0x1000);
+        let off = 0x100;
+        img.put(off, &build_dmar());
+        let mut scratch = [0u8; 1024];
+        assert_eq!(table_ok(img.pa(off), b"DMAR", &mut scratch), Some(48 + 32));
+    }
+
+    #[test]
+    fn table_ok_refuses_broken_checksum() {
+        let mut img = Image::new(0x1000);
+        let off = 0x100;
+        let mut dmar = build_dmar();
+        dmar[20] ^= 0x40; // corrupt OEMID — checksum no longer sums to 0
+        img.put(off, &dmar);
+        let mut scratch = [0u8; 1024];
+        assert_eq!(table_ok(img.pa(off), b"DMAR", &mut scratch), None);
+    }
+
+    #[test]
+    fn table_ok_refuses_wrong_signature() {
+        let mut img = Image::new(0x1000);
+        let off = 0x100;
+        img.put(off, &build_dmar());
+        let mut scratch = [0u8; 1024];
+        assert_eq!(table_ok(img.pa(off), b"HPET", &mut scratch), None);
+    }
+
+    #[test]
+    fn table_ok_refuses_hostile_lengths() {
+        let mut img = Image::new(0x1000);
+        let off = 0x100;
+        for bad in [0u32, 35, 1025, u32::MAX] {
+            let mut dmar = build_dmar();
+            dmar[4..8].copy_from_slice(&bad.to_le_bytes());
+            // keep the whole-table checksum honest so ONLY the length
+            // is under test
+            let sum: u8 = dmar.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+            dmar[9] = dmar[9].wrapping_sub(sum);
+            img.put(off, &dmar);
+            let mut scratch = [0u8; 1024];
+            assert_eq!(
+                table_ok(img.pa(off), b"DMAR", &mut scratch),
+                None,
+                "len={bad}"
+            );
+        }
+        // the minimum legal table (exactly the 36-byte header, honest
+        // checksum) is accepted with its length.
+        img.put(off, &build_dir(b"DMAR", &[]));
+        let mut scratch = [0u8; 1024];
+        assert_eq!(table_ok(img.pa(off), b"DMAR", &mut scratch), Some(36));
+    }
+
+    #[test]
+    fn read_table_rejects_checksum_corruption() {
+        // RED on the pre-F12 code: the DMAR path accepted any table
+        // whose declared length fit the scratch — a bit-flipped table
+        // was a parsed table.
+        let mut img = Image::new(0x1000);
+        let off = 0x100;
+        let mut dmar = build_dmar();
+        dmar[24] ^= 0x80; // corrupt a reserved byte
+        img.put(off, &dmar);
+        let mut buf = [0u8; dmar::MAX_TABLE_BYTES];
+        assert!(matches!(
+            read_table(img.pa(off), &mut buf),
+            Err(DmarError::BadChecksum)
+        ));
+        // and the uncorrupted table still reads.
+        img.put(off, &build_dmar());
+        assert!(read_table(img.pa(off), &mut buf).is_ok());
     }
 }

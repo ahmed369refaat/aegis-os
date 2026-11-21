@@ -5,16 +5,24 @@ use crate::strutil::line;
 
 #[cfg(not(test))]
 pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) {
-    // Directory header: sig[4] + len u32 at +4.
-    let mut hdr = [0u8; 8];
-    crate::arch::acpi::read_bytes(dir_pa, &mut hdr);
-    let len = u32::from(hdr[4])
-        | (u32::from(hdr[5]) << 8)
-        | (u32::from(hdr[6]) << 16)
-        | (u32::from(hdr[7]) << 24);
-    let xsdt = &hdr[..4] == b"XSDT";
+    // F12: the directory itself must earn trust before its entry
+    // pointers are read — signature, length, checksum.
+    let mut scratch = [0u8; 1024];
+    let dir_sig: &[u8; 4] = if crate::arch::acpi::read_byte(dir_pa) == b'X' {
+        b"XSDT"
+    } else {
+        b"RSDT"
+    };
+    let Some(dir_len) = crate::arch::acpi::table_ok(dir_pa, dir_sig, &mut scratch) else {
+        line(
+            out,
+            &["[ACPI] directory table failed validation (sig/length/checksum) — refusing the walk"],
+        );
+        return;
+    };
+    let xsdt = dir_sig == b"XSDT";
     let stride: u64 = if xsdt { 8 } else { 4 };
-    let n = ((len as u64).saturating_sub(36)) / stride;
+    let n = ((dir_len as u64).saturating_sub(36)) / stride;
     let mut hpet_pa: u64 = 0;
     let mut madt_pa: u64 = 0;
     let mut mcfg_pa: u64 = 0;
@@ -51,14 +59,19 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) {
         ],
     );
 
-    // MADT: count LAPIC/IOAPIC entries.
+    // MADT: count LAPIC/IOAPIC entries. F12: validated first — a
+    // corrupted MADT is a refusal, not a walk.
+    let mut mlen = 0u32;
     if madt_pa != 0 {
-        let mut mb = [0u8; 44];
-        crate::arch::acpi::read_bytes(madt_pa, &mut mb);
-        let mlen = u32::from(mb[4])
-            | (u32::from(mb[5]) << 8)
-            | (u32::from(mb[6]) << 16)
-            | (u32::from(mb[7]) << 24);
+        match crate::arch::acpi::table_ok(madt_pa, b"APIC", &mut scratch) {
+            Some(len) => mlen = len,
+            None => {
+                line(out, &["[MADT] table failed validation — refusing"]);
+                madt_pa = 0;
+            }
+        }
+    }
+    if madt_pa != 0 {
         let mut lapic = 0u64;
         let mut ioapic = 0u64;
         let mut ioapic_addr: u64 = 0;
@@ -97,7 +110,11 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) {
         );
     }
 
-    // MCFG: the ECAM window.
+    // MCFG: the ECAM window. F12: validated first.
+    if mcfg_pa != 0 && crate::arch::acpi::table_ok(mcfg_pa, b"MCFG", &mut scratch).is_none() {
+        line(out, &["[MCFG] table failed validation — refusing"]);
+        mcfg_pa = 0;
+    }
     if mcfg_pa != 0 {
         let base = crate::memops::read_u64(mcfg_pa + 44);
         let seg = crate::memops::read_u16(mcfg_pa + 52);
@@ -123,6 +140,12 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) {
     }
 
     // HPET: table +44 = the block's base address (space at +40).
+    // HPET. F12: validated first — the block pointer at +44 is only
+    // read from a table that passed sig/length/checksum.
+    if hpet_pa != 0 && crate::arch::acpi::table_ok(hpet_pa, b"HPET", &mut scratch).is_none() {
+        line(out, &["[HPET] table failed validation — skipping"]);
+        hpet_pa = 0;
+    }
     if hpet_pa != 0 {
         let space = crate::arch::acpi::read_byte(hpet_pa + 40);
         let block = crate::memops::read_u64(hpet_pa + 44);
