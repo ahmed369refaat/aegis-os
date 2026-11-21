@@ -4,6 +4,24 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Changed — driver-stack review round 4, Phase 4-A (ADR-0016): the module split
+
+- `kernel-x86_64/src/drvstack.rs` (4,389 lines, twelve subsystems
+  accreted across ADR-0013/0014/0015 and F4–F9) is now
+  `src/drvstack/` — one module per subsystem (`vtd`, `broker`, `pci`,
+  `vblk`, `vnet`, `netutil`, `e1k`, `nvme`, `ahci`, `xhci`, `acpi`,
+  `ext2`, `legacy`) with `mod.rs` keeping the shared teardown
+  discipline, the pool-owner tags, and the step sequencing. A **pure
+  move**: signatures, boot markers, and lane greps stay
+  byte-identical — all three boot lanes PASS on the split alone (the
+  pc lane's M1 exit criteria, the q35 lane's VT-d trace assertions +
+  7/7 screen check, the q35-neg fail-closed control).
+- The ADR index rows for 0014/0015 (missing since their landing) are
+  restored; ADR-0016 documents the split and the two commits that
+  follow in-phase (MmioBus windows, one-close() DriverSession).
+- One source typo fixed in the move: AHCI_OWNER's doc comment had a
+  `//` line where `///` was meant.
+
 ### Fixed — driver-stack review round 4, Phase 2 (ADR-0015): IOMMU integrity
 
 - **F1 — `map_run` is atomic** (a `DmaProt` contract guarantee now):
