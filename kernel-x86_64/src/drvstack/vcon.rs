@@ -189,7 +189,12 @@ pub(crate) fn console_step<const N: usize>(
     for (i, &b) in PROOF.iter().enumerate() {
         crate::virtio::write_u8_pa(data_pa + 4 + i as u64, b);
     }
-    v::write_desc(desc_pa, data_pa, 4, 0, 1); // header, chained
+    // Round I: the header descriptor needs DESC_F_NEXT — without the
+    // flag the next-index field is ignored, the device treats the
+    // 4-byte header as the whole request, and the host file received
+    // exactly those 4 bytes (the observed failure: console.out held
+    // the header alone, the payload never left the machine).
+    v::write_desc(desc_pa, data_pa, 4, v::DESC_F_NEXT, 1); // header, chained
     v::write_desc(desc_pa + 16, data_pa + 4, PROOF.len() as u32, 0, 0); // payload, last
     let avail_idx = v::read_u16_pa(avail_pa + 2);
     v::write_u16_pa(v::avail_slot_addr(avail_pa, avail_idx % qsize), 0);

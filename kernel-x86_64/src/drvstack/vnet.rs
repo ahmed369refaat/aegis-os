@@ -543,7 +543,17 @@ pub(crate) fn net_step<const N: usize>(
     // kick that follows must arrive as a MESSAGE, and the teardown
     // reverses the whole thing. With interrupt remapping live the
     // message is the REMAPPED format through this device's IRTE.
-    msix_irq_step(out, dev, &mmio, n1, &mut session);
+    msix_irq_step(
+        out,
+        dev,
+        &mmio,
+        n1,
+        &mut session,
+        tx_desc,
+        tx_buf,
+        tx_avail,
+        qs1,
+    );
 
     // ── teardown: revoke + scrub (the broker discipline) ──
     session.close(out);
@@ -554,6 +564,10 @@ pub(crate) fn net_step<const N: usize>(
 /// prove the delivery through the bounded window — the first
 /// message-signaled interrupt in the tree. Refuses closed (markers,
 /// no crash) at every step: no cap, malformed layout, broker refusal.
+/// Round I: the kick needs WORK — a notify on an idle queue never
+/// fires (the device interrupts on the used-ring update, and there is
+/// none), so the step queues one fresh TX first; the ring geometry
+/// rides in (the frames belong to the caller's session).
 #[cfg(not(test))]
 fn msix_irq_step<const N: usize>(
     out: &mut dyn FnMut(&str),
@@ -561,9 +575,14 @@ fn msix_irq_step<const N: usize>(
     mmio: &crate::virtio::MmioVirtio,
     tx_notify_off: u16,
     session: &mut crate::session::DriverSession<'_, N, crate::arch::vtd::Vtd>,
+    tx_desc: u64,
+    tx_buf: u64,
+    tx_avail: u64,
+    tx_qsize: u16,
 ) {
     use crate::irq;
     use crate::msi;
+    use crate::virtio as v;
 
     // The broker vector this device's messages land on (domain: the
     // ADR-0018 domain the claim assigned — dev.dom).
@@ -661,10 +680,25 @@ fn msix_irq_step<const N: usize>(
         ],
     );
 
-    // Kick the TX queue: the used-ring update fires entry 2 (vq 1's
-    // vector) — with IF=0 it pends in the LAPIC IRR until the window.
+    // Queue one fresh TX so the kick has WORK: the used-ring update
+    // (not the network) is the event that fires entry 2 (vq 1's
+    // vector) — round I: the bare notify on the drained queue never
+    // fired, and the window honestly timed out every run.
+    v::write_net_header(tx_buf);
+    v::write_desc(tx_desc, tx_buf, v::NET_HDR_LEN + 60, 0, 0);
+    let idx = v::read_u16_pa(tx_avail + 2);
+    v::write_u16_pa(v::avail_slot_addr(tx_avail, idx % tx_qsize), 0);
+    v::write_u16_pa(tx_avail + 2, idx.wrapping_add(1));
     mmio.notify(1, tx_notify_off);
-    match irq::wait_for_delivery(400_000_000) {
+    // The budget is TSC cycles; QEMU TCG's TSC advances with the
+    // emulated instruction stream, so 400M cycles was ten-plus
+    // wall-clock minutes and the LANE timed out before the window's
+    // own honesty could print. 40M is ~13ms on real iron at 3 GHz
+    // (generous for a device that answers in microseconds) and under
+    // a minute under TCG. The SPIN variant, deliberately: a silent
+    // device is a live outcome here and the mwait window would sleep
+    // through its own deadline (see wait_for_delivery_spin).
+    match irq::wait_for_delivery_spin(40_000_000) {
         Some(v) => {
             let (served, lost, _pending) = irq::counts(VNET_OWNER).unwrap_or((0, 0, 0));
             let mut c1 = [0u8; 18];

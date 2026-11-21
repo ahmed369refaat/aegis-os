@@ -26,7 +26,7 @@ fn err_name(e: &aegis_os::ext2::Ext2Error) -> &'static str {
 }
 
 /// The partition layer's error names (the marker vocabulary).
-fn part_err_name(e: &aegis_os::part::PartError) -> &'static str {
+pub(crate) fn part_err_name(e: &aegis_os::part::PartError) -> &'static str {
     match e {
         aegis_os::part::PartError::Short => "short read",
         aegis_os::part::PartError::BadMbrSignature => "bad MBR signature",
@@ -101,7 +101,13 @@ pub(crate) fn ext2_over_ahci(
                                         p.name_str(),
                                         "' LBA ",
                                         strutil::dec(p.first_lba, &mut b1),
-                                        "..",
+                                        // The lane markers expect the
+                                        // inclusive range (first..=last,
+                                        // the GPT span). Round 6 wrote
+                                        // the greps with "..=" while the
+                                        // print had ".." — every lane ran
+                                        // red on that marker since.
+                                        "..=",
                                         strutil::dec(p.last_lba, &mut b2),
                                         " — ext2 mounts at the partition base",
                                     ],

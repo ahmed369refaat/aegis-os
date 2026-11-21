@@ -111,3 +111,90 @@ pub fn init() {
     serial::write_str(crate::strutil::dec(cpu as u64, &mut b2));
     serial::write_str("\n");
 }
+
+// ── MMIO GiB windows in the direct map ──────────────────────────────
+//
+// The direct map ships with ONE GiB (RAM); the LAPIC/VT-d window
+// maps the FOURTH (0xC000_0000.., arch::lapic / arch::vtd). Round 6's
+// ADR-0020 added the ECAM seam but never mapped the GiB the MCFG
+// window lives in — on q35 that is the THIRD (0x8000_0000..0xBFFF_FFFF
+// at PCIEXBAR 0xB000_0000), so the first config read through the
+// direct map #PF'd and the kernel halted ("unexpected fault"). The
+// lane never reached it (the GPT marker bug kept it red earlier), so
+// the gap hid until the FAT32 round ran the lane to the end.
+
+/// The 1-GiB direct-map PDPT indices spanned by [pa, pa+len) —
+/// pure, host-tested. `None` on zero length, arithmetic overflow, or
+/// a range beyond the 512-GiB PML4[273] slot (a wrong address must
+/// refuse, never fault).
+#[must_use]
+pub fn gib_span(pa: u64, len: u64) -> Option<(u64, u64)> {
+    if len == 0 {
+        return None;
+    }
+    let end = pa.checked_add(len - 1)?;
+    if end >= 1u64 << 39 {
+        return None;
+    }
+    Some((pa >> 30, end >> 30))
+}
+
+/// Map the spanned 1-GiB PDPT entries as RW+NX huge pages (the
+/// LAPIC-window trick, generalized). Idempotent: entries that are
+/// already present are left alone (the fourth GiB belongs to the
+/// LAPIC/VT-d window; the first to RAM). Returns how many entries it
+/// wrote — the caller's marker prints it, and the first access
+/// through the window is the boot-lane proof.
+#[cfg(not(test))]
+pub fn map_gib_windows(pa: u64, len: u64) -> u32 {
+    use crate::{arch::lapic::PTE_PS, hw, memops};
+    let Some((first, last)) = gib_span(pa, len) else {
+        return 0;
+    };
+    // The direct map's PDPT: PML4[273] → pdpt_dm (init() built it).
+    let pml4 = hw::read_cr3() & ADDR_MASK;
+    let pdpt = memops::read_u64(pml4 + 273 * 8) & ADDR_MASK;
+    let mut mapped = 0u32;
+    for gib in first..=last {
+        let slot = pdpt + gib * 8;
+        if memops::read_u64(slot) & pte::PTE_P != 0 {
+            continue; // already mapped — LAPIC/VT-d/RAM own it
+        }
+        let pte_val = (gib << 30) | pte::PTE_P | pte::PTE_W | PTE_PS | pte::PTE_G | pte::PTE_NX;
+        memops::write_u64(slot, pte_val);
+        mapped += 1;
+    }
+    // Same-value CR3 reload: the new global entries enter the TLB
+    // under the same discipline as every other window mapping.
+    hw::write_cr3(pml4);
+    mapped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gib_span;
+
+    #[test]
+    fn spans_are_the_covered_gib_indices() {
+        // q35's ECAM window: 256 MiB at 0xB000_0000 — one GiB (index 2).
+        assert_eq!(gib_span(0xB000_0000, 256 << 20), Some((2, 2)));
+        // A window straddling a GiB boundary.
+        assert_eq!(gib_span(0xBFF0_0000, 32 << 20), Some((2, 3)));
+        // The RAM direct map's own GiB.
+        assert_eq!(gib_span(0, 1 << 30), Some((0, 0)));
+        // Unaligned base and length still land on the right indices.
+        assert_eq!(gib_span(0x7FFF_F000, 0x2000), Some((1, 2)));
+    }
+
+    #[test]
+    fn hostile_spans_refuse() {
+        assert_eq!(gib_span(0xB000_0000, 0), None, "zero length");
+        assert_eq!(gib_span(u64::MAX, 1), None, "end overflow");
+        assert_eq!(
+            gib_span(1u64 << 39, 1),
+            None,
+            "beyond the 512-GiB direct-map slot"
+        );
+        assert_eq!(gib_span(1u64 << 38, u64::MAX), None, "length overflow");
+    }
+}
