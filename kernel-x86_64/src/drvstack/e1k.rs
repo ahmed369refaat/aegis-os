@@ -1,9 +1,10 @@
 //! The e1000 NIC: descriptors through the broker + the DHCP round trip.
 
 use super::netutil;
-use super::{line, revoke_or_quarantine};
 use crate::frames::FramePool;
+use crate::mmio::MmioBus;
 use crate::strutil;
+use crate::strutil::line;
 
 /// The pool owner tag for e1000 frames (rx/tx rings + buffers).
 pub const E1K_OWNER: u32 = 45;
@@ -43,7 +44,7 @@ pub(crate) fn e1k_step<const N: usize>(
     broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
     inv: &crate::pci::Inventory,
 ) {
-    use aegis_os::dma::{DmaDir, DmaVerdict};
+    use aegis_os::dma::DmaVerdict;
 
     let Some(dev) = inv.find_by(0x8086, 0x02) else {
         line(out, &["[E1K] no e1000 to drive on this machine"]);
@@ -74,10 +75,33 @@ pub(crate) fn e1k_step<const N: usize>(
             &["[E1K] identity mode: no IOMMU on this machine — same flow, unbrokered frames (the device-DMA control lane)"],
         );
     }
-    let Some(mmio) = crate::pci::mem_bar_base(dev, 0) else {
+    let Some(bar) = crate::pci::mem_bar(dev, 0) else {
         line(out, &["[E1K] BAR0 unresolved — refusing"]);
         return;
     };
+    // ADR-0016: one window for every register this driver touches,
+    // checked at the door — the per-access refusals below are
+    // defense-in-depth (a None there is an internal inconsistency the
+    // log admits, never a wild access).
+    let Some(bus) = crate::mmio::BarMmio::new(bar.base, bar.size) else {
+        line(
+            out,
+            &["[E1K] BAR0 window malformed (zero/wrapping) — refusing"],
+        );
+        return;
+    };
+    if bus.window().len() < E1K_RAH + 4 {
+        let mut lb = [0u8; 18];
+        line(
+            out,
+            &[
+                "[E1K] BAR0 window too small for the register set (len=0x",
+                strutil::hex(bus.window().len(), &mut lb),
+                " < 0x5408) — refusing",
+            ],
+        );
+        return;
+    }
     // F9e claim order: MEM now; BME after the rings are broker-
     // mapped — EXCEPT the identity control lane (no IOMMU, no
     // mappings to gate on). Read back — a CF8 discipline bug here
@@ -102,12 +126,20 @@ pub(crate) fn e1k_step<const N: usize>(
             ],
         );
     }
-    let r32 = |off: u64| crate::memops::read_u32(mmio + off);
-    let w32 = |off: u64, v: u32| crate::memops::write_u32(mmio + off, v);
-
-    // MAC + link from RAL/RAH and STATUS.
-    let ral = r32(E1K_RAL);
-    let rah = r32(E1K_RAH);
+    // MAC + link from RAL/RAH and STATUS (window-checked; a refusal
+    // here is a driver-side inconsistency — nothing is mapped yet, so
+    // the refusal is just the verdict).
+    let (Some(ral), Some(rah), Some(status)) = (
+        bus.read32(E1K_RAL),
+        bus.read32(E1K_RAH),
+        bus.read32(E1K_STATUS),
+    ) else {
+        line(
+            out,
+            &["[E1K] register window refused a MAC/status read — refusing"],
+        );
+        return;
+    };
     let mac = [
         (ral & 0xFF) as u8,
         ((ral >> 8) & 0xFF) as u8,
@@ -116,7 +148,7 @@ pub(crate) fn e1k_step<const N: usize>(
         (rah & 0xFF) as u8,
         ((rah >> 8) & 0xFF) as u8,
     ];
-    let link_up = r32(E1K_STATUS) & 0x2 != 0;
+    let link_up = status & 0x2 != 0;
     let mut macs = [0u8; 17];
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for i in 0..6 {
@@ -139,11 +171,23 @@ pub(crate) fn e1k_step<const N: usize>(
 
     // Frames: RX ring, TX ring, one buffer each (e1000 is 32-bit
     // DMA — pool frames below 4 GiB satisfy it).
+    // ADR-0016/F10: the session owns every acquisition — identity or
+    // brokered — and every exit below is one close().
+    let mut session = crate::session::DriverSession::new(
+        k,
+        pool,
+        broker,
+        Some(dev),
+        E1K_OWNER,
+        identity,
+        "[E1K] teardown: revoke_all(0) → ",
+        "[E1K] teardown (identity): frames freed, no broker regions",
+    );
     let mut frames = [0u64; 4];
     for slot in frames.iter_mut() {
-        match pool.alloc_for(&mut k.frames, E1K_OWNER) {
-            Ok(pa) => *slot = pa,
-            Err(_) => {
+        match session.frame() {
+            Some(pa) => *slot = pa,
+            None => {
                 line(out, &["[E1K] pool exhausted — refusing"]);
                 return;
             }
@@ -152,10 +196,7 @@ pub(crate) fn e1k_step<const N: usize>(
     let [rx_ring, tx_ring, rx_buf, tx_buf] = frames;
     if !identity {
         for &pa in frames.iter() {
-            if broker
-                .map_region(0, pa, 4096, DmaDir::Bidirectional)
-                .is_err()
-            {
+            if session.map(pa).is_none() {
                 line(out, &["[E1K] broker refused a frame — refusing"]);
                 return;
             }
@@ -169,22 +210,57 @@ pub(crate) fn e1k_step<const N: usize>(
     }
 
     // Program the rings. One RX descriptor posted (index 0), RDT=1.
-    w32(E1K_RDBAL, rx_ring as u32);
-    w32(E1K_RDBAL + 4, 0); // RDBAH (32-bit DMA)
-    w32(E1K_RDLEN, (E1K_NDESC * 16) as u32);
-    w32(E1K_RDH, 0);
+    // Every write goes through the window; a refusal after the rings
+    // are mapped is a full teardown (the device has BME by then).
+    let rx_prog = [
+        (E1K_RDBAL, rx_ring as u32),
+        (E1K_RDBAL + 4, 0), // RDBAH (32-bit DMA)
+        (E1K_RDLEN, (E1K_NDESC * 16) as u32),
+        (E1K_RDH, 0),
+    ];
+    for &(off, v) in rx_prog.iter() {
+        if !bus.write32(off, v) {
+            line(
+                out,
+                &["[E1K] register window refused an RX write — teardown"],
+            );
+            session.close(out);
+            return;
+        }
+    }
     crate::memops::write_u64(rx_ring, rx_buf); // desc[0].buffer_addr
-    w32(E1K_RDT, 1);
-    w32(E1K_RCTL, 0x8002); // EN | BAM — BAM is bit 15 (0x8000) per
-                           // e1000x_regs.h; the broadcast OFFER needs
-                           // it or receive_filter drops it silently
+    let rx_tail = [(E1K_RDT, 1u32), (E1K_RCTL, 0x8002 /* EN | BAM */)];
+    for &(off, v) in rx_tail.iter() {
+        if !bus.write32(off, v) {
+            line(
+                out,
+                &["[E1K] register window refused an RX write — teardown"],
+            );
+            session.close(out);
+            return;
+        }
+    }
+    // BAM is bit 15 (0x8000) per e1000x_regs.h; the broadcast OFFER
+    // needs it or receive_filter drops it silently.
 
-    w32(E1K_TDBAL, tx_ring as u32);
-    w32(E1K_TDBAL + 4, 0);
-    w32(E1K_TDLEN, (E1K_NDESC * 16) as u32);
-    w32(E1K_TDH, 0);
-    w32(E1K_TDT, 0);
-    w32(E1K_TCTL, 0x2); // EN
+    let tx_prog = [
+        (E1K_TDBAL, tx_ring as u32),
+        (E1K_TDBAL + 4, 0),
+        (E1K_TDLEN, (E1K_NDESC * 16) as u32),
+        (E1K_TDH, 0),
+        (E1K_TDT, 0),
+        (E1K_TCTL, 0x2 /* EN */),
+    ];
+    for &(off, v) in tx_prog.iter() {
+        if !bus.write32(off, v) {
+            line(
+                out,
+                &["[E1K] register window refused a TX write — teardown"],
+            );
+            session.close(out);
+            return;
+        }
+    }
 
     // Build + TX the DISCOVER.
     netutil::build_dhcp_discover_at(tx_buf, mac);
@@ -192,7 +268,14 @@ pub(crate) fn e1k_step<const N: usize>(
     crate::memops::write_u32(tx_ring + 8, 290); // length
     crate::memops::write_u32(tx_ring + 12, 0); // cso/css/special
     netutil::put8(tx_ring + 11, 0x0B); // cmd: EOP | IFCS | RS
-    w32(E1K_TDT, 1);
+    if !bus.write32(E1K_TDT, 1) {
+        line(
+            out,
+            &["[E1K] register window refused the TX tail write — teardown"],
+        );
+        session.close(out);
+        return;
+    }
 
     // Poll TX completion: DD is bit 0 of the upper dword (+12) —
     // E1000_TXD_STAT_DD=0x1 in QEMU's e1000x_regs.h, and the
@@ -217,23 +300,7 @@ pub(crate) fn e1k_step<const N: usize>(
                 "[E1K] TX: DISCOVER built+rings armed, descriptor consumed (TDH 0→1) — no egress on this QEMU lane (open: device IOMMU attachment; see drivers.md)"
             }],
         );
-        if identity {
-            line(
-                out,
-                &["[E1K] teardown (identity): frames freed, no broker regions"],
-            );
-        } else {
-            revoke_or_quarantine(
-                k,
-                pool,
-                out,
-                broker,
-                E1K_OWNER,
-                &frames,
-                Some(dev),
-                "[E1K] teardown: revoke_all(0) → ",
-            );
-        }
+        session.close(out);
 
         return;
     }
@@ -254,9 +321,15 @@ pub(crate) fn e1k_step<const N: usize>(
         spins += 1;
     }
     if crate::virtio::read_u8_pa(rx_ring + 12) & 1 == 0 {
-        let rdh = r32(E1K_RDH);
-        let rdt = r32(E1K_RDT);
-        let rctl = r32(E1K_RCTL);
+        let (Some(rdh), Some(rdt), Some(rctl)) = (
+            bus.read32(E1K_RDH),
+            bus.read32(E1K_RDT),
+            bus.read32(E1K_RCTL),
+        ) else {
+            line(out, &["[E1K] register window refused an RX debug read"]);
+            session.close(out);
+            return;
+        };
         let mut rb = [0u8; 18];
         let mut rc = [0u8; 18];
         let mut re = [0u8; 18];
@@ -284,26 +357,7 @@ pub(crate) fn e1k_step<const N: usize>(
             out,
             &["[E1K] RX: no packet arrived (poll budget exhausted)"],
         );
-        if identity {
-            line(
-                out,
-                &["[E1K] teardown (identity): frames freed, no broker regions"],
-            );
-        } else {
-            revoke_or_quarantine(
-                k,
-                pool,
-                out,
-                broker,
-                E1K_OWNER,
-                &frames,
-                Some(dev),
-                "[E1K] teardown: revoke_all(0) → ",
-            );
-        }
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, E1K_OWNER);
-        }
+        session.close(out);
         return;
     }
     let rx_len = crate::memops::read_u16(rx_ring + 8);
@@ -372,28 +426,7 @@ pub(crate) fn e1k_step<const N: usize>(
     }
 
     // Teardown: revoke + scrub, frames home.
-    if identity {
-        line(
-            out,
-            &["[E1K] teardown (identity): frames freed, no broker regions"],
-        );
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, E1K_OWNER);
-        }
-    } else {
-        // The helper owns frame freeing on the broker path — and on
-        // poison, quarantines them (ADR-0015 F2).
-        revoke_or_quarantine(
-            k,
-            pool,
-            out,
-            broker,
-            E1K_OWNER,
-            &frames,
-            Some(dev),
-            "[E1K] teardown: revoke_all(0) → ",
-        );
-    }
+    session.close(out);
 }
 
 // ── NVMe (checklist item 6): admin + I/O queue pairs, IDENTIFY, a

@@ -1,8 +1,8 @@
 //! virtio-blk: the modern virtio handshake + queue rings through the broker.
 
-use super::{line, revoke_or_quarantine};
 use crate::frames::FramePool;
 use crate::strutil;
+use crate::strutil::line;
 
 /// The pool owner tag for virtio-blk frames (rings, control page,
 /// data page) — distinct from the VT-d table budget so the M1
@@ -111,7 +111,7 @@ pub(crate) fn virtio_step<const N: usize>(
     inv: &crate::pci::Inventory,
 ) {
     use crate::virtio as v;
-    use aegis_os::dma::{DmaDir, DmaVerdict};
+    use aegis_os::dma::DmaVerdict;
 
     let Some(dev) = inv
         .find_by(0x1AF4, 0x01)
@@ -206,11 +206,24 @@ pub(crate) fn virtio_step<const N: usize>(
     }
 
     // ── ring frames: pool + broker FIRST, device second ──
+    // ADR-0016/F10: the session owns every acquisition from here on —
+    // a mid-flight refusal (pool OR broker) still closes on return;
+    // the stranded-frame/region class is gone by construction.
+    let mut session = crate::session::DriverSession::new(
+        k,
+        pool,
+        broker,
+        Some(dev),
+        VBLK_OWNER,
+        false,
+        "[VBLK] teardown: revoke_all(0) → ",
+        "",
+    );
     let mut frames = [0u64; 5];
     for (i, slot) in frames.iter_mut().enumerate() {
-        match pool.alloc_for(&mut k.frames, VBLK_OWNER) {
-            Ok(pa) => *slot = pa,
-            Err(_) => {
+        match session.frame() {
+            Some(pa) => *slot = pa,
+            None => {
                 let mut b = [0u8; 20];
                 line(
                     out,
@@ -226,11 +239,10 @@ pub(crate) fn virtio_step<const N: usize>(
     }
     let [desc_pa, avail_pa, used_pa, ctrl_pa, data_pa] = frames;
     let mut cookies = [0u64; 5];
-    let mut ok = true;
     for (i, &pa) in frames.iter().enumerate() {
-        match broker.map_region(0, pa, 4096, DmaDir::Bidirectional) {
-            Ok(view) => cookies[i] = view.cookie,
-            Err(_) => {
+        match session.map(pa) {
+            Some(cookie) => cookies[i] = cookie,
+            None => {
                 let mut b = [0u8; 20];
                 line(
                     out,
@@ -240,13 +252,9 @@ pub(crate) fn virtio_step<const N: usize>(
                         " — refusing (the device gets no addresses)",
                     ],
                 );
-                ok = false;
-                break;
+                return;
             }
         }
-    }
-    if !ok {
-        return;
     }
     let mut n = [0u8; 20];
     line(
@@ -410,18 +418,15 @@ pub(crate) fn virtio_step<const N: usize>(
     // ask the device to DMA into the now-unmapped page. Proof = the
     // SLPTE reads back absent (P=0) AND FSTS.PPF sets: the IOMMU
     // faulted the access to a page the broker unmapped.
-    broker
-        .region_complete(0, cookies[4])
-        .expect("data region live");
-    broker
-        .unmap_region(0, cookies[4])
-        .expect("abort handshake done");
-    let _ = pool.free(&mut k.frames, data_pa, VBLK_OWNER);
+    session
+        .complete_unmap(0, cookies[4])
+        .expect("data region live + abort handshake done");
+    session.hand_back(data_pa);
     // The tables' own verdict, read back from the walk the device must
     // now take: the SLPTE for the dead page must be absent (P=0).
-    let slpt_root = broker.prot().dom_slpt(0);
+    let slpt_root = session.with_prot(|p| p.dom_slpt(0));
     let pte_absent = match slpt_root {
-        Some(root) => broker.prot().slpte_of(root, data_pa).is_none(),
+        Some(root) => session.with_prot(|p| p.slpte_of(root, data_pa).is_none()),
         None => false, // no SLPT root: the proof cannot even be attempted
     };
     let want = submit(&queue, data_pa, 0, v::BLK_T_IN); // the dead page
@@ -435,7 +440,7 @@ pub(crate) fn virtio_step<const N: usize>(
         return;
     }
     let completed = poll_used(&queue, want);
-    let fsts = broker.prot().fsts();
+    let fsts = session.with_prot(|p| p.fsts());
     let ppf = fsts & crate::arch::vtd::FSTS_PPF != 0;
     let mut hf = [0u8; 18];
     line(
@@ -490,16 +495,7 @@ pub(crate) fn virtio_step<const N: usize>(
     }
 
     // ── teardown: revoke the rest with the device still attached ──
-    revoke_or_quarantine(
-        k,
-        pool,
-        out,
-        broker,
-        VBLK_OWNER,
-        &frames,
-        Some(dev),
-        "[VBLK] teardown: broker revoke_all(0) → ",
-    );
+    session.close(out);
 }
 
 // ── Phase 2: the virtio-net driver — same transport, two queues,

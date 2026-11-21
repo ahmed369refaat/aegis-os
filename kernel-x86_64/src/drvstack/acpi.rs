@@ -1,7 +1,7 @@
 //! ACPI table directory walk: HPET/MADT/MCFG discovery markers.
 
-use super::line;
 use crate::strutil;
+use crate::strutil::line;
 
 #[cfg(not(test))]
 pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) {
@@ -127,18 +127,48 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) {
         let space = crate::arch::acpi::read_byte(hpet_pa + 40);
         let block = crate::memops::read_u64(hpet_pa + 44);
         if space == 0 && block != 0 {
-            let caps = crate::memops::read_u64(block);
+            // ADR-0016: a FixedMmio window for the block — the
+            // table's address is trusted only as far as the window
+            // math allows (HPET blocks are 1024 bytes; the counter
+            // at +0xF0 and the config at +0x10 must both fit).
+            use crate::mmio::{FixedMmio, MmioBus};
+            let Some(bus) = FixedMmio::new(block, 0x1000) else {
+                line(
+                    out,
+                    &["[HPET] block address malformed (wrapping) — skipped"],
+                );
+                return;
+            };
+            if bus.window().len() < 0xF0 + 8 {
+                line(out, &["[HPET] window math failed — skipped"]);
+                return;
+            }
+            let (Some(caps), Some(cfg)) = (bus.read64(0), bus.read64(0x10)) else {
+                line(out, &["[HPET] register window refused a read — skipped"]);
+                return;
+            };
             let period = caps >> 32; // femtoseconds
             let freq = 1_000_000_000_000_000u64.checked_div(period).unwrap_or(0);
             // Enable the main counter, read it twice.
-            let cfg = crate::memops::read_u64(block + 0x10);
-            crate::memops::write_u64(block + 0x10, cfg | 1);
-            let c1 = crate::memops::read_u64(block + 0xF0);
+            if !bus.write64(0x10, cfg | 1) {
+                line(
+                    out,
+                    &["[HPET] register window refused the enable — skipped"],
+                );
+                return;
+            }
+            let Some(c1) = bus.read64(0xF0) else {
+                line(
+                    out,
+                    &["[HPET] register window refused a counter read — skipped"],
+                );
+                return;
+            };
             let mut spins = 0u64;
             while spins < 2_000_000 {
                 spins += 1;
             }
-            let c2 = crate::memops::read_u64(block + 0xF0);
+            let c2 = bus.read64(0xF0).unwrap_or(c1);
             let mut c = [0u8; 18];
             let mut f = [0u8; 20];
             let mut dd = [0u8; 20];

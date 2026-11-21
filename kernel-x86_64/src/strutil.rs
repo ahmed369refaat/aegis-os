@@ -39,6 +39,16 @@ pub fn hex(v: u64, buf: &mut [u8; 18]) -> &str {
     core::str::from_utf8(&buf[..18]).unwrap_or("")
 }
 
+/// Emit a log line as its parts then a newline — the one logging
+/// primitive every boot step shares (moved out of `drvstack` so the
+/// session module can use it too, ADR-0016).
+pub fn line(out: &mut dyn FnMut(&str), parts: &[&str]) {
+    for p in parts {
+        out(p);
+    }
+    out("\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

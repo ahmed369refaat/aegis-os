@@ -6,6 +6,7 @@ use crate::arch;
 use crate::arch::acpi::Discovery;
 use crate::frames::FramePool;
 use crate::strutil;
+use crate::strutil::line;
 use aegis_os::dmar::{self, Dmar, DmarStruct};
 
 // ADR-0016: one module per subsystem — the split is a pure move; the
@@ -48,86 +49,12 @@ fn hw_code(e: &aegis_os::dma::DmaError) -> &'static str {
     }
 }
 
-pub(crate) fn line(out: &mut dyn FnMut(&str), parts: &[&str]) {
-    for p in parts {
-        out(p);
-    }
-    out("\n");
-}
-
 /// The pool owner tag for VT-d translation tables (root, context,
 /// SLPT, the IQ frame) and the proof pages — distinct so the M1
 /// zero-leak accounting can name them (they are intentionally still
 /// held at the end of boot: the IOMMU is live infrastructure, not a
 /// leak; the ledger says so).
 pub const VTD_TABLE_OWNER: u32 = 42;
-
-/// F2 (ADR-0015) teardown semantics, shared by every driver path:
-/// revoke the domain, print the byte-compatible happy-path marker,
-/// and on POISON fail closed — the device's bus mastering goes off,
-/// frames inside poisoned ranges are quarantined (QUARANTINE_OWNER,
-/// never freed while the device can still reach them) and only the
-/// clean frames return to the pool. Every teardown and refusal path
-/// goes through here, so no driver can hand a device-reachable page
-/// back to the allocator.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn revoke_or_quarantine<const N: usize>(
-    k: &mut aegis_os::Kernel<N>,
-    pool: &mut FramePool<N>,
-    out: &mut dyn FnMut(&str),
-    broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
-    owner: u32,
-    frames: &[u64],
-    dev: Option<&crate::pci::PciDev>,
-    marker: &str,
-) -> aegis_os::dma::RevokeOutcome {
-    // F9b: bus mastering goes off FIRST — every teardown, refusal
-    // and poison path arrives here, and none of them may leave a
-    // device that can still issue DMA while its mappings dissolve.
-    if let Some(d) = dev {
-        crate::pci::disable_bus_master(d);
-    }
-    let outcome = broker.revoke_all(0);
-    let mut nr = [0u8; 20];
-    line(
-        out,
-        &[
-            marker,
-            strutil::dec(outcome.revoked as u64, &mut nr),
-            " region(s) unmapped; frames return scrubbed",
-        ],
-    );
-    if outcome.poisoned > 0 {
-        if let Some(d) = dev {
-            crate::pci::disable_bus_master(d);
-        }
-        let mut np = [0u8; 20];
-        line(
-            out,
-            &[
-                marker,
-                " POISON: ",
-                strutil::dec(outcome.poisoned as u64, &mut np),
-                " region(s) still mapped in hardware — bus mastering off, frames QUARANTINED (ADR-0015 F2)",
-            ],
-        );
-        for &pa in frames {
-            let hit = broker
-                .poisoned_regions()
-                .any(|p| pa >= p.base && pa + 4096 <= p.base + p.len);
-            if hit {
-                let _ = pool.quarantine(pa, crate::frames::QUARANTINE_OWNER);
-            } else {
-                let _ = pool.free(&mut k.frames, pa, owner);
-            }
-        }
-    } else {
-        for &pa in frames {
-            let _ = pool.free(&mut k.frames, pa, owner);
-        }
-    }
-    outcome
-}
 
 /// The driver-stack entry point (kmain step 14): discover the
 /// firmware's DMA-remapping description, print the ADR-0013 marker

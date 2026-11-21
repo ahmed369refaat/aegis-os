@@ -1,8 +1,8 @@
 //! Read-only ext2 over AHCI (ADR-0014): superblock -> dirent -> file data.
 
 use super::ahci::ahci_read_dma;
-use super::line;
 use crate::strutil;
+use crate::strutil::line;
 
 /// The pool owner tag for the ext2 slice's AHCI frames.
 pub const EXT2_OWNER: u32 = 49;
@@ -12,7 +12,7 @@ pub const EXT2_OWNER: u32 = 49;
 #[cfg(not(test))]
 pub(crate) fn ext2_over_ahci(
     out: &mut dyn FnMut(&str),
-    abar: u64,
+    bus: &crate::mmio::BarMmio,
     clb: u64,
     ctba: u64,
     fis: u64,
@@ -22,17 +22,21 @@ pub(crate) fn ext2_over_ahci(
     // frame set (the restart path was measured broken: even with the
     // FRE=0 rule honored, the re-issued commands complete with no
     // data on this QEMU build).
-    let port = abar + 0x100;
+    let port = 0x100u64; // window-relative (the bus carries the ABAR base)
     let mut h = [0u8; 18];
     // Superblock: LBA 2 (byte 1024, 1KiB blocks).
-    if !ahci_read_dma(abar, clb, ctba, data, 2) {
+    if !ahci_read_dma(bus, clb, ctba, data, 2) {
         line(out, &["[EXT2] superblock read did not complete — refusing"]);
         return;
     }
     let magic = crate::virtio::read_u16_pa(data + 56);
     let inode_size = crate::virtio::read_u16_pa(data + 88);
     if magic != 0xEF53 {
-        let tfd = crate::memops::read_u32(port + 0x20);
+        // ADR-0016: the TFD debug read goes through the same window as
+        // every other register access; a refusal is printed, never a
+        // silent 0 without a note.
+        use crate::mmio::MmioBus;
+        let tfd = bus.read32(port + 0x20);
         let d0 = crate::memops::read_u64(data);
         let f0 = crate::memops::read_u64(fis);
         let mut hd = [0u8; 18];
@@ -48,7 +52,12 @@ pub(crate) fn ext2_over_ahci(
             out,
             &[
                 "[EXT2] dbg read LBA2: TFD=0x",
-                strutil::hex(u64::from(tfd), &mut h),
+                strutil::hex(u64::from(tfd.unwrap_or(0)), &mut h),
+                if tfd.is_none() {
+                    " (read refused by the register window)"
+                } else {
+                    ""
+                },
                 " data[0]=0x",
                 strutil::hex(d0, &mut hd),
                 " d2h_fis[0]=0x",
@@ -97,14 +106,14 @@ pub(crate) fn ext2_over_ahci(
         ],
     );
     // Group descriptor: LBA 4 (block 2), bg_inode_table u32 @+8.
-    if !ahci_read_dma(abar, clb, ctba, data, 4) {
+    if !ahci_read_dma(bus, clb, ctba, data, 4) {
         line(out, &["[EXT2] group-descriptor read failed — refusing"]);
         return;
     }
     let itable = crate::memops::read_u32(data + 8); // block number
                                                     // Root inode (2): at itable*1024 + 128 → its sector + offset.
     let root_byte = u64::from(itable) * 1024 + 128;
-    if !ahci_read_dma(abar, clb, ctba, data, root_byte / 512) {
+    if !ahci_read_dma(bus, clb, ctba, data, root_byte / 512) {
         line(out, &["[EXT2] root-inode read failed — refusing"]);
         return;
     }
@@ -125,7 +134,7 @@ pub(crate) fn ext2_over_ahci(
         return;
     }
     // Directory block: walk dirents, find "hello.txt".
-    if !ahci_read_dma(abar, clb, ctba, data, u64::from(rblock) * 2) {
+    if !ahci_read_dma(bus, clb, ctba, data, u64::from(rblock) * 2) {
         line(out, &["[EXT2] root-dir read failed — refusing"]);
         return;
     }
@@ -158,14 +167,14 @@ pub(crate) fn ext2_over_ahci(
     }
     // hello.txt's inode: at itable*1024 + (ino-1)*inode_size.
     let f_byte = u64::from(itable) * 1024 + u64::from(hello_ino - 1) * u64::from(inode_size);
-    if !ahci_read_dma(abar, clb, ctba, data, f_byte / 512) {
+    if !ahci_read_dma(bus, clb, ctba, data, f_byte / 512) {
         line(out, &["[EXT2] file-inode read failed — refusing"]);
         return;
     }
     let foff = f_byte % 512;
     let fsize = crate::memops::read_u32(data + foff + 4);
     let fblock = crate::memops::read_u32(data + foff + 40);
-    if !ahci_read_dma(abar, clb, ctba, data, u64::from(fblock) * 2) {
+    if !ahci_read_dma(bus, clb, ctba, data, u64::from(fblock) * 2) {
         line(out, &["[EXT2] file-data read failed — refusing"]);
         return;
     }
