@@ -37,3 +37,5 @@ it does not merge.
 | [0016](0016-driver-stack-modules-mmio-bus-driver-session.md) | Driver-stack modules, MmioBus windows, one-close() DriverSession | Accepted (review round 4, Phase 4) |
 | [0017](0017-ring3-driver-domains.md) | Ring-3 driver domains: drivers as monitored, brokered clients | Accepted (first slice — IpcMmio + device core — host-proven; ring-3 transport next) |
 | [0018](0018-one-iommu-domain-per-device.md) | One IOMMU domain per device: kernel-allocated ids, scoped sessions, sized table budget | Accepted (review round 5, Phase A) |
+| [0019](0019-interrupt-broker-msix-irte.md) | The interrupt chain: broker-owned vectors, IOAPIC, MSI/MSI-X, VT-d IRTE, the delivery window, and the platform slice (FADT power, TSC calibration, entropy, GPT) | Accepted (review round 6 — host-proven + lane markers; the IR lane ships this round, proven in CI) |
+| [0020](0020-multi-bus-pci-ecam.md) | Multi-bus PCI: the ECAM config seam + the recursive bridge walk, lifting the bus-0-only refusal | Accepted (review round 6) |

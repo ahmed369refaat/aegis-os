@@ -76,6 +76,7 @@ case "${1:-}" in
                   -device virtio-blk-pci,disable-legacy=on,iommu_platform=on,drive=vd0
                   -netdev user,id=n0
                   -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on
+                  -device virtio-rng-pci,disable-legacy=on,iommu_platform=on
                   -netdev user,id=n1
                   -device e1000,netdev=n1
                   -drive id=nvme0,if=none,format=raw,file=target/nvme0.img
@@ -87,10 +88,24 @@ case "${1:-}" in
                   -device usb-storage,drive=usb0
                   -vga std
                   -qmp unix:/tmp/qmp.sock,server,nowait
-                  -drive id=vd0,if=none,format=raw,file=target/vdisk0.img)
+                  -drive id=vd0,if=none,format=raw,file=target/vdisk0.img
+                  -device pcie-root-port,id=rp0,bus=pcie.0
+                  -drive id=vd1,if=none,format=raw,file=target/vdisk1.img
+                  -device virtio-blk-pci,bus=rp0,disable-legacy=on,drive=vd1)
     EXTRA_GREPS=(
       "[IOMMU] dmar: pa="
       "[IOMMU] dmar: pa=0x"  # placeholder replaced below; see lane block
+      "[PCI ] config access: ECAM @"  # ADR-0020: the MCFG window drives the scan
+      "[PCI ] bridge at this slot — traversed"  # ADR-0020: the root port was walked
+      "[PCI ] 1:0.0 "  # ADR-0020: the virtio-blk BEHIND the root port, enumerated on bus 1
+      "[RNG ] rdrand: "  # the CPU entropy source probed (present or absent, honestly)
+      "[RNG ] virtio-rng alive: qsize="  # the bus entropy source through the broker
+      "[RNG ] virtio-rng: 16 bytes harvested"  # real device entropy → the pool
+      "[RNG ] pool: mixes="  # the health feed + two live draws
+      "[TSC ] calibrated: "  # HPET-sourced TSC frequency (the tick stops being a guess)
+      "[PWR ] FADT: PM1a control @"  # the power paths read the firmware's own addresses
+      "[IDLE] mwait woke on the delivery store"  # C0 idle: MONITOR/MWAIT, woken by the real IRQ
+      "[GPT ] partition 1 'aegis-root' LBA 34..=289"  # the partition layer under the ext2 mount
       "[VNET] alive: MAC="
       "[VNET] dbg q1 readback:"  # the device holds exactly the frames we mapped
       "[VNET] TX: DHCP DISCOVER sent"
@@ -111,6 +126,12 @@ case "${1:-}" in
       "[HPET] block @"  # the live counter
       "[MADT] LAPIC entries="  # parsed
       "[MCFG] ECAM base"  # parsed
+      "[IRQ ] ioapic live @"  # ADR-0019: the IOAPIC probed from the MADT
+      "[IRQ ] armed: isa irq 1 → gsi"  # ADR-0019: GSI 1 → a broker vector, RTE read-back ok
+      "[IRQ ] DELIVERED: vector"  # ADR-0019: the end-to-end line-interrupt chain (EOI + mailbox)
+      "[MSIX] armed: entries="  # ADR-0019: the NIC's MSI-X table pointed at a broker vector
+      "[MSIX] DELIVERED: vector"  # ADR-0019: the first message-signaled interrupt (no poll)
+      "[MSIX] disabled + vector released"  # the teardown discipline
       "[KBD2] negotiated scancode set 2, ack="  # the real 0xF0/0x02 exchange
       "[KBD2] scancode"  # the QMP round trip
       "[EXT2] hello.txt (inode 12, 17 bytes): \"HELLO-AEGIS-EXT2.\" ← read-only ext2 over AHCI"  # the mount LIVE (ADR-0014: the stale FIS was three driver bugs)
@@ -136,7 +157,36 @@ case "${1:-}" in
       "[E1K] RX:"
       "[AHCI] identity mode:"  # ADR-0014 step 5: the stale-FIS control
       "[AHCI] IDENTIFY completed:"  # command 1 must complete here too
+      "[GPT ] partition 1 'aegis-root' LBA 34..=289"  # the partition layer: protective MBR + GPT CRCs verified, ext2 at the partition base
       "[EXT2] hello.txt (inode 12, 17 bytes): \"HELLO-AEGIS-EXT2.\" ← read-only ext2 over AHCI"  # ADR-0014: the mount works on BOTH lanes
+    )
+    ;;
+  --verify-q35-ir)
+    # ADR-0019's IR lane: the SAME machine with interrupt remapping
+    # ON — every device MSI must arrive in the remapped format through
+    # its IRTE or the IOMMU faults it. A focused lane (the two virtio
+    # devices; the keyboard's IOAPIC compat-RTE proof stays on the
+    # base q35 lane, where it was proven).
+    MODE=verify
+    MACHINE_ARGS=(-machine q35 -cpu max -m 128M
+                  -device intel-iommu,intremap=on
+                  -device virtio-blk-pci,disable-legacy=on,iommu_platform=on,drive=vd0
+                  -netdev user,id=n0
+                  -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on
+                  -drive id=vd0,if=none,format=raw,file=target/vdisk0.img)
+    EXTRA_GREPS=(
+      "[IOMMU] dmar: pa="
+      "[IOMMU] dmar: "  # the struct markers (drhd line)
+      "[IR  ] enabled: 256 IRTEs"  # IRTA + SIRTP + IRE, the broker owns the table
+      "[VBLK] alive"  # the block device still drives through the IOMMU
+      "[VNET] alive: MAC="
+      "[VNET] TX: DHCP DISCOVER sent"
+      "[VNET] RX: "  # the full round trip with IR live
+      "[MSIX] format: remapped"  # the message went through the IRTE, not compat
+      "[MSIX] armed: entries="
+      "[MSIX] DELIVERED: vector"  # ADR-0019 end to end: MSI-X → IRTE → vector → mailbox
+      "[MSIX] disabled + vector released"
+      "cross-device DMA FAULTED (FSTS.PPF set)"  # the ADR-0018 negative probe still faults with IR on
     )
     ;;
 esac
@@ -154,8 +204,9 @@ QEMU_ARGS=("${MACHINE_ARGS[@]}" -kernel "$IMAGE" -display none -serial stdio -no
 # except sdisk0, which must be the REAL ext2 image the mount reads).
 # They are generated here so the lane is self-contained in CI (they
 # used to exist only on one dev machine — a latent CI break).
-if [ "$MODE" = "verify" ] && { [ "${1:-}" = "--verify-q35" ] || [ "${1:-}" = "--verify-q35-noiommu" ]; }; then
+if [ "$MODE" = "verify" ] && { [ "${1:-}" = "--verify-q35" ] || [ "${1:-}" = "--verify-q35-noiommu" ] || [ "${1:-}" = "--verify-q35-ir" ]; }; then
   dd if=/dev/urandom of=target/vdisk0.img bs=1K count=64 status=none
+  dd if=/dev/urandom of=target/vdisk1.img bs=1K count=64 status=none  # the bus-1 disk behind rp0
 fi
 if [ "$MODE" = "verify" ] && [ "${1:-}" = "--verify-q35" ]; then
   dd if=/dev/zero of=target/nvme0.img bs=1K count=128 status=none
@@ -172,6 +223,9 @@ if [ "$MODE" = "verify" ]; then
   case "${1:-}" in
     --verify-q35)
       echo "==> [4/4] booting in QEMU (TCG, q35 + intel-iommu) — M1/M2 markers + ADR-0013 DMAR discovery"
+      ;;
+    --verify-q35-ir)
+      echo "==> [4/4] booting in QEMU (TCG, q35 + intel-iommu intremap=on) — ADR-0019: MSI-X through the IRTE"
       ;;
     --verify-q35-noiommu)
       echo "==> [4/4] booting in QEMU (TCG, q35, NO iommu) — M1/M2 markers + the fail-closed absent proof"
@@ -194,6 +248,11 @@ if [ "$MODE" = "verify" ]; then
     rm -f /tmp/qmp.sock /tmp/screen.ppm
     touch "$LOG"
     (python3 "$(dirname "$0")/scripts/qmp_drive.py" "$LOG" >/tmp/qmp-drive.log 2>&1 &)
+  fi
+  # The IR lane waits out the same keyboard poll budget (no QMP key is
+  # injected there — the IOAPIC proof belongs to the base lane).
+  if [ "${1:-}" = "--verify-q35-ir" ]; then
+    QEMU_TIMEOUT=240
   fi
   # ADR-0014: the q35 lane runs with the VT-d trace on, so the lane
   # can PROVE no device takes the pass-through fast path. The trace
@@ -279,7 +338,7 @@ if [ "$MODE" = "verify" ]; then
       grep -qF "[IOMMU] broker: quota enforced" "$LOG" || { echo "VERIFY FAIL: quota enforcement not proven"; ok=0; }
       grep -qF "[IOMMU] broker: revoke_all(0)" "$LOG" || { echo "VERIFY FAIL: teardown path not proven"; ok=0; }
       grep -qF "[IOMMU] dma-drivers=1 (broker live over VT-d)" "$LOG" || { echo "VERIFY FAIL: dma-drivers verdict must be 1 on the IOMMU lane"; ok=0; }
-      grep -qF "[PCI ] scan bus 0: " "$LOG" || { echo "VERIFY FAIL: PCI inventory marker missing"; ok=0; }
+      grep -qF "[PCI ] scan (bridge walk): " "$LOG" || { echo "VERIFY FAIL: PCI inventory marker missing"; ok=0; }
       grep -qF "0x1af4" "$LOG" || { echo "VERIFY FAIL: the virtio-blk must be in the inventory"; ok=0; }
 grep -qF "(virtio-blk) → dom" "$LOG" || { echo "VERIFY FAIL: the virtio-blk claim must go through the broker (ADR-0018: its own domain)"; ok=0; }
       # ── ADR-0014: translation is REAL or the lane fails ──

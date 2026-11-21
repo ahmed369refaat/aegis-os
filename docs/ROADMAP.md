@@ -55,6 +55,16 @@ zero external dependencies, unsafe confined to the allowlist (arch/,
 boot/, hw.rs, memops.rs, sched/ — as defined in scripts/check_unsafe.sh,
 ratcheted at 78).
 
+**Round 6 ("G", ADR-0019/0020):** the interrupt chain is live —
+the broker-owned device vectors (49..=112), the IOAPIC line path
+(the QMP key delivers end to end), x2APIC, virtio-net on MSI-X, and
+VT-d interrupt remapping through broker-owned IRTEs (the
+`--verify-q35-ir` lane) — plus multi-bus PCI over the ECAM seam
+(devices behind root ports claim domains), FADT-sourced
+power-off/reboot, HPET-calibrated TSC, live entropy sources
+(RDRAND/RDSEED + virtio-rng), MONITOR/MWAIT idle, and GPT partition
+parsing under the ext2 mount.
+
 **Not present at all (each gets its stage below):** timer interrupts and
 preemption, SMP, demand paging/COW, the ELF loader, the full ring-3
 syscall surface, block devices, on-disk filesystems, real networking,

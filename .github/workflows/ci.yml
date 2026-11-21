@@ -108,6 +108,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
       - name: q35 + intel-iommu + virtio-blk: DMAR found (haw, DRHD inventory)
         run: ./boot.sh --verify-q35
+      - name: q35 + intel-iommu intremap=on: ADR-0019 MSI-X through the IRTE
+        run: ./boot.sh --verify-q35-ir
       - name: q35 without iommu: the fail-closed absent proof
         run: ./boot.sh --verify-q35-noiommu
 

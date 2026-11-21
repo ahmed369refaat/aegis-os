@@ -4,6 +4,64 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Changed — review round 6 ("G"): the interrupt chain, multi-bus PCI, and the platform slice (ADR-0019 + ADR-0020)
+
+- **The interrupt broker (ADR-0019)** — `kernel-x86_64/src/irq.rs`:
+  vectors 49..=112 are broker-owned from boot (64 stubs + gates in
+  `idt::load`, the dispatch route); `alloc` is the only way a vector
+  gets an owner (one per device, duplicate tags refuse); `deliver`
+  EOIs FIRST then lands the delivery in a per-device mailbox
+  (served/lost/pending, cap 1024 — surplus counted, never wrapped);
+  an unowned vector is a named halt. The bounded delivery window
+  (`wait_for_delivery`) pauses the tick, opens IF, and sleeps in
+  **MWAIT on the LAST_DELIVERED word** when the CPU offers MONITOR
+  (armed-late re-check included), spinning otherwise.
+- **IOAPIC + x2APIC**: the MADT's interrupt view parsed pure
+  (IOAPIC entries + ISA-IRQ→GSI overrides, hostile truncations
+  stop the walk); the IOAPIC's RTE encoded field-by-field,
+  programmed masked-first, bounds-checked against the probed max;
+  the LAPIC switches to x2APIC when CPUID offers it (MSR
+  0x800+(off>>4), mode-aware EOI). **The lane's proof**: the QMP
+  key arrives MID-WINDOW and delivers ISA IRQ1 → GSI1 → vector →
+  EOI → mailbox — the first line interrupt in the tree that is not
+  a poll.
+- **MSI/MSI-X + VT-d IRTE**: the MSI-X table (BIR/offset decode,
+  BAR-size bounds, masked-first entry writes, read-back) points
+  virtio-net at a broker vector — the TX kick's completion arrives
+  as a MESSAGE. When the DMAR declares interrupt remapping, IR
+  enables (IRTA + SIRTP + IRE on the accumulated GCMD word, 256
+  IRTEs on a scrubbed frame) and the NIC's messages switch to the
+  REMAPPED format through IRTE n = broker slot n (layouts pinned
+  against QEMU's decoder; reserved fields zero by construction).
+  New lane `--verify-q35-ir` (`intremap=on`) proves the remapped
+  path end to end in CI.
+- **Multi-bus PCI (ADR-0020)**: the config seam
+  (`CfgAccess::LegacyPorts | Ecam`) with bounds-checked ECAM
+  address math; `enumerate_multi` walks THROUGH type-1 bridges
+  (visited-set loop protection, depth cap 8, the same
+  BAR/capability code now bus-parameterized); the F9 bus-0-only
+  refusal is LIFTED — devices behind bridges claim their own
+  ADR-0018 domains. The q35 lane gains a pcie-root-port with a
+  virtio-blk behind it; the ECAM marker, the traversed marker, and
+  the bus-1 device line are asserted. Inventory cap 32 → 48.
+- **The platform slice**: power paths read the FADT
+  (`arch/pwr.rs` — PM1a + the reset register, offsets pinned
+  against Linux's actbl.h; power-off and reboot go through the
+  firmware's addresses with loud legacy fallbacks); the TSC is
+  calibrated against the live HPET counter (the preempt tick stops
+  riding a guessed constant); entropy exists (RDRAND/RDSEED +
+  virtio-rng harvested through the broker into a splitmix64-mixed
+  pool with honest counters — a mixer, not yet a CSPRNG, stated);
+  and the storage stack reads a REAL partition table
+  (`src/part.rs`: protective MBR + GPT with both CRC-32s enforced,
+  typed hostile refusals — the ext2 mount rides the 'aegis-root'
+  partition base, raw-LBA-0 fallback marked).
+- **Unsafe ratchet 93 → 99** (six single-instruction `hw` wrappers,
+  ADR-0019 referenced in `scripts/unsafe-count.txt`); ~60 new host
+  tests across the kernel and policy crates; every marker the new
+  lanes assert is listed in the ADRs.
+
+
 ### Changed — review round 5, Phase E: ADR-0017's first slice — the IpcMmio channel
 
 - **`kernel-x86_64/src/ipc_mmio.rs`**: a driver's register access as
