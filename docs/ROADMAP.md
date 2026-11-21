@@ -46,11 +46,11 @@ stays) · POSIX ABI → Stage 5 · drivers → Stage 6 · hardening
 capability generations, ten-check memory policy, in-memory VFS + Unix DAC
 + chroot, pipes, signals, fd tables, CFS, buddy allocator, rate-limited
 brokered sockets, capability-endpoint async IPC, behavior monitor with
-graduated response) — 307 lib tests; a bootable two-stage x86_64 kernel
+graduated response) — 319 lib tests; a bootable two-stage x86_64 kernel
 (ELF32 multiboot stub → ELF64 kernel) with a real 4096-frame pool,
 scrub-on-free verified by read-back, per-domain page tables, SMEP/SMAP,
 kernel-image W^X, SYSCALL/SYSRET ring-3 entry, and the seven-run ring-3
-sequence asserted by the CI boot test — 249 kernel host tests; 562 total,
+sequence asserted by the CI boot test — 249 kernel host tests; 568 total,
 zero external dependencies, unsafe confined to the allowlist (arch/,
 boot/, hw.rs, memops.rs, sched/ — as defined in scripts/check_unsafe.sh,
 ratcheted at 78).
