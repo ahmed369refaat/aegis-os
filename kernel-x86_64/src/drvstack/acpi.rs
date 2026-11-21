@@ -616,29 +616,32 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
             // TSC calibration: elapsed femtoseconds = counter delta ×
             // period; tsc_hz = tsc_delta × 1e15 / elapsed. Guards: a
             // dead period, a zero delta, and a quotient beyond any
-            // real CPU (≥ 16 GHz) all keep the fallback.
+            // real CPU (≥ 16 GHz) all keep the fallback. Round I: the
+            // arithmetic moved to u128 — the old
+            // `tsc_delta.checked_mul(1e15)` overflowed u64 for ANY
+            // real window (a 2M-spin calibration is millions of TSC
+            // ticks, and the product with 10^15 exceeds 2^64 ten
+            // times over), so the "calibrated" marker had never
+            // printed — hidden behind the round-6 lane crash, like
+            // every other proof on this lane.
             if period > 0 && c2 != c1 {
-                let elapsed_fs = c2.wrapping_sub(c1).saturating_mul(period);
-                let tsc_delta = t2.wrapping_sub(t1);
-                if let Some(hz) = (tsc_delta.checked_mul(1_000_000_000_000_000))
-                    .and_then(|num| num.checked_div(elapsed_fs))
-                {
-                    if (1_000_000u64..16_000_000_000u64).contains(&hz) {
-                        crate::sched::preempt::set_tick_interval(hz / 100); // 10 ms
-                        let mut m = [0u8; 20];
-                        line(
-                            out,
-                            &[
-                                "[TSC ] calibrated: ",
-                                strutil::dec(hz / 1_000_000, &mut m),
-                                " MHz (HPET-sourced; the preempt tick rides it now)",
-                            ],
-                        );
-                    } else {
-                        line(out, &["[TSC ] calibration quotient out of band — keeping the fallback cadence"]);
-                    }
+                let elapsed_fs = u128::from(c2.wrapping_sub(c1)) * u128::from(period);
+                let tsc_delta = u128::from(t2.wrapping_sub(t1));
+                let hz128 = tsc_delta * 1_000_000_000_000_000u128 / elapsed_fs;
+                if (1_000_000u128..16_000_000_000u128).contains(&hz128) {
+                    let hz = hz128 as u64;
+                    crate::sched::preempt::set_tick_interval(hz / 100); // 10 ms
+                    let mut m = [0u8; 20];
+                    line(
+                        out,
+                        &[
+                            "[TSC ] calibrated: ",
+                            strutil::dec(hz / 1_000_000, &mut m),
+                            " MHz (HPET-sourced; the preempt tick rides it now)",
+                        ],
+                    );
                 } else {
-                    line(out, &["[TSC ] calibration arithmetic overflowed — keeping the fallback cadence"]);
+                    line(out, &["[TSC ] calibration quotient out of band — keeping the fallback cadence"]);
                 }
             } else {
                 line(out, &["[TSC ] calibration window degenerate (no counter advance) — keeping the fallback cadence"]);

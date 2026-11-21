@@ -328,8 +328,14 @@ pub fn validate_caps(ver: u32, cap: u64, ecap: u64, haw_bits: u8) -> Result<Caps
 }
 
 /// Domains the Phase-0 Vtd tracks (the kernel broker is domain 0;
-/// driver domains arrive with the Phase-1 model).
-pub const MAX_VTD_DOMAINS: usize = 8;
+/// driver domains arrive with the Phase-1 model). Round I: raised
+/// 8 → 16 — the q35 lane now claims nine devices (vblk, vnet, e1000,
+/// nvme, ahci, xhci, console, rng, balloon), dom 7 was the last
+/// handout, and rng/balloon were REFUSED on budget; the claim gate
+/// should refuse for policy reasons, not because the table budget
+/// ran out one device early. The derived TABLE_BUDGET (below) keeps
+/// covering every domain's worst case.
+pub const MAX_VTD_DOMAINS: usize = 16;
 /// Bounded table-frame budget: root + IQ + context tables + SLPT
 /// tables. Loud exhaustion (`OutOfTables`), never a guess.
 /// The frame pool the identity map covers: 16 MiB at POOL_BASE —
@@ -1767,7 +1773,13 @@ mod tests {
         assert_eq!(POOL_2M_SPANS_WORST, 9, "16 MiB aligned + 1 span slack");
         assert_eq!(worst_case_tables(1), 3 + 12);
         assert_eq!(worst_case_tables(8), 3 + 8 * 12);
-        assert_eq!(TABLE_BUDGET, 99, "covers every domain's worst case");
+        // Round I: 16 domains (the q35 lane claims nine devices);
+        // the derived budget scales with the const, still loud.
+        assert_eq!(
+            TABLE_BUDGET,
+            3 + 16 * 12,
+            "covers every domain's worst case"
+        );
     }
 
     /// ADR-0018: exhausting the NEW multi-domain budget is a typed

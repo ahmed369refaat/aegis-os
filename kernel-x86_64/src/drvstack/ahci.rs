@@ -293,6 +293,9 @@ pub(crate) fn ahci_step<const N: usize>(
         // The block layer's first slice rides the LIVE port: read-only
         // ext2 (superblock → root dir → hello.txt) via READ DMA.
         super::ext2::ext2_over_ahci(out, &bus, clb, ctba, fis, data);
+        // The ESP slice follows on the same port: GPT partition 2,
+        // read-only FAT32 (BPB → root dirent → cluster chain).
+        super::fat32::fat32_over_ahci(out, &bus, clb, ctba, fis, data);
     } else {
         line(
             out,

@@ -23,6 +23,7 @@ mod ahci;
 mod broker;
 mod e1k;
 mod ext2;
+mod fat32;
 mod irq;
 mod legacy;
 mod netutil;

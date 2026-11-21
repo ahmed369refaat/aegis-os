@@ -127,14 +127,21 @@ pub fn cpuid7_ebx() -> u64 {
     // (LLVM reserves it), and an `out(reg)` temporary is allocation
     // luck — if the allocator picks RBX itself, the restore-pop
     // clobbers the result (observed: SMEP/SMAP read as off in one
-    // build, on in another). Bulletproof pattern instead: push a slot,
-    // CPUID, store EBX INTO the slot, and pop the slot straight into
-    // the operand — no intermediate register at all.
+    // build, on in another). Round I: the previous shape ("push /
+    // cpuid / mov %rbx,(%rsp) / pop {b}") ALSO destroyed the caller's
+    // callee-saved RBX — the mov overwrote the saved original with
+    // CPUID's EBX and the pop handed that to the output, so the
+    // original never came back (the release build faulted on it: the
+    // driver stack's inventory pointer lived in RBX across this
+    // call). The XCHG fixes both: it swaps CPUID's EBX into the slot
+    // and the ORIGINAL RBX back into the register; the pop then
+    // feeds the output with the wanted word. No intermediate
+    // register, no allocation luck, RBX preserved.
     unsafe {
         core::arch::asm!(
             "push %rbx",
             "cpuid",
-            "movq %rbx, (%rsp)",
+            "xchgq %rbx, (%rsp)",
             "pop {b}",
             in("eax") 7u32,
             in("ecx") 0u32,
@@ -150,35 +157,39 @@ pub fn cpuid7_ebx() -> u64 {
 }
 
 /// CPUID leaf 1's ECX — the feature word carrying TSC-deadline (bit 24;
-/// decoded in arch/features). Same ADR-0008 bulletproof pattern as
-/// `cpuid7_ebx`: RBX cannot be an asm operand (LLVM reserves it), so
-/// the wanted value travels through the pushed stack slot, never a
-/// temporary register the allocator might recycle.
+/// decoded in arch/features) and RDRAND (bit 30). Same ADR-0008
+/// bulletproof pattern as `cpuid7_ebx`: RBX cannot be an asm operand
+/// (LLVM reserves it), so the wanted value travels through the pushed
+/// stack slot, never a temporary register the allocator might recycle.
 pub fn cpuid1_ecx() -> u64 {
     let a: u32;
     let c: u64;
     let d: u32;
-    let e: u32;
-    // SAFETY: CPUID is unprivileged; the push/store/pop sequence moves
-    // ECX's result through the pushed slot (see cpuid7_ebx for the
-    // allocation-luck failure this avoids). ECX's final register value
-    // is dead (the slot already saved it), hence the throwaway `e`.
+    // SAFETY: CPUID is unprivileged. The sequence saves RBX (CPUID
+    // destroys it), stores the wanted ECX into the output operand,
+    // and pops the ORIGINAL RBX back — round I: the previous
+    // "push / mov %rcx,(%rsp) / pop" shape overwrote the SAVED RBX
+    // with the result and popped that, silently destroying the
+    // caller's callee-saved RBX (the release build kept a driver-
+    // stack inventory pointer there; the q35 lane faulted on it the
+    // moment a step crossed a CPUID call). ECX's own output is dead
+    // here (the mov already saved it), hence no throwaway operand.
     unsafe {
         core::arch::asm!(
             "push %rbx",
             "cpuid",
-            "movq %rcx, (%rsp)",
-            "pop {c}",
+            "movq %rcx, {c}",
+            "pop %rbx",
             in("eax") 1u32,
             in("ecx") 0u32,
             lateout("eax") a,
-            lateout("ecx") e,
+            lateout("ecx") _,
             lateout("edx") d,
             c = out(reg) c,
             options(att_syntax),
         );
     }
-    let _ = (a, d, e);
+    let _ = (a, d);
     c
 }
 

@@ -51,6 +51,22 @@ pub(crate) fn pci_step(
                     " (MCFG)",
                 ],
             );
+            // The ADR-0020 follow-up (round I): the window's GiBs must
+            // be PRESENT in the direct map before the first config
+            // read — on q35 the MCFG sits in the third GiB, which
+            // nothing else maps (round 6 shipped the seam without
+            // this; the first read #PF'd and the kernel halted).
+            let span = (u64::from(eb - sb) + 1) << 20; // 1 MiB per bus
+            let gibs = crate::mm::map_gib_windows(base, span);
+            let mut g1 = [0u8; 20];
+            line(
+                out,
+                &[
+                    "[PCI ] ECAM window mapped: ",
+                    strutil::dec(u64::from(gibs), &mut g1),
+                    " GiB page(s), RW+NX (direct map)",
+                ],
+            );
             pci::CfgAccess::Ecam {
                 base,
                 start_bus: sb,
@@ -455,6 +471,89 @@ pub(crate) fn pci_step(
                         }
                         Some((dom, Ok(()))) => {
                             inv.set_dom(vendor, class_hi, dom);
+                            let mut db = [0u8; 20];
+                            line(
+                                out,
+                                &[
+                                    "[PCI ] claim: ",
+                                    label,
+                                    " → dom ",
+                                    strutil::dec(u64::from(dom), &mut db),
+                                    " ok (broker assigned, ADR-0018)",
+                                ],
+                            );
+                        }
+                        Some((dom, Err(e))) => {
+                            domains.release(dom);
+                            line(
+                                out,
+                                &[
+                                    "[PCI ] claim: broker refused the ",
+                                    label,
+                                    " assignment (",
+                                    hw_code(&e),
+                                    ")",
+                                ],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Round I: the claim gates for the remaining virtio devices —
+    // console (virtio id 3), rng (id 4), balloon (id 5). Their steps
+    // ran UNCLAIMED through rounds G/H: the sessions drove with
+    // dom 0 (the kernel's own domain), and an unclaimed device's DMA
+    // fails closed at the IOMMU — every completion honestly timed
+    // out ("DID NOT COMPLETE (budget)") the moment the ECAM fix let
+    // the q35 lane reach them. The claim gate is the designed path
+    // to a device's own domain; matched by virtio device id (the
+    // family's class codes are ambiguous), legacy and modern both
+    // (0x1000+id and 0x1040+id differ only in bit 6).
+    for (virtio_id, label) in [
+        (3u16, "virtio-console"),
+        (4u16, "virtio-rng"),
+        (5u16, "virtio-balloon"),
+    ] {
+        if let Some(dev) = inv.devices[..inv.count]
+            .iter()
+            .find(|d| d.vendor == 0x1AF4 && (d.device & !0x40) == (0x1000 + virtio_id))
+            .copied()
+        {
+            let rmrr = dmar.rmrr_covers(0, dev.bus, dev.dev, dev.func);
+            match pci::check_claim(&dev, broker.verdict(), rmrr) {
+                Err(e) => {
+                    line(
+                        out,
+                        &[
+                            "[PCI ] claim: ",
+                            label,
+                            " REFUSED (",
+                            describe_claim_error(e),
+                            ")",
+                        ],
+                    );
+                }
+                Ok(()) => {
+                    let (bus, d, f) = (dev.bus, dev.dev, dev.func);
+                    match domains
+                        .alloc()
+                        .map(|dom| (dom, broker.assign_device(dom, 0, bus, (d, f))))
+                    {
+                        None => {
+                            line(
+                                out,
+                                &[
+                                    "[PCI ] claim: ",
+                                    label,
+                                    " REFUSED (no free IOMMU domain — ADR-0018)",
+                                ],
+                            );
+                        }
+                        Some((dom, Ok(()))) => {
+                            inv.set_dom_dev(0x1AF4, dev.device, dom);
                             let mut db = [0u8; 20];
                             line(
                                 out,

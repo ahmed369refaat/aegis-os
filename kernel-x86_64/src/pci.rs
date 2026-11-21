@@ -264,6 +264,23 @@ impl Inventory {
             .find(|d| d.vendor == vendor && (d.class >> 8) as u8 == class_hi)
     }
 
+    /// ADR-0018 + round I: record a claimed device's domain by vendor
+    /// + DEVICE id — the virtio family's class codes are ambiguous
+    /// (rng/console/balloon share "uncategorized"), so their claims
+    /// match the id. Returns false when no such device is held.
+    pub fn set_dom_dev(&mut self, vendor: u16, device: u16, dom: u32) -> bool {
+        match self.devices[..self.count]
+            .iter()
+            .position(|d| d.vendor == vendor && d.device == device)
+        {
+            Some(i) => {
+                self.devices[i].dom = dom;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// ADR-0018: record the claimed device's IOMMU domain.
     pub fn set_dom(&mut self, vendor: u16, class_hi: u8, dom: u32) -> bool {
         match self.devices[..self.count]
@@ -679,8 +696,11 @@ pub fn ecam_addr(base: u64, start_bus: u8, bus: u8, dev: u8, func: u8, off: u8) 
     if dev >= 32 || func >= 8 {
         return None;
     }
-    // The bus must sit in the window MCFG declared.
-    if bus < start_bus || bus.wrapping_sub(start_bus) > 255 {
+    // The bus must sit at or after the window's start; the window's
+    // END is the caller's bound (CfgAccess::resolve checks end_bus —
+    // a u8 spread can never exceed it, and the old `> 255` arm here
+    // was a tautology the compiler flagged).
+    if bus < start_bus {
         return None;
     }
     let rel = u64::from(bus.wrapping_sub(start_bus));
@@ -862,6 +882,45 @@ fn walk_bus(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round I: `set_dom_dev` is the id-matched claim recording — the
+    /// virtio rng/console/balloon devices share ambiguous class codes,
+    /// so their domains are recorded by vendor+device id. The right
+    /// record moves, distractors do not, and a miss is a clean false.
+    #[test]
+    fn set_dom_dev_matches_by_vendor_and_device_id() {
+        let mk = |vendor: u16, device: u16, dom: u32| PciDev {
+            bus: 0,
+            dev: 1,
+            func: 0,
+            vendor,
+            device,
+            class: 0xFF00,
+            header: 0,
+            bars: [None; 6],
+            dom,
+            bar_count: 0,
+            cap_ids: [0; MAX_CAPS],
+            cap_ptrs: [0; MAX_CAPS],
+            cap_count: 0,
+        };
+        let mut inv = Inventory::empty();
+        // A virtio-rng (modern 0x1044) beside same-vendor distractors.
+        inv.devices[0] = mk(0x1AF4, 0x1044, 0);
+        inv.devices[1] = mk(0x1AF4, 0x1042, 0); // virtio-blk
+        inv.devices[2] = mk(0x8086, 0x1044, 0); // wrong vendor, same id
+        inv.count = 3;
+        assert!(inv.set_dom_dev(0x1AF4, 0x1044, 7));
+        assert_eq!(inv.devices[0].dom, 7, "the rng record takes the domain");
+        assert_eq!(inv.devices[1].dom, 0, "the blk distractor is untouched");
+        assert_eq!(
+            inv.devices[2].dom, 0,
+            "the wrong-vendor record is untouched"
+        );
+        // A clean miss changes nothing and reports false.
+        assert!(!inv.set_dom_dev(0x1AF4, 0x9999, 9));
+        assert_eq!(inv.devices[0].dom, 7);
+    }
 
     /// F9 (review round 4): the command-register discipline, modeled.
     /// The Status half of 0x04 is write-1-to-clear — the OLD 32-bit

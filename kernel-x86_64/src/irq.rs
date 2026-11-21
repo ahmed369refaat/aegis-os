@@ -279,6 +279,14 @@ pub fn wait_for_delivery(budget_tsc: u64) -> Option<u8> {
     loop {
         let v = LAST_DELIVERED.load(Ordering::SeqCst);
         if v != 0 {
+            // Round I: under load the delivery can land between the
+            // sti and the first load (the sti shadow covers exactly
+            // one instruction) — the silent break here printed NO
+            // proof line and the lane's idle grep failed on a race.
+            // The proof must name the path that actually happened.
+            crate::serial::write_str(
+                "[IDLE] delivery landed before mwait slept (loop top) — C0 window live\n",
+            );
             break;
         }
         if hw::read_tsc() >= deadline {
@@ -313,6 +321,42 @@ pub fn wait_for_delivery(budget_tsc: u64) -> Option<u8> {
     hw::cli();
     crate::sched::preempt::resume_ticks();
     Some(LAST_DELIVERED.load(Ordering::SeqCst))
+}
+
+/// The non-idle variant of the delivery window: the same bounded,
+/// interrupt-open wait WITHOUT MONITOR/MWAIT — a plain spin. MWAIT
+/// sleeps until SOME interrupt arrives, so when the awaited message
+/// never fires (a device that stays silent — a live outcome every
+/// marker must be able to say loudly), the sleeping wait never
+/// returns to check its own TSC deadline and the boot hangs INSIDE
+/// the window (observed: the MSI-X proof under QEMU TCG; the budget
+/// change from 400M to 40M cycles had no effect for exactly this
+/// reason). The idle proof (the QMP key that always arrives) keeps
+/// the mwait path; message proofs where silence is possible use
+/// this one.
+#[cfg(not(test))]
+pub fn wait_for_delivery_spin(budget_tsc: u64) -> Option<u8> {
+    use crate::hw;
+    crate::sched::preempt::pause_ticks();
+    LAST_DELIVERED.store(0, Ordering::SeqCst);
+    hw::sti();
+    let deadline = hw::read_tsc() + budget_tsc;
+    loop {
+        let v = LAST_DELIVERED.load(Ordering::SeqCst);
+        if v != 0 || hw::read_tsc() >= deadline {
+            break;
+        }
+    }
+    hw::cli();
+    crate::sched::preempt::resume_ticks();
+    // A silent window is `None` — returning the zero word here would
+    // have the caller print "DELIVERED: vector 0x0", a false proof.
+    let v = LAST_DELIVERED.load(Ordering::SeqCst);
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 #[cfg(test)]
