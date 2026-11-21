@@ -56,8 +56,10 @@ pub mod drvstack;
 #[cfg(not(test))]
 pub mod kmain;
 pub mod mm;
+pub mod mmio;
 #[cfg(not(test))]
 pub mod serial;
+pub mod session;
 
 pub mod frames;
 #[cfg(not(test))]

@@ -1,9 +1,9 @@
 //! AHCI: ABAR/port bring-up, IDENTIFY, DMA reads + the ext2 mount entry.
 
 use super::ext2::ext2_over_ahci;
-use super::{line, revoke_or_quarantine};
 use crate::frames::FramePool;
 use crate::strutil;
+use crate::strutil::line;
 
 // ── AHCI/SATA (checklist item 7): the q35's built-in ich9-ahci —
 // port bring-up, command list + FIS rx + PRDT via broker frames, an
@@ -22,7 +22,7 @@ pub(crate) fn ahci_step<const N: usize>(
     broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
     inv: &crate::pci::Inventory,
 ) {
-    use aegis_os::dma::{DmaDir, DmaVerdict};
+    use aegis_os::dma::DmaVerdict;
 
     let Some(dev) = inv.find_by(0x8086, 0x01) else {
         line(out, &["[AHCI] no AHCI to drive on this machine"]);
@@ -39,17 +39,45 @@ pub(crate) fn ahci_step<const N: usize>(
             &["[AHCI] identity mode: no IOMMU on this machine — same two-command sequence, unbrokered frames (the stale-FIS control lane)"],
         );
     }
-    let Some(abar) = crate::pci::mem_bar_base(dev, 5) else {
+    let Some(bar) = crate::pci::mem_bar(dev, 5) else {
         line(out, &["[AHCI] ABAR (BAR5) unresolved — refusing"]);
         return;
     };
+    // ADR-0016: one window for the ABAR; port 0's registers reach
+    // 0x100+0x38 (CI) — the door check makes that a claim, and the
+    // per-access refusals below are defense-in-depth.
+    let Some(bus) = crate::mmio::BarMmio::new(bar.base, bar.size) else {
+        line(
+            out,
+            &["[AHCI] ABAR window malformed (zero/wrapping) — refusing"],
+        );
+        return;
+    };
+    if bus.window().len() < 0x100 + 0x38 + 4 {
+        let mut lb = [0u8; 18];
+        line(
+            out,
+            &[
+                "[AHCI] ABAR window too small for port 0's registers (len=0x",
+                strutil::hex(bus.window().len(), &mut lb),
+                ") — refusing",
+            ],
+        );
+        return;
+    }
     // F9e: MEM now; BME after the port frames are broker-mapped.
     crate::pci::enable_mem(dev);
-    let r32 = |off: u64| crate::memops::read_u32(abar + off);
-    let w32 = |off: u64, v: u32| crate::memops::write_u32(abar + off, v);
-    let ghc_ae = r32(0x04) & 0x8000_0000 != 0;
-    let pi = r32(0x0C);
-    let sig = r32(0x100 + 0x24);
+    use crate::mmio::MmioBus;
+    let (Some(ghc), Some(pi), Some(sig)) =
+        (bus.read32(0x04), bus.read32(0x0C), bus.read32(0x100 + 0x24))
+    else {
+        line(
+            out,
+            &["[AHCI] register window refused a GHC/PI/SIG read — refusing"],
+        );
+        return;
+    };
+    let ghc_ae = ghc & 0x8000_0000 != 0;
     let mut h = [0u8; 18];
     let mut h2 = [0u8; 18];
     line(
@@ -69,11 +97,23 @@ pub(crate) fn ahci_step<const N: usize>(
         return;
     }
 
+    // ADR-0016/F10: the session owns the port frames — identity or
+    // brokered; every exit below is one close().
+    let mut session = crate::session::DriverSession::new(
+        k,
+        pool,
+        broker,
+        Some(dev),
+        AHCI_OWNER,
+        identity,
+        "[AHCI] teardown: revoke_all(0) → ",
+        "[AHCI] teardown (identity): frames freed, no broker regions",
+    );
     let mut frames = [0u64; 4];
     for slot in frames.iter_mut() {
-        match pool.alloc_for(&mut k.frames, AHCI_OWNER) {
-            Ok(pa) => *slot = pa,
-            Err(_) => {
+        match session.frame() {
+            Some(pa) => *slot = pa,
+            None => {
                 line(out, &["[AHCI] pool exhausted — refusing"]);
                 return;
             }
@@ -82,10 +122,7 @@ pub(crate) fn ahci_step<const N: usize>(
     let [clb, ctba, fis, data] = frames;
     if !identity {
         for &pa in frames.iter() {
-            if broker
-                .map_region(0, pa, 4096, DmaDir::Bidirectional)
-                .is_err()
-            {
+            if session.map(pa).is_none() {
                 line(out, &["[AHCI] broker refused a frame — refusing"]);
                 return;
             }
@@ -106,18 +143,46 @@ pub(crate) fn ahci_step<const N: usize>(
         crate::pci::enable_bus_master(dev);
     }
 
-    // Stop the engine, reprogram CLB/FB, restart with FRE|ST.
-    let cmd = r32(0x100 + 0x18);
-    w32(0x100 + 0x18, cmd & !1); // ~ST
+    // Stop the engine, reprogram CLB/FB, restart with FRE|ST. The
+    // frames are mapped and the device has BME — a refused write here
+    // is a full teardown.
+    let Some(cmd) = bus.read32(0x100 + 0x18) else {
+        line(
+            out,
+            &["[AHCI] register window refused a PxCMD read — teardown"],
+        );
+        session.close(out);
+        return;
+    };
+    if !bus.write32(0x100 + 0x18, cmd & !1) {
+        line(
+            out,
+            &["[AHCI] register window refused a PxCMD write — teardown"],
+        );
+        session.close(out);
+        return;
+    }
     let mut spins = 0u64;
-    while r32(0x100 + 0x20) & 0x88 != 0 && spins < 4_000_000 {
+    while bus.read32(0x100 + 0x20).is_some_and(|v| v & 0x88 != 0) && spins < 4_000_000 {
         spins += 1;
     } // TFD.BSY|DRQ
-    w32(0x100, clb as u32);
-    w32(0x100 + 0x04, 0);
-    w32(0x100 + 0x08, fis as u32);
-    w32(0x100 + 0x0C, 0);
-    w32(0x100 + 0x18, 0x11); // FRE | ST
+    let port_prog = [
+        (0x100u64, clb as u32),
+        (0x100 + 0x04, 0),
+        (0x100 + 0x08, fis as u32),
+        (0x100 + 0x0C, 0),
+        (0x100 + 0x18, 0x11 /* FRE | ST */),
+    ];
+    for &(off, v) in port_prog.iter() {
+        if !bus.write32(off, v) {
+            line(
+                out,
+                &["[AHCI] register window refused a port write — teardown"],
+            );
+            session.close(out);
+            return;
+        }
+    }
 
     // Command header 0: CFL=5, PRDTL=1; table at ctba.
     crate::memops::write_u32(clb, 5 | (1 << 16));
@@ -140,12 +205,21 @@ pub(crate) fn ahci_step<const N: usize>(
     crate::memops::write_u32(ctba + 0x8C, 511);
 
     // Issue and poll CI bit 0.
-    w32(0x100 + 0x38, 1);
+    if !bus.write32(0x100 + 0x38, 1) {
+        line(
+            out,
+            &["[AHCI] register window refused the CI write — teardown"],
+        );
+        session.close(out);
+        return;
+    }
     let mut spins = 0u64;
-    while r32(0x100 + 0x38) & 1 != 0 && spins < 10_000_000 {
+    while bus.read32(0x100 + 0x38).is_some_and(|v| v & 1 != 0) && spins < 10_000_000 {
         spins += 1;
     }
-    if r32(0x100 + 0x38) & 1 == 0 && r32(0x100 + 0x20) & 0x88 == 0 {
+    let ci_done = bus.read32(0x100 + 0x38).is_some_and(|v| v & 1 == 0)
+        && bus.read32(0x100 + 0x20).is_some_and(|v| v & 0x88 == 0);
+    if ci_done {
         let w0 = crate::virtio::read_u16_pa(data);
         let sn = crate::memops::read_u64(data + 20); // serial words 10-11
         let mut hs = [0u8; 18];
@@ -165,35 +239,16 @@ pub(crate) fn ahci_step<const N: usize>(
         );
         // The block layer's first slice rides the LIVE port: read-only
         // ext2 (superblock → root dir → hello.txt) via READ DMA.
-        ext2_over_ahci(out, abar, clb, ctba, fis, data);
+        ext2_over_ahci(out, &bus, clb, ctba, fis, data);
     } else {
         line(
             out,
             &["[AHCI] IDENTIFY issued, no completion on this lane (open: the device-DMA cluster; see drivers.md)"],
         );
     }
-    if identity {
-        line(
-            out,
-            &["[AHCI] teardown (identity): frames freed, no broker regions"],
-        );
-        for &pa in frames.iter() {
-            let _ = pool.free(&mut k.frames, pa, AHCI_OWNER);
-        }
-    } else {
-        // The helper owns frame freeing on the broker path — and on
-        // poison, quarantines them (ADR-0015 F2).
-        revoke_or_quarantine(
-            k,
-            pool,
-            out,
-            broker,
-            AHCI_OWNER,
-            &frames,
-            Some(dev),
-            "[AHCI] teardown: revoke_all(0) → ",
-        );
-    }
+    // Teardown: the identity lane frees with BME cut first; the
+    // broker path runs the shared revoke discipline (ADR-0016/F10).
+    session.close(out);
 }
 
 // ── USB xHCI bring-up (checklist item 12): caps, halt, reset, DCBAAP
@@ -205,9 +260,14 @@ pub(crate) fn ahci_step<const N: usize>(
 /// (1 sector) into `buf` and wait for CI to clear. Returns false if
 /// the command never completes.
 #[cfg(not(test))]
-pub(crate) fn ahci_read_dma(abar: u64, clb: u64, ctba: u64, buf: u64, lba: u64) -> bool {
-    let r32 = |off: u64| crate::memops::read_u32(abar + off);
-    let w32 = |off: u64, v: u32| crate::memops::write_u32(abar + off, v);
+pub(crate) fn ahci_read_dma(
+    bus: &crate::mmio::BarMmio,
+    clb: u64,
+    ctba: u64,
+    buf: u64,
+    lba: u64,
+) -> bool {
+    use crate::mmio::MmioBus;
     // Header 0: CFL=5, PRDTL=1, table at ctba.
     crate::memops::write_u32(clb, 5 | (1 << 16));
     crate::memops::write_u32(clb + 4, 0);
@@ -259,16 +319,19 @@ pub(crate) fn ahci_read_dma(abar: u64, clb: u64, ctba: u64, buf: u64, lba: u64) 
     // command — measured: CI stays set, no FIS, no data; ahci.c:1317
     // "Engine currently busy, try again later"). Wait TFD clean first.
     let mut spins = 0u64;
-    while r32(0x100 + 0x20) & 0x88 != 0 && spins < 8_000_000 {
+    while bus.read32(0x100 + 0x20).is_some_and(|v| v & 0x88 != 0) && spins < 8_000_000 {
         spins += 1;
     }
-    if r32(0x100 + 0x20) & 0x88 != 0 {
-        return false; // engine stuck busy — honest failure
+    if !bus.read32(0x100 + 0x20).is_some_and(|v| v & 0x88 == 0) {
+        return false; // engine stuck busy (or window refused) — honest failure
     }
-    w32(0x100 + 0x38, 1); // CI bit 0
+    if !bus.write32(0x100 + 0x38, 1) {
+        return false; // CI write refused — honest failure
+    }
     let mut spins = 0u64;
-    while r32(0x100 + 0x38) & 1 != 0 && spins < 10_000_000 {
+    while bus.read32(0x100 + 0x38).is_some_and(|v| v & 1 != 0) && spins < 10_000_000 {
         spins += 1;
     }
-    r32(0x100 + 0x38) & 1 == 0 && r32(0x100 + 0x20) & 0x88 == 0
+    bus.read32(0x100 + 0x38).is_some_and(|v| v & 1 == 0)
+        && bus.read32(0x100 + 0x20).is_some_and(|v| v & 0x88 == 0)
 }

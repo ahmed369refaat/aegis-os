@@ -1,9 +1,9 @@
 //! virtio-net: RX/TX rings through the broker, the DHCP round trip.
 
 use super::netutil;
-use super::{line, revoke_or_quarantine};
 use crate::frames::FramePool;
 use crate::strutil;
+use crate::strutil::line;
 
 /// The pool owner tag for virtio-net frames (rings ×2, RX/TX buffer
 /// pages) — distinct from every other holder in the M1 accounting.
@@ -67,7 +67,7 @@ pub(crate) fn net_step<const N: usize>(
     inv: &crate::pci::Inventory,
 ) {
     use crate::virtio as v;
-    use aegis_os::dma::{DmaDir, DmaVerdict};
+    use aegis_os::dma::DmaVerdict;
 
     let Some(dev) = inv
         .find_by(0x1AF4, 0x02)
@@ -181,11 +181,23 @@ pub(crate) fn net_step<const N: usize>(
     }
 
     // ── frames: two ring sets + one buffer page each ──
+    // ADR-0016/F10: the session owns every acquisition; a mid-flight
+    // refusal still closes on return.
+    let mut session = crate::session::DriverSession::new(
+        k,
+        pool,
+        broker,
+        Some(dev),
+        VNET_OWNER,
+        false,
+        "[VNET] teardown: revoke_all(0) → ",
+        "",
+    );
     let mut frames = [0u64; 8];
     for (i, slot) in frames.iter_mut().enumerate() {
-        match pool.alloc_for(&mut k.frames, VNET_OWNER) {
-            Ok(pa) => *slot = pa,
-            Err(_) => {
+        match session.frame() {
+            Some(pa) => *slot = pa,
+            None => {
                 let mut b = [0u8; 20];
                 line(
                     out,
@@ -201,10 +213,7 @@ pub(crate) fn net_step<const N: usize>(
     }
     let [rx_desc, rx_avail, rx_used, tx_desc, tx_avail, tx_used, rx_buf, tx_buf] = frames;
     for &pa in frames.iter() {
-        if broker
-            .map_region(0, pa, 4096, DmaDir::Bidirectional)
-            .is_err()
-        {
+        if session.map(pa).is_none() {
             line(
                 out,
                 &["[VNET] broker refused a frame — refusing (the device gets no addresses)"],
@@ -443,16 +452,7 @@ pub(crate) fn net_step<const N: usize>(
             out,
             &["[VNET] TX: DISCOVER published+kicked (290 bytes, xid=0xa6515151) — QEMU did not consume it (open: TX bh)"],
         );
-        revoke_or_quarantine(
-            k,
-            pool,
-            out,
-            broker,
-            VNET_OWNER,
-            &frames,
-            Some(dev),
-            "[VNET] teardown: revoke_all(0) → ",
-        );
+        session.close(out);
         return;
     }
     line(
@@ -532,16 +532,7 @@ pub(crate) fn net_step<const N: usize>(
     }
 
     // ── teardown: revoke + scrub (the broker discipline) ──
-    revoke_or_quarantine(
-        k,
-        pool,
-        out,
-        broker,
-        VNET_OWNER,
-        &frames,
-        Some(dev),
-        "[VNET] teardown: revoke_all(0) → ",
-    );
+    session.close(out);
 }
 
 // ── the classic PC devices: screen (VBE on QEMU's std VGA), keyboard

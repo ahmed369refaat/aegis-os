@@ -1,6 +1,6 @@
 # ADR-0016: Driver-stack module architecture — the split, MmioBus windows, one-close() DriverSession
 
-- **Status:** Proposed (the split landed; MmioBus + DriverSession are this phase's follow-up commits)
+- **Status:** Accepted (all three parts landed: the split, MmioBus, one-close() DriverSession)
 - **Stage:** M3 driver stack (review round 4, F10 + the architecture Phase 6 builds on)
 - **Date:** 2026-11-21
 

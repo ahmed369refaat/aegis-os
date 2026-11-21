@@ -34,4 +34,4 @@ it does not merge.
 | [0013](0013-iommu-vtd-dma-isolation.md) | IOMMU/VT-d: kernel-brokered DMA isolation for driver domains | Accepted (Phases 0–2 + enforcement live on the q35 lane; ADR-0014/0015 hardening) |
 | [0014](0014-context-entry-tt-multilevel.md) | Context-entry TT=0b10: second-level translation is load-bearing | Accepted (the pass-through bug fixed in 3f7ca26) |
 | [0015](0015-map-run-atomicity-poison-quarantine.md) | map_run atomicity, poison quarantine, domain-scoped cookies | Accepted (F1–F3 in d7a1ca9; the one-close() unification is ADR-0016/F10) |
-| [0016](0016-driver-stack-modules-mmio-bus-driver-session.md) | Driver-stack modules, MmioBus windows, one-close() DriverSession | Proposed (split landed; MmioBus + DriverSession follow in-phase) |
+| [0016](0016-driver-stack-modules-mmio-bus-driver-session.md) | Driver-stack modules, MmioBus windows, one-close() DriverSession | Accepted (review round 4, Phase 4) |

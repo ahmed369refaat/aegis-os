@@ -4,6 +4,63 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Changed — driver-stack review round 4, Phase 4-B (ADR-0016): MmioBus windows
+
+- **`kernel-x86_64/src/mmio.rs` — every device register access goes
+  through a bounds-checked window** (ADR-0016). A `MmioWindow` is
+  established once per device — `BarMmio` from an enumerated BAR
+  (base + the size the scanner measured), `FixedMmio` for
+  firmware-named blocks (the HPET) — refusing zero-length and
+  wrapping ranges. The `MmioBus` trait's accessors (`read8/16/32/64`,
+  `write32/64`) take window-relative offsets and refuse out-of-window
+  access with `None`/`false` — a device-supplied number (or our own
+  arithmetic bug) can never steer the kernel outside the claimed
+  registers; refusals are verdicts the caller handles, never panics
+  and never a silent 0. The window math is pure and host-tested at
+  the edges (zero/wrap refusal, `off+len` overflow, the last valid
+  byte, a 16-bit access straddling the end, byte reads needing their
+  whole containing dword, and a fake-bus test proving out-of-window
+  offsets never reach the volatile core). The volatile core delegates
+  to `memops` — no new `unsafe` enters the tree (check_unsafe 93/93).
+- **Five drivers converted** (e1k, nvme, ahci+ext2, xHCI ×2 steps,
+  HPET): raw `memops::*(bar_base + off)` register accesses are gone;
+  the device-derived offsets that remained raw — NVMe doorbells
+  (stride from CAP.DSTRD), xHCI's caplen/dboff/rtsoff — are now
+  door-checked once then window-checked per access, and every
+  refusal prints an explicit marker. The virtio drivers keep their
+  F5 `MmioVirtio` (already windowed at `resolve()`); the arch layer's
+  own registers (LAPIC, VT-d programming in `arch/vtd.rs`) stay in
+  the tested arch module.
+
+### Changed — driver-stack review round 4, Phase 4-C (ADR-0016): one-close() DriverSession (F10)
+
+- **`kernel-x86_64/src/session.rs` — the mid-flight refusal leak dies
+  by construction.** Every driver run (vblk, vnet, e1k, nvme, ahci,
+  both xHCI steps) now acquires pool frames and broker regions
+  through a `DriverSession` that records them as they are acquired;
+  ONE `close(out)` runs the ordered teardown (BME off →
+  revoke_or_quarantine → frames home) with the lane markers verbatim,
+  and `Drop` is the silent safety net — a driver that returns early
+  for ANY reason still cannot strand a frame, leave a region mapped,
+  or leave a device with bus mastering past its owner's lifetime.
+  Pinned by four host tests (a fake `DmaProt` + the real
+  `FramePool`/`Kernel`): `no_frame_stranded_on_early_refusal` (alloc
+  three, map two, refuse the third, drop — everything home),
+  `close_frees_and_revokes_everything` (marker verbatim),
+  `drop_alone_is_the_safety_net`, `identity_close_prints_and_frees`.
+- The session is generic over `DmaProt` (the fake in tests today;
+  ADR-0017's brokered channels next) and carries the teardown core
+  (`revoke_or_quarantine` moved in from drvstack/mod.rs — it was only
+  ever the session's engine). `strutil::line` is the shared logging
+  primitive (moved out of drvstack for the same reason).
+- The identity lanes close correctly for the first time: bus
+  mastering is cut BEFORE the frames go home (the old hand-rolled
+  identity teardowns freed first — a real device-reach window on the
+  no-IOMMU lane).
+- vblk's enforcement probe runs through the session
+  (`complete_unmap` + `with_prot` + `hand_back` — the unmapped data
+  page returns home exactly once).
+
 ### Changed — driver-stack review round 4, Phase 4-A (ADR-0016): the module split
 
 - `kernel-x86_64/src/drvstack.rs` (4,389 lines, twelve subsystems
