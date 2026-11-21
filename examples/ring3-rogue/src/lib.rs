@@ -40,9 +40,15 @@ _ring3_start:
 3:  mov eax, 63
     mov edi, 99                        /* exit(99): WRONG answer — loud */
     syscall
-5:  /* ── mode 3 (N2): quarantine spam — six forbidden syscalls and a
+5:  /* ── mode 3 (N2): quarantine spam — five forbidden syscalls and a
        crossing write per iteration; the counter lives in the data page
-       because SYSCALL destroys RCX/R11. ── */
+       because SYSCALL destroys RCX/R11. ADR-0022 recalibration: the
+       MMAP spam (nr 4) left this list because MMAP/MUNMAP/FORK/EXEC/
+       WAIT entered the SERVICE surface with the process model — a
+       syscall the profile allows is no longer a "forbidden" spam
+       seed, and its ENOSYS-en route halved the denied-ratio signal
+       (measured: audit-only score 64 vs the 65 quarantine threshold,
+       one point short — the audit-only lane caught it). ── */
     mov dword ptr [0x00403008], 30000
 6:  mov eax, 200                      /* unknown nr: a denial */
     syscall
@@ -53,8 +59,6 @@ _ring3_start:
     mov eax, 6                        /* SYS_SPAWN */
     syscall
     mov eax, 11                       /* SYS_IOCTL */
-    syscall
-    mov eax, 4                        /* SYS_MMAP */
     syscall
     mov eax, 1                        /* SYS_WRITE with a crossing
                                           pointer: -EFAULT = a fault */
