@@ -11,47 +11,104 @@ use super::line;
 use crate::strutil;
 use aegis_os::dmar::Dmar;
 
-/// Phase 1 (checklist item 2 + item 4's first slice): enumerate bus 0
-/// over CF8/CFC, print the inventory (one line per function: ids,
-/// class, the driver stack's honest name for it, sized BARs, the
-/// capability list), then exercise the REAL claim gate on the first
-/// virtio-blk: endpoint + not-bridge-class + IOMMU verdict + not
-/// RMRR-covered, then the broker's `assign_device`. On machines
-/// without the IOMMU the claim refuses — the negative proof.
+/// Phase 1 → ADR-0020: enumerate THROUGH bridges over the config
+/// access seam (ECAM when the MCFG declares a usable window for
+/// segment 0, the legacy CF8/CFC pair otherwise), print the inventory
+/// (one line per function: bus:dev.fn, ids, class, the driver
+/// stack's honest name for it, sized BARs, the capability list),
+/// then exercise the REAL claim gate on the first virtio-blk:
+/// endpoint + not-bridge-class + IOMMU verdict + not RMRR-covered,
+/// then the broker's `assign_device`. On machines without the IOMMU
+/// the claim refuses — the negative proof.
 #[cfg(not(test))]
 pub(crate) fn pci_step(
     out: &mut dyn FnMut(&str),
+    dir_pa: u64,
     dmar: &Dmar,
     broker: &mut aegis_os::dma::DmaBroker<crate::arch::vtd::Vtd>,
     domains: &mut crate::session::DomainIds,
 ) -> crate::pci::Inventory {
     use crate::pci;
 
-    let mut inv = pci::enumerate_bus0();
+    // The access seam (ADR-0020): the machine's MCFG window when it
+    // declares one, the legacy port pair otherwise. The lane prints
+    // which — the two are not equivalent (CF8 vanishes on UEFI-only
+    // servers; ECAM needs the firmware's window).
+    let access = match crate::drvstack::acpi::ecam_window(dir_pa) {
+        Some((base, 0, sb, eb)) => {
+            let mut c = [0u8; 18];
+            let mut b1 = [0u8; 20];
+            let mut b2 = [0u8; 20];
+            line(
+                out,
+                &[
+                    "[PCI ] config access: ECAM @0x",
+                    strutil::hex(base, &mut c),
+                    " bus ",
+                    strutil::dec(u64::from(sb), &mut b1),
+                    "..",
+                    strutil::dec(u64::from(eb), &mut b2),
+                    " (MCFG)",
+                ],
+            );
+            pci::CfgAccess::Ecam { base, start_bus: sb, end_bus: eb }
+        }
+        _ => {
+            line(out, &["[PCI ] config access: legacy CF8/CFC (no usable MCFG window)"]);
+            pci::CfgAccess::LegacyPorts
+        }
+    };
+
+    let mut inv = pci::enumerate_multi(
+        &mut |b, d, f, o| access.read32(b, d, f, o),
+        &mut |b, d, f, o, v| access.write32(b, d, f, o, v),
+        0,
+    );
+    // The walk's shape: how many buses carry devices (the bridge walk
+    // reached past bus 0 iff this count exceeds one).
+    let mut buses_seen = 0u64;
+    for i in 0..inv.count {
+        let mut fresh = true;
+        for j in 0..i {
+            if inv.devices[j].bus == inv.devices[i].bus {
+                fresh = false;
+                break;
+            }
+        }
+        if fresh {
+            buses_seen += 1;
+        }
+    }
     let mut n = [0u8; 20];
+    let mut nb = [0u8; 20];
     line(
         out,
         &[
-            "[PCI ] scan bus 0: ",
+            "[PCI ] scan (bridge walk): ",
             strutil::dec(inv.count as u64, &mut n),
-            " device(s)",
+            " device(s) on ",
+            strutil::dec(buses_seen, &mut nb),
+            " bus(es)",
         ],
     );
     let mut b1 = [0u8; 20];
     let mut b2 = [0u8; 20];
     for d in &inv.devices[..inv.count] {
         let mut h = [0u8; 6];
-        let mut parts: [&str; 8] = [""; 8];
+        let mut bb = [0u8; 20];
+        let mut parts: [&str; 10] = [""; 10];
         parts[0] = "[PCI ] ";
-        parts[1] = strutil::dec(u64::from(d.dev), &mut b1);
-        parts[2] = ".";
-        parts[3] = strutil::dec(u64::from(d.func), &mut b2);
-        parts[4] = " ";
-        parts[5] = hex4(d.vendor, &mut h);
-        parts[6] = ":";
+        parts[1] = strutil::dec(u64::from(d.bus), &mut bb);
+        parts[2] = ":";
+        parts[3] = strutil::dec(u64::from(d.dev), &mut b1);
+        parts[4] = ".";
+        parts[5] = strutil::dec(u64::from(d.func), &mut b2);
+        parts[6] = " ";
+        parts[7] = hex4(d.vendor, &mut h);
+        parts[8] = ":";
         // vendor:device + class + name, then BARs and caps on their
         // own lines (the array is fixed-size: no formatting crutches).
-        line(out, &parts[..7]);
+        line(out, &parts[..9]);
         let mut h2 = [0u8; 6];
         let mut c = [0u8; 6];
         line(
@@ -66,13 +123,12 @@ pub(crate) fn pci_step(
             ],
         );
         if !pci::is_endpoint_header(d.header) {
-            // F9: a bridge topology this driver stack cannot isolate
-            // (single-domain Phase-2 model; devices behind bridges are
-            // not enumerated, not claimed, and their DMA fails closed
-            // on missing context entries). Say so loudly.
+            // ADR-0020: the bridge was TRAVERSED (its secondary bus is
+            // in this inventory); the line says what the walk did —
+            // the old F9 refusal (bus 0 only) is lifted.
             line(
                 out,
-                &["[PCI ] bridge at this slot — devices behind it are NOT driven (isolation boundary, F9)"],
+                &["[PCI ] bridge at this slot — traversed: devices behind it ARE enumerated (ADR-0020)"],
             );
         }
         for b in d.bars[..d.bar_count].iter().flatten() {
