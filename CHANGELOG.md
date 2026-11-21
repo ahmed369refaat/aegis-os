@@ -4,6 +4,33 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Changed — review round 5, Phase C: history, secrets and repo guards (NO history changes)
+
+- **`scripts/check-history-clean.sh`**: scans every blob reachable
+  from any ref — not just the tree at HEAD — for the incident classes
+  (ELF cores via the 20-byte header's e_type, oversize blobs outside
+  the known allowlist, assignment-shaped credential patterns shared
+  with check-no-binaries.sh, with the same self-literal exclusions).
+  Measured today: exactly the three historical `kernel-x86_64/core`
+  blobs (8,167,424 / 8,183,808 / 2,805,760 bytes) and nothing else —
+  zero false positives. Wired into CI as REPORT-ONLY: its failure is
+  the standing reminder that the human purge is pending; the flip to
+  `--strict` (build-fatal) is documented in the script, the runbook,
+  and the CI step.
+- **The incident runbook grows the verification step**: after the
+  purge, both `git log --all --oneline -- kernel-x86_64/core` and
+  `git rev-list --all --objects | grep -E '(^|/)core$'` must print
+  NOTHING — checked on the purged clone before pushing and on a fresh
+  clone after.
+- **`check-ist-sections.sh` fails honestly**: a missing kernel ELF now
+  prints "kernel ELF not found: build first or pass a path" instead of
+  the misleading "IST symbols missing" (hit twice in practice during
+  this round — the raw kernel ELF, not the packaged boot image, is
+  the expected argument; CI already invokes it argument-less after the
+  build).
+- NO history was rewritten, no refs deleted, no force used — the
+  purge and rotation remain human steps per the runbook.
+
 ### Changed — review round 5, Phase B: hostile-device tests for every driver
 
 The drvstack tree compiled OUT of test builds entirely

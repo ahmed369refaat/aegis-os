@@ -56,6 +56,15 @@ artifacts directly; the only supported way to run the kernel is
    credential patterns (token/secret/api-key assignments, GitHub and AWS key
    prefixes, private-key PEM headers).
 
+4. `scripts/check-history-clean.sh` (round 5, Phase C; wired into CI as
+   report-only) scans EVERY REACHABLE BLOB — not just the tree at HEAD —
+   for the same three classes (ELF cores, oversize blobs outside the
+   allowlist, assignment-shaped credential patterns). Today it reports the
+   three historical `kernel-x86_64/core` blobs (8,167,424 / 8,183,808 /
+   2,805,760 bytes) and nothing else. Its failure in CI is the standing
+   reminder that the purge below is pending; after the purge, flip the CI
+   invocation to `--strict` so any recurrence is build-fatal.
+
 These steps stop the file from being tracked again. They do **not** remove
 it from history — git keeps every version of every tracked file reachable
 from any ref.
@@ -80,13 +89,23 @@ from any ref.
    `git push --force --tags`. This rewrites public history — coordinate with
    collaborators first. (This step is deliberately left to a human; no
    automation in this repository ever rewrites history or force-pushes.)
-4. **Ask forks and clones to re-clone.** Old clones keep the blob in their
+4. **Verify the purge before announcing it.** Both commands must
+   print NOTHING (run them on the purged clone before pushing, and on
+   a fresh clone after):
+   ```
+   git log --all --oneline -- kernel-x86_64/core
+   git rev-list --all --objects | grep -E '(^|/)core$'
+   ```
+   If either prints a line, the blob (or a stale ref) is still
+   reachable — re-check `git for-each-ref` for `refs/original/*`,
+   remote refs, and tags before pushing.
+5. **Ask forks and clones to re-clone.** Old clones keep the blob in their
    object stores even after the upstream is purged.
-5. **Disable core dumps in the dev shell** so this cannot recur:
+6. **Disable core dumps in the dev shell** so this cannot recur:
    `ulimit -c 0` (or `limit coredumpsize 0`), or system-wide with
    systemd-coredump set to `storage=none`. The CI guard catches a
    recurrence at push time even if the shell setting is forgotten.
-6. Optionally, check what else that environment block contained before
+7. Optionally, check what else that environment block contained before
    rotating (step 1 should not wait for this).
 
 ## Evidence trail

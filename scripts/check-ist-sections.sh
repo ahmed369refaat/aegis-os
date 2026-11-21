@@ -7,6 +7,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 KELF="${1:-target/x86_64-unknown-none/release/aegis-kernel}"
+if [ ! -f "$KELF" ]; then
+  echo "FAIL: kernel ELF not found: $KELF — build first (cargo build -p aegis-kernel --release --target x86_64-unknown-none) or pass a path: scripts/check-ist-sections.sh <kernel-elf>" >&2
+  exit 1
+fi
 exec python3 - "$KELF" <<'PY'
 import re
 import subprocess
