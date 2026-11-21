@@ -202,8 +202,8 @@ pub(crate) fn net_step<const N: usize>(
     let mut frames = [0u64; 8];
     for (i, slot) in frames.iter_mut().enumerate() {
         match session.frame() {
-            Some(pa) => *slot = pa,
-            None => {
+            Ok(pa) => *slot = pa,
+            Err(_) => {
                 let mut b = [0u8; 20];
                 line(
                     out,

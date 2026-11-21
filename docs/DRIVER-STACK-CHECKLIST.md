@@ -84,3 +84,12 @@ capacity self-test.
   1 GiB window PTE ⇒ zero new mappings, zero unsafe delta targeted.
 - CI: 10 jobs incl. thumbv7em no-std + aarch64/riscv64 policy-core
   builds; the new q35 lanes are additive.
+
+## Round 5 (2026-11-21) — status
+
+| Item | Status |
+| --- | --- |
+| One IOMMU domain per device (ADR-0018) | **LIVE**: per-device claims (dom 1..6 on the q35 lane), scoped sessions, derived table budget (99), the hw-proof unassigns, and the LIVE cross-device negative probe (e1000 → vnet-only page FAULTS; the lane fails without it) |
+| Hostile-device tests per driver (Phase B) | **LIVE**: 19 drvstack tests + the shared testharness; every driver module covered (nvme 6, ahci 3, e1k 2, xhci 2, netutil 2, vblk 2, vnet 1, legacy 1); the step-orchestration modules sequence over tested layers |
+| History/secrets guards (Phase C) | **LIVE (report-only)**: check-history-clean.sh finds exactly the 3 historical core blobs; the human purge runbook has the verification commands |
+| Session budget loudness (Phase D) | **LIVE**: typed FrameError, the BUDGET EXCEEDED marker, per-driver proof documented |

@@ -160,8 +160,8 @@ pub(crate) fn xhci_step<const N: usize>(
     let mut frames = [0u64; 2];
     for slot in frames.iter_mut() {
         match session.frame() {
-            Some(pa) => *slot = pa,
-            None => {
+            Ok(pa) => *slot = pa,
+            Err(_) => {
                 line(out, &["[XHCI] pool exhausted — refusing"]);
                 return;
             }
@@ -357,8 +357,8 @@ pub(crate) fn xhci_cmdring_step<const N: usize>(
     let mut frames = [0u64; 4];
     for slot in frames.iter_mut() {
         match session.frame() {
-            Some(pa) => *slot = pa,
-            None => {
+            Ok(pa) => *slot = pa,
+            Err(_) => {
                 line(out, &["[XTRB] pool exhausted — refusing"]);
                 return;
             }

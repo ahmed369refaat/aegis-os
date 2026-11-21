@@ -209,8 +209,8 @@ pub(crate) fn e1k_step<const N: usize>(
     let mut frames = [0u64; 4];
     for slot in frames.iter_mut() {
         match session.frame() {
-            Some(pa) => *slot = pa,
-            None => {
+            Ok(pa) => *slot = pa,
+            Err(_) => {
                 line(out, &["[E1K] pool exhausted — refusing"]);
                 return;
             }
@@ -573,7 +573,7 @@ pub(crate) fn e1k_cross_device_probe_step<const N: usize>(
             "[E1K-PROBE] teardown",
             "",
         );
-        let Some(ring) = session.frame() else {
+        let Ok(ring) = session.frame() else {
             line(
                 out,
                 &["[IOMMU] cross-device probe: pool exhausted — skipped"],

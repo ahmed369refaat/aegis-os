@@ -16,7 +16,7 @@ use aegis_os::dmar::{self, Dmar, DmarStruct};
 // ADR-0016: one module per subsystem — the split is a pure move; the
 // step sequencing below is the only thing that knows them all.
 #[cfg(test)]
-mod testharness;
+pub(crate) mod testharness;
 
 mod acpi;
 mod ahci;
