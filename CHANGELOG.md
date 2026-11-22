@@ -1,5 +1,63 @@
 # Changelog
 
+## [Unreleased] — ADR-0003 slice 2 (v1): open(2) joins the Linux entry — the O_* word translates, never passes through
+
+### The feature
+
+- **nr 2 → SYS_OPEN** — the whitelist grows its first syscall whose
+  ARGUMENT word needs translation (round S handled shape differences;
+  this is a different ENCODING). Linux's O_RDONLY is 0 — the internal
+  0 is "no access at all" — so the word must never reach
+  `open_flags` raw. `sysabi::linux_open_flags` (host-tested) maps the
+  access mode (bits 0..1) to O_READ/O_WRITE, rides O_CREAT (0x40) and
+  O_TRUNC (0x200) along, and **refuses -EINVAL on every other bit**
+  (O_EXCL, O_APPEND, O_NONBLOCK, O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC,
+  acc==3): a bit whose semantics the internal VFS cannot honor is
+  never silently dropped — O_EXCL's "only create if absent" would let
+  a caller open an existing file. O_TRUNC|O_RDONLY dies in the
+  internal decoder with the same EINVAL a native caller gets.
+- Blob mode 13 grows the probes: create `/pub/s.txt` (O_RDWR|O_CREAT,
+  0o644), write the 16-byte pattern, close, **reopen O_RDONLY and read
+  it back through an independent cursor**, then the O_EXCL (0xC2) and
+  O_APPEND (0x442) refusal probes. Error stubs 213-221 exit_group with
+  the probe's identity.
+- `wait4`(61)/`execve`(59) stay UNMAPPED, now for the honest reason:
+  SYS_WAIT/SYS_EXEC exist in the policy space but the kernel has no
+  dispatch arm — they land with the process-model slice, not as stubs
+  that answer wrong.
+
+### Found live (the red's dividend): the launch-exit gap
+
+- **A run that exits straight out of launch (never parks) leaves its
+  exit in USER_RUN, and kmain's mailbox-only drain never sees it** —
+  dispatch_next records only the runs IT resumes. Round S never
+  tripped this: the mode-13 parent always parked (sched_yield) before
+  exiting. The slice-2 red did: open refused -EACCES (uid 1045 cannot
+  create under the root-owned "/"), the blob exited 213 straight out
+  of launch, and the harness reported "saw fewer exits" while the
+  exit sat in the slot. Fix: the mode-13 harness takes USER_RUN first
+  (try_take, the ADR-0026 tolerant twin — the parked flow returns
+  with the slot empty) and applies the same verdict/teardown as the
+  mailbox drain.
+- The blob's path is `/pub/s.txt` — the world-writable subtree, the
+  round-J convention (the domain's deterministic uid is 1000+id).
+
+### Proof
+
+- Red: nr 2 → -ENOSYS → exit 213 swallowed by the harness gap
+  (saved as boot-pc-open2-RED.txt); after the harness fix the same
+  -EACCES exit printed its identity — the gap closed before the
+  feature could prove itself.
+- Green: **all three lanes** (pc, q35 with intel-iommu, q35-noiommu)
+  `BOOT VERIFY: PASS` with the extended
+  `[M3] linux-abi: v1 entry live — … open(2) O_* translated
+  (O_EXCL/O_APPEND refused) …` marker.
+- Gates: fmt, both clippy lanes, unsafe 121/121 (unchanged),
+  asm-patterns, no-binaries, IST, history-clean; 9 test suites
+  (kernel 275: +2 linux_open_flags decoder tests; lib 346: the
+  whitelist table + edge updated — nr 2 moved from the edge to the
+  mapped set).
+
 ## [Unreleased] — Phase 0 hygiene (round S follow-up): hw.rs unified, docs synced
 
 ### The kernel's only mixed-syntax asm file is gone

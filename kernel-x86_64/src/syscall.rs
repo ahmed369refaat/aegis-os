@@ -153,9 +153,14 @@ mod tests {
         assert_eq!(translate_nr(9, true), Some(4)); // mmap
         assert_eq!(translate_nr(13, true), Some(25)); // rt_sigaction
         assert_eq!(translate_nr(0, true), Some(0)); // read: identity
+                                                    // Slice 2: open(2) joins the mapped set — its O_* word is
+                                                    // translated at the SYS_OPEN arm (Linux's O_RDONLY is 0,
+                                                    // the internal 0 is "no access": the encodings are NOT the
+                                                    // same word-shape, so the arm translates instead of passing).
+        assert_eq!(translate_nr(2, true), Some(2)); // open(2) -> SYS_OPEN
                                                     // The edge: sub-64 collisions must NOT pass (uname vs EXIT is
                                                     // the sharp one), nor unmapped Linux nrs.
-        for nr in [2u64, 4, 12, 32, 39, 59, 61, 63, 64, 293] {
+        for nr in [4u64, 12, 32, 39, 59, 61, 63, 64, 293] {
             assert_eq!(translate_nr(nr, true), None, "nr {nr}");
         }
     }
@@ -312,7 +317,7 @@ mod exec {
             // Round J: the file family runs on the LIVE lib kernel —
             // marshaled through sysabi, executed by `Kernel::execute`.
             Decision::Allowed if sysabi::FILE_FAMILY.contains(&nr8) => {
-                sys_file(run, nr8, a1, a2, a3)
+                sys_file(run, nr8, a1, a2, a3, linux_abi)
             }
             Decision::Allowed => {
                 // In the mask, but not implemented (MMAP, SPAWN, IPC,
@@ -569,6 +574,7 @@ mod exec {
         a1: u64,
         a2: u64,
         a3: u64,
+        linux_abi: bool,
     ) -> u64 {
         use aegis_os::sys::SysRequest;
         use aegis_os::syscall::{SYS_CLOSE, SYS_DUP, SYS_OPEN, SYS_PIPE, SYS_READ};
@@ -576,7 +582,7 @@ mod exec {
             return (-ENOSYS) as u64;
         };
         match nr {
-            SYS_OPEN => sys_open(run, k, a1, a2, a3),
+            SYS_OPEN => sys_open(run, k, a1, a2, a3, linux_abi),
             SYS_READ => sys_read(run, k, a1, a2, a3),
             SYS_CLOSE => match fd_arg(a1) {
                 Ok(fd) => match k.execute(run.domain, SysRequest::Close { fd }) {
@@ -633,9 +639,27 @@ mod exec {
         path_va: u64,
         flags: u64,
         mode: u64,
+        linux_abi: bool,
     ) -> u64 {
         use aegis_os::sys::SysRequest;
         use aegis_os::vfs::Mode;
+        // ADR-0003 (v1 slice 2): a Linux-mode caller passes a Linux
+        // O_* word — the encoding is NOT the internal one (Linux's
+        // O_RDONLY is 0, the internal 0 is "no access at all"), so
+        // the word is translated at the entry and every bit whose
+        // semantics the internal VFS cannot honor (O_EXCL, O_APPEND,
+        // O_NONBLOCK, O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, ...) is
+        // refused -EINVAL — never silently dropped. O_TRUNC|O_RDONLY
+        // then dies in `open_flags` with the same EINVAL a native
+        // caller gets (POSIX-undefined, kernel-refused).
+        let flags = if linux_abi {
+            match sysabi::linux_open_flags(flags) {
+                Ok(f) => f,
+                Err(e) => return e as u64,
+            }
+        } else {
+            flags
+        };
         let (read, write, create, truncate) = match sysabi::open_flags(flags) {
             Ok(f) => f,
             Err(e) => return e as u64,

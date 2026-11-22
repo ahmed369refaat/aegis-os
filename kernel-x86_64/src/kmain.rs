@@ -1775,6 +1775,29 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // kmain resumes when the nested dispatcher empties; drain all
         // three exits and tear each domain down.
         let mut clean = 0usize;
+        // The launch-path exit: a run may exit straight out of launch
+        // (never parked) — its exit sits in USER_RUN, not the mailbox
+        // (dispatch_next records only the runs IT resumed; both exit
+        // paths leave the run in the slot). Round S never saw this:
+        // the parent always parked before exiting. try_take is the
+        // ADR-0026 tolerant twin — the parked flow returns with the
+        // slot empty and the mailbox carries every exit.
+        if let Some(run) = crate::sched::context::try_take() {
+            if !matches!(run.exit, crate::sched::context::ExitKind::Exited(0)) {
+                let mut b = [0u8; 20];
+                crate::serial::write_str("[M3] linux-abi: ERROR: dom=");
+                crate::serial::write_str(strutil::dec(u64::from(run.domain), &mut b));
+                crate::serial::write_str(" exit=");
+                if let crate::sched::context::ExitKind::Exited(c) = run.exit {
+                    crate::serial::write_str(strutil::dec(c, &mut b));
+                }
+                crate::serial::write_str("; halting\n");
+                hw::halt_forever();
+            }
+            clean += 1;
+            mm::user::destroy_user(&mut k, &mut pool, run.domain);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, run.domain);
+        }
         while let Some((dom, exit)) = crate::sched::park::completed_drain() {
             if !matches!(exit, crate::sched::context::ExitKind::Exited(0)) {
                 line(
@@ -2366,8 +2389,13 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     //      bounds check and the policy gate; profiles stay internal-
     //      op-based). The blob exercises the shape differences: pipe
     //      (22) splits rax=read/rdx=write, exit_group (231) aliases
-    //      exit, mmap (9) demands MAP_PRIVATE|MAP_ANONYMOUS; and the
-    //      two whitelist probes — uname (63) must answer -ENOSYS
+    //      exit, mmap (9) demands MAP_PRIVATE|MAP_ANONYMOUS; open
+    //      (2) translates the Linux O_* word at the arm (create /
+    //      write / close / O_RDONLY reopen with read-back through an
+    //      independent cursor, then O_EXCL and O_APPEND must REFUSE
+    //      -EINVAL — a bit we cannot honor is never silently
+    //      dropped); and the two whitelist probes — uname (63) must
+    //      answer -ENOSYS
     //      (internal 63 is EXIT: a pass-through would exit a Linux
     //      binary on uname) and getpid (39) likewise. fork (57)
     //      under the Linux ABI; the child's store into the CoW-shared
@@ -2427,7 +2455,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         if clean == 2 {
             line(
                 &mut out,
-                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, uname(63) -> -ENOSYS"],
+                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, open(2) O_* translated (O_EXCL/O_APPEND refused), uname(63) -> -ENOSYS"],
             );
         } else {
             line(

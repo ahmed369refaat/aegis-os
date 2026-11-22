@@ -79,6 +79,52 @@ pub fn open_flags(bits: u64) -> Result<(bool, bool, bool, bool), i64> {
     Ok((read, write, create, truncate))
 }
 
+// ─── Linux open(2) flags (x86_64 ABI, bits/fcntl-linux.h) ───
+// The access mode is the low TWO bits (O_RDONLY=0 — the absence of a
+// bit is a mode!), then the single-bit modifiers. Only the bits whose
+// semantics the internal VFS honors are translated; everything else
+// refuses -EINVAL at the entry — an ABI that silently drops a bit
+// the caller relied on (O_EXCL's "only create if absent", O_APPEND's
+// write-position contract) is not an ABI.
+pub const LINUX_O_ACCMODE: u64 = 0x3;
+pub const LINUX_O_WRONLY: u64 = 0x1;
+pub const LINUX_O_RDWR: u64 = 0x2;
+pub const LINUX_O_CREAT: u64 = 0x40;
+pub const LINUX_O_EXCL: u64 = 0x80;
+pub const LINUX_O_TRUNC: u64 = 0x200;
+pub const LINUX_O_APPEND: u64 = 0x400;
+pub const LINUX_O_NONBLOCK: u64 = 0x800;
+pub const LINUX_O_DIRECTORY: u64 = 0x10000;
+pub const LINUX_O_NOFOLLOW: u64 = 0x20000;
+pub const LINUX_O_CLOEXEC: u64 = 0x80000;
+/// The bits we honor: the access mode + O_CREAT + O_TRUNC.
+pub const LINUX_OPEN_HONORED: u64 = LINUX_O_ACCMODE | LINUX_O_CREAT | LINUX_O_TRUNC;
+
+/// Translate a Linux open(2) flags word into the internal 4-bit
+/// encoding (`open_flags` validates the result — O_TRUNC without
+/// write refuses exactly as it does for a native caller). acc==3 is
+/// invalid in Linux too; unknown/unhonored bits refuse rather than
+/// drop.
+pub fn linux_open_flags(bits: u64) -> Result<u64, i64> {
+    if bits & !LINUX_OPEN_HONORED != 0 {
+        return Err(-EINVAL);
+    }
+    let acc = bits & LINUX_O_ACCMODE;
+    let mut out = match acc {
+        0 => O_READ,
+        LINUX_O_WRONLY => O_WRITE,
+        LINUX_O_RDWR => O_READ | O_WRITE,
+        _ => return Err(-EINVAL), // acc==3: not a Linux access mode
+    };
+    if bits & LINUX_O_CREAT != 0 {
+        out |= O_CREAT;
+    }
+    if bits & LINUX_O_TRUNC != 0 {
+        out |= O_TRUNC;
+    }
+    Ok(out)
+}
+
 /// The full SysError → errno table. Every lib refusal keeps a distinct
 /// Linux meaning at the ring-3 boundary; nothing collapses into a
 /// catch-all (the same F14 discipline `into_sys` applies inside the
@@ -217,6 +263,60 @@ mod tests {
         // O_TRUNC without O_WRITE: POSIX-undefined, kernel-refused.
         assert_eq!(open_flags(O_READ | O_TRUNC), Err(-EINVAL));
         assert_eq!(open_flags(O_CREAT | O_TRUNC), Err(-EINVAL));
+    }
+
+    #[test]
+    fn linux_open_flags_translates_the_honored_bits() {
+        // The access mode is the low two bits; O_RDONLY is 0 (the
+        // absence of a bit — the reason a raw Linux word must never
+        // reach `open_flags`, where 0 means "no access at all").
+        assert_eq!(linux_open_flags(0), Ok(O_READ));
+        assert_eq!(linux_open_flags(LINUX_O_WRONLY), Ok(O_WRITE));
+        assert_eq!(linux_open_flags(LINUX_O_RDWR), Ok(O_READ | O_WRITE));
+        // O_CREAT and O_TRUNC ride along into the internal positions.
+        assert_eq!(
+            linux_open_flags(LINUX_O_RDWR | LINUX_O_CREAT),
+            Ok(O_READ | O_WRITE | O_CREAT)
+        );
+        assert_eq!(
+            linux_open_flags(LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_TRUNC),
+            Ok(O_WRITE | O_CREAT | O_TRUNC)
+        );
+        // The translated word must survive the internal decoder.
+        assert_eq!(
+            open_flags(linux_open_flags(LINUX_O_RDWR | LINUX_O_CREAT).unwrap()),
+            Ok((true, true, true, false))
+        );
+    }
+
+    #[test]
+    fn linux_open_flags_refuses_what_it_cannot_honor() {
+        // acc==3 is not a Linux access mode.
+        assert_eq!(linux_open_flags(0x3), Err(-EINVAL));
+        // Semantic bits the internal VFS does not implement —
+        // refuse, never silently drop (O_EXCL's "only create if
+        // absent" would let a caller open an existing file).
+        assert_eq!(
+            linux_open_flags(LINUX_O_RDWR | LINUX_O_CREAT | LINUX_O_EXCL),
+            Err(-EINVAL)
+        );
+        assert_eq!(
+            linux_open_flags(LINUX_O_RDWR | LINUX_O_APPEND),
+            Err(-EINVAL)
+        );
+        assert_eq!(linux_open_flags(LINUX_O_NONBLOCK), Err(-EINVAL));
+        assert_eq!(linux_open_flags(LINUX_O_DIRECTORY), Err(-EINVAL));
+        assert_eq!(linux_open_flags(LINUX_O_NOFOLLOW), Err(-EINVAL));
+        assert_eq!(linux_open_flags(LINUX_O_CLOEXEC), Err(-EINVAL));
+        // O_TRUNC|O_RDONLY translates to O_READ|O_TRUNC, which the
+        // internal decoder then refuses (POSIX-undefined, same rule
+        // as a native caller) — the two-layer contract holds.
+        assert_eq!(
+            open_flags(linux_open_flags(LINUX_O_TRUNC).unwrap()),
+            Err(-EINVAL)
+        );
+        // A high bit Linux does not define on this ABI either.
+        assert_eq!(linux_open_flags(1 << 31), Err(-EINVAL));
     }
 
     #[test]

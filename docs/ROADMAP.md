@@ -337,11 +337,16 @@ ABI flag (`Abi::Linux`, supervisor-declared, fork-inherited) and the
 bounds check and the policy gate; unmapped nrs — including every
 sub-64 collision, e.g. Linux's uname 63 vs the internal EXIT 63 —
 answer `-ENOSYS` audited). Shape differences honored: pipe's
-rax/rdx split, exit_group's alias, mmap's PRIVATE|ANON-only flags;
-blob mode 13 (`[M3] linux-abi:`) proves it on all three lanes.
-`open` stays unmapped until its O_* decoding round. Still ahead:
-the execve/wait4 arms, the errno model's full sweep, and the musl /
-busybox acceptance runs below.
+rax/rdx split, exit_group's alias, mmap's PRIVATE|ANON-only flags.
+**Slice 2 (round T) landed `open(2)`**: the Linux O_* word translates
+at the SYS_OPEN arm (access mode → O_READ/O_WRITE, O_CREAT/O_TRUNC
+ride along; O_EXCL / O_APPEND / every un-honorable bit refuses
+-EINVAL, never silently dropped), proven by blob mode 13 on all
+three lanes — create / write / close / O_RDONLY reopen with
+read-back, and both refusal probes. Still ahead: the wait4/execve
+arms (the internal SYS_WAIT/SYS_EXEC have no kernel dispatch yet),
+the errno model's full sweep, and the musl / busybox acceptance runs
+below.
 
 **Tasks (per ADR-0003):** a Linux-ABI dispatch table in front of the
 policy gate (internal ids stay; entry numbers are Linux's): fork (COW via

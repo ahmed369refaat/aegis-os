@@ -46,6 +46,7 @@ pub enum Abi {
 pub fn linux_nr_to_core(nr: u64) -> Option<u64> {
     match nr {
         0 => Some(SYS_READ as u64),            // read(2)
+        2 => Some(SYS_OPEN as u64),            // open(2) — O_* translated, not passed through
         1 => Some(SYS_WRITE as u64),           // write(2)
         3 => Some(SYS_CLOSE as u64),           // close(2)
         9 => Some(SYS_MMAP as u64),            // mmap(2) — ANON|PRIVATE only
@@ -427,6 +428,7 @@ mod adr0003_tests {
         let cases: &[(u64, u8)] = &[
             (0, SYS_READ),            // read(2)
             (1, SYS_WRITE),           // write(2)
+            (2, SYS_OPEN),            // open(2) — O_* translated at the entry
             (3, SYS_CLOSE),           // close(2)
             (9, SYS_MMAP),            // mmap(2)
             (11, SYS_MUNMAP),         // munmap(2)
@@ -450,26 +452,12 @@ mod adr0003_tests {
     /// v1: the whitelist's EDGE — the collisions that must NOT pass
     /// through. Linux 63 is uname; internal 63 is EXIT (a
     /// pass-through would exit a Linux binary on uname). Linux 39 is
-    /// getpid, 2 is open (different O_* encoding), 59/61/32/293 have
-    /// no ABI arm.
+    /// getpid, 59/61/32/293 have no ABI arm. (open — nr 2 — lived on
+    /// this edge until slice 2: its O_* word is TRANSLATED now, the
+    /// encoding difference handled at the SYS_OPEN arm.)
     #[test]
     fn linux_table_refuses_the_collisions() {
-        for nr in [
-            2u64,
-            4,
-            5,
-            12,
-            14,
-            32,
-            39,
-            59,
-            61,
-            63,
-            64,
-            293,
-            1000,
-            u64::MAX,
-        ] {
+        for nr in [4u64, 5, 12, 14, 32, 39, 59, 61, 63, 64, 293, 1000, u64::MAX] {
             assert_eq!(linux_nr_to_core(nr), None, "nr {nr} must not pass");
         }
     }

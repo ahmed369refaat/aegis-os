@@ -1337,6 +1337,86 @@ pipe_b_got:
     syscall
     cmp rax, -38
     jne 211f
+    /* open(2) — nr 2, the slice-2 arm: the O_* word is TRANSLATED at
+       the entry, never passed through (the internal encoding is a
+       4-bit contract; a raw Linux word would set bits that mean
+       something else there). Path "/l" is self-written at 0x4033a0,
+       the read-back buffer at 0x403340 (0x403330 is the pipe buf);
+       the path is "/pub/s.txt" (the round-J writable subtree). */
+    /* The round-J convention: /pub is the world-writable subtree
+       (the domain's uid is 1000+id — root-owned "/" refuses). */
+    movabs rax, 0x742E732F6275702F /* "/pub/s.t" */
+    mov qword ptr [0x004033a0], rax
+    mov dword ptr [0x004033a8], 0x00007478 /* "xt\0\0" */
+    mov eax, 2                        /* open("/l", O_RDWR|O_CREAT=0x42, 0o644) */
+    mov rdi, 0x004033a0
+    mov esi, 0x42
+    mov edx, 0x1A4
+    syscall
+    cmp rax, 3
+    jl 213f
+    mov r15, rax                      /* the file fd */
+    mov eax, 1                        /* write(fd, pat, 16) — nr 1 */
+    mov edi, r15d
+    mov rsi, 0x00403310
+    mov edx, 16
+    syscall
+    cmp rax, 16
+    jne 214f
+    mov eax, 3                        /* close(fd) — nr 3 */
+    mov edi, r15d
+    syscall
+    cmp rax, 0
+    jne 215f
+    mov eax, 2                        /* reopen("/l", O_RDONLY=0, 0): an
+                                          independent cursor must read
+                                          the sixteen bytes back */
+    mov rdi, 0x004033a0
+    xor esi, esi
+    xor edx, edx
+    syscall
+    cmp rax, 3
+    jl 216f
+    mov r15, rax
+    mov eax, 0                        /* read(fd, buf, 16) — nr 0 */
+    mov edi, r15d
+    mov rsi, 0x00403340
+    mov edx, 16
+    syscall
+    cmp rax, 16
+    jne 217f
+    movabs rax, 0x0123456789ABCDEF
+    cmp rax, qword ptr [0x00403340]
+    jne 218f
+    movabs rax, 0xFEDCBA9876543210
+    cmp rax, qword ptr [0x00403348]
+    jne 218f
+    mov eax, 3                        /* close(fd) — nr 3 */
+    mov edi, r15d
+    syscall
+    cmp rax, 0
+    jne 219f
+    mov eax, 2                        /* O_EXCL (0x80): we have no
+                                          exclusive-create semantics, so
+                                          the word must REFUSE -EINVAL —
+                                          silently dropping the bit would
+                                          let an "only create if absent"
+                                          caller open an existing file */
+    mov rdi, 0x004033a0
+    mov esi, 0xC2                     /* O_RDWR|O_CREAT|O_EXCL */
+    xor edx, edx
+    syscall
+    cmp rax, -22
+    jne 220f
+    mov eax, 2                        /* O_APPEND (0x400): no append mode
+                                          in the internal VFS — refuse,
+                                          not approximate */
+    mov rdi, 0x004033a0
+    mov esi, 0x442                    /* O_RDWR|O_CREAT|O_APPEND */
+    xor edx, edx
+    syscall
+    cmp rax, -22
+    jne 221f
     mov eax, 57                       /* fork() — nr 57 */
     syscall
     test rax, rax
@@ -1545,6 +1625,60 @@ pipe_b_got:
     syscall
     mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
     mov edi, 212
+    syscall
+213: mov eax, 231
+    mov edi, 213                      /* open(nr 2, O_RDWR|O_CREAT) gave no fd */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 213
+    syscall
+214: mov eax, 231
+    mov edi, 214                      /* the file write (nr 1) short */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 214
+    syscall
+215: mov eax, 231
+    mov edi, 215                      /* close(file) (nr 3) failed */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 215
+    syscall
+216: mov eax, 231
+    mov edi, 216                      /* reopen(O_RDONLY) gave no fd */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 216
+    syscall
+217: mov eax, 231
+    mov edi, 217                      /* the read-back (nr 0) short */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 217
+    syscall
+218: mov eax, 231
+    mov edi, 218                      /* the read-back bytes wrong */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 218
+    syscall
+219: mov eax, 231
+    mov edi, 219                      /* close(reopened) (nr 3) failed */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 219
+    syscall
+220: mov eax, 231
+    mov edi, 220                      /* O_EXCL did not refuse -EINVAL */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 220
+    syscall
+221: mov eax, 231
+    mov edi, 221                      /* O_APPEND did not refuse -EINVAL */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 221
     syscall
 "#,
 );

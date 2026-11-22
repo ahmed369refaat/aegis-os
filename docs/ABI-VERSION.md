@@ -28,6 +28,7 @@ live domain (ADR-0003's refuse rule).
 | Linux nr | internal op | notes |
 |----|------|-------|
 | 0 read / 1 write / 3 close | 0 / 1 / 3 | identical shapes |
+| 2 open | 2 | **the O_* word translates at the arm** (slice 2): access mode (bits 0..1: RDONLY=0, WRONLY=1, RDWR=2; 3 is invalid) → the internal O_READ/O_WRITE bits, O_CREAT (0x40) and O_TRUNC (0x200) ride along; every other bit — O_EXCL (0x80), O_APPEND (0x400), O_NONBLOCK (0x800), O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, ... — **refuses -EINVAL**, never silently dropped (a bit whose semantics the internal VFS cannot honor is not a courtesy to approximate; O_EXCL's "only create if absent" would let a caller open an existing file). O_TRUNC without write then dies in the internal decoder with the same -EINVAL a native caller gets. mode is masked to 0o777 as v0.4 |
 | 9 mmap | 4 | flags (arg4) must be exactly `MAP_PRIVATE\|MAP_ANONYMOUS` (0x22); MAP_SHARED / file-backed / MAP_FIXED refuse `-EINVAL` |
 | 11 munmap | 5 | whole-region, as v0.4 |
 | 13 rt_sigaction | 25 | |
@@ -41,19 +42,28 @@ live domain (ADR-0003's refuse rule).
 | 62 kill | 14 | |
 | 228 clock_gettime | 23 | |
 
-**Deliberately NOT mapped (slice 1):** `open` (2) — Linux's O_*
-encoding (O_RDONLY=0, O_CREAT=0x40) differs from the internal
-O_READ=0x1 family; it lands with the filesystem round, not
-mistranslated. `wait4` (61), `execve` (59), `dup` (32), `pipe2`
-(293): no ABI arm yet. Each answers `-ENOSYS` today.
+**Deliberately NOT mapped (slice 2):** `wait4` (61) and `execve` (59)
+— the internal `SYS_WAIT`/`SYS_EXEC` ids exist in the policy space but
+the kernel has no dispatch arm for them yet; the translation lands
+with the process-model slice, not as a stub that answers wrong.
+`dup` (32), `pipe2` (293): no ABI arm yet. Each answers `-ENOSYS`
+today. (`open` — nr 2 — lived on this edge until slice 2: the encoding
+difference is now handled by translating at the SYS_OPEN arm.)
 
 Lane proof: blob mode 13 (`[M3] linux-abi:` marker) — one domain
 speaking ONLY Linux nrs: console write, the pipe split, the byte
 round-trip, EOF after the write end closes (D7 via Linux nrs), mmap
-store/load + the MAP_SHARED refusal, the uname(63) and getpid(39)
+store/load + the MAP_SHARED refusal, **open(2) with O_RDWR|O_CREAT on
+`/pub/s.txt` (the world-writable subtree — the domain's uid is
+1000+id), write/close, an O_RDONLY reopen with read-back through an
+independent cursor, and the O_EXCL (0xC2) and O_APPEND (0x442)
+-EINVAL refusals** (slice 2), the uname(63) and getpid(39)
 `-ENOSYS` probes, fork + the CoW child store, both sides
 `exit_group(0)`. Red: pre-change, nr 22 hit internal SCHED_YIELD and
-the boot hung with zero clean exits.
+the boot hung with zero clean exits. Red (slice 2): nr 2 answered
+-ENOSYS and the run exited 213 — which the harness swallowed (the
+never-parked launch exit sat in USER_RUN; fixed by taking it before
+the mailbox drain), so the first red showed as "saw fewer exits".
 
 ## v0.4 — the ring-3 entry surface (complete, unchanged)
 
