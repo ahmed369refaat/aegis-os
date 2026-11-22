@@ -26,8 +26,8 @@ use crate::{
     syscall::{
         SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV,
         SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP,
-        SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SCHED_YIELD,
-        SYS_SIGACTION, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
+        SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_PIPE_READ,
+        SYS_PIPE_WRITE, SYS_READ, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
     },
     Kernel, KernelError,
 };
@@ -170,6 +170,24 @@ pub enum SysRequest<'a> {
         dst: u32,
         va: u32,
         len: u32,
+    },
+    /// ADR-0029: pipe_read(channel, buf) — the owner drains its byte
+    /// channel by ENDPOINT ID (the cross-domain path: a cap but no
+    /// fd). READ cap + owner, the recv rules. Short read; 0 at EOF;
+    /// WouldBlock (EAGAIN) when empty with the write end open.
+    PipeRead {
+        channel: u32,
+        buf: &'a mut [u8],
+    },
+    /// ADR-0029: pipe_write(channel, bytes) — write bytes onto a byte
+    /// channel by endpoint id. WRITE cap, the send rules: short write
+    /// at the free space, BrokenPipe (EPIPE) after the read end
+    /// closes, WouldBlock (EAGAIN) when full. A parked owner wakes
+    /// with the byte count (wake-without-consume: the bytes stay for
+    /// the owner's own pipe_read).
+    PipeWrite {
+        channel: u32,
+        bytes: &'a [u8],
     },
     Ioctl {
         cmd: u32,
@@ -383,7 +401,15 @@ impl<const N: usize> Kernel<N> {
                         Ok(SysValue::Count(n))
                     }
                     FdTarget::PipeRead(pipe) => {
-                        let n = self.pipes.read(pipe, buf).map_err(SysError::Pipe)?;
+                        // ADR-0029 D2: fd discipline unchanged — the
+                        // fd IS the handle (per-domain table, dup-aware,
+                        // no ambient reach: a domain can only name ids
+                        // its own pipe()/fork put in ITS table); the
+                        // ring behind it is the endpoint byte channel.
+                        let n = self
+                            .endpoints
+                            .channel_read(pipe, buf)
+                            .map_err(SysError::Pipe)?;
                         Ok(SysValue::Count(n))
                     }
                     FdTarget::PipeWrite(_) => Err(SysError::BadFd(fd)),
@@ -427,7 +453,12 @@ impl<const N: usize> Kernel<N> {
                         Ok(SysValue::Count(n))
                     }
                     FdTarget::PipeWrite(pipe) => {
-                        let n = self.pipes.write(pipe, bytes).map_err(SysError::Pipe)?;
+                        // ADR-0029 D2: fd discipline (see the read
+                        // arm) over the endpoint byte channel.
+                        let n = self
+                            .endpoints
+                            .channel_write(pipe, bytes)
+                            .map_err(SysError::Pipe)?;
                         Ok(SysValue::Count(n))
                     }
                     FdTarget::PipeRead(_) => Err(SysError::BadFd(fd)),
@@ -448,15 +479,17 @@ impl<const N: usize> Kernel<N> {
                     .close(fd)
                     .ok_or(SysError::BadFd(fd))?;
                 match entry.target {
-                    // Closing a pipe fd drops one reference: the end closes
-                    // (readers see EOF / writers get EPIPE) only when the
-                    // last referencing descriptor goes away. An InvalidPipe
-                    // error here means the slot was already reclaimed.
+                    // Closing a pipe fd drops one channel reference: the
+                    // end closes (readers see EOF / writers get EPIPE)
+                    // only when the last referencing descriptor goes
+                    // away, and a both-ends-closed channel reclaims
+                    // its slot. An InvalidPipe error here means the
+                    // endpoint was already reclaimed or destroyed.
                     FdTarget::PipeRead(p) => {
-                        let _ = self.pipes.release_read(p);
+                        let _ = self.endpoints.channel_release_read(p);
                     }
                     FdTarget::PipeWrite(p) => {
-                        let _ = self.pipes.release_write(p);
+                        let _ = self.endpoints.channel_release_write(p);
                     }
                     FdTarget::File(_) => {}
                     // Round J: closing a reserved slot frees it for
@@ -468,41 +501,60 @@ impl<const N: usize> Kernel<N> {
                 Ok(SysValue::Unit)
             }
             SysRequest::Pipe => {
-                let pipe = self.pipes.create().map_err(SysError::Pipe)?;
-                // Short-lived borrows only: fd table and pipe table are
-                // distinct kernel objects touched one at a time.
+                // ADR-0029 D2: a pipe IS a channel endpoint now —
+                // owned by the caller, the two fds carrying the
+                // ENDPOINT id. NO capability is minted here (the F18
+                // rule: no syscall grows a domain's capability table):
+                // the fd path keeps the M1 fd discipline — the fd IS
+                // the handle, tables are per-domain, dup-aware — while
+                // the ENDPOINT-addressed path (PipeRead/PipeWrite) is
+                // the capability-gated cross-domain surface.
+                // Transactional on every refusal: a full channel table
+                // or fd table leaves nothing behind.
+                self.domain_mut(domain_id).map_err(into_sys)?;
+                let ep = self
+                    .endpoints
+                    .create_channel(domain_id)
+                    .map_err(SysError::Ipc)?;
+                // Short-lived borrows only: the fd table and the
+                // endpoint table are distinct kernel objects touched
+                // one at a time.
                 let read_fd = self
                     .domain_mut(domain_id)
                     .map_err(into_sys)?
                     .fds
-                    .alloc(FdTarget::PipeRead(pipe))
-                    .map_err(SysError::Fd)?;
-                if let Err(e) = self.pipes.acquire_read(pipe) {
+                    .alloc(FdTarget::PipeRead(ep))
+                    .map_err(|e| {
+                        // Roll the whole creation back.
+                        let _ = self.endpoints.destroy(ep);
+                        SysError::Fd(e)
+                    })?;
+                if let Err(e) = self.endpoints.channel_acquire_read(ep) {
                     self.drop_quietly(domain_id, read_fd);
-                    let _ = self.pipes.close_write(pipe);
+                    let _ = self.endpoints.destroy(ep);
                     return Err(SysError::Pipe(e));
                 }
                 let write_fd = self
                     .domain_mut(domain_id)
                     .map_err(into_sys)?
                     .fds
-                    .alloc(FdTarget::PipeWrite(pipe));
+                    .alloc(FdTarget::PipeWrite(ep));
                 let write_fd = match write_fd {
                     Ok(fd) => fd,
                     Err(e) => {
                         // Roll back so a failed pipe() leaves no half-open
                         // descriptors behind.
                         self.drop_quietly(domain_id, read_fd);
-                        let _ = self.pipes.release_read(pipe);
-                        let _ = self.pipes.close_write(pipe);
+                        let _ = self.endpoints.channel_release_read(ep);
+                        let _ = self.endpoints.destroy(ep);
                         return Err(SysError::Fd(e));
                     }
                 };
-                if let Err(e) = self.pipes.acquire_write(pipe) {
+                if let Err(e) = self.endpoints.channel_acquire_write(ep) {
                     self.drop_quietly(domain_id, read_fd);
                     self.drop_quietly(domain_id, write_fd);
-                    let _ = self.pipes.close_read(pipe);
-                    let _ = self.pipes.close_write(pipe);
+                    let _ = self.endpoints.channel_release_read(ep);
+                    let _ = self.endpoints.destroy(ep);
                     return Err(SysError::Pipe(e));
                 }
                 Ok(SysValue::FdPair(read_fd, write_fd))
@@ -521,8 +573,8 @@ impl<const N: usize> Kernel<N> {
                 };
                 // A duplicated pipe end is a second reference to it.
                 let acquire = match target {
-                    FdTarget::PipeRead(p) => self.pipes.acquire_read(p),
-                    FdTarget::PipeWrite(p) => self.pipes.acquire_write(p),
+                    FdTarget::PipeRead(p) => self.endpoints.channel_acquire_read(p),
+                    FdTarget::PipeWrite(p) => self.endpoints.channel_acquire_write(p),
                     FdTarget::File(_) => Ok(()),
                     // Round J: a reserved slot carries no pipe/end
                     // refcount — dup copies it like any entry.
@@ -542,10 +594,10 @@ impl<const N: usize> Kernel<N> {
                     Err(e) => {
                         match target {
                             FdTarget::PipeRead(p) => {
-                                let _ = self.pipes.release_read(p);
+                                let _ = self.endpoints.channel_release_read(p);
                             }
                             FdTarget::PipeWrite(p) => {
-                                let _ = self.pipes.release_write(p);
+                                let _ = self.endpoints.channel_release_write(p);
                             }
                             FdTarget::File(_) => {}
                             FdTarget::Reserved => {}
@@ -556,10 +608,10 @@ impl<const N: usize> Kernel<N> {
                 if let Some(old) = replaced {
                     match old.target {
                         FdTarget::PipeRead(p) => {
-                            let _ = self.pipes.release_read(p);
+                            let _ = self.endpoints.channel_release_read(p);
                         }
                         FdTarget::PipeWrite(p) => {
-                            let _ = self.pipes.release_write(p);
+                            let _ = self.endpoints.channel_release_write(p);
                         }
                         FdTarget::File(_) => {}
                         FdTarget::Reserved => {}
@@ -854,6 +906,24 @@ impl<const N: usize> Kernel<N> {
                 if owner != domain_id {
                     return Err(SysError::Ipc(crate::ipc::IpcError::NotOwner(domain_id)));
                 }
+                // ADR-0029: a byte channel answers by AVAIL — bytes
+                // waiting return the count NOW (no park, no consume;
+                // the owner drains them with pipe_read); an empty
+                // channel parks exactly like an empty queue.
+                if self.endpoints.is_channel(channel) {
+                    return match self.endpoints.channel_avail(channel) {
+                        Ok(0) => {
+                            self.ipc_wait_register(
+                                domain_id,
+                                crate::ipc::IpcWaitKind::AwaitingMsg { endpoint: channel },
+                            );
+                            let _ = self.sched.set_runnable(domain_id, false);
+                            Ok(SysValue::Unit)
+                        }
+                        Ok(n) => Ok(SysValue::Count(n)),
+                        Err(e) => Err(SysError::Pipe(e)),
+                    };
+                }
                 match self.endpoints.pop(channel) {
                     Ok(m) => Ok(SysValue::Count(m.len as usize)),
                     Err(crate::ipc::IpcError::QueueEmpty) => {
@@ -868,10 +938,16 @@ impl<const N: usize> Kernel<N> {
                 }
             }
             SysRequest::IpcReply { channel, len } => {
-                // ADR-0026: the owner answers its oldest waiting
+                // ADR-0026: the owner answers its OLDEST waiting
                 // caller; the reply's len is the caller's wake value.
                 if len > crate::ipc::IPC_MAX_MSG_BYTES {
                     return Err(SysError::Ipc(crate::ipc::IpcError::TooLong(len)));
+                }
+                // ADR-0029: reply is a MESSAGE op — a channel id
+                // refuses the type-discipline refusal, not a fake
+                // "nobody is asking".
+                if self.endpoints.is_channel(channel) {
+                    return Err(SysError::Ipc(crate::ipc::IpcError::WrongKind));
                 }
                 self.require_endpoint_cap(domain_id, channel, Rights::READ)?;
                 let owner = self
@@ -917,6 +993,52 @@ impl<const N: usize> Kernel<N> {
                 // Unit = "validated; the kernel side maps" (the mmap
                 // precedent — the return VA is kernel-side truth).
                 Ok(SysValue::Unit)
+            }
+            SysRequest::PipeRead { channel, buf } => {
+                // ADR-0029 D3: the endpoint-addressed byte path —
+                // READ cap + OWNER (the recv rules: one reader, the
+                // service that owns the channel).
+                self.require_endpoint_cap(domain_id, channel, Rights::READ)?;
+                let owner = self
+                    .endpoints
+                    .owner_of(channel)
+                    .ok_or(SysError::Ipc(crate::ipc::IpcError::InvalidHandle))?;
+                if owner != domain_id {
+                    return Err(SysError::Ipc(crate::ipc::IpcError::NotOwner(domain_id)));
+                }
+                let n = self
+                    .endpoints
+                    .channel_read(channel, buf)
+                    .map_err(SysError::Pipe)?;
+                Ok(SysValue::Count(n))
+            }
+            SysRequest::PipeWrite { channel, bytes } => {
+                // ADR-0029 D3: WRITE cap (the send rules), then the
+                // ring write and the wake-without-consume rendezvous:
+                // an owner parked AwaitingMsg wakes with the byte
+                // count, the BYTES STAY in the ring for its own
+                // pipe_read — no hidden cross-space copy rides the
+                // wake.
+                self.require_endpoint_cap(domain_id, channel, Rights::WRITE)?;
+                let owner = self
+                    .endpoints
+                    .owner_of(channel)
+                    .ok_or(SysError::Ipc(crate::ipc::IpcError::InvalidHandle))?;
+                let n = self
+                    .endpoints
+                    .channel_write(channel, bytes)
+                    .map_err(SysError::Pipe)?;
+                let waiting = self.ipc_waiters.iter().any(|w| {
+                    matches!(w, Some(w)
+                        if w.domain == owner
+                            && w.kind == crate::ipc::IpcWaitKind::AwaitingMsg { endpoint: channel })
+                });
+                if waiting {
+                    self.ipc_wait_clear(owner);
+                    self.ipc_wake_push(owner, n as u64);
+                    let _ = self.sched.set_runnable(owner, true);
+                }
+                Ok(SysValue::Count(n))
             }
             SysRequest::Ioctl { .. } => Err(SysError::NotImplemented(SYS_IOCTL)),
             SysRequest::NetRecv { .. } => Err(SysError::NotImplemented(SYS_NET_RECV)),
@@ -1130,6 +1252,8 @@ fn syscall_nr(req: &SysRequest<'_>) -> u8 {
         SysRequest::IpcRecvWait { .. } => SYS_IPC_RECV_WAIT,
         SysRequest::IpcReply { .. } => SYS_IPC_REPLY,
         SysRequest::IpcGrantFrames { .. } => SYS_IPC_GRANT,
+        SysRequest::PipeRead { .. } => SYS_PIPE_READ,
+        SysRequest::PipeWrite { .. } => SYS_PIPE_WRITE,
         SysRequest::Ioctl { .. } => SYS_IOCTL,
         SysRequest::NetRecv { .. } => SYS_NET_RECV,
     }

@@ -78,7 +78,6 @@ use crate::memory::{MemError, MemFlags};
 use crate::monitor::{BehaviorMonitor, DomainStats, MonitorConfig, Verdict};
 use crate::monitor::{MonitorMode, Response};
 use crate::net::{SocketTable, TokenBucket};
-use crate::pipe::PipeTable;
 use crate::profile::DomainProfile;
 use crate::response::{apply_response, EventAction, SecurityEvent, TELEMETRY_CAPACITY};
 use crate::ringbuf::RingBuffer;
@@ -129,8 +128,6 @@ pub struct Kernel<const N: usize = { crate::buddy::FRAME_COUNT }> {
     // ── Linux-like state ──
     /// Global filesystem with Unix permissions.
     pub(crate) vfs: Vfs,
-    /// Anonymous pipes shared between domains via fds.
-    pub pipes: PipeTable,
     /// Brokered sockets (owned by domains, rate-limited per domain).
     pub(crate) sockets: SocketTable,
     /// ADR-0004 endpoints: per-domain queues behind capability gates.
@@ -194,7 +191,6 @@ impl<const N: usize> Kernel<N> {
             telemetry: RingBuffer::new()
                 .expect("TELEMETRY_CAPACITY is a power of two by construction"),
             vfs: Vfs::new(),
-            pipes: PipeTable::new(),
             sockets: SocketTable::new(),
             buckets: [None; MAX_DOMAINS],
             endpoints: ipc::EndpointTable::new(),
@@ -434,10 +430,10 @@ impl<const N: usize> Kernel<N> {
             if let Some(entry) = parent_fds.get(*pfd) {
                 match entry.target {
                     FdTarget::PipeRead(pipe) => {
-                        let _ = self.pipes.acquire_read(pipe);
+                        let _ = self.endpoints.channel_acquire_read(pipe);
                     }
                     FdTarget::PipeWrite(pipe) => {
-                        let _ = self.pipes.acquire_write(pipe);
+                        let _ = self.endpoints.channel_acquire_write(pipe);
                     }
                     _ => {}
                 }
@@ -503,15 +499,16 @@ impl<const N: usize> Kernel<N> {
             exit: None,
         })?;
         let child = Domain::forked(pid, &template);
-        // Every pipe end in the copied table gains one reference.
+        // Every pipe end in the copied table gains one channel
+        // reference (ADR-0029: the ends are endpoint ids now).
         for fd in 0..MAX_FDS {
             if let Some(entry) = template.fds.get(fd as u8) {
                 match entry.target {
                     FdTarget::PipeRead(pipe) => {
-                        let _ = self.pipes.acquire_read(pipe);
+                        let _ = self.endpoints.channel_acquire_read(pipe);
                     }
                     FdTarget::PipeWrite(pipe) => {
-                        let _ = self.pipes.acquire_write(pipe);
+                        let _ = self.endpoints.channel_acquire_write(pipe);
                     }
                     _ => {}
                 }
@@ -579,9 +576,9 @@ impl<const N: usize> Kernel<N> {
         }
         for &(is_write, pipe) in &released[..rn] {
             if is_write {
-                let _ = self.pipes.release_write(pipe);
+                let _ = self.endpoints.channel_release_write(pipe);
             } else {
-                let _ = self.pipes.release_read(pipe);
+                let _ = self.endpoints.channel_release_read(pipe);
             }
         }
         Ok(())
@@ -804,10 +801,10 @@ impl<const N: usize> Kernel<N> {
             {
                 match entry.target {
                     FdTarget::PipeRead(p) => {
-                        let _ = self.pipes.release_read(p);
+                        let _ = self.endpoints.channel_release_read(p);
                     }
                     FdTarget::PipeWrite(p) => {
-                        let _ = self.pipes.release_write(p);
+                        let _ = self.endpoints.channel_release_write(p);
                     }
                     FdTarget::File(_) => {}
                     FdTarget::Reserved => {}
@@ -1403,6 +1400,69 @@ impl<const N: usize> Kernel<N> {
             .map_err(|_| KernelError::Ipc(crate::ipc::IpcError::TableFull))
     }
 
+    /// ADR-0029 D4: the supervisor byte-channel bootstrap — create a
+    /// CHANNEL endpoint owned by `owner_id` (the service that will
+    /// drain it), granting the owner the full conferable capability
+    /// (READ|WRITE|GRANT) exactly like `ipc_endpoint_create` grants
+    /// on message endpoints. The WRITE half is what a supervisor
+    /// grants to a writer domain (`ipc_endpoint_grant` works on
+    /// channels unchanged — the cap table is kind-agnostic, the
+    /// operations are not). A channel created here never sees fd
+    /// refs, so it never self-reclaims: it lives until the
+    /// supervisor's `ipc_endpoint_destroy`.
+    pub fn ipc_channel_create(
+        &mut self,
+        supervisor_id: u32,
+        owner_id: u32,
+    ) -> Result<(u32, crate::capability::CapHandle), KernelError> {
+        if self.domain_mut(supervisor_id)?.uid != 0 {
+            return Err(KernelError::NotAuthorized(supervisor_id));
+        }
+        self.domain_mut(owner_id)?; // the owner must exist
+        let id = self
+            .endpoints
+            .create_channel(owner_id)
+            .map_err(KernelError::Ipc)?;
+        let cap = crate::capability::Capability {
+            resource: crate::capability::Resource::Endpoint(id),
+            rights: crate::capability::Rights::READ
+                | crate::capability::Rights::WRITE
+                | crate::capability::Rights::GRANT,
+            generation: 0,
+        };
+        let inserted = {
+            let d = self.domain_mut(owner_id)?;
+            d.caps.insert(cap)
+        };
+        match inserted {
+            Ok(h) => Ok((id, h)),
+            Err(_) => {
+                // Roll back: never leave a channel nobody can reach.
+                let _ = self.endpoints.destroy(id);
+                Err(KernelError::Ipc(crate::ipc::IpcError::TableFull))
+            }
+        }
+    }
+
+    /// ADR-0029: dup introspection for a byte channel —
+    /// `(read_refs, write_refs)`, None for dead ids and message
+    /// endpoints. The tests' pipe-ref assertions ride this (the old
+    /// `pub pipes` table was wider exposure than the kernel needs).
+    #[must_use]
+    pub fn channel_refs(&self, endpoint_id: u32) -> Option<(u8, u8)> {
+        Some((
+            self.endpoints.channel_read_refs(endpoint_id)?,
+            self.endpoints.channel_write_refs(endpoint_id)?,
+        ))
+    }
+
+    /// Live endpoint count (message queues and byte channels) — the
+    /// leak-check assertion the process-model tests make.
+    #[must_use]
+    pub fn live_endpoint_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
     /// ADR-0004: destroy an endpoint. Its queue is dropped with it and
     /// the id is dead forever — every capability on it fails closed on
     /// the next use (ids are never reused). Supervisor only (uid 0);
@@ -1527,7 +1587,7 @@ pub mod prelude {
     pub use crate::net::{
         NetError, Socket, SocketState, SocketTable, TokenBucket, RATE_WINDOW_TICKS,
     };
-    pub use crate::pipe::{PipeError, PipeTable, MAX_PIPES, PIPE_CAPACITY};
+    pub use crate::pipe::PipeError;
     pub use crate::preempt::{Preemptor, TickDecision};
     pub use crate::ringbuf::{RingBuffer, RingError};
     pub use crate::sched::{SchedEntity, SchedError, Scheduler, NICE0_WEIGHT, NICE_TO_WEIGHT};
@@ -3238,7 +3298,7 @@ mod tests {
         }
         k.destroy_domain(1).unwrap();
         assert_eq!(
-            k.pipes.len(),
+            k.endpoints.len(),
             0,
             "replaced/self-dup pipe ends must not leak"
         );
@@ -3343,7 +3403,7 @@ mod tests {
             SysValue::FdPair(r, w) => (r, w),
             other => panic!("{:?}", other),
         };
-        assert_eq!(k.pipes.len(), 1);
+        assert_eq!(k.endpoints.len(), 1);
         // And a brokered socket + bucket.
         k.net_open(1).unwrap();
         assert_eq!(k.sockets.len(), 1);
@@ -3351,7 +3411,7 @@ mod tests {
         k.destroy_domain(1).unwrap();
         // Slot freed, pipe reclaimed, socket closed, scheduler unregistered.
         assert_eq!(k.domain_state(1), None);
-        assert_eq!(k.pipes.len(), 0);
+        assert_eq!(k.endpoints.len(), 0);
         assert_eq!(k.sockets.len(), 0);
         assert!(k.sched.entity(1).is_none());
         assert!(k
@@ -3379,7 +3439,7 @@ mod tests {
         // exactly once and reclaim the pipe slot.
         k.syscall(1, SysRequest::Dup { fd: w, new_fd: 9 }).unwrap();
         k.destroy_domain(1).unwrap();
-        assert_eq!(k.pipes.len(), 0);
+        assert_eq!(k.endpoints.len(), 0);
         let _ = r;
     }
 
@@ -3862,5 +3922,398 @@ mod adr0027_grants {
             ),
             Ok(SysValue::Unit)
         ));
+    }
+}
+
+// ── ADR-0029: pipes over endpoints ─────────────────────────────
+
+#[cfg(test)]
+mod adr0029_pipes_over_endpoints {
+    use super::*;
+    use crate::capability::Rights;
+    use crate::profile::service_profile;
+    use crate::sys::{SysError, SysRequest, SysValue};
+
+    /// The channel frame: a uid-0 supervisor (1), the OWNER/reader
+    /// service (3), a writer (2) granted WRITE on the owner's
+    /// CHANNEL, and a stranger (4) holding nothing.
+    fn frame() -> (Kernel<{ crate::buddy::FRAME_COUNT }>, u32) {
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        k.create_domain(3, service_profile()).unwrap();
+        k.create_domain(4, service_profile()).unwrap();
+        let (ep, _h) = k.ipc_channel_create(1, 3).unwrap();
+        k.ipc_endpoint_grant(1, ep, 2, Rights::WRITE).unwrap();
+        (k, ep)
+    }
+
+    /// D2: SYS_PIPE creates a CHANNEL ENDPOINT — the table grows, the
+    /// fds carry the endpoint id, the M1 fd semantics ride on top
+    /// byte-exact, and (the F18 rule, extended to the new syscall)
+    /// NO capability is minted: the fd is the handle.
+    #[test]
+    fn pipe_syscall_creates_channel_without_minting_caps() {
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        let before = k.endpoints.len();
+        let minted = k.domain_mut(1).unwrap().caps.len();
+        let (r, w) = match k.syscall(1, SysRequest::Pipe).unwrap() {
+            SysValue::FdPair(r, w) => (r, w),
+            other => panic!("{:?}", other),
+        };
+        assert_eq!(k.endpoints.len(), before + 1, "a pipe IS an endpoint now");
+        assert_eq!(
+            k.domain_mut(1).unwrap().caps.len(),
+            minted,
+            "F18: pipe() mints nothing — the fd is the handle"
+        );
+        // The fds carry the ENDPOINT id.
+        let ep = k.endpoints.live_ids().last().unwrap();
+        assert_eq!(
+            k.domain_mut(1).unwrap().fds.get(r).map(|e| e.target),
+            Some(crate::fd::FdTarget::PipeRead(ep))
+        );
+        // The M1 semantics preserved: short write, byte-exact read.
+        assert_eq!(
+            k.syscall(
+                1,
+                SysRequest::Write {
+                    fd: w,
+                    bytes: b"hello, aegis"
+                }
+            ),
+            Ok(SysValue::Count(12))
+        );
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            k.syscall(
+                1,
+                SysRequest::Read {
+                    fd: r,
+                    buf: &mut buf
+                }
+            ),
+            Ok(SysValue::Count(12))
+        );
+        assert_eq!(&buf[..12], b"hello, aegis");
+    }
+
+    /// D2's property: revocation reaches the fd path — destroy the
+    /// endpoint under the fds and every pipe fd op fails closed.
+    #[test]
+    fn pipe_fds_fail_closed_when_the_endpoint_dies() {
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        k.create_domain_with(9, service_profile(), 0, 0, 0).unwrap();
+        let (r, w) = match k.syscall(1, SysRequest::Pipe).unwrap() {
+            SysValue::FdPair(r, w) => (r, w),
+            other => panic!("{:?}", other),
+        };
+        let ep = k.endpoints.live_ids().last().unwrap();
+        k.ipc_endpoint_destroy(9, ep).unwrap();
+        let mut buf = [0u8; 4];
+        assert!(matches!(
+            k.syscall(
+                1,
+                SysRequest::Read {
+                    fd: r,
+                    buf: &mut buf
+                }
+            ),
+            Err(SysError::Pipe(crate::pipe::PipeError::InvalidPipe(_)))
+        ));
+        assert!(matches!(
+            k.syscall(1, SysRequest::Write { fd: w, bytes: b"x" }),
+            Err(SysError::Pipe(crate::pipe::PipeError::InvalidPipe(_)))
+        ));
+    }
+
+    /// D3: the cross-domain byte path — the writer (WRITE cap) fills
+    /// the channel; the stranger (no cap) is refused; the owner
+    /// drains byte-exact; a WRITE-only holder cannot read.
+    #[test]
+    fn pipe_write_cross_domain_capability_gated() {
+        let (mut k, ep) = frame();
+        let payload: &[u8] = b"stream-bytes-over-endpoints!";
+        assert_eq!(
+            k.syscall(
+                2,
+                SysRequest::PipeWrite {
+                    channel: ep,
+                    bytes: payload
+                }
+            ),
+            Ok(SysValue::Count(payload.len()))
+        );
+        // The stranger holds no cap: the organic refusal.
+        assert_eq!(
+            k.syscall(
+                4,
+                SysRequest::PipeWrite {
+                    channel: ep,
+                    bytes: b"x"
+                }
+            ),
+            Err(SysError::PermissionDenied)
+        );
+        // A dead id fails closed at the CAP gate first (no cap on an
+        // id nobody ever granted — the organic refusal; the InvalidPipe
+        // for a dead id under a live cap is table-tested).
+        assert_eq!(
+            k.syscall(
+                2,
+                SysRequest::PipeWrite {
+                    channel: ep + 100,
+                    bytes: b"x"
+                }
+            ),
+            Err(SysError::PermissionDenied)
+        );
+        // The owner drains byte-exact.
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            k.syscall(
+                3,
+                SysRequest::PipeRead {
+                    channel: ep,
+                    buf: &mut buf
+                }
+            ),
+            Ok(SysValue::Count(payload.len()))
+        );
+        assert_eq!(&buf[..payload.len()], payload);
+        // WRITE-only holder cannot read (the recv rules: one reader):
+        // refused at the CAP gate (no READ right — the organic
+        // refusal). A READ holder that is NOT the owner reaches the
+        // owner check and gets NotOwner.
+        let mut small = [0u8; 4];
+        assert_eq!(
+            k.syscall(
+                2,
+                SysRequest::PipeRead {
+                    channel: ep,
+                    buf: &mut small
+                }
+            ),
+            Err(SysError::PermissionDenied)
+        );
+        k.ipc_endpoint_grant(1, ep, 4, Rights::READ).unwrap();
+        assert_eq!(
+            k.syscall(
+                4,
+                SysRequest::PipeRead {
+                    channel: ep,
+                    buf: &mut small
+                }
+            ),
+            Err(SysError::Ipc(crate::ipc::IpcError::NotOwner(4)))
+        );
+    }
+
+    /// D3's rendezvous: a channel_write onto an endpoint whose owner
+    /// is parked AwaitingMsg wakes it with the byte count and leaves
+    /// the bytes in the ring (wake-without-consume).
+    #[test]
+    fn pipe_write_wakes_parked_owner_without_consuming() {
+        let (mut k, ep) = frame();
+        assert_eq!(
+            k.syscall(3, SysRequest::IpcRecvWait { channel: ep }),
+            Ok(SysValue::Unit)
+        );
+        assert!(!k.sched.entity(3).unwrap().runnable, "the owner parked");
+        assert_eq!(
+            k.syscall(
+                2,
+                SysRequest::PipeWrite {
+                    channel: ep,
+                    bytes: &[9u8; 24]
+                }
+            ),
+            Ok(SysValue::Count(24))
+        );
+        assert!(k.sched.entity(3).unwrap().runnable, "the write woke it");
+        assert_eq!(k.pop_ipc_wake(), Some((3, 24)));
+        // The bytes STAYED (the reader drains them itself).
+        assert_eq!(k.endpoints.channel_avail(ep), Ok(24));
+    }
+
+    /// recv_wait on a channel with bytes waiting answers the count
+    /// NOW (the fast path): no park, no consume.
+    #[test]
+    fn recv_wait_channel_fast_path_returns_avail() {
+        let (mut k, ep) = frame();
+        assert_eq!(
+            k.syscall(
+                2,
+                SysRequest::PipeWrite {
+                    channel: ep,
+                    bytes: &[5u8; 40]
+                }
+            ),
+            Ok(SysValue::Count(40))
+        );
+        assert_eq!(
+            k.syscall(3, SysRequest::IpcRecvWait { channel: ep }),
+            Ok(SysValue::Count(40))
+        );
+        assert!(k.sched.entity(3).unwrap().runnable, "never parked");
+        assert_eq!(k.endpoints.channel_avail(ep), Ok(40), "nothing consumed");
+        assert_eq!(k.pop_ipc_wake(), None);
+    }
+
+    /// The bounded channel is not an unbounded privilege: a full ring
+    /// refuses EAGAIN, a short write tells the truth.
+    #[test]
+    fn pipe_write_is_bounded_short_and_eagain() {
+        let (mut k, ep) = frame();
+        assert_eq!(
+            k.syscall(
+                2,
+                SysRequest::PipeWrite {
+                    channel: ep,
+                    bytes: &[1u8; 300]
+                }
+            ),
+            Ok(SysValue::Count(crate::ipc::CHANNEL_CAPACITY)),
+            "short write at the free space"
+        );
+        assert_eq!(
+            k.syscall(
+                2,
+                SysRequest::PipeWrite {
+                    channel: ep,
+                    bytes: b"!"
+                }
+            ),
+            Err(SysError::Pipe(crate::pipe::PipeError::WouldBlock))
+        );
+    }
+
+    /// Type discipline at the syscall layer: message ops on a channel
+    /// refuse WrongKind; pipe ops on a message endpoint refuse
+    /// NotAChannel.
+    #[test]
+    fn message_and_channel_ops_refuse_each_other() {
+        let (mut k, ep) = frame();
+        // A message endpoint for the reverse direction; the writer
+        // holds a WRITE cap on it so the probe reaches the TYPE
+        // check (the cap gate fires first otherwise — the right
+        // order).
+        let (msg, _h) = k.ipc_endpoint_create(1, 3).unwrap();
+        k.ipc_endpoint_grant(1, msg, 2, Rights::WRITE).unwrap();
+        assert_eq!(
+            k.syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 8
+                }
+            ),
+            Err(SysError::Ipc(crate::ipc::IpcError::WrongKind))
+        );
+        assert_eq!(
+            k.syscall(
+                3,
+                SysRequest::IpcReply {
+                    channel: ep,
+                    len: 8
+                }
+            ),
+            Err(SysError::Ipc(crate::ipc::IpcError::WrongKind))
+        );
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            k.syscall(
+                3,
+                SysRequest::PipeRead {
+                    channel: msg,
+                    buf: &mut buf
+                }
+            ),
+            Err(SysError::Pipe(crate::pipe::PipeError::NotAChannel(msg)))
+        );
+        assert_eq!(
+            k.syscall(
+                2,
+                SysRequest::PipeWrite {
+                    channel: msg,
+                    bytes: b"x"
+                }
+            ),
+            Err(SysError::Pipe(crate::pipe::PipeError::NotAChannel(msg)))
+        );
+    }
+
+    /// Closing both pipe fds reclaims the channel slot (the fd-scoped
+    /// lifetime) — and the id stays dead forever.
+    #[test]
+    fn pipe_close_reclaims_the_channel_slot() {
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        let (r, w) = match k.syscall(1, SysRequest::Pipe).unwrap() {
+            SysValue::FdPair(r, w) => (r, w),
+            other => panic!("{:?}", other),
+        };
+        let ep = k.endpoints.live_ids().last().unwrap();
+        assert_eq!(
+            k.syscall(1, SysRequest::Close { fd: w }),
+            Ok(SysValue::Unit)
+        );
+        // Write end closed, read end open: EOF readable, slot alive.
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            k.syscall(
+                1,
+                SysRequest::Read {
+                    fd: r,
+                    buf: &mut buf
+                }
+            ),
+            Ok(SysValue::Count(0))
+        );
+        assert_eq!(
+            k.syscall(1, SysRequest::Close { fd: r }),
+            Ok(SysValue::Unit)
+        );
+        assert_eq!(k.endpoints.owner_of(ep), None, "the slot reclaimed itself");
+    }
+
+    /// The fork story over channels: the child inherits the fds AND
+    /// the caps (∩), so its pipe fds keep working — the Unix pipeline
+    /// shape, attenuated.
+    #[test]
+    fn fork_child_inherits_working_pipe_fds() {
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        let (r, w) = match k.syscall(1, SysRequest::Pipe).unwrap() {
+            SysValue::FdPair(r, w) => (r, w),
+            other => panic!("{:?}", other),
+        };
+        let child = k.fork_process(1).unwrap();
+        // The child writes through ITS inherited write fd; the parent
+        // reads through its read fd.
+        assert_eq!(
+            k.syscall(
+                child,
+                SysRequest::Write {
+                    fd: w,
+                    bytes: b"from-child"
+                }
+            ),
+            Ok(SysValue::Count(10))
+        );
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            k.syscall(
+                1,
+                SysRequest::Read {
+                    fd: r,
+                    buf: &mut buf
+                }
+            ),
+            Ok(SysValue::Count(10))
+        );
+        assert_eq!(&buf[..10], b"from-child");
     }
 }

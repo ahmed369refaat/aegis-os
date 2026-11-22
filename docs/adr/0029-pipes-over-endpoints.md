@@ -58,25 +58,39 @@ bytes through a message queue, no messages past a byte ring.
 ### D2 — the fd path reroutes onto channels (lib)
 
 `SysRequest::Pipe` becomes `pipe_channel_create(caller)`: a fresh
-channel endpoint owned by the caller, a **self-granted cap
-READ|WRITE** (no GRANT — conferring on *other* domains stays the
-supervisor's privilege), and the two fds — `FdTarget::PipeRead(ep)` /
-`PipeWrite(ep)` now carry the **endpoint id**. Transactional: a full
-cap table or fd table rolls the whole creation back (the
-`ipc_endpoint_create` discipline).
+channel endpoint owned by the caller and the two fds —
+`FdTarget::PipeRead(ep)` / `PipeWrite(ep)` now carry the **endpoint
+id**. Transactional: a full channel table or fd table rolls the whole
+creation back (the `ipc_endpoint_create` discipline).
 
-Every fd pipe read/write/close/dup and the fork/destroy release paths
-swap `self.pipes.*` for `self.endpoints.channel_*` **behind
-`require_endpoint_cap`** — the fd path is now capability-gated like
-everything else, which buys a real property: a supervisor revoking
-the owner's endpoint cap stops the owner's own fds mid-flight
-(revocation reaches the byte path; the ADR-0025 "revoke-on-exit"
-consequence note becomes load-bearing). Fork children keep working by
-construction: the child's caps are the parent's ∩, the fd table is
-copied — both sides of the gate attenuate together.
+**No capability is minted — the F18 rule bent the design, not the
+invariant.** The first cut self-granted the caller READ|WRITE on the
+fresh endpoint and gated the fd reads/writes behind
+`require_endpoint_cap`; the F18 test (`a_domain_cannot_mint_
+capabilities`: *no syscall grows a domain's capability table*) failed
+within minutes — `pipe()` had minted a fourth cap. The invariant is
+pinned and correct: the capability table is supervisor-auditable
+state, and syscalls do not touch it. So the fd path keeps the M1 fd
+discipline exactly — **the fd IS the handle** (per-domain table,
+dup-aware, no ambient reach: a domain can only name ids its own
+`pipe()`/fork put in *its* table), while the ENDPOINT-addressed path
+(`SYS_PIPE_READ`/`WRITE`, D3) is the capability-gated cross-domain
+surface. A supervisor can still stop any fd pipe cold —
+`ipc_endpoint_destroy` under the fds and every op fails closed
+(EBADF, the no-ABA rule) — which the executor tests prove. What is
+genuinely lost: mid-flight REVOKE of one end without killing the
+endpoint; a later round can add a revoke that targets the fd table if
+a caller ever needs it.
 
-`Kernel.pipes`, `PipeTable`, and its table tests are deleted. One
-byte-path, one authority.
+Fork children keep working by construction: the fd table copies, the
+channel refs acquire — both sides attenuate together, no caps
+involved.
+
+`Kernel.pipes`, `PipeTable`, and its table tests are deleted; the
+ring engine and its ref/EOF/EPIPE semantics survive inside the
+endpoint (`pipe.rs` keeps the engine, `ipc.rs` hosts it). One
+byte-path, one table, one id space. The `pub pipes` field's test
+exposure narrows to `channel_refs`/`live_endpoint_count` accessors.
 
 ### D3 — the endpoint-addressed byte ABI (internal nrs 30/31)
 
@@ -171,10 +185,11 @@ truth explicit and test-pinned.
 - **Host (red first)**: the channel table suite (roundtrip, short
   write/read, EOF/EPIPE, dup-aware release, fd-scoped reclamation,
   WrongKind both directions, ids never reused); the executor suite
-  (Pipe creates a cap'd channel; cross-domain PipeWrite/PipeRead;
-  the no-cap EACCES; the rendezvous wake contents; recv_wait's
-  channel fast path; fork fd inheritance over channels; the M1 pipe
-  semantics preserved through execute()).
+  (Pipe creates a channel and mints NO caps — F18 extended; the M1 fd
+  semantics through execute(); cross-domain PipeWrite/PipeRead; the
+  no-cap EACCES; the rendezvous wake contents; recv_wait's channel
+  fast path; fork fd inheritance over channels; endpoint-death
+  closing the fds).
 - **Lanes**: the mode-12 pair above; the marker; the refusal probes
   in-blob (a wrong count, a wrong errno, or a wrong byte exits
   nonzero and the marker refuses to print).

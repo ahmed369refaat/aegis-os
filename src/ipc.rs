@@ -293,6 +293,21 @@ impl EndpointTable {
         self.channel(id)?.read(buf)
     }
 
+    /// Open read-end descriptors on the channel (dup introspection;
+    /// tests and telemetry). None on dead ids and message endpoints.
+    #[must_use]
+    pub fn channel_read_refs(&self, id: u32) -> Option<u8> {
+        let e = self.find(id)?;
+        e.pipe.as_ref().map(|p| p.read_refs())
+    }
+
+    /// Open write-end descriptors on the channel (dup introspection).
+    #[must_use]
+    pub fn channel_write_refs(&self, id: u32) -> Option<u8> {
+        let e = self.find(id)?;
+        e.pipe.as_ref().map(|p| p.write_refs())
+    }
+
     /// Bytes waiting in the channel (the `recv_wait` fast path and
     /// probes). `NotAChannel` on message endpoints, `InvalidPipe` on
     /// dead ids.

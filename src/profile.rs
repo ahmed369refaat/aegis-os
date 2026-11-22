@@ -15,8 +15,8 @@ use crate::syscall::{
     SyscallMask, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK,
     SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY,
     SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_NET_RECV,
-    SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_UNLINK,
-    SYS_WAIT, SYS_WRITE,
+    SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_READ, SYS_SCHED_YIELD,
+    SYS_SIGACTION, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
 };
 
 /// The surface a domain of this class keeps while *degraded* (the
@@ -66,6 +66,8 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_IPC_REPLY)
                 | (1u64 << SYS_IPC_GRANT)
                 | (1u64 << SYS_PIPE)
+                | (1u64 << SYS_PIPE_READ)
+                | (1u64 << SYS_PIPE_WRITE)
                 | (1u64 << SYS_DUP)
                 | (1u64 << SYS_KILL)
                 | (1u64 << SYS_CHROOT)
@@ -96,6 +98,8 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_IPC_REPLY)
                 | (1u64 << SYS_IPC_GRANT)
                 | (1u64 << SYS_PIPE)
+                | (1u64 << SYS_PIPE_READ)
+                | (1u64 << SYS_PIPE_WRITE)
                 | (1u64 << SYS_DUP)
                 | (1u64 << SYS_WAIT)
                 | (1u64 << SYS_EXIT),
@@ -241,6 +245,8 @@ pub const fn app_profile() -> DomainProfile {
                 | (1u64 << SYS_OPEN)
                 | (1u64 << SYS_CLOSE)
                 | (1u64 << SYS_PIPE)
+                | (1u64 << SYS_PIPE_READ)
+                | (1u64 << SYS_PIPE_WRITE)
                 | (1u64 << SYS_DUP)
                 | (1u64 << SYS_FORK)
                 | (1u64 << SYS_EXEC)

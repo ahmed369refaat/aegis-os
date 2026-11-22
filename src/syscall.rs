@@ -87,6 +87,16 @@ pub const SYS_IPC_REPLY: u8 = 28;
 /// on dst, RW-only, through the receiver's own policy (quota and
 /// overlap apply); the return is the VA where they landed in dst.
 pub const SYS_IPC_GRANT: u8 = 29;
+/// ADR-0029: pipe_read(channel, buf, len) — the OWNER drains its byte
+/// channel by endpoint id (READ cap + owner, the recv rules). Short
+/// read; 0 at EOF; -EAGAIN empty. Internal nr (Linux 30 is shmat —
+/// the ABI-VERSION v0.4 collision table).
+pub const SYS_PIPE_READ: u8 = 30;
+/// ADR-0029: pipe_write(channel, buf, len) — write bytes onto a byte
+/// channel by endpoint id (WRITE cap, the send rules). Short write;
+/// -EPIPE after the read end closes; -EAGAIN full. Internal nr
+/// (Linux 31 is shmctl).
+pub const SYS_PIPE_WRITE: u8 = 31;
 /// Reserved: domain exit. Always reachable; a mask without it is rejected
 /// by convention (see `profile` tests).
 pub const SYS_EXIT: u8 = 63;

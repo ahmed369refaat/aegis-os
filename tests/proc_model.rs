@@ -142,7 +142,7 @@ fn spawn_inherits_exactly_the_fd_map_and_nothing_else() {
     }
     // The pipe's read end gained exactly one reference.
     if let FdTarget::PipeRead(id) = read_fd(&k, child, 7).unwrap().target {
-        assert_eq!(k.pipes.read_refs(id), Some(2));
+        assert_eq!(k.channel_refs(id).map(|(r, _)| r), Some(2));
     } else {
         panic!("fd 7 should be a pipe read end");
     }
@@ -261,10 +261,10 @@ fn fork_copies_mask_fds_positions_cloexec_and_caps() {
     assert!(read_fd(&k, child, 3).unwrap().cloexec, "cloexec rides fork");
     // Pipe ends gained a reference each.
     if let FdTarget::PipeRead(id) = read_fd(&k, child, 4).unwrap().target {
-        assert_eq!(k.pipes.read_refs(id), Some(2));
+        assert_eq!(k.channel_refs(id).map(|(r, _)| r), Some(2));
     }
     if let FdTarget::PipeWrite(id) = read_fd(&k, child, 5).unwrap().target {
-        assert_eq!(k.pipes.write_refs(id), Some(2));
+        assert_eq!(k.channel_refs(id).map(|(_, w)| w), Some(2));
     }
     // Credentials and jail copy.
     let (pu, pg) = (k.domain(PARENT).unwrap().uid, k.domain(PARENT).unwrap().gid);
@@ -330,11 +330,15 @@ fn exec_closes_cloexec_fds_and_keeps_the_rest() {
     k.set_cloexec(PARENT, 4, true).unwrap();
     let child = k.fork_process(PARENT).unwrap();
     if let FdTarget::PipeRead(id) = read_fd(&k, PARENT, 4).unwrap().target {
-        assert_eq!(k.pipes.read_refs(id), Some(2));
+        assert_eq!(k.channel_refs(id).map(|(r, _)| r), Some(2));
         k.exec_replace(child, &app_profile().syscalls, Some(false))
             .unwrap();
         assert!(read_fd(&k, child, 4).is_none(), "cloexec fd closed");
-        assert_eq!(k.pipes.read_refs(id), Some(1), "the reference went home");
+        assert_eq!(
+            k.channel_refs(id).map(|(r, _)| r),
+            Some(1),
+            "the reference went home"
+        );
         assert!(read_fd(&k, child, 3).is_some(), "unflagged fds survive");
     } else {
         panic!("fd 4 should be a pipe read end");
@@ -829,7 +833,7 @@ fn random_lifecycles_conserve_everything_after_teardown() {
 
     assert_eq!(k.live_domain_count(), 0, "every domain slot returned home");
     assert_eq!(k.proc_meta_count(), 0, "every meta slot returned home");
-    assert_eq!(k.pipes.len(), 0, "every pipe reclaimed");
+    assert_eq!(k.live_endpoint_count(), 0, "every pipe reclaimed");
     assert!(
         k.sched.entity(PARENT).is_none(),
         "scheduler empty for PARENT"
