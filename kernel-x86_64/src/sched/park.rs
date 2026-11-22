@@ -249,6 +249,20 @@ mod boot {
         });
         let run = context::take();
         context::stash_parked(run, ctx);
+        // ADR-0028's park-unwind rule: an INNER park (a run resumed by
+        // a live dispatcher level) RETURNS to that level's loop — the
+        // resume slot already holds its resume_parked label, and its
+        // post-return try_take sees None ("the parked case just
+        // loops"). Nesting a fresh dispatch_next per park used to
+        // grow the chain stack (depth 8) and then the kernel stack —
+        // a server parking once per request could not survive its own
+        // load; the bench round's 32-call RTT found it live (the
+        // corrupted resume slot stranded both runs). Only the
+        // OUTERMOST park — a flat-launched run parking for the first
+        // time, no level below — starts the dispatcher.
+        if context::park_chain_depth() > 0 {
+            context::resume_kernel();
+        }
         dispatch_next()
     }
 

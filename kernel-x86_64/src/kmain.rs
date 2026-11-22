@@ -1091,6 +1091,8 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                     serial::write_str(strutil::dec(*vector as u64, &mut b1));
                     serial::write_str(")");
                 }
+                // A live run never reaches a proof's post-run match.
+                crate::sched::context::ExitKind::Running => serial::write_str("running?"),
             }
             serial::write_str(" state=");
             serial::write_str(match k.domain_state(12) {
@@ -1228,6 +1230,8 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                     serial::write_str(strutil::dec(vector as u64, &mut b2));
                     serial::write_str(")");
                 }
+                // A live run never reaches a proof's post-run match.
+                crate::sched::context::ExitKind::Running => serial::write_str("running?"),
             }
             serial::write_str(" write_bytes=");
             serial::write_str(strutil::dec(run.write_bytes, &mut b3));
@@ -2059,6 +2063,149 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
     }
 
+    // ── 22. ADR-0028: the bench — the honest measurement round.
+    //      "Measured, not guessed" finally has numbers: the blob
+    //      itself times every operation end-to-end with rdtsc (the
+    //      syscall entry, the park, the wake, the resume — what a
+    //      real caller pays), and self-reports the raw TSC deltas in
+    //      hex through SYS_WRITE (a `[BENCH]` line above). This
+    //      block supplies the topology (a responder parked in
+    //      recv_wait for the RTT; a parked grantee for the grant;
+    //      fork children for the CoW samples) and the CALIBRATION
+    //      line: the ACPI-measured tsc_hz that converts the deltas.
+    //      The decoder: scripts/bench-decode.py. Expected drains: 6
+    //      clean exits (the measurer, the responder, 4 children). ──
+    {
+        if let Some((dom, _)) = crate::sched::park::completed_drain() {
+            let mut b = [0u8; 20];
+            crate::serial::write_str("[M3] bench: ERROR: stale mailbox entry dom=");
+            crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+            crate::serial::write_str("; halting\n");
+            hw::halt_forever();
+        }
+        struct BenchRun {
+            run: crate::sched::context::UserRun,
+            ctx: crate::sched::context::UserContext,
+        }
+        let mut runs: [Option<BenchRun>; 2] = [None, None];
+        for (i, dom) in [40u32, 41].iter().enumerate() {
+            // data[1]: 0 = measurer, 1 = responder; data[2..10]:
+            // channel E; data[10]: the responder's id (the grant dst).
+            let mut data = [0u8; 0x70];
+            data[0] = 11;
+            data[1] = u8::from(*dom == 41);
+            match mm::user::spawn_user_blob(
+                &mut k,
+                &mut pool,
+                *dom,
+                aegis_os::profile::service_profile(),
+                RING3_PREEMPT,
+                &data,
+            ) {
+                Ok(sp) => {
+                    runs[i] = Some(BenchRun {
+                        run: sp.run,
+                        ctx: sp.ctx,
+                    })
+                }
+                Err(_) => {
+                    line(&mut out, &["[M3] bench: ERROR: spawn failed; halting"]);
+                    hw::halt_forever();
+                }
+            }
+        }
+        // The supervisor 39 (uid 0, never runs): the endpoint owned
+        // by the responder, WRITE granted to the measurer, and the
+        // GRANT gate conferred (the Domain cap on the responder —
+        // the measurer's uid is derived, never root).
+        let _ = k.create_domain_with(39, aegis_os::profile::service_profile(), 0, 0, 0);
+        let ep_e = k.ipc_endpoint_create(39, 41).expect("endpoint E");
+        let _ = k.ipc_endpoint_grant(39, ep_e.0, 40, aegis_os::capability::Rights::WRITE);
+        k.cap_grant_domain_to(39, 40, 41)
+            .expect("the measurer's Domain cap on the responder");
+        let _ = k.sched.unregister(39);
+        let bake = |run: &mut crate::sched::context::UserRun, chan: u64, dst: u8| {
+            if let Some(page) = run.tables.translate(0x00403000) {
+                crate::memops::write_u64(page + 2, chan);
+                crate::memops::write_u16(page + 10, u16::from(dst));
+            }
+        };
+        if let Some(r) = runs[0].as_mut() {
+            bake(&mut r.run, u64::from(ep_e.0), 41);
+        }
+        if let Some(r) = runs[1].as_mut() {
+            bake(&mut r.run, u64::from(ep_e.0), 41);
+        }
+
+        // The responder parked-runnable (it recv_waits first thing);
+        // the measurer flat-launched (the opening yield hands it over
+        // once, then it owns the CPU for every sample).
+        if let Some(r) = runs[1].take() {
+            crate::sched::context::stash_parked(
+                r.run,
+                crate::sched::context::ParkedContext::from_user_context(&r.ctx),
+            );
+        } else {
+            line(&mut out, &["[M3] bench: ERROR: responder missing; halting"]);
+            hw::halt_forever();
+        }
+        {
+            let Some(r) = runs[0].take() else {
+                line(&mut out, &["[M3] bench: ERROR: measurer missing; halting"]);
+                hw::halt_forever();
+            };
+            let kernel_cr3 = hw::read_cr3();
+            r.run.tables.activate();
+            crate::sched::context::begin(r.run);
+            crate::sched::context::launch(&r.ctx);
+            hw::write_cr3(kernel_cr3);
+        }
+        // The expected drains: the measurer, the responder, and the
+        // 4 fork children the CoW samples leave behind.
+        let mut clean = 0usize;
+        while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            if !matches!(exit, crate::sched::context::ExitKind::Exited(0)) {
+                let mut b = [0u8; 20];
+                crate::serial::write_str("[M3] bench: ERROR: dom=");
+                crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+                crate::serial::write_str(" exit=");
+                if let crate::sched::context::ExitKind::Exited(c) = exit {
+                    crate::serial::write_str(strutil::dec(c, &mut b));
+                }
+                crate::serial::write_str("\n");
+                line(
+                    &mut out,
+                    &["[M3] bench: ERROR: a run exited nonzero; halting"],
+                );
+                hw::halt_forever();
+            }
+            clean += 1;
+            mm::user::destroy_user(&mut k, &mut pool, dom);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+        }
+        let mut b1 = [0u8; 20];
+        if clean == 6 {
+            line(
+                &mut out,
+                &["[M3] bench: 6 clean exits, metrics self-reported above in TSC cycles"],
+            );
+            crate::serial::write_str("[M3] bench: tsc_hz=");
+            crate::serial::write_str(strutil::dec(crate::clock::tsc_hz(), &mut b1));
+            crate::serial::write_str(" (ACPI-calibrated; decode with scripts/bench-decode.py)\n");
+        } else {
+            let mut b2 = [0u8; 20];
+            crate::serial::write_str("[M3] bench: drained clean=");
+            crate::serial::write_str(strutil::dec(clean as u64, &mut b2));
+            crate::serial::write_str(" of 6\n");
+
+            line(
+                &mut out,
+                &["[M3] bench: ERROR: expected 6 clean exits, saw fewer; halting"],
+            );
+            hw::halt_forever();
+        }
+    }
+
     // ── 13. the terminal guard-page proof: the write must #PF, the
     // dispatch must confirm CR2 is exactly the guard page, print the
     // marker, and power off cleanly (CI greps it). Reached only when
@@ -2229,6 +2376,8 @@ fn preempt_demo<const N: usize>(
         let writes = run.write_bytes;
         {
             let (what, code) = match &run.exit {
+                // A live run never reaches the reaper's match.
+                crate::sched::context::ExitKind::Running => ("running?", 0),
                 crate::sched::context::ExitKind::Exited(c) => ("exited", *c),
                 crate::sched::context::ExitKind::Fault { vector, .. } => {
                     // A fault during the demo is a demo failure — these

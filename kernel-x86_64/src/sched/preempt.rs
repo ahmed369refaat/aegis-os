@@ -175,6 +175,18 @@ pub fn on_timer_tick(frame: &mut ExceptionFrame) {
                 Some(id) => id,
                 None => return, // raced an exit (single CPU: unreachable)
             };
+            // ADR-0028's tick guard: a run that has already written
+            // its exit (SYS_EXIT's arm sets it, then ticks the window
+            // clock, then resumes the kernel) must NEVER be parked and
+            // re-entered — the exit would be lost mid-arm and the run
+            // stranded parked-not-runnable while its user RIP walked
+            // on past its own exit syscall (the bench round's exit
+            // storm found it live). Let it finish dying.
+            if let Some(exit) = context::active_exit() {
+                if !matches!(exit, crate::sched::context::ExitKind::Running) {
+                    return; // Keep semantics: the arm completes the exit
+                }
+            }
             // Park the interrupted run from the frame, then install the
             // next one INTO the frame — the rewrite is the context
             // switch; CR3 + USER_RUN complete it.

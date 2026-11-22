@@ -123,3 +123,7 @@
 #      returns. The same PARKED static, the same single-CPU IF=0
 #      discipline as stash_parked beside it.
 119
+# 122 (from 119): ADR-0028 D3/D4 — active_exit + park_chain_depth (the tick guard,
+# the park-unwind rule) + parked_rip (the deadlock post-mortem): three single-peek
+# reads, the is_parked pattern.
+122

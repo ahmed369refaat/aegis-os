@@ -61,6 +61,8 @@ _ring3_start:
     je 15f                            /* mode 9: the sync pair */
     cmp al, 10
     je 16f                            /* mode 10: the grant pair */
+    cmp al, 11
+    je 17f                            /* mode 11: the bench pair */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -177,7 +179,7 @@ _ring3_start:
     call next_instr
 next_instr:
     pop rsi
-    add rsi, 0x5DE                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
+    add rsi, 0x947                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
     mov rdx, 0x0040C000               /* the kernel's trampoline page */
     syscall
     test rax, rax
@@ -662,6 +664,277 @@ grant_reply_done:
     xor edi, edi
     syscall
 
+17: /* ── mode 11: the bench pair (ADR-0028) ────────────────────── */
+    /* The honest measurement round: rdtsc INSIDE the blob, around
+       each operation end-to-end (syscall entry, park, wake, resume —
+       everything a real caller pays). Two roles: 0 = the measurer
+       (yield baseline, call/reply RTT, the grant syscall, the CoW
+       fault+copy), 1 = the responder (recv_wait -> reply, exits on
+       the 63 sentinel). The report: raw TSC deltas in hex through
+       SYS_WRITE — the decoder script converts with the kernel's
+       ACPI-calibrated tsc_hz. No numbers are guessed anywhere. */
+    movzx eax, byte ptr [0x00403001]
+    mov rbx, qword ptr [0x00403002]    /* channel E */
+    test eax, eax
+    jnz bench_responder
+
+    /* ── the measurer ── */
+    mov eax, 24                        /* the opening yield (the
+                                          discipline; also hands the
+                                          responder the CPU so it is
+                                          parked in recv_wait before
+                                          any measurement) */
+    syscall
+    /* three windows: A = the metrics buffer (r12), B = the CoW
+       subject (r13, mapped later), C = the grant source (r14) */
+    mov eax, 4
+    xor edi, edi
+    mov rsi, 4096
+    mov edx, 3
+    syscall
+    mov r12, rax
+    cmp rax, 0x0040D000
+    jb 160f
+    /* the phase self-check anchor: the true window, parked where
+       NOTHING may touch it; every phase then asserts r12 against it
+       (a distinct exit code names the phase that lost it) */
+    mov qword ptr [0x00403040], rax
+    mov eax, 4
+    xor edi, edi
+    mov rsi, 4096
+    mov edx, 3
+    syscall
+    mov r14, rax
+    cmp rax, r12
+    jbe 160f
+    /* ── the yield baseline: the park+dispatch floor (nobody else
+       runnable — the responder is BLOCKED, not runnable) ── */
+    mov r8, -1                         /* min = MAX */
+    xor r9, r9                         /* sum */
+    mov r15, 16
+bench_yield:
+    rdtsc
+    mov r10d, eax                      /* t0 */
+    mov eax, 24
+    syscall
+    rdtsc
+    sub eax, r10d                      /* d (32-bit deltas: safe) */
+    mov r11d, eax
+    add r9, r11
+    cmp r11d, r8d
+    jae bench_yield_next
+    mov r8d, r11d
+bench_yield_next:
+    dec r15
+    jnz bench_yield
+    mov [r12], r8
+    mov [r12+8], r9
+    mov rax, [0x00403040]
+    cmp r12, rax
+    jne 170f                           /* r12 lost in the yield phase */
+    /* ── the call/reply RTT (the responder is parked in recv_wait;
+       every call rendezvouses: park, wake it, it runs and replies,
+       we wake — the full cycle) ── */
+    mov r8, -1
+    xor r9, r9
+    mov r15, 32
+bench_rtt:
+    rdtsc
+    mov r10d, eax
+    mov eax, 26                        /* call(E, 7) */
+    mov rdi, rbx
+    mov rsi, 7
+    syscall
+    cmp rax, 42
+    jne 160f
+    rdtsc
+    sub eax, r10d
+    mov r11d, eax
+    add r9, r11
+    cmp r11d, r8d
+    jae bench_rtt_next
+    mov r8d, r11d
+bench_rtt_next:
+    dec r15
+    jnz bench_rtt
+    mov [r12+0x10], r8
+    mov [r12+0x18], r9
+    mov rax, [0x00403040]
+    cmp r12, rax
+    jne 171f                           /* r12 lost in the RTT phase */
+    /* ── the grant syscall (walk + refcounts + map through the
+       receiver's policy; the receiver stays parked throughout) ── */
+    mov rax, 0x1234BEEF                /* a pattern into C */
+    mov [r14], rax
+    rdtsc
+    mov r10d, eax
+    movzx edi, byte ptr [0x0040300A]   /* dst: the responder's id */
+    mov rsi, r14
+    mov edx, 4096
+    mov eax, 29                        /* ipc_grant_frames */
+    syscall
+    mov r13, rax                       /* the landed VA */
+    cmp rax, 0x0040D000
+    jb 160f
+    rdtsc
+    sub eax, r10d
+    mov r11d, eax
+    mov [r12+0x28], r11
+    mov rax, [0x00403040]
+    cmp r12, rax
+    jne 172f                           /* r12 lost in the grant phase */
+    /* ── the CoW fault+copy: fork (all writable pages demoted,
+       every frame refcounted — the child lives parked), then ONE
+       write: the fault, the copy, the remap, the resume — inside
+       one instruction's wall time. The yield reaps the child (its
+       D2 exit-release drops our shared refs back to one). ── */
+    mov eax, 4
+    xor edi, edi
+    mov rsi, 4096
+    mov edx, 3
+    syscall
+    mov r13, rax                       /* B: the CoW subject */
+    cmp rax, r14
+    jbe 160f
+    mov rax, 0x0DEFACED                /* a pre-fault pattern */
+    mov [r13], rax
+    mov r8, -1
+    xor r9, r9
+    mov r15, 4
+bench_cow:
+    mov eax, 57                        /* fork */
+    syscall
+    test rax, rax
+    jz bench_child
+    rdtsc
+    mov r10d, eax
+    mov rax, 0x0DEFACED
+    mov [r13], rax                     /* THE write: fault+copy */
+    rdtsc
+    sub eax, r10d
+    mov r11d, eax
+    add r9, r11
+    cmp r11d, r8d
+    jae bench_cow_next
+    mov r8d, r11d
+bench_cow_next:
+    mov eax, 24                        /* yield: reap the child */
+    syscall
+    dec r15
+    jnz bench_cow
+    mov [r12+0x30], r8
+    mov [r12+0x38], r9
+    /* ── the sentinel: the responder exits on 63 ── */
+    mov eax, 7
+    mov rdi, rbx
+    mov rsi, 63
+    syscall
+    cmp rax, 0
+    jl 160f
+    /* ── the self-report: "[BENCH] " + 10 hex words + newline ── */
+    mov rax, 0x205D48434E45425B        /* "[BENCH] " LE: 5B 42 45 4E 43 48 5D 20 */
+    mov [r12+0x100], rax
+    /* the readback guard: did MY store land where I can see it? */
+    mov rbx, [r12+0x100]
+    cmp rbx, rax
+    jne 162f                           /* my own store vanished */
+    lea rdi, [r12+0x108]
+    mov rsi, [r12]
+    call bench_fmt
+    mov rsi, [r12+8]
+    call bench_fmt
+    mov rsi, 16
+    call bench_fmt
+    mov rsi, [r12+0x10]
+    call bench_fmt
+    mov rsi, [r12+0x18]
+    call bench_fmt
+    mov rsi, 32
+    call bench_fmt
+    mov rsi, [r12+0x28]
+    call bench_fmt
+    mov rsi, [r12+0x30]
+    call bench_fmt
+    mov rsi, [r12+0x38]
+    call bench_fmt
+    mov rsi, 4
+    call bench_fmt
+    mov al, 10                          /* the newline */
+    mov [rdi], al
+    inc rdi
+    mov rsi, rdi
+    sub rsi, r12
+    sub rsi, 0x100                      /* the length */
+    mov eax, 1                          /* write(1, buf, len) */
+    mov edi, 1
+    mov rdx, rsi
+    mov rsi, r12
+    add rsi, 0x100
+    syscall
+    cmp rax, rdx
+    jne 160f
+    mov eax, 63
+    xor edi, edi
+    syscall
+
+bench_child:
+    mov eax, 63                         /* the fork child: its job
+                                           is to EXIST (keep the
+                                           share alive for the
+                                           parent's fault) */
+    xor edi, edi
+    syscall
+
+bench_responder:
+    /* ── the responder: recv_wait -> reply, 63 = done ── */
+    mov eax, 27
+    mov rdi, rbx
+    syscall
+    cmp rax, 63
+    je bench_resp_done
+    xor r13d, r13d                      /* the retry budget */
+bench_resp_reply:
+    mov eax, 28                         /* reply(E, 42) */
+    mov rdi, rbx
+    mov rsi, 42
+    syscall
+    cmp rax, 1
+    je bench_responder
+    cmp rax, -11                        /* EAGAIN: the transient */
+    jne 161f
+    inc r13
+    cmp r13, 64
+    jae 161f
+    mov eax, 24                         /* yield: let it park */
+    syscall
+    jmp bench_resp_reply
+bench_resp_done:
+    mov eax, 63
+    xor edi, edi
+    syscall
+
+bench_fmt:
+    /* rsi = value, rdi = dst: 16 hex chars + a space. rcx/rax are
+       scratch (no syscall inside; the caller re-loads them). */
+    mov ecx, 16
+bench_fmt_digit:
+    rol rsi, 4
+    mov eax, esi
+    and eax, 0xF
+    add al, '0'
+    cmp al, '9'
+    jbe bench_fmt_store
+    add al, 7
+bench_fmt_store:
+    mov [rdi], al
+    inc rdi
+    dec ecx
+    jnz bench_fmt_digit
+    mov al, ' '
+    mov [rdi], al
+    inc rdi
+    ret
+
 sig_handler:                          /* SIGUSR1: set the flag, ret */
     mov rax, 0x51515151
     mov qword ptr [0x00403060], rax
@@ -780,6 +1053,24 @@ sig_handler:                          /* SIGUSR1: set the flag, ret */
     syscall
 155: mov eax, 63
     mov edi, 155                      /* the grantee: the reply did not wake */
+    syscall
+160: mov eax, 63
+    mov edi, 160                      /* the measurer: a bench step failed */
+    syscall
+162: mov eax, 63
+    mov edi, 162                      /* the measurer: own readback failed */
+    syscall
+161: mov eax, 63
+    mov edi, 161                      /* the responder: a reply failed */
+    syscall
+170: mov eax, 63
+    mov edi, 170                      /* r12 lost in the yield phase */
+    syscall
+171: mov eax, 63
+    mov edi, 171                      /* r12 lost in the RTT phase */
+    syscall
+172: mov eax, 63
+    mov edi, 172                      /* r12 lost in the grant phase */
     syscall
 "#,
 );

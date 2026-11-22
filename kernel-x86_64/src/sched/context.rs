@@ -68,6 +68,15 @@ impl UserContext {
 /// prints: what faulted, where, and under which error-code bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitKind {
+    /// The run is still live (the default from spawn to its final
+    /// syscall). ADR-0028's tick guard reads this: a run that has
+    /// already written its exit must NEVER be preempt-parked and
+    /// resumed — its exit would be lost mid-arm and the run stranded
+    /// in the parked table (found live by the bench round's exit
+    /// storm: the tick fired between `run.exit = Exited(..)` and
+    /// `resume_kernel`, the dying run was parked as not-runnable,
+    /// and the completion mailbox never saw it).
+    Running,
     /// The domain called SYS_EXIT(code).
     Exited(u64),
     /// A CPU fault at CPL3 (the domain is terminated; the kernel lives).
@@ -140,7 +149,7 @@ impl UserRun {
             domain,
             mask,
             quarantined,
-            exit: ExitKind::Exited(0),
+            exit: ExitKind::Running,
             write_bytes: 0,
             bad_syscalls: 0,
             denied: 0,
@@ -440,6 +449,18 @@ mod entry {
         }
     }
 
+    /// How many dispatch levels are live (the park-unwind rule's
+    /// peek: an INNER park returns to the current level's loop, only
+    /// the outermost park starts a dispatcher — ADR-0028's fix for
+    /// the nesting storm: a server that parks once per request used
+    /// to nest one dispatch_next PER REQUEST, exhausting the chain
+    /// stack (depth 8) and then the kernel stack — the bench round's
+    /// 32-call RTT found it live. With the rule, depth is ~1 forever.
+    pub fn park_chain_depth() -> usize {
+        // SAFETY: a read-only peek under the single-CPU contract.
+        unsafe { PARK_CHAIN_DEPTH }
+    }
+
     /// Take the saved outer chain (the unwind consumes it).
     ///
     /// SAFETY: single CPU, IF=0 on the caller's path.
@@ -694,6 +715,31 @@ mod entry {
         // SAFETY: a read-only peek under the same single-CPU contract.
         let table = core::ptr::addr_of!(PARKED);
         unsafe { (*table).iter().flatten().any(|(r, _)| r.domain == domain) }
+    }
+
+    /// The ACTIVE run's exit kind, if a run is on the CPU — the
+    /// ADR-0028 tick guard's read: `Running` means the interrupt may
+    /// preempt normally; anything else means the run is mid-exit and
+    /// must be left alone to finish dying.
+    pub fn active_exit() -> Option<crate::sched::context::ExitKind> {
+        // SAFETY: a read-only peek under the single-CPU contract.
+        let slot = core::ptr::addr_of_mut!(USER_RUN);
+        unsafe { (*slot).as_ref().map(|r| r.exit) }
+    }
+
+    /// The parked image's resume RIP (the deadlock post-mortem's
+    /// pin: which syscall, which instruction, the run stranded
+    /// mid-what).
+    pub fn parked_rip(domain: u32) -> Option<u64> {
+        // SAFETY: a read-only peek under the same single-CPU contract.
+        let table = core::ptr::addr_of!(PARKED);
+        unsafe {
+            (*table)
+                .iter()
+                .flatten()
+                .find(|(r, _)| r.domain == domain)
+                .map(|(_, c)| c.rip)
+        }
     }
 
     /// How many runs are parked (diagnostics).
@@ -1016,14 +1062,14 @@ mod entry {
 /// it re-exports.
 #[cfg(not(test))]
 pub use entry::{
-    park_chain_save, park_chain_take, pool_mut, restore_resume_chain, save_resume_chain, set_pool,
-    shares_mut, ResumeChain,
+    park_chain_depth, park_chain_save, park_chain_take, pool_mut, restore_resume_chain,
+    save_resume_chain, set_pool, shares_mut, ResumeChain,
 };
 
 #[cfg(not(test))]
 pub use entry::{
-    active, active_domain, begin, current, enter_ring3, enter_ring3_parked, is_parked, kernel_mut,
-    launch, note_live_fault, park_from_frame, parked_count, patch_parked_rax, record_fault,
-    resume_kernel, resume_parked, saved_rip, saved_rsp, set_kernel, stash_parked, take,
-    take_parked, try_take, unpark_into_frame,
+    active, active_domain, active_exit, begin, current, enter_ring3, enter_ring3_parked, is_parked,
+    kernel_mut, launch, note_live_fault, park_from_frame, parked_count, parked_rip,
+    patch_parked_rax, record_fault, resume_kernel, resume_parked, saved_rip, saved_rsp, set_kernel,
+    stash_parked, take, take_parked, try_take, unpark_into_frame,
 };

@@ -1098,6 +1098,16 @@ impl<const N: usize> Kernel<N> {
 
     /// ADR-0026: record a wake — (domain, resume value). The kernel
     /// side drains the list and patches each parked image's RAX.
+    /// The domain's current IPC wait, if any (diagnostics; the
+    /// deadlock post-mortem's eyes).
+    pub fn ipc_wait_of(&self, domain: u32) -> Option<crate::ipc::IpcWaitKind> {
+        self.ipc_waiters
+            .iter()
+            .flatten()
+            .find(|w| w.domain == domain)
+            .map(|w| w.kind)
+    }
+
     pub(crate) fn ipc_wake_push(&mut self, domain: u32, value: u64) {
         if self.ipc_wake_n < self.ipc_wakes.len() {
             self.ipc_wakes[self.ipc_wake_n] = (domain, value);

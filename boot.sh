@@ -380,6 +380,11 @@ if [ "$MODE" = "verify" ]; then
   # behind at teardown — the mismatch line is the loud accounting
   # catch (it printed "freed 5 of 9" every boot since the fork round).
   grep -q "MM ] teardown" "$LOG" && { echo "VERIFY FAIL: frame accounting leaked at teardown"; ok=0; }
+  # ADR-0028: the bench — the blob's self-reported metrics + the
+  # kernel's calibration line (the two halves of one measurement).
+  grep -q "\[BENCH\] " "$LOG" || { echo "VERIFY FAIL: BENCH metrics line missing"; ok=0; }
+  grep -qF "[M3] bench: 6 clean exits" "$LOG" || { echo "VERIFY FAIL: M3 bench marker missing"; ok=0; }
+  grep -qF "[M3] bench: tsc_hz=" "$LOG" || { echo "VERIFY FAIL: bench calibration line missing"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the
