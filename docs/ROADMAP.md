@@ -212,11 +212,17 @@ synchronous call/reply fast path, async endpoints, shared memory grants,
 and signals; pipes become a wrapper over endpoints (the existing lib pipe
 semantics preserved on top).
 
-**Status (M2 week 1):** task 2 (async endpoints) is DONE in the lib —
-`src/ipc.rs` + the IpcSend/IpcRecv executors, capability-gated, bounded
-FIFO, monotonic never-reused ids; see ADR-0004's implementation note.
-Tasks 1 (sync fast path), 3 (page grants) and 4 (pipes-over-endpoints)
-follow per M2-PLAN.
+**Status (round Q, ADR-0029):** ALL SIX TASKS DONE. Async endpoints
+(M2 week 1, ADR-0004) → ring-3 async (ADR-0025) → sync call/reply
+over the park machinery (ADR-0026) → page grants (ADR-0027) → the
+honest bench with measured numbers (ADR-0028) → **pipes as endpoint
+byte channels (ADR-0029)**: the ambient `PipeTable` is deleted, the
+ring engine rides inside `EndpointTable`, `pipe()` at the ABI creates
+a channel endpoint (fds carry the endpoint id, F18 untouched — no cap
+minting), and the cross-domain byte path (`pipe_read`/`pipe_write`,
+internal nrs 30/31) is capability-gated with the
+wake-without-consume rendezvous. ABI-VERSION v0.4 documents the full
+internal surface with the Linux collision ledger.
 
 **Tasks:**
 1. Endpoint objects with capability handles (grant/revoke via the existing

@@ -44,7 +44,8 @@ use aegis_os::sys::{SysRequest, SysValue};
 use aegis_os::syscall::{
     gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_IPC_CALL, SYS_IPC_GRANT,
     SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MMAP, SYS_MUNMAP,
-    SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_WRITE,
+    SYS_NANOSLEEP, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN,
+    SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -249,6 +250,8 @@ mod exec {
             Decision::Allowed if nr8 == SYS_IPC_RECV_WAIT => sys_ipc_recv_wait(run, a1),
             Decision::Allowed if nr8 == SYS_IPC_REPLY => sys_ipc_reply(run, a1, a2),
             Decision::Allowed if nr8 == SYS_IPC_GRANT => sys_grant_frames(run, a1, a2, a3),
+            Decision::Allowed if nr8 == SYS_PIPE_READ => sys_pipe_read(run, a1, a2, a3),
+            Decision::Allowed if nr8 == SYS_PIPE_WRITE => sys_pipe_write(run, a1, a2, a3),
             // Round J: the file family runs on the LIVE lib kernel —
             // marshaled through sysabi, executed by `Kernel::execute`.
             Decision::Allowed if sysabi::FILE_FAMILY.contains(&nr8) => {
@@ -1162,6 +1165,118 @@ mod exec {
         // image, one more region in its tables and space.
         context::stash_parked(brun, bctx);
         base
+    }
+
+    /// pipe_read(channel, buf, len) — ADR-0029: the owner drains its
+    /// byte channel by ENDPOINT ID (the cross-domain path: a cap but
+    /// no fd). The `sys_read` shape: the executor fills a kernel
+    /// buffer once (no double-fetch), the bytes copy out byte-exact
+    /// under the blessed SMAP window.
+    fn sys_pipe_read(
+        run: &mut crate::sched::context::UserRun,
+        channel: u64,
+        buf: u64,
+        len: u64,
+    ) -> u64 {
+        use crate::mm::user_range::copy_out_bytes;
+        if channel > u32::MAX as u64 {
+            return (-EINVAL) as u64;
+        }
+        if len as usize > sysabi::MAX_READ {
+            return (-EINVAL) as u64;
+        }
+        if !validate_user_range(run, buf, len, sysabi::MAX_READ as u64) {
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_fault(run.domain);
+            }
+            return (-EFAULT) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        let mut kbuf = [0u8; sysabi::MAX_READ];
+        match k.execute(
+            run.domain,
+            SysRequest::PipeRead {
+                channel: channel as u32,
+                buf: &mut kbuf[..len as usize],
+            },
+        ) {
+            Ok(SysValue::Count(n)) => {
+                IN_USER_COPY.store(true, Ordering::SeqCst);
+                if crate::hw::smap_active() {
+                    crate::hw::stac();
+                }
+                let wrote = copy_out_bytes(buf, &kbuf[..n], &|va, b| memops::write_u8_va(va, b));
+                if crate::hw::smap_active() {
+                    crate::hw::clac();
+                }
+                IN_USER_COPY.store(false, Ordering::SeqCst);
+                wrote
+            }
+            // READ answers Count (short reads, 0 at EOF).
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// pipe_write(channel, buf, len) — ADR-0029: write bytes onto a
+    /// byte channel by endpoint id (WRITE cap, the send rules). The
+    /// `sys_write_file` shape: copy-in once under the blessed SMAP
+    /// window, then the executor; a rendezvous may have woken the
+    /// parked owner — patch its image before returning (the
+    /// sys_ipc_send rule).
+    fn sys_pipe_write(
+        run: &mut crate::sched::context::UserRun,
+        channel: u64,
+        buf: u64,
+        len: u64,
+    ) -> u64 {
+        if channel > u32::MAX as u64 {
+            return (-EINVAL) as u64;
+        }
+        if len as usize > MAX_WRITE {
+            return (-EINVAL) as u64;
+        }
+        if !validate_user_range(run, buf, len, MAX_WRITE as u64) {
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_fault(run.domain);
+            }
+            return (-EFAULT) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        let mut kbuf = [0u8; MAX_WRITE];
+        let mut pos = 0usize;
+        IN_USER_COPY.store(true, Ordering::SeqCst);
+        if crate::hw::smap_active() {
+            crate::hw::stac();
+        }
+        crate::mm::user_range::copy_user_bytes(buf, len, &memops::read_u8_va, |b| {
+            kbuf[pos] = b;
+            pos += 1;
+        });
+        if crate::hw::smap_active() {
+            crate::hw::clac();
+        }
+        IN_USER_COPY.store(false, Ordering::SeqCst);
+        let r = match k.execute(
+            run.domain,
+            SysRequest::PipeWrite {
+                channel: channel as u32,
+                bytes: &kbuf[..len as usize],
+            },
+        ) {
+            Ok(SysValue::Count(n)) => n as u64,
+            // WRITE answers Count.
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        };
+        // The write may have rendezvoused with a parked owner — the
+        // wake must land in its image before this arm returns.
+        drain_ipc_wakes();
+        r
     }
 
     /// SYS_READ(fd, buf, len): the executor fills a KERNEL buffer
