@@ -372,6 +372,8 @@ if [ "$MODE" = "verify" ]; then
   grep -qF "[M3] cow: fork shared" "$LOG" || { echo "VERIFY FAIL: M3 cow marker missing"; ok=0; }
   # ADR-0025: the async IPC proof (caps, bounded queues, both ends).
   grep -qF "[M3] ipc: 8+ messages over 2 channels" "$LOG" || { echo "VERIFY FAIL: M3 ipc marker missing"; ok=0; }
+  # ADR-0026: the sync call/reply proof (rendezvous + queued, both).
+  grep -qF "[M3] sync: 2 round-trips" "$LOG" || { echo "VERIFY FAIL: M3 sync marker missing"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the

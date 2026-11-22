@@ -650,6 +650,29 @@ mod entry {
         panic!("stash_parked: the parked-run table is full (bookkeeping bug)");
     }
 
+    /// ADR-0026: patch a parked run's RAX — gprs[14], the slot
+    /// `parked_from_syscall` built from the syscall's `result`. The
+    /// sync-IPC wake path: the reply/rendezvous sets the value the
+    /// parked run's syscall will return when the dispatcher resumes
+    /// it. Returns false when the domain is not parked (a woken run
+    /// that already exited, or was never parked — the caller treats
+    /// it as a no-op, not a bug: the waiter's state is the core's
+    /// truth, and IT was already cleared).
+    pub fn patch_parked_rax(domain: u32, rax: u64) -> bool {
+        // SAFETY: as stash_parked — single CPU, touched only from the
+        // syscall/tick paths (IF=0) or kmain between runs.
+        let table = core::ptr::addr_of_mut!(PARKED);
+        unsafe {
+            for slot in (*table).iter_mut().flatten() {
+                if slot.0.domain == domain {
+                    slot.1.gprs[14] = rax;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Withdraw the parked run of `domain`, if it is parked.
     pub fn take_parked(domain: u32) -> Option<(UserRun, ParkedContext)> {
         // SAFETY: as stash_parked.
@@ -1000,7 +1023,7 @@ pub use entry::{
 #[cfg(not(test))]
 pub use entry::{
     active, active_domain, begin, current, enter_ring3, enter_ring3_parked, is_parked, kernel_mut,
-    launch, note_live_fault, park_from_frame, parked_count, record_fault, resume_kernel,
-    resume_parked, saved_rip, saved_rsp, set_kernel, stash_parked, take, take_parked, try_take,
-    unpark_into_frame,
+    launch, note_live_fault, park_from_frame, parked_count, patch_parked_rax, record_fault,
+    resume_kernel, resume_parked, saved_rip, saved_rsp, set_kernel, stash_parked, take,
+    take_parked, try_take, unpark_into_frame,
 };

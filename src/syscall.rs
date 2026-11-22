@@ -73,6 +73,16 @@ pub const SYS_SIGACTION: u8 = 25;
 /// policy gate and re-validates every frame field against its own
 /// delivery record.
 pub const SYS_SIGRETURN: u8 = 24;
+/// ADR-0026: the sync IPC rendezvous (internal nrs; the Linux
+/// renumbering lands with Phase 5's ABI-VERSION table, like the
+/// async pair at 7/8).
+pub const SYS_IPC_CALL: u8 = 26;
+/// ipc_recv_wait(2): the blocking recv — pop now if a message waits,
+/// park the owner until one arrives.
+pub const SYS_IPC_RECV_WAIT: u8 = 27;
+/// ipc_reply(2): the owner answers its oldest waiting caller; the
+/// caller's blocked call returns the reply len.
+pub const SYS_IPC_REPLY: u8 = 28;
 /// Reserved: domain exit. Always reachable; a mask without it is rejected
 /// by convention (see `profile` tests).
 pub const SYS_EXIT: u8 = 63;

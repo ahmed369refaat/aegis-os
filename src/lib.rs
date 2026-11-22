@@ -161,6 +161,18 @@ pub struct Kernel<const N: usize = { crate::buddy::FRAME_COUNT }> {
     /// time base `tick` speaks (the core never learns the unit). One
     /// entry per sleeping domain; bounded by MAX_DOMAINS.
     pub(crate) sleepers: [Option<(u32, u64)>; MAX_DOMAINS],
+    /// ADR-0026: the sync-IPC waiter table — one blocking wait per
+    /// domain (a second call replaces the first, the sleepers' rule).
+    pub(crate) ipc_waiters: [Option<crate::ipc::IpcWait>; MAX_DOMAINS],
+    /// ADR-0026: the FIFO clock for call waiters (monotone; replies
+    /// answer the oldest caller on the endpoint first).
+    pub(crate) ipc_wait_seq: u64,
+    /// ADR-0026: the wake list — (domain, resume value) pairs the
+    /// reply/rendezvous executors produced. The KERNEL side drains it
+    /// after the syscall and patches each parked image's RAX (the
+    /// layering rule: the core decides, the kernel applies).
+    pub(crate) ipc_wakes: [(u32, u64); MAX_DOMAINS],
+    pub(crate) ipc_wake_n: usize,
 }
 
 impl Kernel<{ crate::buddy::FRAME_COUNT }> {
@@ -195,6 +207,10 @@ impl<const N: usize> Kernel<N> {
             procs: proc::ProcTable::new(),
             exec_policy: proc::ExecPolicyTable::new(),
             sleepers: [None; MAX_DOMAINS],
+            ipc_waiters: [None; MAX_DOMAINS],
+            ipc_wait_seq: 0,
+            ipc_wakes: [(0, 0); MAX_DOMAINS],
+            ipc_wake_n: 0,
         }
     }
 
@@ -814,6 +830,13 @@ impl<const N: usize> Kernel<N> {
                 *slot = None;
             }
         }
+        // ADR-0026: a dying domain's IPC wait dies with it (a reply
+        // later must not wake a dead id — wake_due's belt, same rule).
+        for slot in self.ipc_waiters.iter_mut() {
+            if matches!(*slot, Some(w) if w.domain == id) {
+                *slot = None;
+            }
+        }
         // Unregister from the fair scheduler and free the slot.
         let _ = self.sched.unregister(id);
         self.domains[slot] = None;
@@ -1022,6 +1045,120 @@ impl<const N: usize> Kernel<N> {
             }
         }
         woke
+    }
+
+    /// ADR-0026: register (or replace) a domain's blocking IPC wait.
+    /// One wait per domain — the sleepers' rule.
+    pub(crate) fn ipc_wait_register(&mut self, domain: u32, kind: crate::ipc::IpcWaitKind) {
+        self.ipc_wait_seq = self.ipc_wait_seq.wrapping_add(1);
+        let wait = crate::ipc::IpcWait {
+            domain,
+            kind,
+            seq: self.ipc_wait_seq,
+        };
+        // Replace in place if one exists; else the first free slot.
+        for slot in self.ipc_waiters.iter_mut() {
+            if matches!(*slot, Some(w) if w.domain == domain) {
+                *slot = Some(wait);
+                return;
+            }
+        }
+        for slot in self.ipc_waiters.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(wait);
+                return;
+            }
+        }
+        // Unreachable: waiters are bounded by live domains, and a
+        // full table means a bookkeeping leak — fail loud, not silent.
+        panic!("ipc_wait_register: the waiter table is full (bookkeeping bug)");
+    }
+
+    /// ADR-0026: clear a domain's wait (the reply consumed it).
+    pub(crate) fn ipc_wait_clear(&mut self, domain: u32) {
+        for slot in self.ipc_waiters.iter_mut() {
+            if matches!(*slot, Some(w) if w.domain == domain) {
+                *slot = None;
+                return;
+            }
+        }
+    }
+
+    /// ADR-0026: the OLDEST awaiting-reply caller on an endpoint
+    /// (FIFO by seq; None = nobody is asking).
+    #[must_use]
+    pub fn ipc_oldest_caller(&self, endpoint: u32) -> Option<u32> {
+        self.ipc_waiters
+            .iter()
+            .flatten()
+            .filter(|w| w.kind == crate::ipc::IpcWaitKind::AwaitingReply { endpoint })
+            .min_by_key(|w| w.seq)
+            .map(|w| w.domain)
+    }
+
+    /// ADR-0026: record a wake — (domain, resume value). The kernel
+    /// side drains the list and patches each parked image's RAX.
+    pub(crate) fn ipc_wake_push(&mut self, domain: u32, value: u64) {
+        if self.ipc_wake_n < self.ipc_wakes.len() {
+            self.ipc_wakes[self.ipc_wake_n] = (domain, value);
+            self.ipc_wake_n += 1;
+        }
+        // Overflow is unreachable: a waking syscall clears the wait
+        // BEFORE pushing (one wake per waiter per drain), and the
+        // drain runs after every waking syscall.
+    }
+
+    /// ADR-0026: the kernel-side drain — pops one (domain, value).
+    /// The syscall layer applies each to the parked image's RAX.
+    pub fn pop_ipc_wake(&mut self) -> Option<(u32, u64)> {
+        if self.ipc_wake_n == 0 {
+            return None;
+        }
+        self.ipc_wake_n -= 1;
+        Some(self.ipc_wakes[self.ipc_wake_n])
+    }
+
+    /// ADR-0026: the rendezvous push — send AND call both come
+    /// through here. After the bounded push, an owner parked in
+    /// recv_wait on this endpoint consumes the message the moment it
+    /// lands (pop what was pushed — the queue only holds the async
+    /// backlog, never a message an AwaitingMsg owner will take).
+    pub(crate) fn ipc_push_rendezvous(
+        &mut self,
+        channel: u32,
+        sender: u32,
+        len: u32,
+    ) -> Result<usize, crate::sys::SysError> {
+        use crate::sys::SysError;
+        let free = self
+            .endpoints
+            .push(channel, sender, len)
+            .map_err(SysError::Ipc)?;
+        // The owner, if parked AwaitingMsg here, takes it now.
+        let owner = match self.endpoints.owner_of(channel) {
+            Some(o) => o,
+            None => return Ok(free),
+        };
+        let waiting = self.ipc_waiters.iter().any(|w| {
+            matches!(w, Some(w)
+                if w.domain == owner
+                    && w.kind == crate::ipc::IpcWaitKind::AwaitingMsg { endpoint: channel })
+        });
+        if waiting {
+            // The pop returns exactly the just-pushed message: an
+            // AwaitingMsg waiter implies the queue was empty at park
+            // time, and every push since then rendezvoused (the
+            // invariant that keeps this FIFO-safe).
+            if self.endpoints.pop(channel).is_ok() {
+                self.ipc_wait_clear(owner);
+                self.ipc_wake_push(owner, u64::from(len));
+                let _ = self.sched.set_runnable(owner, true);
+                // The message left with the woken owner: the free
+                // budget is the full depth again (honest telemetry).
+                return Ok(crate::ipc::IPC_QUEUE_DEPTH);
+            }
+        }
+        Ok(free)
     }
 
     /// ADR-0023 D7: the earliest FUTURE wake deadline — the idle loop's
@@ -3249,5 +3386,290 @@ mod tests {
             k.create_domain(MAX_DOMAINS as u32, parser_profile()),
             Err(KernelError::TooManyDomains)
         );
+    }
+}
+
+// ── ADR-0026: sync call/reply over the park machinery ──────────
+
+#[cfg(test)]
+mod adr0026_sync_ipc {
+    use super::*;
+    use crate::capability::Rights;
+    use crate::ipc::{IpcError, IpcWaitKind};
+    use crate::profile::service_profile;
+    use crate::sys::{SysError, SysRequest, SysValue};
+
+    /// The common frame: a uid-0 supervisor (1), an endpoint owner
+    /// (3), and callers (2, 4) granted WRITE on the owner's endpoint.
+    fn frame() -> (Kernel<{ crate::buddy::FRAME_COUNT }>, u32) {
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.create_domain(2, service_profile()).unwrap();
+        k.create_domain(3, service_profile()).unwrap();
+        k.create_domain(4, service_profile()).unwrap();
+        let (ep, _h) = k.ipc_endpoint_create(1, 3).unwrap();
+        k.ipc_endpoint_grant(1, ep, 2, Rights::WRITE).unwrap();
+        k.ipc_endpoint_grant(1, ep, 4, Rights::WRITE).unwrap();
+        (k, ep)
+    }
+
+    /// call blocks the caller and registers the wait; reply answers
+    /// the OLDEST caller first (FIFO) and produces the wake pair.
+    #[test]
+    fn call_blocks_and_reply_wakes_fifo() {
+        let (mut k, ep) = frame();
+        // Two callers call; both park with Unit.
+        for d in [2u32, 4] {
+            assert!(matches!(
+                k.syscall(
+                    d,
+                    SysRequest::IpcCall {
+                        channel: ep,
+                        len: 7
+                    }
+                ),
+                Ok(SysValue::Unit)
+            ));
+            assert!(!k.sched.entity(d).unwrap().runnable, "caller {d} blocked");
+        }
+        // The owner replies: the FIRST caller (domain 2) wakes first.
+        assert!(matches!(
+            k.syscall(
+                3,
+                SysRequest::IpcReply {
+                    channel: ep,
+                    len: 0x11
+                }
+            ),
+            Ok(SysValue::Count(1))
+        ));
+        assert!(
+            k.sched.entity(2).unwrap().runnable,
+            "the oldest caller woke"
+        );
+        assert!(
+            !k.sched.entity(4).unwrap().runnable,
+            "the second still waits"
+        );
+        assert_eq!(k.pop_ipc_wake(), Some((2, 0x11)));
+        assert_eq!(k.pop_ipc_wake(), None, "one reply, one wake");
+        // The second reply wakes the second caller.
+        assert!(matches!(
+            k.syscall(
+                3,
+                SysRequest::IpcReply {
+                    channel: ep,
+                    len: 0x22
+                }
+            ),
+            Ok(SysValue::Count(1))
+        ));
+        assert!(k.sched.entity(4).unwrap().runnable);
+        assert_eq!(k.pop_ipc_wake(), Some((4, 0x22)));
+    }
+
+    /// The owner's recv_wait fast path: a waiting message pops now
+    /// (Count), no block.
+    #[test]
+    fn recv_wait_fast_path_pops_without_blocking() {
+        let (mut k, ep) = frame();
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 9
+                }
+            ),
+            Ok(SysValue::Count(_))
+        ));
+        assert!(matches!(
+            k.syscall(3, SysRequest::IpcRecvWait { channel: ep }),
+            Ok(SysValue::Count(9))
+        ));
+        assert!(k.sched.entity(3).unwrap().runnable, "never parked");
+        assert_eq!(k.pop_ipc_wake(), None);
+    }
+
+    /// recv_wait on empty parks the owner; the next push RENDEZVOUSES
+    /// (the message self-consumes; the owner wakes with the len; the
+    /// queue stays empty).
+    #[test]
+    fn recv_wait_blocks_and_the_push_rendezvouses() {
+        let (mut k, ep) = frame();
+        assert!(matches!(
+            k.syscall(3, SysRequest::IpcRecvWait { channel: ep }),
+            Ok(SysValue::Unit)
+        ));
+        assert!(!k.sched.entity(3).unwrap().runnable, "the owner parked");
+        // An async SEND (not just call) wakes the parked owner.
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcSend {
+                    channel: ep,
+                    len: 5
+                }
+            ),
+            Ok(SysValue::Count(_))
+        ));
+        assert!(
+            k.sched.entity(3).unwrap().runnable,
+            "rendezvous woke the owner"
+        );
+        assert_eq!(k.pop_ipc_wake(), Some((3, 5)));
+        // The message left with the owner: the queue is empty again
+        // (the async backlog never holds a rendezvoused message).
+        assert!(
+            matches!(
+                k.syscall(3, SysRequest::IpcRecvWait { channel: ep }),
+                Ok(SysValue::Unit)
+            ),
+            "the queue is empty — the owner parks again"
+        );
+    }
+
+    /// The call's push rides the same rendezvous: an owner parked in
+    /// recv_wait takes the CALL's message immediately.
+    #[test]
+    fn the_call_message_rendezvouses_too() {
+        let (mut k, ep) = frame();
+        assert!(matches!(
+            k.syscall(3, SysRequest::IpcRecvWait { channel: ep }),
+            Ok(SysValue::Unit)
+        ));
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcCall {
+                    channel: ep,
+                    len: 12
+                }
+            ),
+            Ok(SysValue::Unit)
+        ));
+        // Both the owner (the message) and the caller (awaiting
+        // reply) are in their waits; the owner is RUNNABLE (woken).
+        assert!(k.sched.entity(3).unwrap().runnable);
+        assert!(!k.sched.entity(2).unwrap().runnable);
+        assert_eq!(k.pop_ipc_wake(), Some((3, 12)));
+        // The caller's wait is the AwaitingReply kind on ep.
+        assert!(k.ipc_waiters.iter().any(|w| matches!(w,
+            Some(w) if w.domain == 2
+                && w.kind == IpcWaitKind::AwaitingReply { endpoint: ep })));
+    }
+
+    /// reply with nobody asking is the transient truth: EAGAIN-style.
+    #[test]
+    fn reply_with_no_waiter_refuses_eagain() {
+        let (mut k, ep) = frame();
+        assert!(matches!(
+            k.syscall(
+                3,
+                SysRequest::IpcReply {
+                    channel: ep,
+                    len: 1
+                }
+            ),
+            Err(SysError::Ipc(IpcError::QueueEmpty))
+        ));
+    }
+
+    /// A dying domain's wait dies with it: the reply finds no waiter.
+    #[test]
+    fn destroy_clears_the_wait() {
+        let (mut k, ep) = frame();
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcCall {
+                    channel: ep,
+                    len: 3
+                }
+            ),
+            Ok(SysValue::Unit)
+        ));
+        k.destroy_domain(2).unwrap();
+        assert!(k.ipc_waiters.iter().all(|w| w.is_none()));
+        assert!(matches!(
+            k.syscall(
+                3,
+                SysRequest::IpcReply {
+                    channel: ep,
+                    len: 1
+                }
+            ),
+            Err(SysError::Ipc(IpcError::QueueEmpty))
+        ));
+    }
+
+    /// A second call while one is outstanding REPLACES the wait (the
+    /// sleepers' rule: one blocking wait per domain).
+    #[test]
+    fn a_second_call_replaces_the_wait() {
+        let (mut k, ep) = frame();
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcCall {
+                    channel: ep,
+                    len: 1
+                }
+            ),
+            Ok(SysValue::Unit)
+        ));
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcCall {
+                    channel: ep,
+                    len: 2
+                }
+            ),
+            Ok(SysValue::Unit)
+        ));
+        let n = k
+            .ipc_waiters
+            .iter()
+            .flatten()
+            .filter(|w| w.domain == 2)
+            .count();
+        assert_eq!(n, 1, "one wait per domain, replaced not stacked");
+        // And the reply finds exactly that one.
+        assert!(matches!(
+            k.syscall(
+                3,
+                SysRequest::IpcReply {
+                    channel: ep,
+                    len: 9
+                }
+            ),
+            Ok(SysValue::Count(1))
+        ));
+    }
+
+    /// The no-cap gate holds on the sync arms exactly as on send:
+    /// WRITE gates call, READ gates recv_wait/reply, and the owner
+    /// check refuses a non-owner's recv_wait/reply.
+    #[test]
+    fn the_sync_arms_keep_the_gates() {
+        let (mut k, ep) = frame();
+        // A caller granted only WRITE cannot recv_wait or reply: the
+        // READ gate refuses FIRST (the async recv's order — the cap
+        // denial is the stronger, earlier signal).
+        assert!(matches!(
+            k.syscall(2, SysRequest::IpcRecvWait { channel: ep }),
+            Err(SysError::PermissionDenied)
+        ));
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcReply {
+                    channel: ep,
+                    len: 1
+                }
+            ),
+            Err(SysError::PermissionDenied)
+        ));
     }
 }

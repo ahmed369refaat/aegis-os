@@ -24,9 +24,10 @@ use crate::signal::{DefaultAction, SignalError};
 use crate::vfs::{Access, InodeKind, Mode, VfsError};
 use crate::{
     syscall::{
-        SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR,
-        SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE,
-        SYS_READ, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
+        SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_RECV_WAIT,
+        SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP,
+        SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SCHED_YIELD, SYS_SIGACTION,
+        SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
     },
     Kernel, KernelError,
 };
@@ -135,6 +136,27 @@ pub enum SysRequest<'a> {
     },
     IpcRecv {
         channel: u32,
+    },
+    /// ADR-0026: ipc_call(channel, len) — the sync rendezvous. The
+    /// same bounded push as send, then the caller BLOCKS awaiting the
+    /// owner's reply; the wake patches the parked image's RAX with
+    /// the reply len (the executor returns Unit = "parked; the value
+    /// arrives through the wake path").
+    IpcCall {
+        channel: u32,
+        len: u32,
+    },
+    /// ADR-0026: ipc_recv_wait(channel) — the owner's blocking recv.
+    /// A waiting message pops now (Count(len), no park); an empty
+    /// queue parks the owner until a push rendezvouses.
+    IpcRecvWait {
+        channel: u32,
+    },
+    /// ADR-0026: ipc_reply(channel, len) — the owner answers its
+    /// OLDEST waiting caller (FIFO); returns how many waiters woke.
+    IpcReply {
+        channel: u32,
+        len: u32,
     },
     Ioctl {
         cmd: u32,
@@ -754,12 +776,13 @@ impl<const N: usize> Kernel<N> {
                 self.endpoints
                     .owner_of(channel)
                     .ok_or(SysError::Ipc(crate::ipc::IpcError::InvalidHandle))?;
-                self.endpoints
-                    .push(channel, domain_id, len)
-                    // Count = free queue slots after the push (the
-                    // EAGAIN budget, mirroring NetSend's token count).
+                // ADR-0026: the push rides the rendezvous — an owner
+                // parked in recv_wait consumes the message now (the
+                // queue only holds the async backlog). The count is
+                // the free-slot budget after the push (the original
+                // send contract, unchanged).
+                self.ipc_push_rendezvous(channel, domain_id, len)
                     .map(SysValue::Count)
-                    .map_err(SysError::Ipc)
             }
             SysRequest::IpcRecv { channel } => {
                 // ADR-0004 slice 1 (async recv): READ == RECV, and the
@@ -776,6 +799,86 @@ impl<const N: usize> Kernel<N> {
                     .pop(channel)
                     .map(|m| SysValue::Count(m.len as usize))
                     .map_err(SysError::Ipc)
+            }
+            SysRequest::IpcCall { channel, len } => {
+                // ADR-0026: the sync half — the same gate, the same
+                // bounded queue (sync is not a privilege around
+                // capacity), then the caller parks awaiting the reply.
+                if len > crate::ipc::IPC_MAX_MSG_BYTES {
+                    return Err(SysError::Ipc(crate::ipc::IpcError::TooLong(len)));
+                }
+                self.require_endpoint_cap(domain_id, channel, Rights::WRITE)?;
+                self.endpoints
+                    .owner_of(channel)
+                    .ok_or(SysError::Ipc(crate::ipc::IpcError::InvalidHandle))?;
+                // The rendezvous push: an owner parked in recv_wait
+                // consumes the message the moment it lands. The free
+                // budget is dropped on the floor — the caller parks;
+                // the REPLY's len is the resume value.
+                self.ipc_push_rendezvous(channel, domain_id, len)?;
+                // Block the caller. One blocking wait per domain: a
+                // second call while one is outstanding REPLACES the
+                // registration (the sleepers' rule).
+                self.ipc_wait_register(
+                    domain_id,
+                    crate::ipc::IpcWaitKind::AwaitingReply { endpoint: channel },
+                );
+                // The caller just passed the domain checks above —
+                // a sched refusal here is unreachable; map it honestly
+                // anyway (the F14 discipline: no identity-swallowing).
+                let _ = self.sched.set_runnable(domain_id, false);
+                Ok(SysValue::Unit) // "parked — the value arrives via the wake"
+            }
+            SysRequest::IpcRecvWait { channel } => {
+                // ADR-0026: the blocking recv — the owner's fast path
+                // is the async recv verbatim; only the empty queue
+                // parks.
+                self.require_endpoint_cap(domain_id, channel, Rights::READ)?;
+                let owner = self
+                    .endpoints
+                    .owner_of(channel)
+                    .ok_or(SysError::Ipc(crate::ipc::IpcError::InvalidHandle))?;
+                if owner != domain_id {
+                    return Err(SysError::Ipc(crate::ipc::IpcError::NotOwner(domain_id)));
+                }
+                match self.endpoints.pop(channel) {
+                    Ok(m) => Ok(SysValue::Count(m.len as usize)),
+                    Err(crate::ipc::IpcError::QueueEmpty) => {
+                        self.ipc_wait_register(
+                            domain_id,
+                            crate::ipc::IpcWaitKind::AwaitingMsg { endpoint: channel },
+                        );
+                        let _ = self.sched.set_runnable(domain_id, false);
+                        Ok(SysValue::Unit)
+                    }
+                    Err(e) => Err(SysError::Ipc(e)),
+                }
+            }
+            SysRequest::IpcReply { channel, len } => {
+                // ADR-0026: the owner answers its oldest waiting
+                // caller; the reply's len is the caller's wake value.
+                if len > crate::ipc::IPC_MAX_MSG_BYTES {
+                    return Err(SysError::Ipc(crate::ipc::IpcError::TooLong(len)));
+                }
+                self.require_endpoint_cap(domain_id, channel, Rights::READ)?;
+                let owner = self
+                    .endpoints
+                    .owner_of(channel)
+                    .ok_or(SysError::Ipc(crate::ipc::IpcError::InvalidHandle))?;
+                if owner != domain_id {
+                    return Err(SysError::Ipc(crate::ipc::IpcError::NotOwner(domain_id)));
+                }
+                match self.ipc_oldest_caller(channel) {
+                    Some(waiter) => {
+                        self.ipc_wait_clear(waiter);
+                        self.ipc_wake_push(waiter, u64::from(len));
+                        let _ = self.sched.set_runnable(waiter, true);
+                        Ok(SysValue::Count(1))
+                    }
+                    // Nobody is asking: the transient truth, not a
+                    // bad handle.
+                    None => Err(SysError::Ipc(crate::ipc::IpcError::QueueEmpty)),
+                }
             }
             SysRequest::Ioctl { .. } => Err(SysError::NotImplemented(SYS_IOCTL)),
             SysRequest::NetRecv { .. } => Err(SysError::NotImplemented(SYS_NET_RECV)),
@@ -985,6 +1088,9 @@ fn syscall_nr(req: &SysRequest<'_>) -> u8 {
         SysRequest::Spawn { .. } => SYS_SPAWN,
         SysRequest::IpcSend { .. } => SYS_IPC_SEND,
         SysRequest::IpcRecv { .. } => SYS_IPC_RECV,
+        SysRequest::IpcCall { .. } => SYS_IPC_CALL,
+        SysRequest::IpcRecvWait { .. } => SYS_IPC_RECV_WAIT,
+        SysRequest::IpcReply { .. } => SYS_IPC_REPLY,
         SysRequest::Ioctl { .. } => SYS_IOCTL,
         SysRequest::NetRecv { .. } => SYS_NET_RECV,
     }

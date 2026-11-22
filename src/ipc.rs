@@ -55,6 +55,28 @@ pub enum IpcError {
     UnknownDomain(u32),
 }
 
+/// ADR-0026: what a sync-IPC-blocked domain is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcWaitKind {
+    /// Blocked in ipc_call on `endpoint`: the owner's reply is the
+    /// wake value (the reply's len).
+    AwaitingReply { endpoint: u32 },
+    /// Blocked in ipc_recv_wait on `endpoint` (the owner): the next
+    /// push's rendezvous delivers the message len.
+    AwaitingMsg { endpoint: u32 },
+}
+
+/// One registered waiter: the waiting domain + the kind + the FIFO
+/// sequence (replies answer the OLDEST caller first). Slots are
+/// insertion-ordered, like the sleepers' — the domain rides IN the
+/// entry, never in the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcWait {
+    pub domain: u32,
+    pub kind: IpcWaitKind,
+    pub seq: u64,
+}
+
 /// One queued message record (payload length + authenticated sender).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message {

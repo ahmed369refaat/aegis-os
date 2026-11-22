@@ -13,9 +13,9 @@
 use crate::capability::Rights;
 use crate::syscall::{
     SyscallMask, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK,
-    SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP,
-    SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SCHED_YIELD,
-    SYS_SIGACTION, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
+    SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND,
+    SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN,
+    SYS_PIPE, SYS_READ, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
 };
 
 /// The surface a domain of this class keeps while *degraded* (the
@@ -60,6 +60,9 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_CLOSE)
                 | (1u64 << SYS_IPC_SEND)
                 | (1u64 << SYS_IPC_RECV)
+                | (1u64 << SYS_IPC_CALL)
+                | (1u64 << SYS_IPC_RECV_WAIT)
+                | (1u64 << SYS_IPC_REPLY)
                 | (1u64 << SYS_PIPE)
                 | (1u64 << SYS_DUP)
                 | (1u64 << SYS_KILL)
@@ -86,6 +89,9 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_CLOSE)
                 | (1u64 << SYS_IPC_SEND)
                 | (1u64 << SYS_IPC_RECV)
+                | (1u64 << SYS_IPC_CALL)
+                | (1u64 << SYS_IPC_RECV_WAIT)
+                | (1u64 << SYS_IPC_REPLY)
                 | (1u64 << SYS_PIPE)
                 | (1u64 << SYS_DUP)
                 | (1u64 << SYS_WAIT)
@@ -131,6 +137,9 @@ pub const fn driver_profile() -> DomainProfile {
                 | (1u64 << SYS_IOCTL)
                 | (1u64 << SYS_IPC_SEND)
                 | (1u64 << SYS_IPC_RECV)
+                | (1u64 << SYS_IPC_CALL)
+                | (1u64 << SYS_IPC_RECV_WAIT)
+                | (1u64 << SYS_IPC_REPLY)
                 | (1u64 << SYS_EXIT),
         ),
         // Degraded driver: IOCTL is the whole point — it stays; the
@@ -153,12 +162,20 @@ pub const fn plugin_profile() -> DomainProfile {
             (1u64 << SYS_READ)
                 | (1u64 << SYS_IPC_SEND)
                 | (1u64 << SYS_IPC_RECV)
+                | (1u64 << SYS_IPC_CALL)
+                | (1u64 << SYS_IPC_RECV_WAIT)
+                | (1u64 << SYS_IPC_REPLY)
                 | (1u64 << SYS_EXIT),
         ),
         // Degraded plugin: keep its IPC lifeline, stop reading new
         // inputs.
         degraded_syscalls: SyscallMask::from_bits(
-            (1u64 << SYS_IPC_SEND) | (1u64 << SYS_IPC_RECV) | (1u64 << SYS_EXIT),
+            (1u64 << SYS_IPC_SEND)
+                | (1u64 << SYS_IPC_RECV)
+                | (1u64 << SYS_IPC_CALL)
+                | (1u64 << SYS_IPC_RECV_WAIT)
+                | (1u64 << SYS_IPC_REPLY)
+                | (1u64 << SYS_EXIT),
         ),
         quota_pages: 32,
         base_rights: Rights::READ,
@@ -179,6 +196,9 @@ pub const fn netd_profile() -> DomainProfile {
                 | (1u64 << SYS_CLOSE)
                 | (1u64 << SYS_IPC_SEND)
                 | (1u64 << SYS_IPC_RECV)
+                | (1u64 << SYS_IPC_CALL)
+                | (1u64 << SYS_IPC_RECV_WAIT)
+                | (1u64 << SYS_IPC_REPLY)
                 | (1u64 << SYS_NET_SEND)
                 | (1u64 << SYS_NET_RECV)
                 | (1u64 << SYS_EXIT),
@@ -247,7 +267,8 @@ mod degraded_tests {
     use super::*;
     use crate::syscall::{
         SYS_CLOSE, SYS_DUP, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_MMAP,
-        SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_WRITE,
+        SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE,
+        SYS_READ, SYS_WRITE,
     };
 
     /// F8: every profile's degraded surface is a STRICT subset of its

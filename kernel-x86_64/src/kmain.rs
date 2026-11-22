@@ -1798,6 +1798,128 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         let _ = &mut parked;
     }
 
+    // ── 20. ADR-0026: the sync IPC proof — call/reply over the
+    //      park machinery, ring 3 to ring 3. A caller and a callee
+    //      (the endpoint owner) trade TWO round-trips; both halves
+    //      of the unified contract fire deterministically (the
+    //      blob's yields pin the order): exchange 1 through the
+    //      RENDEZVOUS (the callee parks in recv_wait before the
+    //      caller's call — the push self-consumes, the callee wakes
+    //      with the request len), exchange 2 through the QUEUED fast
+    //      path (the callee yields between reply and the next
+    //      recv_wait; the caller's call lands while nobody waits —
+    //      the message queues; the callee's recv_wait pops it, no
+    //      park). The caller's call returns exactly the reply len
+    //      (the wake patched RAX); the callee's reply wakes exactly
+    //      one waiter. ──
+    {
+        if let Some((dom, _)) = crate::sched::park::completed_drain() {
+            let mut b = [0u8; 20];
+            crate::serial::write_str("[M3] sync: ERROR: stale mailbox entry dom=");
+            crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+            crate::serial::write_str("; halting\n");
+            hw::halt_forever();
+        }
+        struct SyncRun {
+            run: crate::sched::context::UserRun,
+            ctx: crate::sched::context::UserContext,
+        }
+        let mut runs: [Option<SyncRun>; 2] = [None, None];
+        for (i, dom) in [34u32, 35].iter().enumerate() {
+            // data[1]: 0 = caller, 1 = callee; the channel lands at
+            // data[2..] once the endpoint exists.
+            let mut data = [0u8; 0x70];
+            data[0] = 9;
+            data[1] = u8::from(*dom == 35);
+            match mm::user::spawn_user_blob(
+                &mut k,
+                &mut pool,
+                *dom,
+                aegis_os::profile::service_profile(),
+                RING3_PREEMPT,
+                &data,
+            ) {
+                Ok(sp) => {
+                    runs[i] = Some(SyncRun {
+                        run: sp.run,
+                        ctx: sp.ctx,
+                    })
+                }
+                Err(_) => {
+                    line(&mut out, &["[M3] sync: ERROR: spawn failed; halting"]);
+                    hw::halt_forever();
+                }
+            }
+        }
+        let _ = k.create_domain_with(36, aegis_os::profile::service_profile(), 0, 0, 0);
+        let ep_d = k.ipc_endpoint_create(36, 35).expect("endpoint D");
+        let _ = k.ipc_endpoint_grant(36, ep_d.0, 34, aegis_os::capability::Rights::WRITE);
+        // The supervisor never runs (the round-M rule).
+        let _ = k.sched.unregister(36);
+        // Bake the channel id into each run's data page.
+        let bake = |run: &mut crate::sched::context::UserRun, chan: u64| {
+            if let Some(page) = run.tables.translate(0x00403000) {
+                crate::memops::write_u64(page + 2, chan);
+            }
+        };
+        if let Some(r) = runs[0].as_mut() {
+            bake(&mut r.run, u64::from(ep_d.0));
+        }
+        if let Some(r) = runs[1].as_mut() {
+            bake(&mut r.run, u64::from(ep_d.0));
+        }
+        // The callee stashed parked-runnable; the caller runs via the
+        // flat launch, opens with the round-M yield, and the nested
+        // dispatcher runs the pair to completion — the caller's call
+        // parks it, the callee's reply wakes it, both exits land in
+        // the mailbox.
+        if let Some(r) = runs[1].take() {
+            crate::sched::context::stash_parked(
+                r.run,
+                crate::sched::context::ParkedContext::from_user_context(&r.ctx),
+            );
+        } else {
+            line(&mut out, &["[M3] sync: ERROR: callee missing; halting"]);
+            hw::halt_forever();
+        }
+        {
+            let Some(r) = runs[0].take() else {
+                line(&mut out, &["[M3] sync: ERROR: caller missing; halting"]);
+                hw::halt_forever();
+            };
+            let kernel_cr3 = hw::read_cr3();
+            r.run.tables.activate();
+            crate::sched::context::begin(r.run);
+            crate::sched::context::launch(&r.ctx);
+            hw::write_cr3(kernel_cr3);
+        }
+        let mut clean = 0usize;
+        while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            if !matches!(exit, crate::sched::context::ExitKind::Exited(0)) {
+                line(
+                    &mut out,
+                    &["[M3] sync: ERROR: a run exited nonzero; halting"],
+                );
+                hw::halt_forever();
+            }
+            clean += 1;
+            mm::user::destroy_user(&mut k, &mut pool, dom);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+        }
+        if clean == 2 {
+            line(
+                &mut out,
+                &["[M3] sync: 2 round-trips, call blocked and returned both replies, recv_wait returned both requests"],
+            );
+        } else {
+            line(
+                &mut out,
+                &["[M3] sync: ERROR: expected 2 clean exits, saw fewer; halting"],
+            );
+            hw::halt_forever();
+        }
+    }
+
     // ── 13. the terminal guard-page proof: the write must #PF, the
     // dispatch must confirm CR2 is exactly the guard page, print the
     // marker, and power off cleanly (CI greps it). Reached only when

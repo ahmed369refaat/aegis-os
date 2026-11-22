@@ -42,9 +42,9 @@ pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
 pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
 use aegis_os::sys::{SysRequest, SysValue};
 use aegis_os::syscall::{
-    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_IPC_RECV, SYS_IPC_SEND,
-    SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN,
-    SYS_WRITE,
+    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_IPC_CALL, SYS_IPC_RECV,
+    SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP,
+    SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -230,6 +230,9 @@ mod exec {
             Decision::Allowed if nr8 == SYS_FORK => sys_fork(run),
             Decision::Allowed if nr8 == SYS_IPC_SEND => sys_ipc_send(run, a1, a2),
             Decision::Allowed if nr8 == SYS_IPC_RECV => sys_ipc_recv(run, a1),
+            Decision::Allowed if nr8 == SYS_IPC_CALL => sys_ipc_call(run, a1, a2),
+            Decision::Allowed if nr8 == SYS_IPC_RECV_WAIT => sys_ipc_recv_wait(run, a1),
+            Decision::Allowed if nr8 == SYS_IPC_REPLY => sys_ipc_reply(run, a1, a2),
             // Round J: the file family runs on the LIVE lib kernel —
             // marshaled through sysabi, executed by `Kernel::execute`.
             Decision::Allowed if sysabi::FILE_FAMILY.contains(&nr8) => {
@@ -887,7 +890,7 @@ mod exec {
         let Some(k) = context::kernel_mut() else {
             return (-EPERM) as u64;
         };
-        match k.execute(
+        let r = match k.execute(
             run.domain,
             aegis_os::sys::SysRequest::IpcSend {
                 channel: channel as u32,
@@ -897,7 +900,11 @@ mod exec {
             Ok(aegis_os::sys::SysValue::Count(n)) => n as u64,
             Ok(_) => 0,
             Err(e) => sysabi::errno_of(&e) as u64,
-        }
+        };
+        // ADR-0026: the push may have rendezvoused with a parked
+        // recv_wait owner — patch its image before returning.
+        drain_ipc_wakes();
+        r
     }
 
     /// ipc_recv(channel) — ADR-0025 D1: the owner-only drain (READ ==
@@ -922,6 +929,107 @@ mod exec {
             Ok(_) => 0,
             Err(e) => sysabi::errno_of(&e) as u64,
         }
+    }
+
+    /// ADR-0026: apply the core's wake list — each (domain, value)
+    /// lands in the parked image's RAX (the layering rule: the core
+    /// decides, the kernel applies). Runs after every syscall that
+    /// can wake (send, call, reply), BEFORE any park: the woken
+    /// owner's image must be patched before the dispatcher can
+    /// resume it.
+    fn drain_ipc_wakes() {
+        while let Some(k) = context::kernel_mut() {
+            match k.pop_ipc_wake() {
+                Some((dom, val)) => {
+                    context::patch_parked_rax(dom, val);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// ipc_call(channel, len) — ADR-0026: the sync rendezvous. The
+    /// core pushed the message (a parked recv_wait owner takes it
+    /// THIS instant — the wake drain runs before the park) and
+    /// blocked the caller; the run parks here and the parked image's
+    /// RAX is patched when the owner replies. `call` RETURNS the
+    /// reply's len.
+    fn sys_ipc_call(run: &mut crate::sched::context::UserRun, channel: u64, len: u64) -> u64 {
+        if channel > u32::MAX as u64 || len > u32::MAX as u64 {
+            return (-EINVAL) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        match k.execute(
+            run.domain,
+            aegis_os::sys::SysRequest::IpcCall {
+                channel: channel as u32,
+                len: len as u32,
+            },
+        ) {
+            // Unit = "the caller parked; the reply's len arrives via
+            // the wake path" (the ADR-0026 contract).
+            Ok(aegis_os::sys::SysValue::Unit) => {
+                drain_ipc_wakes();
+                crate::sched::park::park_current_from_syscall(0)
+            }
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// ipc_recv_wait(channel) — ADR-0026: the blocking recv. A
+    /// waiting message pops NOW (Count(len), no park — the async
+    /// recv verbatim); an empty queue parks the owner until a push
+    /// rendezvouses (the push's wake patches the RAX with the len).
+    fn sys_ipc_recv_wait(run: &mut crate::sched::context::UserRun, channel: u64) -> u64 {
+        if channel > u32::MAX as u64 {
+            return (-EINVAL) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        match k.execute(
+            run.domain,
+            aegis_os::sys::SysRequest::IpcRecvWait {
+                channel: channel as u32,
+            },
+        ) {
+            Ok(aegis_os::sys::SysValue::Count(n)) => n as u64,
+            // Unit = "the queue was empty; parked until a rendezvous".
+            Ok(aegis_os::sys::SysValue::Unit) => crate::sched::park::park_current_from_syscall(0),
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// ipc_reply(channel, len) — ADR-0026: the owner answers its
+    /// OLDEST waiting caller. The core cleared the waiter and woke
+    /// the domain; the drain patches the caller's parked RAX with the
+    /// reply len BEFORE this arm returns (the caller could be resumed
+    /// on the very next tick).
+    fn sys_ipc_reply(run: &mut crate::sched::context::UserRun, channel: u64, len: u64) -> u64 {
+        if channel > u32::MAX as u64 || len > u32::MAX as u64 {
+            return (-EINVAL) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        let r = match k.execute(
+            run.domain,
+            aegis_os::sys::SysRequest::IpcReply {
+                channel: channel as u32,
+                len: len as u32,
+            },
+        ) {
+            Ok(aegis_os::sys::SysValue::Count(n)) => n as u64,
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        };
+        // The reply woke a caller: patch its image now.
+        drain_ipc_wakes();
+        r
     }
 
     /// SYS_READ(fd, buf, len): the executor fills a KERNEL buffer

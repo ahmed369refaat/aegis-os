@@ -116,3 +116,10 @@
 #      outer loop must read-an-empty-slot without panicking. The same
 #      static, the same single-CPU IF=0 discipline as take().
 118
+# 119 -> ADR-0026: +1 — patch_parked_rax (context.rs): the sync-IPC
+#      wake path writes the parked image's RAX (gprs[14], the slot
+#      parked_from_syscall built from the syscall's `result`) — the
+#      reply/rendezvous delivers the value the parked run's syscall
+#      returns. The same PARKED static, the same single-CPU IF=0
+#      discipline as stash_parked beside it.
+119

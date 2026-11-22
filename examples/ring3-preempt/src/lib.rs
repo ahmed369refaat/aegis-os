@@ -57,6 +57,8 @@ _ring3_start:
     je 13f                            /* mode 7: the fork/CoW proof */
     cmp al, 8
     je 14f                            /* mode 8: the IPC pair */
+    cmp al, 9
+    je 15f                            /* mode 9: the sync pair */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -173,7 +175,7 @@ _ring3_start:
     call next_instr
 next_instr:
     pop rsi
-    add rsi, 0x34E                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
+    add rsi, 0x416                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
     mov rdx, 0x0040C000               /* the kernel's trampoline page */
     syscall
     test rax, rax
@@ -447,6 +449,77 @@ ipc_rx_done:
     xor edi, edi
     syscall
 
+15: /* ── mode 9: the sync pair (ADR-0026) ──────────────────────── */
+    /* data[1]: 0 = caller, 1 = callee (the endpoint owner).
+       data[2..10]: channel D (LE u64). TWO round-trips, and the two
+       halves of the unified contract both fire, deterministically:
+       exchange 1 through the RENDEZVOUS (the callee parks in
+       recv_wait before the caller's call — the push self-consumes
+       and the callee wakes with the request len), exchange 2 through
+       the QUEUED fast path (the callee YIELDS between reply and the
+       next recv_wait; the caller's call lands while nobody waits —
+       the message queues; the callee's recv_wait POPS it, no park).
+       The interleaving is pinned by the yields, not by luck. */
+    movzx eax, byte ptr [0x00403001]
+    mov rbx, qword ptr [0x00403002]    /* channel D */
+    test eax, eax
+    jnz sync_callee
+
+    /* ── the caller: two calls, each returns exactly the reply len
+       the callee sent — the wake patched RAX ── */
+    /* the opening yield — the round-M discipline: the resume chain
+       set by a real resume_parked before anything else runs */
+    mov eax, 24
+    syscall
+    mov eax, 26                        /* ipc_call(D, 7) */
+    mov rdi, rbx
+    mov rsi, 7
+    syscall
+    cmp rax, 0x11                      /* the reply len, delivered */
+    jne 140f
+    mov eax, 26                        /* ipc_call(D, 9) */
+    mov rdi, rbx
+    mov rsi, 9
+    syscall
+    cmp rax, 0x22
+    jne 140f
+    mov eax, 63
+    xor edi, edi
+    syscall
+
+sync_callee:
+    /* ── the callee: recv_wait blocks (or pops), reply answers;
+       the yield between the exchanges pins the queued path ── */
+    mov eax, 27                        /* ipc_recv_wait(D) */
+    mov rdi, rbx
+    syscall
+    cmp rax, 7                         /* the request len */
+    jne 141f
+    mov eax, 28                        /* ipc_reply(D, 0x11) */
+    mov rdi, rbx
+    mov rsi, 0x11
+    syscall
+    cmp rax, 1                         /* one waiter woken */
+    jne 142f
+    /* the pin: yield NOW — the caller's second call must land while
+       nobody is waiting (the message queues; no rendezvous) */
+    mov eax, 24
+    syscall
+    mov eax, 27                        /* recv_wait: POPS the queued 9 */
+    mov rdi, rbx
+    syscall
+    cmp rax, 9
+    jne 141f
+    mov eax, 28                        /* ipc_reply(D, 0x22) */
+    mov rdi, rbx
+    mov rsi, 0x22
+    syscall
+    cmp rax, 1
+    jne 142f
+    mov eax, 63
+    xor edi, edi
+    syscall
+
 sig_handler:                          /* SIGUSR1: set the flag, ret */
     mov rax, 0x51515151
     mov qword ptr [0x00403060], rax
@@ -523,6 +596,15 @@ sig_handler:                          /* SIGUSR1: set the flag, ret */
     syscall
 139: mov eax, 63
     mov edi, 139                      /* the receiver starved */
+    syscall
+140: mov eax, 63
+    mov edi, 140                      /* a call returned the wrong reply */
+    syscall
+141: mov eax, 63
+    mov edi, 141                      /* a recv_wait returned the wrong len */
+    syscall
+142: mov eax, 63
+    mov edi, 142                      /* a reply did not wake one waiter */
     syscall
 "#,
 );
