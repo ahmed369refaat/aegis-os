@@ -199,20 +199,44 @@ already bridges the coinciding numbers. Renumbering to the Linux
 table stays Phase 5's `v1` work (ADR-0003); v0.4 makes the internal
 truth explicit and test-pinned.
 
+### D7 — round R: the EOF wake (a parked reader can no longer outlive its writers)
+
+Two paths can end a byte channel's write end, and both now signal
+EOF — wake a parked `AwaitingMsg` owner with **0**; its recv_wait
+returns 0 and its next pipe_read reads 0 (drained + closed):
+
+- **The capability sweep at domain death** (the reachable path):
+  teardown inspects the dying domain's channel WRITE caps; when the
+  dying domain is not the owner, no descriptor references the write
+  end, and NO OTHER LIVE WRITER holds WRITE — the end closes and the
+  owner wakes. The owner's own WRITE (the bootstrap grant) does not
+  count: the owner is the reader (found live — counting it kept a
+  dead channel's write end open forever).
+- **The fd-release terminal close**: every write-end fd release
+  (close/dup-replace/cloexec/teardown) routes through one helper that
+  fires the same wake on the open→closed transition. No waiter can be
+  parked on an fd-scoped channel TODAY (recv_wait is cap-gated and
+  pipe() mints no caps — F18), so this half is a no-op by
+  construction until fd-attachment lands; it is wired because the
+  semantic ("whenever a write end dies, signal EOF") is one rule, not
+  two.
+
 ## What is explicitly NOT here
 
-- **Writer-death EOF wake**: a reader parked on a channel whose only
-  writer domain dies stays parked — the same honest answer as
-  ADR-0026's "a stuck server blocks its caller". Waking requires a
-  cross-domain WRITE-cap sweep at destroy time; its own small round
-  if a caller ever needs it.
 - **Blocking pipe_read** (park until bytes, bytes delivered through
   the wake): needs the wake to carry bytes across address spaces.
   The two-step recv_wait + pipe_read protocol is the documented
   answer this round.
 - **fd passing between unrelated domains** (Unix SCM_RIGHTS): the
   supervisor-grants-a-WRITE-cap path is the AegisOS answer; a
-  pass-fd syscall would be new surface for a later ADR.
+  pass-fd syscall would be new surface for a later ADR (when it
+  lands, D7's fd half becomes reachable).
+- **A CoW word-copy optimization** (the K9 handoff's candidate):
+  investigated round R and REJECTED — the copy was already word-wise
+  (u64 read/write_volatile, 512 iterations); ADR-0028 D2's
+  "byte-copy loop" attribution was wrong and is corrected there. The
+  ~430k cycles are the exception path itself (two page walks, the
+  frame alloc, the refcount release, the TLB flush), not the copy.
 
 ## Testing plan
 

@@ -57,8 +57,11 @@ Reading: the RTT and the grant cost the same order — both are
 dominated by the park/wake machinery crossing the scheduler, not
 by their own work (the grant maps ONE page through a ten-check
 policy and still lands within one RTT). The CoW copy is ~4 RTTs:
-the exception path plus a 4 KiB byte-copy loop through the direct
-map plus the remap, all under a fault-and-resume. The floor (2 µs)
+the exception path (two page walks, the frame alloc, the refcount
+release, the TLB flush) plus a 4 KiB WORD-wise copy through the
+direct map (512 u64 volatile pairs — never byte-wise; the round-R
+re-read of the code corrected this attribution) plus the remap,
+all under a fault-and-resume. The floor (2 µs)
 shows the park machinery itself is cheap; everything above it is
 the fair scheduler's pick + the wake chain. These are
 QEMU-TCG-accurate relative numbers — hardware absolute numbers

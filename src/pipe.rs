@@ -83,6 +83,21 @@ impl<const CAP: usize> Pipe<CAP> {
         self.write_refs
     }
 
+    /// Is the write end still open? (ADR-0029 D7's EOF-wake
+    /// transition detector.)
+    pub(crate) fn write_open(&self) -> bool {
+        self.write_open
+    }
+
+    /// Force the write end closed with no fd accounting (ADR-0029
+    /// D7: the last WRITE *capability* died, not a descriptor).
+    /// Returns true when the SLOT should reclaim (the read end was
+    /// already closed too).
+    pub(crate) fn mark_write_closed(&mut self) -> bool {
+        self.write_open = false;
+        !self.read_open
+    }
+
     /// Register one more read-end descriptor (fd alloc/dup).
     pub(crate) fn acquire_read(&mut self) {
         self.read_refs = self.read_refs.saturating_add(1);

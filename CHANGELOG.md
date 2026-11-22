@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased] — round R (ADR-0029 D7): the EOF wake
+
+### Added — a parked reader can no longer outlive its writers
+
+- **D7**: two paths end a byte channel's write end and both now
+  signal EOF — a parked `AwaitingMsg` owner wakes with **0**, its
+  recv_wait returns 0, its next pipe_read reads 0. The capability
+  sweep at domain death (the reachable path: the dying domain's last
+  channel WRITE cap, no fd refs, no other live writer — the owner's
+  own bootstrap WRITE does not count, found live) and the fd-release
+  terminal close (one helper behind every close/dup/cloexec/teardown
+  site; a no-op by construction until fd-attachment lands — recv_wait
+  is cap-gated and pipe() mints no caps, F18).
+- Red→green: 3 new tests (writer-death EOF, second-writer negative,
+  fd terminal-close no-spurious-wake + read-fd EOF); workspace 410
+  green, all gates, pc lane PASS.
+
+### Fixed — the record
+
+- ADR-0028 D2's CoW attribution said "a 4 KiB byte-copy loop" — the
+  copy was already WORD-wise (512 u64 volatile pairs); the K9
+  handoff's "8× word-copy" optimization candidate was investigated
+  and REJECTED with the correction recorded (the ~430k cycles are the
+  exception path itself: two page walks, frame alloc, refcount
+  release, TLB flush). The stale "byte-for-byte" comment in the CoW
+  fix path is corrected too.
+
 ## [Unreleased] — round Q (ADR-0029): pipes over endpoints
 
 ### Added — the byte channel joins the capability world (ADR-0029)

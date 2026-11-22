@@ -576,7 +576,7 @@ impl<const N: usize> Kernel<N> {
         }
         for &(is_write, pipe) in &released[..rn] {
             if is_write {
-                let _ = self.endpoints.channel_release_write(pipe);
+                self.channel_release_write_eof(pipe);
             } else {
                 let _ = self.endpoints.channel_release_read(pipe);
             }
@@ -804,7 +804,7 @@ impl<const N: usize> Kernel<N> {
                         let _ = self.endpoints.channel_release_read(p);
                     }
                     FdTarget::PipeWrite(p) => {
-                        let _ = self.endpoints.channel_release_write(p);
+                        self.channel_release_write_eof(p);
                     }
                     FdTarget::File(_) => {}
                     FdTarget::Reserved => {}
@@ -834,6 +834,10 @@ impl<const N: usize> Kernel<N> {
                 *slot = None;
             }
         }
+        // ADR-0029 D7: the dying writer's LAST channel WRITE caps —
+        // force those write ends closed and signal EOF to parked
+        // owners (a parked reader can no longer outlive its writers).
+        self.channel_caps_eof_sweep(id);
         // Unregister from the fair scheduler and free the slot.
         let _ = self.sched.unregister(id);
         self.domains[slot] = None;
@@ -1468,6 +1472,99 @@ impl<const N: usize> Kernel<N> {
     /// proofs' endpoints before bootstrapping the next round).
     pub fn live_endpoint_ids(&self) -> impl Iterator<Item = u32> + '_ {
         self.endpoints.live_ids()
+    }
+
+    /// ADR-0029 D7: wake a parked `AwaitingMsg` owner when a byte
+    /// channel's write end just died — the EOF signal. The owner's
+    /// recv_wait returns 0 and its next pipe_read reads 0 (drained +
+    /// closed). Callers fire this ONLY on the open→closed transition.
+    fn channel_write_eof_wake(&mut self, ep: u32, was_open: bool) {
+        if !was_open {
+            return;
+        }
+        if self.endpoints.channel_write_open(ep) != Some(false) {
+            return; // still open (or dead/wrong-kind): nothing to signal
+        }
+        let Some(owner) = self.endpoints.owner_of(ep) else {
+            return;
+        };
+        let waiting = self.ipc_waiters.iter().any(|w| {
+            matches!(w, Some(w)
+                if w.domain == owner
+                    && w.kind == crate::ipc::IpcWaitKind::AwaitingMsg { endpoint: ep })
+        });
+        if waiting {
+            self.ipc_wait_clear(owner);
+            self.ipc_wake_push(owner, 0);
+            let _ = self.sched.set_runnable(owner, true);
+        }
+    }
+
+    /// ADR-0029 D7: the fd-path write-end release — drop one
+    /// descriptor reference and, if THAT close took the write end,
+    /// signal EOF to a parked owner. Every fd release site routes
+    /// through here (close/dup-replace/cloexec/teardown).
+    pub(crate) fn channel_release_write_eof(&mut self, ep: u32) {
+        let was_open = self.endpoints.channel_write_open(ep) == Some(true);
+        let _ = self.endpoints.channel_release_write(ep);
+        self.channel_write_eof_wake(ep, was_open);
+    }
+
+    /// ADR-0029 D7: the capability-path sweep at domain death — if
+    /// the dying domain held the LAST WRITE capability on a byte
+    /// channel (it is not the owner, no descriptor references the
+    /// write end, no other live domain holds WRITE), the write end
+    /// dies with it: force it closed and signal EOF to a parked
+    /// owner. A parked reader can no longer outlive its writers.
+    fn channel_caps_eof_sweep(&mut self, dying_id: u32) {
+        // Collect first (borrow discipline): the dying domain's
+        // channel WRITE caps it does not own.
+        let mut owned: [u32; crate::capability::MAX_CAPABILITIES] =
+            [0; crate::capability::MAX_CAPABILITIES];
+        let mut n = 0usize;
+        if let Some(d) = self.domain(dying_id) {
+            for c in d.caps.iter() {
+                if let crate::capability::Resource::Endpoint(eid) = c.resource {
+                    if c.rights.contains(crate::capability::Rights::WRITE)
+                        && n < owned.len()
+                        && self.endpoints.owner_of(eid) != Some(dying_id)
+                        && self.endpoints.is_channel(eid)
+                    {
+                        owned[n] = eid;
+                        n += 1;
+                    }
+                }
+            }
+        }
+        for &eid in &owned[..n] {
+            // Descriptor references still hold the end open.
+            if self.endpoints.channel_write_refs(eid) != Some(0) {
+                continue;
+            }
+            if !self.endpoints.channel_write_open(eid).unwrap_or(false) {
+                continue;
+            }
+            // Another live WRITER still holds WRITE: the end
+            // survives. The OWNER's own WRITE (the bootstrap grant's
+            // READ|WRITE|GRANT) does not count — the owner is the
+            // reader; its WRITE is not a writer's lifeline (found
+            // live: the owner's grant kept a dead channel's write end
+            // open forever and the parked owner never saw EOF).
+            let owner = self.endpoints.owner_of(eid);
+            let other_holder =
+                self.domains.iter().flatten().any(|d| {
+                    d.id != dying_id && Some(d.id) != owner && d.caps.iter().any(|c| {
+                        matches!(c.resource, crate::capability::Resource::Endpoint(e) if e == eid)
+                            && c.rights.contains(crate::capability::Rights::WRITE)
+                    })
+                });
+            if other_holder {
+                continue;
+            }
+            let was_open = self.endpoints.channel_write_open(eid) == Some(true);
+            let _ = self.endpoints.channel_mark_write_closed(eid);
+            self.channel_write_eof_wake(eid, was_open);
+        }
     }
 
     /// ADR-0004: destroy an endpoint. Its queue is dropped with it and
@@ -4322,5 +4419,98 @@ mod adr0029_pipes_over_endpoints {
             Ok(SysValue::Count(10))
         );
         assert_eq!(&buf[..10], b"from-child");
+    }
+
+    /// D7 (fd path): the terminal write-fd close routes through the
+    /// EOF helper (no spurious wake — a parked owner on an fd-scoped
+    /// channel is UNREACHABLE today: recv_wait is cap-gated and
+    /// pipe() mints no caps, F18; the honest observable is the read
+    /// fd's EOF and an empty wake list).
+    #[test]
+    fn fd_write_close_eof_no_spurious_wake() {
+        let mut k = Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        let (r, w) = match k.syscall(1, SysRequest::Pipe).unwrap() {
+            SysValue::FdPair(r, w) => (r, w),
+            other => panic!("{:?}", other),
+        };
+        let child = k.fork_process(1).unwrap();
+        // The parent closes ITS write fd; the child still holds one —
+        // the end must stay open.
+        assert_eq!(
+            k.syscall(1, SysRequest::Close { fd: w }),
+            Ok(SysValue::Unit)
+        );
+        // The child's close takes the LAST write reference: the end
+        // closes through the EOF helper — no waiter exists, so no
+        // wake may fire.
+        assert_eq!(
+            k.syscall(child, SysRequest::Close { fd: w }),
+            Ok(SysValue::Unit)
+        );
+        assert_eq!(k.pop_ipc_wake(), None, "no spurious wake");
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            k.syscall(
+                1,
+                SysRequest::Read {
+                    fd: r,
+                    buf: &mut buf
+                }
+            ),
+            Ok(SysValue::Count(0)),
+            "EOF: drained and closed"
+        );
+    }
+
+    /// D7 (capability path): the writer domain dies holding the last
+    /// WRITE cap — the parked owner wakes with 0 and reads EOF.
+    #[test]
+    fn writer_domain_death_wakes_parked_owner_with_eof() {
+        let (mut k, ep) = frame();
+        assert_eq!(
+            k.syscall(3, SysRequest::IpcRecvWait { channel: ep }),
+            Ok(SysValue::Unit)
+        );
+        assert!(!k.sched.entity(3).unwrap().runnable, "the owner parked");
+        k.destroy_domain(2).unwrap(); // the writer dies, cap and all
+        assert!(
+            k.sched.entity(3).unwrap().runnable,
+            "the cap death closed the write end — EOF woke the owner"
+        );
+        assert_eq!(k.pop_ipc_wake(), Some((3, 0)));
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            k.syscall(
+                3,
+                SysRequest::PipeRead {
+                    channel: ep,
+                    buf: &mut buf
+                }
+            ),
+            Ok(SysValue::Count(0)),
+            "EOF after the writer's death"
+        );
+    }
+
+    /// D7 negative: a second live WRITE holder keeps the end open —
+    /// no wake until the LAST one dies.
+    #[test]
+    fn live_second_writer_keeps_the_channel_open() {
+        let (mut k, ep) = frame();
+        k.ipc_endpoint_grant(1, ep, 4, Rights::WRITE).unwrap();
+        assert_eq!(
+            k.syscall(3, SysRequest::IpcRecvWait { channel: ep }),
+            Ok(SysValue::Unit)
+        );
+        k.destroy_domain(2).unwrap(); // one of two writers dies
+        assert!(
+            !k.sched.entity(3).unwrap().runnable,
+            "domain 4 still holds WRITE — no EOF yet"
+        );
+        assert_eq!(k.pop_ipc_wake(), None);
+        k.destroy_domain(4).unwrap(); // the last writer goes
+        assert!(k.sched.entity(3).unwrap().runnable, "EOF now");
+        assert_eq!(k.pop_ipc_wake(), Some((3, 0)));
     }
 }

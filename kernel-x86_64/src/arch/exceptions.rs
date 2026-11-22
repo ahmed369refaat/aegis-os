@@ -750,8 +750,8 @@ fn try_cow_recovery(f: &ExceptionFrame) -> bool {
     }
 
     // The fix: one private frame under the faulting domain's tag, the
-    // page copied byte-for-byte through the direct map (CR3-
-    // independent), the leaf repointed RW at the copy.
+    // page copied WORD-wise through the direct map (512 u64 volatile
+    // pairs, CR3-independent), the leaf repointed RW at the copy.
     let (Some(pool), Some(k)) = (
         crate::sched::context::pool_mut(),
         crate::sched::context::kernel_mut(),

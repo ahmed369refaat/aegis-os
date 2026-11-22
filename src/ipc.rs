@@ -308,6 +308,29 @@ impl EndpointTable {
         e.pipe.as_ref().map(|p| p.write_refs())
     }
 
+    /// ADR-0029 D7: is the channel's write end still open? None for
+    /// dead ids and message endpoints.
+    #[must_use]
+    pub fn channel_write_open(&self, id: u32) -> Option<bool> {
+        let e = self.find(id)?;
+        e.pipe.as_ref().map(|p| p.write_open())
+    }
+
+    /// ADR-0029 D7: force the write end closed (the last WRITE
+    /// capability died, not a descriptor). Reclaims the slot when the
+    /// read end is already closed too.
+    pub fn channel_mark_write_closed(&mut self, id: u32) -> Result<(), PipeError> {
+        let reclaim = self.channel(id)?.mark_write_closed();
+        if reclaim {
+            self.slots[self
+                .slots
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|e| e.id == id))
+                .expect("a live channel just answered")] = None;
+        }
+        Ok(())
+    }
+
     /// Bytes waiting in the channel (the `recv_wait` fast path and
     /// probes). `NotAChannel` on message endpoints, `InvalidPipe` on
     /// dead ids.

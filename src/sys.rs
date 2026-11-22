@@ -489,7 +489,7 @@ impl<const N: usize> Kernel<N> {
                         let _ = self.endpoints.channel_release_read(p);
                     }
                     FdTarget::PipeWrite(p) => {
-                        let _ = self.endpoints.channel_release_write(p);
+                        self.channel_release_write_eof(p);
                     }
                     FdTarget::File(_) => {}
                     // Round J: closing a reserved slot frees it for
@@ -597,7 +597,7 @@ impl<const N: usize> Kernel<N> {
                                 let _ = self.endpoints.channel_release_read(p);
                             }
                             FdTarget::PipeWrite(p) => {
-                                let _ = self.endpoints.channel_release_write(p);
+                                self.channel_release_write_eof(p);
                             }
                             FdTarget::File(_) => {}
                             FdTarget::Reserved => {}
@@ -611,7 +611,7 @@ impl<const N: usize> Kernel<N> {
                             let _ = self.endpoints.channel_release_read(p);
                         }
                         FdTarget::PipeWrite(p) => {
-                            let _ = self.endpoints.channel_release_write(p);
+                            self.channel_release_write_eof(p);
                         }
                         FdTarget::File(_) => {}
                         FdTarget::Reserved => {}
