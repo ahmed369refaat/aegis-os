@@ -63,6 +63,8 @@ _ring3_start:
     je 16f                            /* mode 10: the grant pair */
     cmp al, 11
     je 17f                            /* mode 11: the bench pair */
+    cmp al, 12
+    je 18f                            /* mode 12: the pipe pair */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -1012,6 +1014,235 @@ sig_handler:                          /* SIGUSR1: set the flag, ret */
 139: mov eax, 63
     mov edi, 139                      /* the receiver starved */
     syscall
+18: /* ── mode 12: the pipe pair (ADR-0029) ──────────────────────── */
+    /* data[1]: 0 = the WRITER (holds WRITE on F only), 1 = the
+       READER (F's owner). data[2..10]: channel F; data[10..18]:
+       channel G (the no-cap probe target). ORDER-AGNOSTIC BY
+       CONSTRUCTION (the ADR-0026 rule — the first cut pinned the
+       interleaving with yields and a q35 tick broke it: preempted
+       between drain and the EAGAIN probe, the reader saw the
+       writer's next write land). Every check below holds under ANY
+       interleaving: the wake value is the first write's count; the
+       24/40 reads are exact-size FIFO drains; B is polled; the
+       final EAGAIN probe runs after the writer's LAST F-write by
+       program order; the bounded fill and the fd round-trip are
+       local state only. */
+    movzx eax, byte ptr [0x00403001]
+    mov rbx, qword ptr [0x00403002]    /* channel F */
+    mov rbp, qword ptr [0x0040300A]    /* channel G */
+    test eax, eax
+    jnz pipe_reader
+
+pipe_writer:
+    /* the opening yield (the round-M discipline) */
+    mov eax, 24
+    syscall
+    /* pattern A at 0x403200 (24 bytes) */
+    movabs rax, 0xAAAAAAAAAAAAAAAA
+    mov qword ptr [0x00403200], rax
+    movabs rax, 0xBBBBBBBBBBBBBBBB
+    mov qword ptr [0x00403208], rax
+    movabs rax, 0xCCCCCCCCCCCCCCCC
+    mov qword ptr [0x00403210], rax
+    /* pattern B at 0x403240 (40 bytes) */
+    movabs rax, 0x1111111111111111
+    mov qword ptr [0x00403240], rax
+    movabs rax, 0x2222222222222222
+    mov qword ptr [0x00403248], rax
+    movabs rax, 0x3333333333333333
+    mov qword ptr [0x00403250], rax
+    movabs rax, 0x4444444444444444
+    mov qword ptr [0x00403258], rax
+    movabs rax, 0x5555555555555555
+    mov qword ptr [0x00403260], rax
+    /* exchange 1: 24 bytes of A onto F — deterministic (the ring is
+       empty; the reader's recv_wait wake value is exactly this
+       write's count, whatever the interleaving) */
+    mov eax, 31                        /* pipe_write(F, A, 24) */
+    mov rdi, rbx
+    mov rsi, 0x00403200
+    mov edx, 24
+    syscall
+    cmp rax, 24
+    jne 180f
+    /* the no-cap probe: G must refuse -EACCES (stateless — never
+       racy) */
+    mov eax, 31
+    mov rdi, rbp
+    mov rsi, 0x00403200
+    mov edx, 8
+    syscall
+    cmp rax, -13
+    jne 181f
+    /* the pin: yield — the reader wakes and drains (or a tick
+       interleaves; every check below is order-agnostic) */
+    mov eax, 24
+    syscall
+    /* exchange 2: 40 bytes of B onto F — deterministic (64 <= 256;
+       a short write is impossible) */
+    mov eax, 31
+    mov rdi, rbx
+    mov rsi, 0x00403240
+    mov edx, 40
+    syscall
+    cmp rax, 40
+    jne 182f
+    /* the pin: yield — the reader drains B and runs its fd
+       round-trip */
+    mov eax, 24
+    syscall
+    /* the PRIVATE bounded fill: the writer's OWN pipe() (fd path,
+       local — zero cross-domain interleaving). Fill exactly 256
+       (MAX_WRITE = the ring's capacity), then one more byte must
+       refuse -EAGAIN: a channel is not an unbounded privilege. */
+    mov eax, 12                        /* pipe() -> (w << 8) | r */
+    syscall
+    cmp rax, 0
+    jle 183f
+    mov r12, rax
+    mov eax, 1                         /* write(wfd, A, 256) */
+    mov edi, r12d
+    shr edi, 8
+    mov rsi, 0x00403200
+    mov edx, 256
+    syscall
+    cmp rax, 256
+    jne 184f
+    mov eax, 1                         /* write(wfd, A, 1) on a FULL ring */
+    mov edi, r12d
+    shr edi, 8
+    mov rsi, 0x00403200
+    mov edx, 1
+    syscall
+    cmp rax, -11
+    jne 185f
+    mov eax, 3                         /* close(wfd) */
+    mov edi, r12d
+    shr edi, 8
+    syscall
+    cmp rax, 0
+    jne 183f
+    mov eax, 3                         /* close(rfd) */
+    movzx edi, r12b
+    syscall
+    cmp rax, 0
+    jne 183f
+    mov eax, 63
+    xor edi, edi
+    syscall
+
+pipe_reader:
+    /* recv_wait parks (the ring is empty — the writer's opening
+       yield hands this run the slot first); the first write's
+       rendezvous wakes it with EXACTLY 24 (the write's count, not
+       the queue total — deterministic under any interleaving) */
+    mov eax, 27
+    mov rdi, rbx
+    syscall
+    cmp rax, 24
+    jne 190f
+    /* drain A: ask EXACTLY 24 — the FIFO returns A's bytes whether
+       or not B landed behind them */
+    mov eax, 30                        /* pipe_read(F, buf, 24) */
+    mov rdi, rbx
+    mov rsi, 0x00403400
+    mov edx, 24
+    syscall
+    cmp rax, 24
+    jne 191f
+    movabs rax, 0xAAAAAAAAAAAAAAAA
+    cmp rax, qword ptr [0x00403400]
+    jne 192f
+    movabs rax, 0xBBBBBBBBBBBBBBBB
+    cmp rax, qword ptr [0x00403408]
+    jne 192f
+    movabs rax, 0xCCCCCCCCCCCCCCCC
+    cmp rax, qword ptr [0x00403410]
+    jne 192f
+    /* B: poll until the writer's 40 lands — order-agnostic by
+       construction (a syscall is atomic from ring 3: the 40 is all
+       there or none of it is; EAGAIN -> yield -> retry, bounded) */
+    xor r13d, r13d                     /* retry counter (R13 survives) */
+pipe_b_poll:
+    mov eax, 30                        /* pipe_read(F, buf, 40) */
+    mov rdi, rbx
+    mov rsi, 0x00403440
+    mov edx, 40
+    syscall
+    cmp rax, 40
+    je pipe_b_got
+    cmp rax, -11
+    jne 195f
+    inc r13d
+    cmp r13d, 16
+    jge 196f                           /* loud: B never landed */
+    mov eax, 24                        /* yield: give the writer a slot */
+    syscall
+    jmp pipe_b_poll
+pipe_b_got:
+    movabs rax, 0x1111111111111111
+    cmp rax, qword ptr [0x00403440]
+    jne 197f
+    movabs rax, 0x3333333333333333
+    cmp rax, qword ptr [0x00403450]
+    jne 197f
+    movabs rax, 0x5555555555555555
+    cmp rax, qword ptr [0x00403460]
+    jne 197f
+    /* empty, PROVABLY now: the writer writes nothing more on F (the
+       bounded fill moved to its own private channel) — EAGAIN is
+       deterministic under any interleaving */
+    mov eax, 30                        /* pipe_read(F, buf, 1) */
+    mov rdi, rbx
+    mov rsi, 0x00403400
+    mov edx, 1
+    syscall
+    cmp rax, -11
+    jne 193f
+    /* the fd round-trip: pipe() now creates a channel endpoint —
+       write through the write fd, read through the read fd, close
+       both (the fd-scoped channel reclaims itself). Local state
+       only: deterministic. */
+    mov eax, 12                        /* pipe() -> (w << 8) | r */
+    syscall
+    cmp rax, 0
+    jle 198f
+    mov r12, rax
+    movabs rax, 0x0000217369676561     /* "aegis!" */
+    mov qword ptr [0x00403280], rax
+    mov eax, 1                         /* write(wfd, buf, 6) */
+    mov edi, r12d
+    shr edi, 8
+    mov rsi, 0x00403280
+    mov edx, 6
+    syscall
+    cmp rax, 6
+    jne 199f
+    mov eax, 0                         /* read(rfd, buf, 16) */
+    movzx edi, r12b
+    mov rsi, 0x00403480
+    mov edx, 16
+    syscall
+    cmp rax, 6
+    jne 199f
+    movabs rax, 0x0000217369676561
+    cmp rax, qword ptr [0x00403480]
+    jne 199f
+    mov eax, 3                         /* close(wfd) */
+    mov edi, r12d
+    shr edi, 8
+    syscall
+    cmp rax, 0
+    jne 198f
+    mov eax, 3                         /* close(rfd) */
+    movzx edi, r12b
+    syscall
+    cmp rax, 0
+    jne 198f
+    mov eax, 63
+    xor edi, edi
+    syscall
+
 140: mov eax, 63
     mov edi, 140                      /* a call returned the wrong reply */
     syscall
@@ -1071,6 +1302,54 @@ sig_handler:                          /* SIGUSR1: set the flag, ret */
     syscall
 172: mov eax, 63
     mov edi, 172                      /* r12 lost in the grant phase */
+    syscall
+180: mov eax, 63
+    mov edi, 180                      /* the pipe writer: write 1 short */
+    syscall
+181: mov eax, 63
+    mov edi, 181                      /* the pipe writer: no-cap EACCES missing */
+    syscall
+182: mov eax, 63
+    mov edi, 182                      /* the pipe writer: write 2 short */
+    syscall
+183: mov eax, 63
+    mov edi, 183                      /* the pipe writer: the private pipe failed */
+    syscall
+184: mov eax, 63
+    mov edi, 184                      /* the pipe writer: the bounded fill short */
+    syscall
+185: mov eax, 63
+    mov edi, 185                      /* the pipe writer: full-ring EAGAIN missing */
+    syscall
+190: mov eax, 63
+    mov edi, 190                      /* the pipe reader: the rendezvous count wrong */
+    syscall
+191: mov eax, 63
+    mov edi, 191                      /* the pipe reader: drain 1 short */
+    syscall
+192: mov eax, 63
+    mov edi, 192                      /* the pipe reader: pattern A wrong */
+    syscall
+193: mov eax, 63
+    mov edi, 193                      /* the pipe reader: empty-channel EAGAIN missing */
+    syscall
+194: mov eax, 63
+    mov edi, 194                      /* the pipe reader: the fast path wrong */
+    syscall
+195: mov eax, 63
+    mov edi, 195                      /* the pipe reader: the B poll wrong errno */
+    syscall
+196: mov eax, 63
+    mov edi, 196                      /* the pipe reader: B never landed */
+    syscall
+197: mov eax, 63
+    mov edi, 197                      /* the pipe reader: pattern B wrong */
+    syscall
+198: mov eax, 63
+    mov edi, 198                      /* the pipe reader: the fd pipe/close failed */
+    syscall
+199: mov eax, 63
+    mov edi, 199                      /* the pipe reader: the fd write/read wrong */
     syscall
 "#,
 );

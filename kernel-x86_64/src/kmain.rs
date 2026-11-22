@@ -2206,6 +2206,160 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
     }
 
+    // ── 23. ADR-0029: the pipe proof — a byte channel crosses
+    //      domains, capability-mediated, and the service story
+    //      completes: control over the message endpoints
+    //      (ADR-0025/26), DATA over the byte channel. A WRITER
+    //      (WRITE cap only) and the READER (F's owner) trade 64
+    //      bytes in two pinned exchanges — the RENDEZVOUS (the parked
+    //      reader wakes with the byte count, wake-without-consume)
+    //      and the FAST PATH (recv_wait answers the avail, no park) —
+    //      plus the live refusals (the no-cap EACCES, the full-ring
+    //      EAGAIN) and the fd round-trip (pipe() now creates a
+    //      channel endpoint; the rerouted fd path proven at ring 3).
+    //      Expected drains: 2 clean exits. The supervisor 44 also
+    //      sweeps the six endpoints the finished proofs left in the
+    //      eight-slot table (caps on destroyed ids fail closed — the
+    //      no-ABA rule; nothing strands) and destroys F/G after the
+    //      pair. ──
+    {
+        if let Some((dom, _)) = crate::sched::park::completed_drain() {
+            let mut b = [0u8; 20];
+            crate::serial::write_str("[M3] pipe: ERROR: stale mailbox entry dom=");
+            crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+            crate::serial::write_str("; halting\n");
+            hw::halt_forever();
+        }
+        struct PipeRun {
+            run: crate::sched::context::UserRun,
+            ctx: crate::sched::context::UserContext,
+        }
+        let mut runs: [Option<PipeRun>; 2] = [None, None];
+        for (i, dom) in [42u32, 43].iter().enumerate() {
+            // data[1]: 0 = the writer, 1 = the reader; data[2..10]:
+            // channel F; data[10..18]: channel G (the no-cap probe).
+            let mut data = [0u8; 0x70];
+            data[0] = 12;
+            data[1] = u8::from(*dom == 43);
+            match mm::user::spawn_user_blob(
+                &mut k,
+                &mut pool,
+                *dom,
+                aegis_os::profile::service_profile(),
+                RING3_PREEMPT,
+                &data,
+            ) {
+                Ok(sp) => {
+                    runs[i] = Some(PipeRun {
+                        run: sp.run,
+                        ctx: sp.ctx,
+                    })
+                }
+                Err(_) => {
+                    line(&mut out, &["[M3] pipe: ERROR: spawn failed; halting"]);
+                    hw::halt_forever();
+                }
+            }
+        }
+        // The supervisor 44 (uid 0, never runs). FIRST the hygiene
+        // sweep: the finished proofs left six endpoints in the
+        // eight-slot table and this round needs F, G, and the
+        // reader's fd channel — three slots that do not exist until
+        // the dead weight goes (found by arithmetic, not by a
+        // TableFull boot failure).
+        let _ = k.create_domain_with(44, aegis_os::profile::service_profile(), 0, 0, 0);
+        // (Collect-then-destroy: the iterator borrows k immutably; the
+        // destroy needs it mutable. A fixed array — no allocation.)
+        let mut stale = [0u32; aegis_os::ipc::MAX_ENDPOINTS];
+        let mut sn = 0usize;
+        for id in k.live_endpoint_ids() {
+            if sn < stale.len() {
+                stale[sn] = id;
+                sn += 1;
+            }
+        }
+        for &id in &stale[..sn] {
+            let _ = k.ipc_endpoint_destroy(44, id);
+        }
+        // F is owned by the READER; G's owner is the supervisor itself
+        // — the writer must hold NOTHING on G (the no-cap probe), and
+        // a self-owned channel never self-reclaims (no fd refs).
+        let (f, _hf) = k.ipc_channel_create(44, 43).expect("channel F");
+        let (g, _hg) = k.ipc_channel_create(44, 44).expect("channel G");
+        let _ = k.ipc_endpoint_grant(44, f, 42, aegis_os::capability::Rights::WRITE);
+        let _ = k.sched.unregister(44);
+        let bake = |run: &mut crate::sched::context::UserRun, f: u64, g: u64| {
+            if let Some(page) = run.tables.translate(0x00403000) {
+                crate::memops::write_u64(page + 2, f);
+                crate::memops::write_u64(page + 10, g);
+            }
+        };
+        if let Some(r) = runs[0].as_mut() {
+            bake(&mut r.run, u64::from(f), u64::from(g));
+        }
+        if let Some(r) = runs[1].as_mut() {
+            bake(&mut r.run, u64::from(f), 0);
+        }
+
+        // The reader parked-runnable (its recv_wait parks before the
+        // writer's first write — the rendezvous half); the writer
+        // flat-launched (the yields pin every exchange).
+        if let Some(r) = runs[1].take() {
+            crate::sched::context::stash_parked(
+                r.run,
+                crate::sched::context::ParkedContext::from_user_context(&r.ctx),
+            );
+        } else {
+            line(&mut out, &["[M3] pipe: ERROR: reader missing; halting"]);
+            hw::halt_forever();
+        }
+        {
+            let Some(r) = runs[0].take() else {
+                line(&mut out, &["[M3] pipe: ERROR: writer missing; halting"]);
+                hw::halt_forever();
+            };
+            let kernel_cr3 = hw::read_cr3();
+            r.run.tables.activate();
+            crate::sched::context::begin(r.run);
+            crate::sched::context::launch(&r.ctx);
+            hw::write_cr3(kernel_cr3);
+        }
+        let mut clean = 0usize;
+        while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            if !matches!(exit, crate::sched::context::ExitKind::Exited(0)) {
+                let mut b = [0u8; 20];
+                crate::serial::write_str("[M3] pipe: ERROR: dom=");
+                crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+                crate::serial::write_str(" exit=");
+                if let crate::sched::context::ExitKind::Exited(c) = exit {
+                    crate::serial::write_str(strutil::dec(c, &mut b));
+                }
+                crate::serial::write_str("; halting\n");
+                hw::halt_forever();
+            }
+            clean += 1;
+            mm::user::destroy_user(&mut k, &mut pool, dom);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+        }
+        if clean == 2 {
+            line(
+                &mut out,
+                &["[M3] pipe: 64 bytes cross-domain byte-exact, caps enforced (EACCES + EAGAIN), rendezvous wake + fd path live"],
+            );
+        } else {
+            line(
+                &mut out,
+                &["[M3] pipe: ERROR: expected 2 clean exits, saw fewer; halting"],
+            );
+            hw::halt_forever();
+        }
+        // The after-sweep: F and G die now; their ids stay dead
+        // forever. The reader's fd channel already reclaimed itself
+        // (both fds closed in-blob — the fd-scoped lifetime).
+        let _ = k.ipc_endpoint_destroy(44, f);
+        let _ = k.ipc_endpoint_destroy(44, g);
+    }
+
     // ── 13. the terminal guard-page proof: the write must #PF, the
     // dispatch must confirm CR2 is exactly the guard page, print the
     // marker, and power off cleanly (CI greps it). Reached only when

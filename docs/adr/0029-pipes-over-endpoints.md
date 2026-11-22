@@ -133,24 +133,58 @@ table; the mode-12 bootstrap sweeps them before creating its pair.
 
 ### D5 — the proof (blob mode 12, the eleventh)
 
-The cross-domain service story, pinned by yields (the mode-9
-discipline):
+The cross-domain service story, **order-agnostic by construction**
+(the ADR-0026 rule — see the hunt below):
 
 - **WRITER** (holds WRITE only): writes 24 bytes (pattern A) onto F;
   probes G — a channel it holds no cap on — and demands the `-EACCES`
-  refusal; yields (the reader wakes and drains); writes 40 bytes
-  (pattern B); fills the ring to its brim and demands `-EAGAIN` (the
-  bounded truth: a channel is not an unbounded privilege); exits.
-- **READER** (the owner): `recv_wait(F)` parks; wakes with exactly
-  24; `pipe_read` drains pattern A byte-exact; a further read refuses
-  `-EAGAIN` (empty, writer alive); yields; `recv_wait` takes the
-  FAST PATH (40 landed while nobody waited); drains pattern B
-  byte-exact; then the fd round-trip — `pipe()`, write through the
-  write fd, read through the read fd, verify, close both — proving
-  the rerouted fd path live at ring 3; exits.
+  refusal (stateless, never racy); yields; writes 40 bytes (pattern
+  B; 64 ≤ 256, a short write is impossible); yields; then the
+  **private bounded fill**: its OWN `pipe()`, a 256-byte fd write
+  (exactly the ring's capacity and the ABI's own MAX_WRITE), one more
+  byte demanding `-EAGAIN` — a channel is not an unbounded privilege —
+  and both fds closed. Local state only: zero cross-domain
+  interleaving.
+- **READER** (the owner): `recv_wait(F)` parks; the first write's
+  rendezvous wakes it with **exactly 24** (the write's count, not the
+  queue total — deterministic under any interleaving); an exact-size
+  24-byte read drains pattern A byte-exact (the FIFO returns A's
+  bytes whether or not B landed behind them); B is **polled**
+  (read-40 / on `-EAGAIN` yield and retry, bounded at 16 — a syscall
+  is atomic from ring 3, so the 40 is all there or none of it is);
+  then the EAGAIN-on-empty probe — **provably deterministic now**: the
+  writer's last F-write precedes this point by program order on both
+  sides; then the fd round-trip — `pipe()`, write through the write
+  fd, read through the read fd, verify, close both — proving the
+  rerouted fd path live at ring 3; exits.
 
-Marker: `[M3] pipe: 64 bytes cross-domain over the channel, caps
-enforced (EACCES + EAGAIN), wake and fast-path both proved`.
+Marker: `[M3] pipe: 64 bytes cross-domain byte-exact, caps enforced
+(EACCES + EAGAIN), rendezvous wake + fd path live`. The recv_wait
+fast path is host-proven (`recv_wait_channel_fast_path_returns_
+avail`); pinning it in the blob is exactly the interleaving trap
+below.
+
+**The hunt (kept — it will recur): the pinned-order proof that a tick
+broke.** The first cut pinned the interleaving with yields and
+demanded the EAGAIN probe land between the writer's two writes. It
+passed the pc lane and failed q35 with exit 193: a tick preempted the
+READER between its drain and the probe, the writer (parked-runnable
+at its yield, its next instruction the 40-byte write) ran, and the
+probe saw the 40 bytes — a proof bug, not a machinery bug. The fix is
+the ADR-0026 discipline applied honestly: no check may depend on
+WHERE the scheduler interleaves. Wake-value determinism, exact-size
+FIFO reads, polling, program-order "no more writes", and local-only
+fills are the five shapes that survive a tick; the redesign uses all
+five.
+
+Two more finds from the same round, both real bugs the blob's growth
+flushed out: **`copy_into_frame` assumed physical contiguity** (true
+for one-page regions; the two-page code region's second frame is
+wherever the pool put it — the blob's tail scribbled a stranger's
+frame, and the writer domain died at its entry with a P=0 fetch
+fault; now page-by-page translate-and-copy), and **the code region
+was one page** (the blob crossed 4096 bytes at 3372 → 4398; CODE_PAGES
+is 2 now, the code→data guard gap still a full absent page).
 
 ### D6 — ABI-VERSION v0.4
 

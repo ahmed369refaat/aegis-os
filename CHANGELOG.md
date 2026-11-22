@@ -1,5 +1,65 @@
 # Changelog
 
+## [Unreleased] — round Q (ADR-0029): pipes over endpoints
+
+### Added — the byte channel joins the capability world (ADR-0029)
+
+- `EndpointTable` byte channels: an `Endpoint` is now a message queue
+  OR a byte channel (`pipe::Pipe` engine at `CHANNEL_CAPACITY` = 256
+  inside it); one monotonic id space, kind fixed at creation, every
+  operation checks it (message ops on a channel → `WrongKind`, pipe
+  ops on a message endpoint → `NotAChannel` — the type discipline is
+  a security property). Two lifetimes: fd-scoped channels reclaim
+  their slot when both ends' refs hit zero (Unix pipe lifetime, id
+  dead forever); supervisor-created channels live until
+  `ipc_endpoint_destroy` (uid 0).
+- `SYS_PIPE_READ`/`SYS_PIPE_WRITE` at the internal nrs 30/31 — the
+  cross-domain byte path: READ cap + owner to drain, WRITE cap to
+  send; short write/read, 0 at EOF, -EPIPE, -EAGAIN; the
+  wake-without-consume rendezvous (a parked `recv_wait` owner wakes
+  with the byte count, the bytes stay for its own `pipe_read`);
+  `recv_wait` on a channel answers the waiting count on the fast
+  path. Profiles: bits 30/31 in service, degraded service, and app.
+- `ipc_channel_create` (the supervisor bootstrap, owner gets
+  READ|WRITE|GRANT) and `live_endpoint_ids` (the hygiene sweep).
+- ABI-VERSION **v0.4**: the COMPLETE internal surface (file family,
+  time, signals, memory/processes, the IPC family with the pipe pair)
+  plus the Linux x86_64 collision ledger (internal 7 vs poll, 12 vs
+  brk, 22 vs pipe, 30/31 vs shmat/shmctl, ...) — Phase 5's v1
+  renumbering starts from the recorded truth.
+- The proof (blob mode 12, the eleventh; the twelfth M3 marker):
+  64 bytes cross-domain byte-exact, the no-cap EACCES and full-ring
+  EAGAIN live, the rendezvous wake, and the fd round-trip —
+  **order-agnostic by construction**, on all three lanes.
+
+### Changed
+
+- `SYS_PIPE`'s two fds now carry the ENDPOINT id; the ambient
+  `PipeTable` and `Kernel.pipes` are DELETED (one ring engine, one
+  table, one id space; the `pub pipes` test exposure narrows to
+  `channel_refs`/`live_endpoint_count`). **No capability is minted**
+  — the F18 invariant ("no syscall grows a domain's capability
+  table") bent the design, not the invariant: the fd path keeps the
+  M1 fd discipline, the endpoint-addressed path is the cap-gated
+  cross-domain surface.
+- The user code region is TWO pages (`CODE_PAGES` 1 → 2; the proof
+  blob crossed 4096 bytes at 3372 → 4484) — the code→data guard gap
+  is still a full absent page, layout-test-pinned.
+
+### Fixed — two real bugs the blob's growth flushed out
+
+- `copy_into_frame` assumed the region is physically contiguous (true
+  for one page, false for two): the blob's tail ran off the first
+  frame into whatever the pool held next — the writer domain died at
+  its entry with a P=0 fetch fault (its page-table frame was the
+  overflow target). Now page-by-page translate-and-copy.
+- The first mode-12 proof pinned its interleaving with yields; a q35
+  tick preempted the reader between drain and the EAGAIN probe and
+  the writer's next write landed (exit 193). Redesigned
+  order-agnostic: wake-value determinism, exact-size FIFO reads,
+  bounded polling, program-order no-more-writes, local-only fills
+  (the five shapes that survive a tick — ADR-0029 D5's hunt record).
+
 All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelog.com/), versions: [SemVer](https://semver.org/).
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)

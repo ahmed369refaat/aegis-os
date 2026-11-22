@@ -1463,6 +1463,13 @@ impl<const N: usize> Kernel<N> {
         self.endpoints.len()
     }
 
+    /// ADR-0029 D4: the live endpoint ids, creation order — the
+    /// supervisor hygiene sweep surface (kmain drains finished
+    /// proofs' endpoints before bootstrapping the next round).
+    pub fn live_endpoint_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.endpoints.live_ids()
+    }
+
     /// ADR-0004: destroy an endpoint. Its queue is dropped with it and
     /// the id is dead forever — every capability on it fails closed on
     /// the next use (ids are never reused). Supervisor only (uid 0);

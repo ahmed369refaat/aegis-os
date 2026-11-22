@@ -205,18 +205,33 @@ pub fn destroy_user<const N: usize>(k: &mut Kernel<N>, pool: &mut FramePool<N>, 
 /// at a time through the direct map). `base` must be a mapped region
 /// start; the caller only ever passes layout bases whose regions were
 /// just mapped.
+///
+/// Page-by-page (ADR-0029): a multi-page region's frames are NOT
+/// physically contiguous — the pool allocates each page independently.
+/// The old single-translate linear copy ran off the first frame's end
+/// into whatever the pool held next (found live: the code region grew
+/// to two pages, the blob crossed 4096 bytes, and the writer domain
+/// died at its entry with a P=0 fetch fault — its page table frame had
+/// been the spinner's overflow target). Translate EVERY page and copy
+/// that page's slice.
 fn copy_into_frame(tables: &PageTables, base: u64, bytes: &[u8]) {
-    let pa = match tables.translate(base) {
-        Some(p) => p,
-        None => return, // unreachable: we just mapped this region
-    };
     let mut off = 0usize;
     while off < bytes.len() {
-        let mut word = [0u8; 8];
-        let n = core::cmp::min(8, bytes.len() - off);
-        word[..n].copy_from_slice(&bytes[off..off + n]);
-        memops::write_u64(pa + off as u64, u64::from_le_bytes(word));
-        off += n;
+        let page = base + (off / 4096) as u64 * 4096;
+        let in_page = off % 4096;
+        let Some(pa) = tables.translate(page) else {
+            return; // unreachable: we just mapped this region
+        };
+        let chunk = core::cmp::min(4096 - in_page, bytes.len() - off);
+        let mut o = 0usize;
+        while o < chunk {
+            let mut word = [0u8; 8];
+            let n = core::cmp::min(8, chunk - o);
+            word[..n].copy_from_slice(&bytes[off + o..off + o + n]);
+            memops::write_u64(pa + (in_page + o) as u64, u64::from_le_bytes(word));
+            o += n;
+        }
+        off += chunk;
     }
 }
 
@@ -226,8 +241,8 @@ mod tests {
 
     #[test]
     fn blob_capacity_covers_the_examples() {
-        // The examples are a few dozen bytes of asm; one code page is
-        // orders of magnitude more than enough — compile-time.
+        // The proof blob crossed one page at ADR-0029 (4398 bytes);
+        // two pages hold it with room for the TTY/shell proofs.
         const _: () = assert!(layout::CODE_PAGES * 4096 >= 128);
     }
 }

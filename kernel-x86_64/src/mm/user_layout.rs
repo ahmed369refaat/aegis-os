@@ -6,9 +6,11 @@
 //! - Every base is page-aligned, above the NULL page, and far below
 //!   `pte::USER_LIMIT` — the user half is structural (ADR-0002).
 //! - Guard gaps of at least one page separate all regions, as the core
-//!   policy demands (`GuardGap` otherwise); here they are two and four
-//!   pages wide, so a runaway stack pointer or code fetch lands in an
-//!   *absent* PTE, not a neighbor.
+//!   policy demands (`GuardGap` otherwise); here they are one-to-two
+//!   and four pages wide (the code region grew to two pages in
+//!   ADR-0029, narrowing the code→data gap to the policy minimum), so
+//!   a runaway stack pointer or code fetch lands in an *absent* PTE,
+//!   not a neighbor.
 //! - Code is RX (NX clear), data and stack are RW with NX set — W^X at
 //!   the hardware level, exactly as `mm::pte` translates it.
 //! - The layout is policy-legal by construction: the host test maps all
@@ -17,9 +19,14 @@
 
 use aegis_os::memory::MemFlags;
 
-/// User code: one RX page at the classic 4 MiB mark.
+/// User code: RX pages at the classic 4 MiB mark. Two pages since
+/// ADR-0029 (the proof blob crossed 4096 bytes with mode 12 — 3372 →
+/// 4398, a real capacity signal, not a one-off; the TTY/shell proofs
+/// of the remaining M3 phases will only grow). The code→data guard
+/// gap narrows from two pages to one — still a full absent-PTE page,
+/// still policy-legal (the layout test pins it).
 pub const CODE_BASE: u64 = 0x0040_0000;
-pub const CODE_PAGES: usize = 1;
+pub const CODE_PAGES: usize = 2;
 /// User data: one RW page, two guard pages above the code region.
 pub const DATA_BASE: u64 = 0x0040_3000;
 pub const DATA_PAGES: usize = 1;

@@ -385,6 +385,10 @@ if [ "$MODE" = "verify" ]; then
   grep -q "\[BENCH\] " "$LOG" || { echo "VERIFY FAIL: BENCH metrics line missing"; ok=0; }
   grep -qF "[M3] bench: 6 clean exits" "$LOG" || { echo "VERIFY FAIL: M3 bench marker missing"; ok=0; }
   grep -qF "[M3] bench: tsc_hz=" "$LOG" || { echo "VERIFY FAIL: bench calibration line missing"; ok=0; }
+  # ADR-0029: the pipe proof — 64 bytes cross-domain over the byte
+  # channel (the rendezvous wake AND the fast path), the live
+  # refusals, and the rerouted fd path.
+  grep -qF "[M3] pipe: 64 bytes cross-domain byte-exact" "$LOG" || { echo "VERIFY FAIL: M3 pipe marker missing"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the
