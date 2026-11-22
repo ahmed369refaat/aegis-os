@@ -108,4 +108,11 @@
 #      paths now read the stub's USER_RBP/R12-R15 slots, and the
 #      wrong-by-principle helper is gone so nobody can reach for it
 #      again), and the diagnostic register reads that hunted it.
-117
+
+# 118 -> ADR-0025: +1 — try_take (context.rs): the tolerant twin of
+#      take() for the dispatcher's post-resume slot read — a run the
+#      dispatcher itself resumed can YIELD (the IPC receivers' poll
+#      loops), the nested park takes USER_RUN on its way out, and the
+#      outer loop must read-an-empty-slot without panicking. The same
+#      static, the same single-CPU IF=0 discipline as take().
+118

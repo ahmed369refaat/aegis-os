@@ -86,6 +86,40 @@ both ends`.
   in-blob (a wrong count or a wrong errno exits nonzero and the
   marker refuses to print).
 
+## The hunt (three structural finds, kept for the record)
+
+The proof tripped three real machinery bugs on its way green — each
+found by the kernel's own loud guards, each fixed structurally:
+
+1. **The strict take after resume** (`park.rs`): `dispatch_next`
+   assumed `resume_parked` returns only on EXIT and took USER_RUN
+   unconditionally. But a run the dispatcher ITSELF resumed can
+   YIELD (the receivers' poll loops): the nested `park_current`
+   takes USER_RUN on its way out, and the outer loop came back to an
+   empty slot ("user run state missing on take"). Fixed with
+   `try_take`: an exit records, an empty slot just continues — the
+   parked run is still runnable.
+2. **The single-slot chain** (`context.rs`): the nested dispatcher's
+   saved outer chain was ONE Option — fine while only flat-launched
+   runs ever yielded (one dispatcher, one chain), but a
+   dispatcher-resumed run that yields nests a SECOND dispatcher whose
+   entry save overwrote the outer chain; the inner unwind consumed
+   the only copy and the outer unwind found nothing ("unwind with no
+   saved chain"). Now a depth-8 stack beside the proven slots
+   (push/pop; overflow is a boot bug, caught loudly).
+3. **The errno contract** (`sysabi.rs`): the cap gate refuses with
+   PermissionDenied → -EACCES, not -EPERM — the blob expected the
+   Unix-mnemonic errno and exited 136 until the probe printed the
+   actual refusal. The gate's convention is host-tested and stays;
+   the blob now pins EACCES with the mapping documented.
+
+A fourth find predates the proof run: a never-running domain (the
+uid-0 supervisor that creates endpoints and grants caps) must leave
+the scheduler after its work — `sched.unregister` — or the next
+yield/tick picks an unparked domain. And the sender's FIRST action
+is a yield: the resume chain must be set by a real resume_parked
+before any receiver can exit through the tick path.
+
 ## Consequences
 
 - The service/app profiles already carry the IPC bits (since round

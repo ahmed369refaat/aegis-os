@@ -373,21 +373,29 @@ mod boot {
                             deliver_to_parked(&mut run, &mut ctx);
                             context::begin(run);
                             context::resume_parked(&ctx);
-                            // Returned: the resumed run EXITED; USER_RUN
-                            // holds it (both exit paths leave it there).
-                            let exited = context::take();
-                            if !record_completed(exited.domain, exited.exit) {
-                                serial::write_str(
-                                    "[SCHD] KERNEL BUG: completed mailbox overflow\n",
-                                );
-                                hw::halt_forever();
-                            }
-                            // The SCHEDULER question settles NOW (the
-                            // exited entity must never be picked
-                            // again); the RESOURCE teardown stays the
-                            // spawner's drain (kmain).
-                            if let Some(k) = context::kernel_mut() {
-                                let _ = preempt::on_exit(&mut k.sched, exited.domain);
+                            // Returned: EITHER the resumed run EXITED
+                            // (USER_RUN holds it — both exit paths
+                            // leave it there) OR it PARKED — a yield
+                            // from a dispatcher-resumed run nests a
+                            // second dispatch_next whose unwind returns
+                            // here with the slot EMPTY (the nested
+                            // park_current took it; found live: the
+                            // IPC receivers' poll loops tripped the
+                            // strict take). The parked case just loops.
+                            if let Some(exited) = context::try_take() {
+                                if !record_completed(exited.domain, exited.exit) {
+                                    serial::write_str(
+                                        "[SCHD] KERNEL BUG: completed mailbox overflow\n",
+                                    );
+                                    hw::halt_forever();
+                                }
+                                // The SCHEDULER question settles NOW
+                                // (the exited entity must never be
+                                // picked again); the RESOURCE teardown
+                                // stays the spawner's drain (kmain).
+                                if let Some(k) = context::kernel_mut() {
+                                    let _ = preempt::on_exit(&mut k.sched, exited.domain);
+                                }
                             }
                             continue;
                         }

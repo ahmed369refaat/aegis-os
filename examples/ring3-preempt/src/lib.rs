@@ -173,7 +173,7 @@ _ring3_start:
     call next_instr
 next_instr:
     pop rsi
-    add rsi, 0x347                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
+    add rsi, 0x34E                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
     mov rdx, 0x0040C000               /* the kernel's trampoline page */
     syscall
     test rax, rax
@@ -353,6 +353,15 @@ fork_child:
     test eax, eax
     jnz ipc_receiver
 
+    /* The opening yield (ADR-0025 hunt): park into dispatch_next
+       BEFORE any send, so the resume chain and RESUME_RIP are set by
+       a real resume_parked — a receiver that exits through the TICK
+       path (unpark_into_frame) lands on RESUME_RIP, and without this
+       the last setter is kmain's flat launch label (found live: the
+       take() panic right after the cow marker). */
+    mov eax, 24
+    syscall
+
     /* ── the sender: fill A until -EAGAIN, fill B until -EAGAIN,
        prove the no-cap channel refuses -EPERM, then YIELD (the
        nested dispatcher runs the parked receivers to completion) ── */
@@ -395,7 +404,10 @@ ipc_tx_b_done:
     mov rdi, rbx
     mov rsi, 7
     syscall
-    cmp rax, -1                         /* -EPERM: the gate refused */
+    cmp rax, -13                        /* -EACCES: the cap gate's refusal
+                                          errno (sysabi maps PermissionDenied
+                                          to EACCES; EPERM is the
+                                          mask/quarantine errno) */
     jne 136f
     /* hand the CPU to the receivers (the nested dispatcher); this
        code resumes only after both have exited, then exits clean */

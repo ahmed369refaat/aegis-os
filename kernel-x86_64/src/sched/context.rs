@@ -407,31 +407,54 @@ mod entry {
         r15: u64,
     }
 
-    /// ADR-0024 D2: the NESTED dispatcher's saved outer chain — the
-    /// same storage discipline as RESUME_RIP/PARK_* (one slot, single
-    /// CPU, written before the first nested resume, consumed at the
-    /// unwind). A plain Option beside its proven neighbors: the
-    /// array-of-one shape at the park module level came out of the
-    /// linker EIGHT TIMES (SAVED_CHAIN.1-.8 — each CGU its own copy,
-    /// state divergence and all); this shape has been single since
-    /// M2-W2.
-    static mut PARK_CHAIN: Option<ResumeChain> = None;
+    /// ADR-0025: the nested dispatcher's saved outer chains — a SMALL
+    /// STACK now, not one slot. The single-slot discipline (ADR-0024
+    /// D2) held while only flat-launched runs ever yielded: one
+    /// dispatcher, one saved chain. But a run the dispatcher ITSELF
+    /// resumed can yield too (the IPC receivers' poll loops) — that
+    /// parks into a SECOND dispatch_next, whose entry save used to
+    /// overwrite the outer chain; the inner unwind then consumed the
+    /// only copy and the outer unwind found nothing ("unwind with no
+    /// saved chain", found live). Depth 8 beside the proven neighbors:
+    /// the same storage discipline, stacked — a park module-level
+    /// array-of-one came out of the linker EIGHT TIMES (each CGU its
+    /// own copy, state divergence); this shape stays in the entry
+    /// module where the CGU dedup is proven.
+    static mut PARK_CHAINS: [Option<ResumeChain>; 8] = [None; 8];
+    static mut PARK_CHAIN_DEPTH: usize = 0;
 
     /// Save the current chain as the nested dispatcher's outer point.
     ///
     /// SAFETY: single CPU, IF=0 on the caller's path.
     pub fn park_chain_save(chain: ResumeChain) {
-        // SAFETY: see the static's doc.
-        unsafe { PARK_CHAIN = Some(chain) }
+        // SAFETY: see the statics' docs; single CPU, IF=0 on this
+        // path. A depth overflow is a boot bug (8 nested dispatchers
+        // means something parks without unwinding) — caught loudly.
+        unsafe {
+            let d = PARK_CHAIN_DEPTH;
+            if d >= 8 {
+                panic!("park chain stack overflow (8 nested dispatchers)");
+            }
+            PARK_CHAINS[d] = Some(chain);
+            PARK_CHAIN_DEPTH = d + 1;
+        }
     }
 
     /// Take the saved outer chain (the unwind consumes it).
     ///
     /// SAFETY: single CPU, IF=0 on the caller's path.
     pub fn park_chain_take() -> Option<ResumeChain> {
-        // SAFETY: see the static's doc; addr_of_mut avoids the
-        // static_mut_refs lint on the .take().
-        unsafe { (*core::ptr::addr_of_mut!(PARK_CHAIN)).take() }
+        // SAFETY: see the statics' docs; pop the most recent save —
+        // nested unwinds return to their own dispatcher first, the
+        // outermost to kmain last. addr_of_mut avoids the
+        // static_mut_refs lint.
+        unsafe {
+            if PARK_CHAIN_DEPTH == 0 {
+                return None;
+            }
+            PARK_CHAIN_DEPTH -= 1;
+            (*core::ptr::addr_of_mut!(PARK_CHAINS[PARK_CHAIN_DEPTH])).take()
+        }
     }
 
     /// Snapshot the current resume chain (see `ResumeChain`).
@@ -749,6 +772,19 @@ mod entry {
         }
     }
 
+    /// The tolerant twin (ADR-0025 hunt): `resume_parked` returns not
+    /// only when the resumed run EXITED (USER_RUN holds it) but also
+    /// when it PARKED — a yield or a preempt switch from a run the
+    /// dispatcher itself resumed: the nested `park_current`/switch
+    /// path takes USER_RUN on its way out, so the outer loop comes
+    /// back to an EMPTY slot and must simply continue (the run is
+    /// parked-runnable and will be picked again). The flat kmain
+    /// `take()` stays strict — nobody parks kmain's own launch.
+    pub fn try_take() -> Option<UserRun> {
+        // SAFETY: single CPU; one withdrawal per resume return.
+        unsafe { (*core::ptr::addr_of_mut!(USER_RUN)).take() }
+    }
+
     /// Record the resume point (RSP + the label below, inside this very
     /// function) and tail-jump into `enter_ring3`. The launch itself
     /// never returns; when the user run ends (SYS_EXIT or a fault), the
@@ -965,6 +1001,6 @@ pub use entry::{
 pub use entry::{
     active, active_domain, begin, current, enter_ring3, enter_ring3_parked, is_parked, kernel_mut,
     launch, note_live_fault, park_from_frame, parked_count, record_fault, resume_kernel,
-    resume_parked, saved_rip, saved_rsp, set_kernel, stash_parked, take, take_parked,
+    resume_parked, saved_rip, saved_rsp, set_kernel, stash_parked, take, take_parked, try_take,
     unpark_into_frame,
 };
