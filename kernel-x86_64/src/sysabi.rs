@@ -126,6 +126,9 @@ pub fn errno_of(e: &SysError) -> i64 {
             aegis_os::pipe::PipeError::InvalidPipe(_) => -EBADF,
             aegis_os::pipe::PipeError::WouldBlock => -EAGAIN,
             aegis_os::pipe::PipeError::BrokenPipe => -EPIPE,
+            // ADR-0029: the id names a message endpoint, not a byte
+            // channel — the wrong-object refusal.
+            aegis_os::pipe::PipeError::NotAChannel(_) => -EINVAL,
         },
         SysError::Signal(aegis_os::signal::SignalError::InvalidSignal(_)) => -EINVAL,
         SysError::Net(n) => match n {
@@ -146,6 +149,9 @@ pub fn errno_of(e: &SysError) -> i64 {
             // the monitor sees the attempt through the escalation feed.
             aegis_os::ipc::IpcError::Escalation => -EPERM,
             aegis_os::ipc::IpcError::UnknownDomain(_) => -ESRCH,
+            // ADR-0029: a message op aimed at a byte channel (the
+            // type-discipline refusal) — wrong object, wrong syscall.
+            aegis_os::ipc::IpcError::WrongKind => -EINVAL,
         },
         SysError::Buddy(_) => -ENOMEM,
         SysError::PermissionDenied => -EACCES,
