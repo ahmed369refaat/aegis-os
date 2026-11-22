@@ -1,21 +1,61 @@
 # ABI Version
 
-**Current: `v0.4 (internal, full surface)`** — the ring-3 entry's
-internal surface is now **complete and test-pinned**: every syscall
-the profiles carry has a documented register contract, an errno map
-(`kernel-x86_64/src/sysabi.rs`, host-tested variant by variant), and
-a lane proof where execution exists. v0.3 documented only the file
-family; v0.4 documents everything the blobs speak, including the
-ADR-0029 pipe pair — and records every collision with Linux's x86_64
-numbering in one table, so the Phase 5 renumbering to `v1`
-(ADR-0003) starts from the truth instead of rediscovering it.
+**Current: `v1 (Linux-compatible entry)`** — a domain can now speak
+**Linux x86_64 numbers at the entry** (ADR-0003): a per-domain ABI
+flag (`Abi::Linux`, supervisor-declared at spawn, inherited across
+fork) switches the entry to a **whitelist** translation table that
+runs BEFORE the bounds check and the policy gate. The internal ids
+stay the policy space — profiles and masks never see Linux numbers.
+v0.4's internal surface (below) is unchanged and remains what the
+round-J blobs speak (`Abi::Internal`, the default).
 
-**Planned: `v1 (Linux-compatible)`** — lands with Stage 5 per
-[ADR-0003](adr/0003-linux-compatible-syscall-abi.md): Linux x86_64
-syscall numbers/registers/errno at the entry, translation to internal
-ops before the policy gate. aarch64 gets its own Linux number table.
-The v0.x surface already carries Linux's errno numbering so the v1
-translation keeps meanings, not just numbers.
+## v1 — the Linux-compatible entry (ADR-0003, round S)
+
+A **per-domain ABI flag** (`Abi::Internal` — the default, v0.4's
+hybrid surface; `Abi::Linux` — the whitelist) picks the number
+translation at the entry. The flag is numbering ONLY: the policy gate
+runs on internal ids after translation either way, so a Linux-mode
+domain's rights are exactly its profile's internal ops — translation
+changes which NUMBERS reach the gate, never which OPS it allows.
+
+The v1 table is a **WHITELIST, not a pass-through** — the round's
+found-live discovery: Linux nrs below 64 collide with internal ops
+(Linux 63 is `uname`, internal 63 is EXIT — a pass-through would make
+a Linux binary's `uname()` call exit the process). Unmapped nrs,
+including every sub-64 collision, answer `-ENOSYS` audited on the
+live domain (ADR-0003's refuse rule).
+
+| Linux nr | internal op | notes |
+|----|------|-------|
+| 0 read / 1 write / 3 close | 0 / 1 / 3 | identical shapes |
+| 9 mmap | 4 | flags (arg4) must be exactly `MAP_PRIVATE\|MAP_ANONYMOUS` (0x22); MAP_SHARED / file-backed / MAP_FIXED refuse `-EINVAL` |
+| 11 munmap | 5 | whole-region, as v0.4 |
+| 13 rt_sigaction | 25 | |
+| 15 rt_sigreturn | 24 | entry machinery, pre-gate |
+| 22 pipe | 12 | **rax = read fd, rdx = write fd** (the x86_64 convention — NOT v0.4's packed word) |
+| 24 sched_yield | 21 | |
+| 33 dup2 | 13 | |
+| 35 nanosleep | 20 | |
+| 57 fork | 18 | child speaks the parent's ABI (inherited) |
+| 60 exit / 231 exit_group | 63 | the alias |
+| 62 kill | 14 | |
+| 228 clock_gettime | 23 | |
+
+**Deliberately NOT mapped (slice 1):** `open` (2) — Linux's O_*
+encoding (O_RDONLY=0, O_CREAT=0x40) differs from the internal
+O_READ=0x1 family; it lands with the filesystem round, not
+mistranslated. `wait4` (61), `execve` (59), `dup` (32), `pipe2`
+(293): no ABI arm yet. Each answers `-ENOSYS` today.
+
+Lane proof: blob mode 13 (`[M3] linux-abi:` marker) — one domain
+speaking ONLY Linux nrs: console write, the pipe split, the byte
+round-trip, EOF after the write end closes (D7 via Linux nrs), mmap
+store/load + the MAP_SHARED refusal, the uname(63) and getpid(39)
+`-ENOSYS` probes, fork + the CoW child store, both sides
+`exit_group(0)`. Red: pre-change, nr 22 hit internal SCHED_YIELD and
+the boot hung with zero clean exits.
+
+## v0.4 — the ring-3 entry surface (complete, unchanged)
 
 ## v0.4 — the ring-3 entry surface (complete)
 
@@ -145,6 +185,11 @@ once.
 
 ## History
 
+- **v1 (ADR-0003, round S):** the Linux-compatible entry — the
+  per-domain ABI flag, the whitelist table, pipe's rax/rdx split,
+  exit_group's alias, mmap's flags rule, unmapped→-ENOSYS. The
+  internal surface below is frozen as v0.4 and remains the default
+  (`Abi::Internal`).
 - **v0.4 (ADR-0029, round Q):** the FULL internal surface — time,
   signals, memory/processes, the IPC family, and the pipe pair at
   30/31 — plus the collision ledger above; pipe() at 12 now creates a

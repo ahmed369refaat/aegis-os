@@ -1,6 +1,6 @@
 # ADR-0003: Linux-compatible syscall ABI
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented slice 1, round S)
 - **Stage:** 5 (POSIX ABI)
 - **Date:** 2026-11-19
 
@@ -52,6 +52,28 @@ change to numbers, structures, or errno behavior requires a bump there.
   exists and is denied outside profiles.
 - aarch64 (Track B onward) uses its own Linux number table at its entry
   — translation is per-arch, policy is shared.
+
+## Implementation notes (round S — slice 1 live)
+
+- **The per-domain ABI flag** (`aegis_os::syscall::Abi`): the
+  collision ledger's resolution. Nrs below 64 are claimed by BOTH
+  surfaces (internal 13 = dup2, Linux 13 = rt_sigaction), so the
+  entry cannot know which table applies without being told. The flag
+  is supervisor-declared (`Kernel::set_domain_abi` — no syscall
+  surface: it changes numbering, never policy) and fork-inherited.
+- **The table is a whitelist, not a pass-through** — found while
+  designing the edge: Linux 63 is `uname`, internal 63 is EXIT. A
+  pass-through would exit a Linux binary on `uname()`. Every unmapped
+  nr — including all sub-64 collisions — answers `-ENOSYS`, audited
+  on the live domain exactly like an unnormalizable nr.
+- **Shape differences honored at the arm, not the table**: pipe(2)
+  answers rax = read fd / rdx = write fd (the frame's RDX slot),
+  exit_group(231) aliases exit, mmap demands
+  MAP_PRIVATE|MAP_ANONYMOUS. open(2) stays unmapped until its O_*
+  decoding round — a mistranslated flag bit is worse than -ENOSYS.
+- **Proof**: blob mode 13 + the `[M3] linux-abi:` marker, red→green
+  on all three lanes (pre-change: nr 22 hit internal SCHED_YIELD,
+  zero clean exits). The gate's mask never sees a Linux number.
 
 ## Alternatives considered
 

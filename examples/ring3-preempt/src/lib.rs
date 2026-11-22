@@ -65,6 +65,8 @@ _ring3_start:
     je 17f                            /* mode 11: the bench pair */
     cmp al, 12
     je 18f                            /* mode 12: the pipe pair */
+    cmp al, 13
+    je 19f                            /* mode 13: the Linux-ABI blob */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -1243,6 +1245,121 @@ pipe_b_got:
     xor edi, edi
     syscall
 
+19: /* ── mode 13: the Linux-ABI blob (ADR-0003 v1) ─────────────── */
+    /* ONE domain speaking ONLY Linux x86_64 numbers: the v1
+       whitelist translates at the entry, BEFORE the bounds check
+       and the policy gate. Every nr below is Linux's. Data page:
+       0x403300 'L', 0x403310 pattern (16 B), 0x403330 read buf,
+       0x403301 the child's 'C'. */
+    mov byte ptr [0x00403300], 0x4C   /* 'L' */
+    mov eax, 1                        /* write(1, "L", 1) — nr 1 */
+    mov edi, 1
+    mov rsi, 0x00403300
+    mov edx, 1
+    syscall
+    cmp rax, 1
+    jne 200f
+    mov eax, 22                       /* pipe() — nr 22: rax=rfd, rdx=wfd (the v1 SPLIT) */
+    syscall
+    cmp rax, 3
+    jl 201f
+    mov r12, rax                      /* rfd */
+    mov r13, rdx                      /* wfd */
+    movabs rax, 0x0123456789ABCDEF
+    mov qword ptr [0x00403310], rax
+    movabs rax, 0xFEDCBA9876543210
+    mov qword ptr [0x00403318], rax
+    mov eax, 1                        /* write(wfd, pat, 16) — nr 1 */
+    mov edi, r13d
+    mov rsi, 0x00403310
+    mov edx, 16
+    syscall
+    cmp rax, 16
+    jne 202f
+    mov eax, 0                        /* read(rfd, buf, 16) — nr 0 */
+    mov edi, r12d
+    mov rsi, 0x00403330
+    mov edx, 16
+    syscall
+    cmp rax, 16
+    jne 203f
+    movabs rax, 0x0123456789ABCDEF
+    cmp rax, qword ptr [0x00403330]
+    jne 204f
+    movabs rax, 0xFEDCBA9876543210
+    cmp rax, qword ptr [0x00403338]
+    jne 204f
+    mov eax, 3                        /* close(wfd) — nr 3 */
+    mov edi, r13d
+    syscall
+    cmp rax, 0
+    jne 205f
+    mov eax, 0                        /* read(rfd, buf, 8) — nr 0: 0 = EOF (D7 via Linux nrs) */
+    mov edi, r12d
+    mov rsi, 0x00403330
+    mov edx, 8
+    syscall
+    cmp rax, 0
+    jne 206f
+    mov eax, 9                        /* mmap(0, 4096, RW, MAP_PRIVATE|MAP_ANONYMOUS) — nr 9 */
+    xor edi, edi
+    mov esi, 4096
+    mov edx, 3
+    mov r10d, 0x22
+    syscall
+    cmp rax, 0x1000
+    jle 207f
+    mov r14, rax
+    mov byte ptr [r14], 0x4D          /* 'M' — the fresh page holds a byte */
+    movzx eax, byte ptr [r14]
+    cmp eax, 0x4D
+    jne 207f
+    mov eax, 9                        /* mmap(..., MAP_SHARED) must refuse -EINVAL */
+    xor edi, edi
+    mov esi, 4096
+    mov edx, 3
+    mov r10d, 0x01
+    syscall
+    cmp rax, -22
+    jne 208f
+    mov eax, 11                       /* munmap(base, 4096) — nr 11 */
+    mov rdi, r14
+    mov esi, 4096
+    syscall
+    cmp rax, 0
+    jne 209f
+    mov eax, 63                       /* uname — nr 63: THE probe. Internal 63 is EXIT;
+                                          the whitelist must answer -ENOSYS, not exit */
+    syscall
+    cmp rax, -38
+    jne 210f
+    mov eax, 39                       /* getpid — nr 39: unmapped -> -ENOSYS */
+    syscall
+    cmp rax, -38
+    jne 211f
+    mov eax, 57                       /* fork() — nr 57 */
+    syscall
+    test rax, rax
+    jz 21f                            /* the child */
+    mov eax, 24                       /* sched_yield() — nr 24: the parked child runs
+                                          (the parent must not exit_group it out of
+                                          the world before it took its turn) */
+    syscall
+    jmp 20f
+21: /* child: the store into the CoW-shared data page faults and
+       takes a private copy (fork/CoW under the Linux ABI too) */
+    mov byte ptr [0x00403301], 0x43   /* 'C' */
+    mov eax, 1                        /* write(1, "C", 1) — nr 1 */
+    mov edi, 1
+    mov rsi, 0x00403301
+    mov edx, 1
+    syscall
+    cmp rax, 1
+    jne 212f
+20: mov eax, 231                      /* exit_group(0) — nr 231 (the alias) */
+    xor edi, edi
+    syscall
+
 140: mov eax, 63
     mov edi, 140                      /* a call returned the wrong reply */
     syscall
@@ -1350,6 +1467,84 @@ pipe_b_got:
     syscall
 199: mov eax, 63
     mov edi, 199                      /* the pipe reader: the fd write/read wrong */
+    syscall
+200: mov eax, 231
+    mov edi, 200                      /* the console write (nr 1) short */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 200
+    syscall
+201: mov eax, 231
+    mov edi, 201                      /* pipe (nr 22) did not split rax/rdx */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 201
+    syscall
+202: mov eax, 231
+    mov edi, 202                      /* the pipe write (nr 1) short */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 202
+    syscall
+203: mov eax, 231
+    mov edi, 203                      /* the pipe read (nr 0) short */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 203
+    syscall
+204: mov eax, 231
+    mov edi, 204                      /* the readback pattern wrong */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 204
+    syscall
+205: mov eax, 231
+    mov edi, 205                      /* close (nr 3) nonzero */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 205
+    syscall
+206: mov eax, 231
+    mov edi, 206                      /* EOF after the write end closed: not 0 */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 206
+    syscall
+207: mov eax, 231
+    mov edi, 207                      /* mmap (nr 9) refused or the page dead */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 207
+    syscall
+208: mov eax, 231
+    mov edi, 208                      /* MAP_SHARED did not refuse -EINVAL */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 208
+    syscall
+209: mov eax, 231
+    mov edi, 209                      /* munmap (nr 11) nonzero */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 209
+    syscall
+210: mov eax, 231
+    mov edi, 210                      /* uname (nr 63) is not -ENOSYS — the whitelist */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 210
+    syscall
+211: mov eax, 231
+    mov edi, 211                      /* getpid (nr 39) is not -ENOSYS */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 211
+    syscall
+212: mov eax, 231
+    mov edi, 212                      /* the child's write (nr 1) short */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 212
     syscall
 "#,
 );

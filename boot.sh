@@ -389,6 +389,7 @@ if [ "$MODE" = "verify" ]; then
   # channel (the rendezvous wake AND the fast path), the live
   # refusals, and the rerouted fd path.
   grep -qF "[M3] pipe: 64 bytes cross-domain byte-exact" "$LOG" || { echo "VERIFY FAIL: M3 pipe marker missing"; ok=0; }
+  grep -qF "[M3] linux-abi: v1 entry live" "$LOG" || { echo "VERIFY FAIL: M3 linux-abi marker missing"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the

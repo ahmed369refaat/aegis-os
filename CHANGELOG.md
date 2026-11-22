@@ -1,5 +1,38 @@
 # Changelog
 
+## [Unreleased] — round S (ADR-0003 slice 1 / ABI-VERSION v1): the Linux-compatible entry
+
+### Added — a domain can speak Linux x86_64 numbers
+
+- **The per-domain ABI flag** (`Abi::Internal` default | `Abi::Linux`,
+  supervisor-declared, fork-inherited): resolves the collision ledger's
+  ambiguity — nrs below 64 are claimed by both surfaces (internal 13 =
+  dup2, Linux 13 = rt_sigaction); the entry now knows which table
+  applies. Numbering only: the policy gate runs on internal ids after
+  translation either way.
+- **The v1 whitelist table** (`linux_nr_to_core`, host-tested entry by
+  entry): read/write/close, mmap/munmap, rt_sigaction/rt_sigreturn,
+  pipe, sched_yield, dup2, nanosleep, fork, exit + exit_group, kill,
+  clock_gettime. **A whitelist, not a pass-through** — the found-live
+  edge: Linux 63 is uname, internal 63 is EXIT; unmapped nrs
+  (including every sub-64 collision) answer -ENOSYS audited.
+- **Shape differences honored**: pipe(2) answers rax=read/rdx=write
+  (the x86_64 convention; the internal packed word unchanged); mmap
+  demands MAP_PRIVATE|MAP_ANONYMOUS (0x22) — MAP_SHARED/file-backed/
+  MAP_FIXED refuse -EINVAL; open stays unmapped (Linux O_* encoding
+  differs — the filesystem round, not a mistranslation).
+- **Blob mode 13** (`[M3] linux-abi:` marker, all three lanes PASS):
+  one domain speaking ONLY Linux nrs — console write, the pipe split,
+  the byte round-trip, EOF after the write end closes (D7 via Linux
+  nrs), mmap store/load + the MAP_SHARED refusal, the uname(63)/
+  getpid(39) -ENOSYS probes, fork + the CoW child store, both sides
+  exit_group(0). Red: pre-change nr 22 hit internal SCHED_YIELD —
+  the boot hung with zero clean exits.
+- Tests: 4 lib (the table, the edge, the targets, the flag's
+  default/set/fork-carry) + 2 kernel (the per-ABI selector); lib 346,
+  kernel 273, workspace 9 suites; fmt, both clippy lanes, unsafe
+  122/122, pc/pi400/q35 PASS.
+
 ## [Unreleased] — round R (ADR-0029 D7): the EOF wake
 
 ### Added — a parked reader can no longer outlive its writers

@@ -41,6 +41,7 @@ pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
 /// launch-relay limitation; after it, a CPL0 fault is a kernel bug.
 pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
 use aegis_os::sys::{SysRequest, SysValue};
+use aegis_os::syscall::Abi;
 use aegis_os::syscall::{
     gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_IPC_CALL, SYS_IPC_GRANT,
     SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MMAP, SYS_MUNMAP,
@@ -82,6 +83,19 @@ pub fn linux_to_core(nr: u64) -> u64 {
         62 => SYS_KILL as u64,      // kill(2)
         57 => SYS_FORK as u64,      // fork(2)
         n => n,
+    }
+}
+
+/// ADR-0003 (v1): the per-ABI entry translation. Linux mode is the
+/// WHITELIST — unmapped nrs answer `None` (including sub-64 nrs that
+/// collide with internal ops: Linux 63 is uname, internal 63 is
+/// EXIT); Internal mode keeps the v0.4 hybrid, where everything
+/// maps (legacy translations + raw internal pass-through).
+pub fn translate_nr(nr: u64, linux_abi: bool) -> Option<u64> {
+    if linux_abi {
+        aegis_os::syscall::linux_nr_to_core(nr)
+    } else {
+        Some(linux_to_core(nr))
     }
 }
 
@@ -131,6 +145,34 @@ mod tests {
     }
 
     #[test]
+    fn v1_translation_is_a_whitelist_linux_mode() {
+        // The mapped set (Linux nr -> internal op).
+        assert_eq!(translate_nr(22, true), Some(12)); // pipe(2)
+        assert_eq!(translate_nr(231, true), Some(63)); // exit_group -> EXIT
+        assert_eq!(translate_nr(60, true), Some(63)); // exit -> EXIT
+        assert_eq!(translate_nr(9, true), Some(4)); // mmap
+        assert_eq!(translate_nr(13, true), Some(25)); // rt_sigaction
+        assert_eq!(translate_nr(0, true), Some(0)); // read: identity
+                                                    // The edge: sub-64 collisions must NOT pass (uname vs EXIT is
+                                                    // the sharp one), nor unmapped Linux nrs.
+        for nr in [2u64, 4, 12, 32, 39, 59, 61, 63, 64, 293] {
+            assert_eq!(translate_nr(nr, true), None, "nr {nr}");
+        }
+    }
+
+    #[test]
+    fn internal_mode_keeps_the_v04_hybrid() {
+        assert_eq!(translate_nr(24, false), Some(SYS_SCHED_YIELD as u64));
+        assert_eq!(translate_nr(35, false), Some(SYS_NANOSLEEP as u64));
+        assert_eq!(translate_nr(228, false), Some(SYS_CLOCK_GETTIME as u64));
+        // The pass-throughs the round-J blobs speak: raw internal nrs
+        // (13 = DUP, 63 = EXIT) and the unnormalized large nr.
+        assert_eq!(translate_nr(13, false), Some(13));
+        assert_eq!(translate_nr(63, false), Some(63));
+        assert_eq!(translate_nr(256, false), Some(256)); // dies in normalize, not here
+    }
+
+    #[test]
     fn gate_results_route_to_errnos() {
         let m = mask();
         assert_eq!(errno_for(&gate(&m, false, SYS_WRITE)), 0);
@@ -163,11 +205,26 @@ mod exec {
     /// value RAX carries back to ring-3.
     pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 {
         SYSCALLS_SERVED.store(true, Ordering::SeqCst);
-        // ADR-0023: translate the Linux ABI numbers first (identity
-        // for everything that already coincides).
-        let nr = linux_to_core(nr);
         let run = context::current();
-
+        // ADR-0003 (v1): the per-domain entry ABI picks the table —
+        // Linux mode is the whitelist (None = -ENOSYS below), Internal
+        // mode keeps the v0.4 hybrid. Either way the translation runs
+        // BEFORE the bounds check (231 -> 63) and BEFORE the policy
+        // gate (the gate sees internal ids, always).
+        let linux_abi = context::kernel_mut()
+            .map(|k| k.domain(run.domain).is_some_and(|d| d.abi == Abi::Linux))
+            .unwrap_or(false);
+        let Some(nr) = translate_nr(nr, linux_abi) else {
+            // The ADR-0003 refuse: an unmapped Linux nr — audited on
+            // the live domain exactly like an unnormalizable one.
+            run.bad_syscalls = run.bad_syscalls.saturating_add(1);
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_unknown_syscall(run.domain);
+                k.tick(crate::hw::read_tsc());
+            }
+            log_denied(run.domain, nr, "unmapped linux nr", -ENOSYS);
+            return (-ENOSYS) as u64;
+        };
         // Full-width bounds check first (see `normalize_nr`), then the
         // shared policy gate — before any argument is examined.
         let Some(nr8) = normalize_nr(nr) else {
@@ -241,7 +298,7 @@ mod exec {
             Decision::Allowed if nr8 == SYS_CLOCK_GETTIME => sys_clock_gettime(run, a1, a2),
             Decision::Allowed if nr8 == SYS_SIGACTION => sys_sigaction(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_KILL => sys_kill(run, a1, a2),
-            Decision::Allowed if nr8 == SYS_MMAP => sys_mmap(run, a1, a2, a3),
+            Decision::Allowed if nr8 == SYS_MMAP => sys_mmap(run, a1, a2, a3, _a4, linux_abi),
             Decision::Allowed if nr8 == SYS_MUNMAP => sys_munmap(run, a1, a2),
             Decision::Allowed if nr8 == SYS_FORK => sys_fork(run),
             Decision::Allowed if nr8 == SYS_IPC_SEND => sys_ipc_send(run, a1, a2),
@@ -529,7 +586,18 @@ mod exec {
                 Err(e) => e as u64,
             },
             SYS_PIPE => match k.execute(run.domain, SysRequest::Pipe) {
-                Ok(v) => sysabi::rax_of(v),
+                Ok(SysValue::FdPair(r, w))
+                    if k.domain(run.domain).is_some_and(|d| d.abi == Abi::Linux) =>
+                {
+                    // ADR-0003 (v1): Linux pipe(2) on x86_64 answers
+                    // rax = read fd, rdx = write fd — the frame's RDX
+                    // slot is what the SYSRET stub pops.
+                    use crate::arch::syscall_entry::write_frame_word;
+                    use crate::arch::syscall_frame::OFF_RDX;
+                    write_frame_word(OFF_RDX, u64::from(w));
+                    u64::from(r)
+                }
+                Ok(v) => sysabi::rax_of(v), // the packed internal ABI
                 Err(e) => sysabi::errno_of(&e) as u64,
             },
             SYS_DUP => match (fd_arg(a1), fd_arg(a2)) {
@@ -746,7 +814,14 @@ mod exec {
     /// ANON only. `addr == 0` picks the lowest policy-acceptable
     /// window at/above the trampoline; a nonzero hint is honored or
     /// refused (never relocated — no MAP_FIXED guessing).
-    fn sys_mmap(run: &mut crate::sched::context::UserRun, addr: u64, len: u64, prot: u64) -> u64 {
+    fn sys_mmap(
+        run: &mut crate::sched::context::UserRun,
+        addr: u64,
+        len: u64,
+        prot: u64,
+        flags: u64,
+        linux_abi: bool,
+    ) -> u64 {
         use crate::mm::page_table::{MapError, PoolSource};
         use crate::mm::user_layout;
         use aegis_os::memory::MemFlags;
@@ -757,6 +832,15 @@ mod exec {
         const MAX_MMAP: u64 = 16 << 20;
 
         if len == 0 || len > MAX_MMAP {
+            return (-EINVAL) as u64;
+        }
+        // ADR-0003 (v1): a Linux-mode caller passes mmap(2) flags in
+        // arg4 — this ABI is ANON|PRIVATE only (0x22); MAP_SHARED, a
+        // file mapping, or MAP_FIXED (which also unmaps overlapping
+        // pages in Linux) refuses rather than mistranslating.
+        const MAP_PRIVATE: u64 = 0x02;
+        const MAP_ANONYMOUS: u64 = 0x20;
+        if linux_abi && flags != (MAP_PRIVATE | MAP_ANONYMOUS) {
             return (-EINVAL) as u64;
         }
         // Linux PROT bits only: READ=1 WRITE=2 EXEC=4.

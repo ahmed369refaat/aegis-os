@@ -307,6 +307,15 @@ impl<const N: usize> Kernel<N> {
             .ok_or(KernelError::UnknownDomain(id))
     }
 
+    /// ADR-0003 (v1): declare a domain's ENTRY ABI (supervisor-only —
+    /// kmain sets it at spawn; there is no syscall surface for it:
+    /// the flag changes number translation, never policy).
+    pub fn set_domain_abi(&mut self, id: u32, abi: crate::syscall::Abi) -> Result<(), KernelError> {
+        self.domain_mut(id)
+            .map(|d| d.abi = abi)
+            .map_err(|_| KernelError::UnknownDomain(id))
+    }
+
     /// ADR-0022: read-only access to a domain (procfs, tests, and the
     /// kernel runtime all observe; mutation stays behind the named
     /// APIs).

@@ -40,6 +40,11 @@ pub enum Decision {
 
 #[derive(Clone)]
 pub struct Domain {
+    /// ADR-0003 (v1): the entry ABI this domain speaks (Internal by
+    /// default — every existing blob; Linux flips the entry to the
+    /// whitelist table). Numbering only: the policy mask stays over
+    /// internal ops either way.
+    pub abi: crate::syscall::Abi,
     pub id: u32,
     pub profile: DomainProfile,
     pub state: DomainState,
@@ -80,6 +85,7 @@ impl Domain {
         // domain — the base_rights mint the initial capabilities below.
         let base_rights = profile.base_rights;
         let mut d = Domain {
+            abi: crate::syscall::Abi::Internal,
             id,
             space: AddressSpace::new(profile.quota_pages),
             profile,
@@ -143,6 +149,7 @@ impl Domain {
         chroot: InodeRef,
     ) -> Self {
         let mut d = Domain {
+            abi: crate::syscall::Abi::Internal,
             id,
             space: AddressSpace::new(profile.quota_pages),
             profile,
@@ -198,6 +205,7 @@ impl Domain {
             let _ = caps.revoke(*h);
         }
         let mut d = Domain {
+            abi: parent.abi, // ADR-0003: the fork child speaks the parent's ABI
             id,
             space: parent.space.clone(),
             profile: parent.profile,

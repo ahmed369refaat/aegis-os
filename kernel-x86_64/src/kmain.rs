@@ -2360,6 +2360,84 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         let _ = k.ipc_endpoint_destroy(44, g);
     }
 
+    // ── 24. ADR-0003 (v1): the Linux-ABI blob — one domain, speaking
+    //      ONLY Linux x86_64 numbers. The per-domain ABI flag flips
+    //      the entry to the WHITELIST table (translation before the
+    //      bounds check and the policy gate; profiles stay internal-
+    //      op-based). The blob exercises the shape differences: pipe
+    //      (22) splits rax=read/rdx=write, exit_group (231) aliases
+    //      exit, mmap (9) demands MAP_PRIVATE|MAP_ANONYMOUS; and the
+    //      two whitelist probes — uname (63) must answer -ENOSYS
+    //      (internal 63 is EXIT: a pass-through would exit a Linux
+    //      binary on uname) and getpid (39) likewise. fork (57)
+    //      under the Linux ABI; the child's store into the CoW-shared
+    //      data page takes its private copy, writes 'C', and both
+    //      sides exit_group(0). Expected drains: 2 clean exits.
+    //      ──
+    {
+        if let Some((dom, _)) = crate::sched::park::completed_drain() {
+            let mut b = [0u8; 20];
+            crate::serial::write_str("[M3] linux-abi: ERROR: stale mailbox entry dom=");
+            crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+            crate::serial::write_str("; halting\n");
+            hw::halt_forever();
+        }
+        let mut data = [0u8; 0x70];
+        data[0] = 13;
+        let sp = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            45,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &data,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(&mut out, &["[M3] linux-abi: ERROR: spawn failed; halting"]);
+                hw::halt_forever();
+            }
+        };
+        // v1: the domain speaks Linux numbers — the supervisor's
+        // declaration, not a syscall (the flag changes number
+        // translation, never policy).
+        let _ = k.set_domain_abi(45, aegis_os::syscall::Abi::Linux);
+        let kernel_cr3 = hw::read_cr3();
+        sp.run.tables.activate();
+        crate::sched::context::begin(sp.run);
+        crate::sched::context::launch(&sp.ctx);
+        hw::write_cr3(kernel_cr3);
+        let mut clean = 0usize;
+        while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            if !matches!(exit, crate::sched::context::ExitKind::Exited(0)) {
+                let mut b = [0u8; 20];
+                crate::serial::write_str("[M3] linux-abi: ERROR: dom=");
+                crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+                crate::serial::write_str(" exit=");
+                if let crate::sched::context::ExitKind::Exited(c) = exit {
+                    crate::serial::write_str(strutil::dec(c, &mut b));
+                }
+                crate::serial::write_str("; halting\n");
+                hw::halt_forever();
+            }
+            clean += 1;
+            mm::user::destroy_user(&mut k, &mut pool, dom);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+        }
+        if clean == 2 {
+            line(
+                &mut out,
+                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, uname(63) -> -ENOSYS"],
+            );
+        } else {
+            line(
+                &mut out,
+                &["[M3] linux-abi: ERROR: expected 2 clean exits, saw fewer; halting"],
+            );
+            hw::halt_forever();
+        }
+    }
+
     // ── 13. the terminal guard-page proof: the write must #PF, the
     // dispatch must confirm CR2 is exactly the guard page, print the
     // marker, and power off cleanly (CI greps it). Reached only when

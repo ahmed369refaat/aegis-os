@@ -10,6 +10,61 @@
 
 use crate::domain::Decision;
 
+/// ADR-0003 (v1): which ABI a domain speaks AT THE ENTRY. The
+/// internal ids stay the policy space; the flag only picks the
+/// NUMBER TRANSLATION — `Internal` keeps the v0.4 hybrid surface
+/// (the six legacy Linux nrs translate, everything else is the raw
+/// internal number), `Linux` is the v1 whitelist below.
+///
+/// The flag is not a security boundary: translation changes which
+/// NUMBERS reach the gate, never which OPS the mask allows — the
+/// gate runs on internal ids after translation either way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Abi {
+    /// v0.4: the blobs' internal surface (legacy translations + raw
+    /// internal nrs).
+    #[default]
+    Internal,
+    /// v1: Linux x86_64 numbers, translated through the whitelist
+    /// before the bounds check and the policy gate.
+    Linux,
+}
+
+/// ADR-0003 (v1): the Linux x86_64 number table — a WHITELIST, not a
+/// pass-through. Every nr below maps to an internal op with an
+/// IDENTICAL register/return shape; every OTHER nr — including nrs
+/// < 64 that collide with internal ops — answers `-ENOSYS` at the
+/// entry (Linux 63 is uname, internal 63 is EXIT: a pass-through
+/// would make a Linux binary's uname() call exit the process).
+///
+/// Deliberately NOT mapped (slice 1):
+/// - `open` (2): Linux's O_* encoding (O_RDONLY=0, O_CREAT=0x40)
+///   differs from the internal O_READ=0x1 family — it lands with the
+///   filesystem round, not mistranslated today.
+/// - `wait4` (61), `execve` (59), `dup` (32), `pipe2` (293): no ABI
+///   arm yet.
+pub fn linux_nr_to_core(nr: u64) -> Option<u64> {
+    match nr {
+        0 => Some(SYS_READ as u64),            // read(2)
+        1 => Some(SYS_WRITE as u64),           // write(2)
+        3 => Some(SYS_CLOSE as u64),           // close(2)
+        9 => Some(SYS_MMAP as u64),            // mmap(2) — ANON|PRIVATE only
+        11 => Some(SYS_MUNMAP as u64),         // munmap(2)
+        13 => Some(SYS_SIGACTION as u64),      // rt_sigaction(2)
+        15 => Some(SYS_SIGRETURN as u64),      // rt_sigreturn(2)
+        22 => Some(SYS_PIPE as u64),           // pipe(2) — rax/rdx split
+        24 => Some(SYS_SCHED_YIELD as u64),    // sched_yield(2)
+        33 => Some(SYS_DUP as u64),            // dup2(2)
+        35 => Some(SYS_NANOSLEEP as u64),      // nanosleep(2)
+        57 => Some(SYS_FORK as u64),           // fork(2)
+        60 => Some(SYS_EXIT as u64),           // exit(2)
+        62 => Some(SYS_KILL as u64),           // kill(2)
+        228 => Some(SYS_CLOCK_GETTIME as u64), // clock_gettime(2)
+        231 => Some(SYS_EXIT as u64),          // exit_group(2) — the alias
+        _ => None,                             // the whitelist's edge
+    }
+}
+
 /// Read from a file/object.
 pub const SYS_READ: u8 = 0;
 /// Write to a file/object.
@@ -359,5 +414,93 @@ mod tests {
             gate(&SyscallMask::NONE, false, SYS_EXIT),
             Decision::DeniedByMask(SYS_EXIT)
         );
+    }
+}
+
+#[cfg(test)]
+mod adr0003_tests {
+    use super::*;
+
+    /// v1: the whitelist, entry by entry (Linux nr -> internal op).
+    #[test]
+    fn linux_table_maps_every_entry() {
+        let cases: &[(u64, u8)] = &[
+            (0, SYS_READ),            // read(2)
+            (1, SYS_WRITE),           // write(2)
+            (3, SYS_CLOSE),           // close(2)
+            (9, SYS_MMAP),            // mmap(2)
+            (11, SYS_MUNMAP),         // munmap(2)
+            (13, SYS_SIGACTION),      // rt_sigaction(2)
+            (15, SYS_SIGRETURN),      // rt_sigreturn(2)
+            (22, SYS_PIPE),           // pipe(2)
+            (24, SYS_SCHED_YIELD),    // sched_yield(2)
+            (33, SYS_DUP),            // dup2(2)
+            (35, SYS_NANOSLEEP),      // nanosleep(2)
+            (57, SYS_FORK),           // fork(2)
+            (60, SYS_EXIT),           // exit(2)
+            (62, SYS_KILL),           // kill(2)
+            (228, SYS_CLOCK_GETTIME), // clock_gettime(2)
+            (231, SYS_EXIT),          // exit_group(2) — the alias
+        ];
+        for &(nr, op) in cases {
+            assert_eq!(linux_nr_to_core(nr), Some(u64::from(op)), "nr {nr}");
+        }
+    }
+
+    /// v1: the whitelist's EDGE — the collisions that must NOT pass
+    /// through. Linux 63 is uname; internal 63 is EXIT (a
+    /// pass-through would exit a Linux binary on uname). Linux 39 is
+    /// getpid, 2 is open (different O_* encoding), 59/61/32/293 have
+    /// no ABI arm.
+    #[test]
+    fn linux_table_refuses_the_collisions() {
+        for nr in [
+            2u64,
+            4,
+            5,
+            12,
+            14,
+            32,
+            39,
+            59,
+            61,
+            63,
+            64,
+            293,
+            1000,
+            u64::MAX,
+        ] {
+            assert_eq!(linux_nr_to_core(nr), None, "nr {nr} must not pass");
+        }
+    }
+
+    /// v1: every mapped target is a real internal op id (< 64 — the
+    /// mask's width) — the gate could never index out of its mask.
+    #[test]
+    fn linux_table_targets_are_internal_ops() {
+        for nr in 0..=300u64 {
+            if let Some(op) = linux_nr_to_core(nr) {
+                assert!(op < u64::from(SYSCALL_COUNT), "nr {nr} -> {op}");
+            }
+        }
+    }
+
+    /// v1: the ABI flag — default Internal, the setter flips it, fork
+    /// carries it (the Linux-mode parent's child speaks Linux too).
+    #[test]
+    fn abi_flag_defaults_sets_and_forks() {
+        use crate::profile::service_profile;
+        let mut k = crate::Kernel::new();
+        k.create_domain(1, service_profile()).unwrap();
+        assert_eq!(k.domain(1).unwrap().abi, Abi::Internal, "the default");
+        k.set_domain_abi(1, Abi::Linux).unwrap();
+        assert_eq!(k.domain(1).unwrap().abi, Abi::Linux);
+        let child = k.fork_process(1).unwrap();
+        assert_eq!(
+            k.domain(child).unwrap().abi,
+            Abi::Linux,
+            "the fork child inherits the parent's entry ABI"
+        );
+        assert!(k.set_domain_abi(99, Abi::Linux).is_err(), "unknown id");
     }
 }
