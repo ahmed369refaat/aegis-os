@@ -127,3 +127,9 @@
 # the park-unwind rule) + parked_rip (the deadlock post-mortem): three single-peek
 # reads, the is_parked pattern.
 122
+# 121 (from 122): Phase-0 hygiene (round S follow-up) — hw::rdtsc DELETED:
+# it was a byte-identical twin of hw::read_tsc (one caller, kmain's boot
+# timing; the monitor, park, preempt, irq, clock and ACPI paths all read
+# read_tsc). One reader, one unsafe site — the file-header invariant
+# ("every function a one-instruction wrapper") now holds without a twin.
+121

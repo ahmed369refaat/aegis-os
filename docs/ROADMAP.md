@@ -331,6 +331,18 @@ registers, errno values) so unmodified static musl/busybox binaries run —
 gated, per-domain, through the policy core. This is the stage that turns
 the kernel into a usable Unix.
 
+**Status:** slice 1 LIVE (round S, ABI-VERSION v1) — the per-domain
+ABI flag (`Abi::Linux`, supervisor-declared, fork-inherited) and the
+**whitelist** translation table at the entry (translation before the
+bounds check and the policy gate; unmapped nrs — including every
+sub-64 collision, e.g. Linux's uname 63 vs the internal EXIT 63 —
+answer `-ENOSYS` audited). Shape differences honored: pipe's
+rax/rdx split, exit_group's alias, mmap's PRIVATE|ANON-only flags;
+blob mode 13 (`[M3] linux-abi:`) proves it on all three lanes.
+`open` stays unmapped until its O_* decoding round. Still ahead:
+the execve/wait4 arms, the errno model's full sweep, and the musl /
+busybox acceptance runs below.
+
 **Tasks (per ADR-0003):** a Linux-ABI dispatch table in front of the
 policy gate (internal ids stay; entry numbers are Linux's): fork (COW via
 per-domain table clone), execve (ELF64 + PIE + early ASLR), exit/wait4,

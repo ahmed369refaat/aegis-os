@@ -255,7 +255,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let stress = runtime::stress_create_destroy(&mut k, &mut pool, 1000, &mut out);
 
     // ── 5. exit-criteria line (CI greps this) ───────────────────────
-    let t_end = hw::rdtsc();
+    let t_end = hw::read_tsc();
     let cycles = t_end.wrapping_sub(t_boot);
 
     let pass = match (&hello, &mon, &stress) {

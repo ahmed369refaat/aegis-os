@@ -1,5 +1,44 @@
 # Changelog
 
+## [Unreleased] — Phase 0 hygiene (round S follow-up): hw.rs unified, docs synced
+
+### The kernel's only mixed-syntax asm file is gone
+
+- **hw.rs: the six port-I/O blocks rewritten Intel → AT&T** — the
+  repo convention is att_syntax (every other multi-operand asm! site
+  in the kernel already is); the port wrappers were the lone Intel
+  holdouts (`out dx, al` → `outb %al, %dx`, `in al, dx` → `inb %dx,
+  %al`, ...). Semantics byte-identical; the full pc-lane boot (every
+  driver path — serial, PCI config, ACPI, IOMMU, LAPIC — rides port
+  I/O) passes with all markers.
+- **`hw::rdtsc` DELETED** — a byte-identical twin of `hw::read_tsc`
+  (one caller, kmain's boot timing; the monitor/park/preempt/irq/
+  clock/ACPI paths all read read_tsc). The unsafe baseline drops
+  122 → 121 (shrinking is always allowed; history entry in
+  `scripts/unsafe-count.txt`).
+- **Two misplaced doc blocks re-homed**: read_cr3's doc had been
+  glued into cpuid7_ebx's block (with the N2 monitor-clock paragraph
+  that belongs to read_tsc); read_cr4's doc had been glued into
+  pic_mask_all's. Each function now carries its own.
+
+### Docs synced to round S
+
+- **ROADMAP** Stage 5 gains the slice-1 status line (the per-domain
+  ABI flag, the whitelist, the shape honors, blob mode 13, and what
+  is still ahead: open's O_* decoding, execve/wait4, the musl/busybox
+  acceptance runs).
+- **README** gains the round-S status bullet (the Linux-compatible
+  entry) and the stale "v0.3 register table" pointer now names v0.4
+  and v1.
+- **SECURITY.md**'s in-scope list now covers the v1 entry translation
+  itself: a mapped nr that changes meaning, an unmapped nr that
+  passes through (Linux 63 = uname vs internal EXIT), or a shape
+  mistranslation is a vulnerability, not a bug.
+
+Gates: fmt, both clippy lanes, unsafe 121/121 (ratcheted down),
+asm-patterns, no-binaries, history-clean; workspace 9 suites; pc-lane
+`BOOT VERIFY: PASS` with every M3 marker.
+
 ## [Unreleased] — round S (ADR-0003 slice 1 / ABI-VERSION v1): the Linux-compatible entry
 
 ### Added — a domain can speak Linux x86_64 numbers

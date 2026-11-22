@@ -32,7 +32,11 @@ project is pre-1.0 and moves fast; we do not backport to old tags.
   mapping escapes, ring-3 reachable kernel memory corruption.
 - The syscall surface: uncounted denials, un-gated syscalls,
   unchecked user pointers (each must be validated once,
-  byte-exact, SMAP-aware).
+  byte-exact, SMAP-aware), and the v1 Linux-ABI entry translation
+  (`Abi::Linux` domains): a mapped nr that changes meaning, an
+  unmapped nr that passes through (the whitelist's edge — Linux 63
+  is uname, internal 63 is EXIT), or a shape mistranslation (pipe's
+  rax/rdx, mmap's flags) is a vulnerability, not a bug.
 - Host tooling that gates releases (`scripts/*.sh`): a guard that
   silently passes (fails open) on the patterns it claims to catch.
 

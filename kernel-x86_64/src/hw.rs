@@ -22,7 +22,9 @@ pub static mut BOOT_TSC_HI: u32 = 0;
 /// callers own the semantics of the port they touch.
 pub fn outb(port: u16, val: u8) {
     // SAFETY: ring-0 CPL; no memory effects beyond the device.
-    unsafe { asm!("out dx, al", in("dx") port, in("al") val, options(nostack, preserves_flags)) }
+    unsafe {
+        asm!("outb %al, %dx", in("dx") port, in("al") val, options(att_syntax, nostack, preserves_flags))
+    }
 }
 
 /// Write one word to an I/O port.
@@ -30,7 +32,9 @@ pub fn outb(port: u16, val: u8) {
 /// SAFETY: as `outb`.
 pub fn outw(port: u16, val: u16) {
     // SAFETY: ring-0 CPL; no memory effects beyond the device.
-    unsafe { asm!("out dx, ax", in("dx") port, in("ax") val, options(nostack, preserves_flags)) }
+    unsafe {
+        asm!("outw %ax, %dx", in("dx") port, in("ax") val, options(att_syntax, nostack, preserves_flags))
+    }
 }
 
 /// Write one dword to an I/O port. PCI config cycles REQUIRE this
@@ -42,7 +46,9 @@ pub fn outw(port: u16, val: u16) {
 /// SAFETY: as `outb`; callers own the port's semantics.
 pub fn outl(port: u16, val: u32) {
     // SAFETY: ring-0 CPL; no memory effects beyond the device.
-    unsafe { asm!("out dx, eax", in("dx") port, in("eax") val, options(nostack, preserves_flags)) }
+    unsafe {
+        asm!("outl %eax, %dx", in("dx") port, in("eax") val, options(att_syntax, nostack, preserves_flags))
+    }
 }
 
 /// Read one byte from an I/O port.
@@ -51,7 +57,9 @@ pub fn outl(port: u16, val: u32) {
 pub fn inb(port: u16) -> u8 {
     let val: u8;
     // SAFETY: ring-0 CPL; a pure device read.
-    unsafe { asm!("in al, dx", out("al") val, in("dx") port, options(nostack, preserves_flags)) }
+    unsafe {
+        asm!("inb %dx, %al", out("al") val, in("dx") port, options(att_syntax, nostack, preserves_flags))
+    }
     val
 }
 
@@ -64,7 +72,9 @@ pub fn inb(port: u16) -> u8 {
 pub fn inw(port: u16) -> u16 {
     let val: u16;
     // SAFETY: ring-0 CPL; a pure device read.
-    unsafe { asm!("in ax, dx", out("ax") val, in("dx") port, options(nostack, preserves_flags)) }
+    unsafe {
+        asm!("inw %dx, %ax", out("ax") val, in("dx") port, options(att_syntax, nostack, preserves_flags))
+    }
     val
 }
 
@@ -75,20 +85,10 @@ pub fn inw(port: u16) -> u16 {
 pub fn inl(port: u16) -> u32 {
     let val: u32;
     // SAFETY: ring-0 CPL; a pure device read.
-    unsafe { asm!("in eax, dx", out("eax") val, in("dx") port, options(nostack, preserves_flags)) }
+    unsafe {
+        asm!("inl %dx, %eax", out("eax") val, in("dx") port, options(att_syntax, nostack, preserves_flags))
+    }
     val
-}
-
-/// Read the timestamp counter.
-///
-/// SAFETY: `rdtsc` has no memory or register side effects beyond its
-/// outputs (which the asm! block declares).
-pub fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    // SAFETY: no memory access, no flags clobber declared by the ISA spec.
-    unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack)) }
-    ((hi as u64) << 32) | lo as u64
 }
 
 /// The TSC value captured at the very first kernel instruction
@@ -109,13 +109,6 @@ pub fn read_cr2() -> u64 {
     v
 }
 
-/// Read the page-table base (CR3). Returns the physical address of the
-/// active PML4 (flag/PCID bits must be masked by the caller).
-///
-/// SAFETY: a pure register read.
-/// N2 (ADR-0007 §2): the monitor's window clock (until a real timer
-/// exists). Raw RDTSC — only window *boundaries* matter, so ordering
-/// against speculation is irrelevant here.
 /// N4 (ADR-0008): CPUID leaf 7 sub-leaf 0's EBX — the SMEP/SMAP
 /// capability word. Decoding is pure (arch/features.rs).
 pub fn cpuid7_ebx() -> u64 {
@@ -212,6 +205,12 @@ pub fn clac() {
     unsafe { core::arch::asm!("clac", options(nostack, preserves_flags)) };
 }
 
+/// N2 (ADR-0007 §2): the monitor's window clock (until a real timer
+/// exists). Raw RDTSC — only window *boundaries* matter, so ordering
+/// against speculation is irrelevant here.
+///
+/// SAFETY: RDTSC is unprivileged, touches no memory, and has no flags
+/// clobber (ISA).
 pub fn read_tsc() -> u64 {
     let lo: u32;
     let hi: u32;
@@ -222,6 +221,10 @@ pub fn read_tsc() -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
+/// Read the page-table base (CR3). Returns the physical address of the
+/// active PML4 (flag/PCID bits must be masked by the caller).
+///
+/// SAFETY: a pure register read.
 pub fn read_cr3() -> u64 {
     let v: u64;
     // SAFETY: no memory access; the ISA guarantees no side effects.
@@ -283,9 +286,6 @@ pub fn swapgs() {
     unsafe { asm!("swapgs", options(nostack, preserves_flags)) }
 }
 
-/// Read control register CR4 (feature flags: PAE, PGE, ...).
-///
-/// SAFETY: a pure register read.
 /// Mask every line on both 8259 PICs. No IRQ source is armed yet (the
 /// LAPIC timer arrives with preemption, M2-W2) and the kernel runs IF=0
 /// in CPL0 — but ring-3 runs IF=1 (USER_RFLAGS), so an unmasked line
@@ -319,6 +319,9 @@ pub fn write_cr0(v: u64) {
     };
 }
 
+/// Read control register CR4 (feature flags: PAE, PGE, ...).
+///
+/// SAFETY: a pure register read.
 pub fn read_cr4() -> u64 {
     let v: u64;
     // SAFETY: no memory access; the ISA guarantees no side effects.
