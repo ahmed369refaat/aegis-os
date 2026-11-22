@@ -343,10 +343,18 @@ at the SYS_OPEN arm (access mode → O_READ/O_WRITE, O_CREAT/O_TRUNC
 ride along; O_EXCL / O_APPEND / every un-honorable bit refuses
 -EINVAL, never silently dropped), proven by blob mode 13 on all
 three lanes — create / write / close / O_RDONLY reopen with
-read-back, and both refusal probes. Still ahead: the wait4/execve
-arms (the internal SYS_WAIT/SYS_EXEC have no kernel dispatch yet),
-the errno model's full sweep, and the musl / busybox acceptance runs
-below.
+read-back, and both refusal probes. **Slice 3 (round U) landed
+`wait4(2)`** on the ADR-0022 D7 core: the blocking path parks with
+the rip-2 re-execute image (resume re-runs the arm; rax carries the
+ORIGINAL nr from the frame's own RAX slot — found live: the
+translated nr made the re-executed entry answer -ENOSYS), the
+child's completion wakes the parent through the waiter registry, and
+the re-executed arm consumes the completed entry (frames via
+`free_frames_of`, then `exit_process` records the zombie) and
+answers the pid + the Linux wstatus word; the blob proves
+WNOHANG/block/reap (7 << 8)/ECHILD on all three lanes. Still ahead:
+the execve arm (the ELF loader), the errno model's full sweep, and
+the musl / busybox acceptance runs below.
 
 **Tasks (per ADR-0003):** a Linux-ABI dispatch table in front of the
 policy gate (internal ids stay; entry numbers are Linux's): fork (COW via

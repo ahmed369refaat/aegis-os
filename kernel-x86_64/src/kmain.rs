@@ -1775,29 +1775,6 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // kmain resumes when the nested dispatcher empties; drain all
         // three exits and tear each domain down.
         let mut clean = 0usize;
-        // The launch-path exit: a run may exit straight out of launch
-        // (never parked) — its exit sits in USER_RUN, not the mailbox
-        // (dispatch_next records only the runs IT resumed; both exit
-        // paths leave the run in the slot). Round S never saw this:
-        // the parent always parked before exiting. try_take is the
-        // ADR-0026 tolerant twin — the parked flow returns with the
-        // slot empty and the mailbox carries every exit.
-        if let Some(run) = crate::sched::context::try_take() {
-            if !matches!(run.exit, crate::sched::context::ExitKind::Exited(0)) {
-                let mut b = [0u8; 20];
-                crate::serial::write_str("[M3] linux-abi: ERROR: dom=");
-                crate::serial::write_str(strutil::dec(u64::from(run.domain), &mut b));
-                crate::serial::write_str(" exit=");
-                if let crate::sched::context::ExitKind::Exited(c) = run.exit {
-                    crate::serial::write_str(strutil::dec(c, &mut b));
-                }
-                crate::serial::write_str("; halting\n");
-                hw::halt_forever();
-            }
-            clean += 1;
-            mm::user::destroy_user(&mut k, &mut pool, run.domain);
-            let _ = crate::sched::preempt::on_exit(&mut k.sched, run.domain);
-        }
         while let Some((dom, exit)) = crate::sched::park::completed_drain() {
             if !matches!(exit, crate::sched::context::ExitKind::Exited(0)) {
                 line(
@@ -2398,9 +2375,20 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     //      answer -ENOSYS
     //      (internal 63 is EXIT: a pass-through would exit a Linux
     //      binary on uname) and getpid (39) likewise. fork (57)
-    //      under the Linux ABI; the child's store into the CoW-shared
-    //      data page takes its private copy, writes 'C', and both
-    //      sides exit_group(0). Expected drains: 2 clean exits.
+    //      under the Linux ABI; then wait4 (61) — slice 3: the
+    //      WNOHANG probe (nothing ready -> 0), the BLOCKING wait
+    //      (the syscall parks rip-2 — resume RE-EXECUTES it; the
+    //      dispatcher runs the fork-parked child, whose exit(7)
+    //      wakes the parent through the waiter registry), the
+    //      re-executed wait reaps: pid == the fork's child, wstatus
+    //      == 7 << 8, and a further wait answers -ECHILD. The
+    //      child's CoW store and its write run on the way to
+    //      exit_group(7). Expected drains: exactly ONE clean exit —
+    //      the parent's; the wait arm CONSUMED the child's completed
+    //      entry (its teardown ran there: destroy_user, then
+    //      exit_process records the zombie wait_process reaps), so
+    //      the mailbox never sees it. The child's honesty is proven
+    //      by the wstatus check, not by the drain count.
     //      ──
     {
         if let Some((dom, _)) = crate::sched::park::completed_drain() {
@@ -2436,6 +2424,33 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         crate::sched::context::launch(&sp.ctx);
         hw::write_cr3(kernel_cr3);
         let mut clean = 0usize;
+        // The launch-path exit: a run may exit straight out of launch
+        // (never parked) — its exit sits in USER_RUN, not the mailbox
+        // (dispatch_next records only the runs IT resumed; both exit
+        // paths leave the run in the slot). try_take is the ADR-0026
+        // tolerant twin — the parked flow returns with the slot empty
+        // and the mailbox carries every exit. (Found live, round U:
+        // round T's edit with this exact comment landed in the IPC
+        // section's harness — the first textual match — benign there
+        // but missing here, and the wait4 parent, which exits without
+        // parking when the arm is absent, exposed the gap as a silent
+        // identity-less "different count".)
+        if let Some(run) = crate::sched::context::try_take() {
+            if !matches!(run.exit, crate::sched::context::ExitKind::Exited(0)) {
+                let mut b = [0u8; 20];
+                crate::serial::write_str("[M3] linux-abi: ERROR: dom=");
+                crate::serial::write_str(strutil::dec(u64::from(run.domain), &mut b));
+                crate::serial::write_str(" exit=");
+                if let crate::sched::context::ExitKind::Exited(c) = run.exit {
+                    crate::serial::write_str(strutil::dec(c, &mut b));
+                }
+                crate::serial::write_str("; halting\n");
+                hw::halt_forever();
+            }
+            clean += 1;
+            mm::user::destroy_user(&mut k, &mut pool, run.domain);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, run.domain);
+        }
         while let Some((dom, exit)) = crate::sched::park::completed_drain() {
             if !matches!(exit, crate::sched::context::ExitKind::Exited(0)) {
                 let mut b = [0u8; 20];
@@ -2452,15 +2467,19 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             mm::user::destroy_user(&mut k, &mut pool, dom);
             let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
         }
-        if clean == 2 {
+        // Slice 3: exactly ONE clean drain — the parent. The wait
+        // arm consumed the child's completed entry (its full teardown
+        // ran there); the child's exit honesty is the blob's wstatus
+        // check (7 << 8), not a second drain.
+        if clean == 1 {
             line(
                 &mut out,
-                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, open(2) O_* translated (O_EXCL/O_APPEND refused), uname(63) -> -ENOSYS"],
+                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, open(2) O_* translated (O_EXCL/O_APPEND refused), wait4(61) WNOHANG/block/reap (wstatus 7<<8, then ECHILD), uname(63) -> -ENOSYS"],
             );
         } else {
             line(
                 &mut out,
-                &["[M3] linux-abi: ERROR: expected 2 clean exits, saw fewer; halting"],
+                &["[M3] linux-abi: ERROR: expected 1 clean exit (the child is consumed by the wait), saw a different count; halting"],
             );
             hw::halt_forever();
         }

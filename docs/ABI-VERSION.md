@@ -39,16 +39,19 @@ live domain (ADR-0003's refuse rule).
 | 35 nanosleep | 20 | |
 | 57 fork | 18 | child speaks the parent's ABI (inherited) |
 | 60 exit / 231 exit_group | 63 | the alias |
+| 61 wait4 | 20 | **blocks via the rip-2 re-execute park** (slice 3): not-ready parks with rip ON the 2-byte `syscall` instruction and rax = the ORIGINAL nr read from the frame's RAX slot — resume re-runs the very arm (the park machinery stays ABI-blind; found live: parking with the TRANSLATED nr made the re-executed entry answer -ENOSYS for a number the whitelist never maps). The child's completion wakes the parent through the waiter registry (`set_runnable` — the same block/wake primitive nanosleep and the IPC rendezvous use). WNOHANG (0x1) honored: nothing-ready answers 0; every other option bit refuses -EINVAL (WUNTRACED/WCONTINUED report job-control states we do not have — the slice-2 open discipline). rusage is accepted and ignored (no accounting yet — documented, not faked). pid: >0 = that child, -1/0 = any, other negatives -ECHILD; no/not-a child -ECHILD. **The reaped child's completed-mailbox entry is consumed BY the arm** — its teardown runs there (frames via `free_frames_of`, then `exit_process` records the zombie `wait_process` reaps; `destroy_domain` is never used: the supervisor removal erases the meta the zombie needs — found live in the slice-3 hunt), so the spawner's drain never sees it. **The wstatus target must be writable in the caller's OWN tables (P+U+W)**: a fork-CoW-shared page is read-only in both tables and the kernel's direct write answers -EFAULT loudly (ADR-0007: a CPL0 fault is a kernel bug — Linux services the CoW for put_user; we refuse — a careful program passes a private page, as the blob does with a post-fork mmap) |
 | 62 kill | 14 | |
 | 228 clock_gettime | 23 | |
 
-**Deliberately NOT mapped (slice 2):** `wait4` (61) and `execve` (59)
-— the internal `SYS_WAIT`/`SYS_EXEC` ids exist in the policy space but
-the kernel has no dispatch arm for them yet; the translation lands
-with the process-model slice, not as a stub that answers wrong.
-`dup` (32), `pipe2` (293): no ABI arm yet. Each answers `-ENOSYS`
-today. (`open` — nr 2 — lived on this edge until slice 2: the encoding
-difference is now handled by translating at the SYS_OPEN arm.)
+**Deliberately NOT mapped (slice 3):** `execve` (59) — the internal
+`SYS_EXEC` id exists in the policy space but the kernel has no ELF
+loading machinery yet; the translation lands with the exec slice, not
+as a stub that answers wrong. `dup` (32), `pipe2` (293): no ABI arm
+yet. Each answers `-ENOSYS` today. (`open` — nr 2 — lived on this edge
+until slice 2: the encoding difference is handled by translating at
+the SYS_OPEN arm; `wait4` — nr 61 — until slice 3: the kernel gained
+the SYS_WAIT arm the ADR-0022 D7 core was waiting for, with the
+rip-2 re-execute park for its blocking path.)
 
 Lane proof: blob mode 13 (`[M3] linux-abi:` marker) — one domain
 speaking ONLY Linux nrs: console write, the pipe split, the byte
@@ -58,12 +61,23 @@ store/load + the MAP_SHARED refusal, **open(2) with O_RDWR|O_CREAT on
 1000+id), write/close, an O_RDONLY reopen with read-back through an
 independent cursor, and the O_EXCL (0xC2) and O_APPEND (0x442)
 -EINVAL refusals** (slice 2), the uname(63) and getpid(39)
-`-ENOSYS` probes, fork + the CoW child store, both sides
+`-ENOSYS` probes, fork + the CoW child store, **wait4 (61) — slice 3:
+the WNOHANG probe (the fork-parked child is not ready -> exactly 0),
+the BLOCKING wait on a private scratch page (the syscall parks
+rip-2; the dispatcher runs the child, whose exit(7) wakes the parent
+through the waiter registry; the re-executed wait reaps: pid == the
+fork's child, wstatus == 7 << 8), then -ECHILD after the reap** — the
+child exits `exit_group(7)` (a nonzero code on purpose: the wstatus
+word is the proof the status crossed the boundary), the parent
 `exit_group(0)`. Red: pre-change, nr 22 hit internal SCHED_YIELD and
 the boot hung with zero clean exits. Red (slice 2): nr 2 answered
 -ENOSYS and the run exited 213 — which the harness swallowed (the
 never-parked launch exit sat in USER_RUN; fixed by taking it before
-the mailbox drain), so the first red showed as "saw fewer exits".
+the mailbox drain), so the first red showed as "saw fewer exits" (and
+the fix's own first landing went to the IPC section's twin harness —
+found live in slice 3 and moved to its true home). Red (slice 3): nr
+61 answered -ENOSYS and the run exited 222, read cleanly through the
+relocated try_take.
 
 ## v0.4 — the ring-3 entry surface (complete, unchanged)
 

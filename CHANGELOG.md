@@ -1,5 +1,86 @@
 # Changelog
 
+## [Unreleased] — ADR-0003 slice 3 (v1): wait4(2) joins the Linux entry — the blocking syscall lands (rip-2 re-execute), on the ADR-0022 D7 core
+
+### The feature
+
+- **nr 61 → SYS_WAIT** — the kernel's first BLOCKING Linux syscall.
+  The ADR-0022 D7 core (`wait_process`/`exit_process`, host-tested
+  since round K) finally has the arm that reaches it. Linux shape:
+  wait4(pid, wstatus*, rusage*, options); rusage accepted and ignored
+  (no accounting yet — documented, not faked).
+- **The rip-2 re-execute park** (`park_current_reexec`): a not-ready
+  wait parks with rip ON the 2-byte `syscall` instruction and rax =
+  the ORIGINAL nr read from the frame's own RAX slot — resume re-runs
+  the very arm against the completed world it waited for. The
+  argument registers ride the image; no wake-time image patching
+  anywhere; the park machinery stays ABI-blind (found live: passing
+  the TRANSLATED nr parked the image with the internal number, and
+  the re-executed entry answered -ENOSYS for a number the whitelist
+  never maps).
+- **The waiter registry** (park.rs): the blocked parent registers
+  BEFORE leaving the ready queue (a preemption window must find it);
+  the dispatcher's completion site wakes the exited run's parent via
+  `set_runnable` — nanosleep's own block/wake primitive, applied to
+  wait.
+- **The consume contract**: the re-executed arm consumes the reaped
+  child's completed-mailbox entry and runs its full teardown — frames
+  via `free_frames_of` (the frame half of `destroy_user`, extracted),
+  THEN `exit_process` records the zombie `wait_process` reaps. The
+  spawner's drain never sees a consumed child; the mode-13 harness
+  expects exactly ONE clean exit (the parent) — the child's honesty
+  is the blob's wstatus check.
+- **wstatus, byte for byte Linux**: exit → (code & 0xff) << 8
+  (WIFEXITED/WEXITSTATUS), kill/fault → the signal in the low 7 bits
+  (the fault vector maps: #DE→SIGFPE, #UD→SIGILL, #GP/#PF→SIGSEGV,
+  else SIGKILL). WNOHANG honored (nothing-ready answers 0); every
+  other option bit refuses -EINVAL (WUNTRACED/WCONTINUED report
+  job-control states this kernel does not have — the slice-2 open
+  discipline). wait.rs is the pure, host-tested half (+4 tests:
+  options/wstatus/ExitKind→ExitStatus/fault-table).
+
+### Found live (the hunt's dividends — four, all fixed in-slice)
+
+1. **Round T's try_take fix landed in the wrong harness**: the edit
+   matched the IPC section's textual twin first — benign there (the
+   IPC sender always parks before exiting) but MISSING in §24; the
+   wait4 parent, which exits without parking when the arm is absent,
+   exposed the gap as an identity-less "different count". Moved to
+   its true home (with a comment naming the trap).
+2. **The translated-nr park**: as above — the re-execute image now
+   reads the frame's own RAX (the number the user spoke).
+3. **`destroy_user` kills the zombie**: its `destroy_domain` tail
+   erases the proc meta, so the arm's `exit_process` after it found
+   no meta and no zombie was ever recorded — the parent answered
+   -ECHILD forever. `free_frames_of` extracted; the arm composes
+   frames → exit_process (the contract's order).
+4. **The kernel's direct user-write cannot service a CoW**: the
+   blob's wstatus sat on the fork-shared data page — read-only in
+   BOTH tables after fork — and the write faulted at CPL0, caught
+   by the ADR-0007 guard ("copy escaped the validated span").
+   Linux services the CoW for put_user; our discipline is the loud
+   refusal: the arm write-validates P+U+W and answers -EFAULT; a
+   careful program passes a private page (the blob mmaps its
+   wstatus scratch post-fork). Documented in ABI-VERSION.
+
+### Proof
+
+- Red (saved): nr 61 → -ENOSYS → exit 222, read cleanly through the
+  relocated try_take.
+- Green: **all three lanes** (pc, q35 with intel-iommu, q35-noiommu)
+  `BOOT VERIFY: PASS` with the extended
+  `[M3] linux-abi: v1 entry live — … wait4(61) WNOHANG/block/reap
+  (wstatus 7<<8, then ECHILD) …` marker — the blocking path driven
+  end-to-end: park → dispatcher runs the child (CoW + write +
+  exit(7)) → waiter-registry wake → re-execute → consume → reap →
+  wstatus == 0x0700 → -ECHILD after.
+- Gates: fmt, both clippy lanes, unsafe 125/125 (+4, ADR-noted in
+  unsafe-count.txt — all in park.rs, the module that owns it; wait.rs
+  and the arm are unsafe-free), asm-patterns, no-binaries, IST,
+  history-clean; 9 suites (kernel 279: +4 wait tests; lib 346: the
+  whitelist table + edge updated — nr 61 moved from the edge to the
+  mapped set).
+
 ## [Unreleased] — ADR-0003 slice 2 (v1): open(2) joins the Linux entry — the O_* word translates, never passes through
 
 ### The feature

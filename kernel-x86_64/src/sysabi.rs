@@ -28,6 +28,7 @@ use aegis_os::syscall::{SYS_CLOSE, SYS_DUP, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_WR
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const ESRCH: i64 = 3;
+pub const ECHILD: i64 = 10;
 pub const EIO: i64 = 5;
 pub const EBADF: i64 = 9;
 pub const EAGAIN: i64 = 11;

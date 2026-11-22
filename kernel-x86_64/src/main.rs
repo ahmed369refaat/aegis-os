@@ -78,6 +78,7 @@ pub mod rng;
 pub mod runtime;
 pub mod sched;
 pub mod strutil;
+pub mod wait;
 // Round J: the outer cfg(not(test)) on `pub mod syscall` was a hidden
 // debt — it compiled the whole module (its 3 host tests included) out
 // of every `cargo test` run, and the tests' missing `SyscallMask`

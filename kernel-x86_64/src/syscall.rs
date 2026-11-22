@@ -46,7 +46,7 @@ use aegis_os::syscall::{
     gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_IPC_CALL, SYS_IPC_GRANT,
     SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MMAP, SYS_MUNMAP,
     SYS_NANOSLEEP, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN,
-    SYS_WRITE,
+    SYS_WAIT, SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -160,7 +160,11 @@ mod tests {
         assert_eq!(translate_nr(2, true), Some(2)); // open(2) -> SYS_OPEN
                                                     // The edge: sub-64 collisions must NOT pass (uname vs EXIT is
                                                     // the sharp one), nor unmapped Linux nrs.
-        for nr in [4u64, 12, 32, 39, 59, 61, 63, 64, 293] {
+                                                    // Slice 3: wait4(61) joins the mapped set — its arm parks
+                                                    // with the re-execute image (rip-2) and reaps through the
+                                                    // ADR-0022 D7 core.
+        assert_eq!(translate_nr(61, true), Some(SYS_WAIT as u64)); // wait4 -> SYS_WAIT
+        for nr in [4u64, 12, 32, 39, 59, 63, 64, 293] {
             assert_eq!(translate_nr(nr, true), None, "nr {nr}");
         }
     }
@@ -306,6 +310,7 @@ mod exec {
             Decision::Allowed if nr8 == SYS_MMAP => sys_mmap(run, a1, a2, a3, _a4, linux_abi),
             Decision::Allowed if nr8 == SYS_MUNMAP => sys_munmap(run, a1, a2),
             Decision::Allowed if nr8 == SYS_FORK => sys_fork(run),
+            Decision::Allowed if nr8 == SYS_WAIT => sys_wait(run, a1, a2, a3, _a4),
             Decision::Allowed if nr8 == SYS_IPC_SEND => sys_ipc_send(run, a1, a2),
             Decision::Allowed if nr8 == SYS_IPC_RECV => sys_ipc_recv(run, a1),
             Decision::Allowed if nr8 == SYS_IPC_CALL => sys_ipc_call(run, a1, a2),
@@ -1014,6 +1019,102 @@ mod exec {
         child as u64
     }
 
+    /// wait4(2) — ADR-0003 v1 slice 3: the Linux wait lands on the
+    /// ADR-0022 D7 core (`wait_process`/`exit_process` were waiting
+    /// in the lib since round K; this is the arm that reaches them).
+    /// Linux shape: wait4(pid, wstatus*, rusage*, options); the
+    /// internal ABI serves the same positions. rusage is accepted
+    /// and IGNORED (no accounting yet — documented, not faked). The
+    /// blocking path parks with the RE-EXECUTE image (rip-2, rax =
+    /// the raw nr): the dispatcher runs the fork-parked child, its
+    /// exit wakes the parent through the waiter registry, and the
+    /// re-executed arm reaps. Every completed child whose mailbox
+    /// entry is consumed HERE gets its full teardown in the arm
+    /// (destroy_user FIRST — the exit_process order contract — then
+    /// the zombie record), so the spawner's drain never sees it.
+    fn sys_wait(
+        run: &mut crate::sched::context::UserRun,
+        pid: u64,
+        wstatus: u64,
+        _rusage: u64,
+        options: u64,
+    ) -> u64 {
+        use aegis_os::proc::ProcError as PE;
+        let nohang = match crate::wait::decode_options(options) {
+            Ok(n) => n,
+            Err(e) => return e as u64,
+        };
+        if wstatus != 0 && !validate_user_write_range(run, wstatus, 4, 4) {
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_fault(run.domain);
+            }
+            return (-EFAULT) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        // Reap-ready: consume every completed entry of one of MY
+        // children (ids collected first — the children_of borrow ends
+        // before the teardown mutates the kernel).
+        const MAX_REAPED: usize = 16;
+        let mut kids = [None; MAX_REAPED];
+        for (slot, m) in kids.iter_mut().zip(k.procs.children_of(run.domain)) {
+            *slot = Some(m.pid);
+        }
+        for child in kids.into_iter().flatten() {
+            if let Some(kind) = crate::sched::park::completed_take(child) {
+                // The full teardown, in the exit_process contract's
+                // order: FRAMES first (the free half of destroy_user —
+                // never destroy_domain: the supervisor removal erases
+                // the meta the zombie record needs, found live in the
+                // slice-3 hunt), then the lib's exit path (teardown +
+                // the zombie wait_process reaps). The kernel-side
+                // sched bookkeeping already ran at the completion site
+                // (every mailbox entry passes dispatch_next).
+                if let Some(pool) = context::pool_mut() {
+                    crate::mm::user::free_frames_of(k, pool, child);
+                }
+                let _ = k.exit_process(child, crate::wait::exit_status_of(&kind));
+            }
+        }
+        match k.wait_process(run.domain, pid as i64, nohang) {
+            Ok((reaped, st)) => {
+                if wstatus != 0 {
+                    let word = crate::wait::wstatus_word(&st).to_le_bytes();
+                    IN_USER_COPY.store(true, Ordering::SeqCst);
+                    if crate::hw::smap_active() {
+                        crate::hw::stac();
+                    }
+                    for (off, b) in word.iter().enumerate() {
+                        memops::write_u8_va(wstatus + off as u64, *b);
+                    }
+                    if crate::hw::smap_active() {
+                        crate::hw::clac();
+                    }
+                    IN_USER_COPY.store(false, Ordering::SeqCst);
+                }
+                u64::from(reaped)
+            }
+            // WNOHANG: nothing ready answers 0 — the pid comes later.
+            Err(PE::WouldBlock) if nohang => 0,
+            Err(PE::WouldBlock) => {
+                // The block: register FIRST (a preemption window before
+                // the park must find the waiter), leave the ready
+                // queue, then park with the re-execute image. A full
+                // registry answers EAGAIN — the honest try-again, the
+                // same refusal shape as fork's capacity family.
+                if !crate::sched::park::waiter_register(run.domain) {
+                    return (-sysabi::EAGAIN) as u64;
+                }
+                let _ = k.sched.set_runnable(run.domain, false);
+                crate::sched::park::park_current_reexec()
+            }
+            Err(PE::NoChildren) | Err(PE::NotAChild(_)) => (-sysabi::ECHILD) as u64,
+            Err(PE::UnknownProcess(_)) => (-sysabi::ESRCH) as u64,
+            Err(_) => (-EINVAL) as u64,
+        }
+    }
+
     /// ipc_send(channel, len) — ADR-0025 D1: the core's capability-
     /// gated async executor (WRITE == send), reached at last from
     /// ring 3. The gate and the organic monitor accounting land in
@@ -1562,6 +1663,35 @@ mod exec {
     /// tables — the same tables its CR3 points at. `max` is the
     /// syscall's own bound (MAX_WRITE / MAX_READ — both 256 today, but
     /// the seam is explicit).
+    /// The write-target twin: present, U, AND W — a write through
+    /// the kernel's direct window cannot take the CoW path the user's
+    /// own store would (a fork-shared page is read-only in BOTH
+    /// tables until the fault services the copy; a CPL0 fault on it
+    /// is a kernel bug by ADR-0007, so the ARM refuses -EFAULT
+    /// instead — found live by the wait4 slice: the blob's wstatus
+    /// sat on the CoW-shared data page and the write faulted loudly).
+    /// A careful program passes a private page (the blob mmaps one
+    /// post-fork); Linux would service the CoW for put_user — our
+    /// discipline is the loud refusal, documented in ABI-VERSION.
+    fn validate_user_write_range(
+        run: &crate::sched::context::UserRun,
+        buf: u64,
+        len: u64,
+        max: u64,
+    ) -> bool {
+        crate::mm::user_range::validate_range(
+            buf,
+            len,
+            max,
+            pte::USER_LIMIT,
+            pte::PAGE_SIZE_U64,
+            &|va| match run.tables.pte_of(va) {
+                Some(e) => e & pte::PTE_U != 0 && e & pte::PTE_P != 0 && e & pte::PTE_W != 0,
+                None => false,
+            },
+        )
+    }
+
     fn validate_user_range(
         run: &crate::sched::context::UserRun,
         buf: u64,

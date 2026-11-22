@@ -132,4 +132,9 @@
 # timing; the monitor, park, preempt, irq, clock and ACPI paths all read
 # read_tsc). One reader, one unsafe site — the file-header invariant
 # ("every function a one-instruction wrapper") now holds without a twin.
-121
+125
+# 125 (was 121): ADR-0003 slice 3 / round U — wait4(61) joins the
+# Linux entry: +4 in sched/park.rs (completed_take, the WAITERS
+# registry pair, park_current_reexec's frame reads — the unsafe
+# stays in park.rs, the module that owns it; wait.rs and the arm
+# are unsafe-free).

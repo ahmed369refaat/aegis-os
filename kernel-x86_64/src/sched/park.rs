@@ -160,12 +160,83 @@ pub fn completed_drain() -> Option<(u32, crate::sched::context::ExitKind)> {
     None
 }
 
+/// wait4 (slice 3): consume ONE completed entry by domain id — the
+/// wait arm's reap-ready step. Taking the entry transfers the child's
+/// whole completion contract to the arm (destroy_user, then
+/// exit_process records the zombie wait_process reaps); kmain's drain
+/// never sees a consumed child, so the arm's teardown IS the drain's
+/// twin. None when this domain holds no entry.
+#[cfg(not(test))]
+pub fn completed_take(domain: u32) -> Option<crate::sched::context::ExitKind> {
+    // SAFETY: as record_completed — single CPU, IF=0 on every path
+    // that reaches here (the syscall arm or the dispatcher).
+    let completed = unsafe { &mut *core::ptr::addr_of_mut!(COMPLETED) };
+    for slot in completed.iter_mut() {
+        if matches!(&*slot, Some((d, _)) if *d == domain) {
+            return slot.take().map(|(_, exit)| exit);
+        }
+    }
+    None
+}
+
+/// wait4 (slice 3): the blocked-waiter registry — parents parked in
+/// the wait4 re-execute image. Registered BEFORE the run leaves the
+/// ready queue (a preemption window between the register and the park
+/// must still find it), cleared at the wake. Bounded by the domain
+/// table; a full registry is a bookkeeping bug, refused loudly.
+#[cfg(not(test))]
+static mut WAITERS: [Option<u32>; aegis_os::MAX_DOMAINS] = [const { None }; aegis_os::MAX_DOMAINS];
+
+/// Register `parent` as blocked in wait4. Returns false when the
+/// table is full (the arm refuses to block then — the caller answers
+/// -EAGAIN, the honest "try again").
+#[cfg(not(test))]
+pub fn waiter_register(parent: u32) -> bool {
+    // SAFETY: single CPU, IF=0 through the syscall arm.
+    let waiters = unsafe { &mut *core::ptr::addr_of_mut!(WAITERS) };
+    if waiters.iter().flatten().any(|&p| p == parent) {
+        return true; // already registered (a re-executed block)
+    }
+    for slot in waiters.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(parent);
+            return true;
+        }
+    }
+    false
+}
+
+/// The wake side of the waiter registry, called by the dispatcher
+/// right after a completion is recorded: if the exiting run's PARENT
+/// is blocked in wait4, it leaves the blocked set now — its
+/// re-executed wait4 finds this exit's zombie and reaps it. The
+/// parent comes from the lib's process table (the layering rule: the
+/// core owns the relationships, the kernel applies the wake).
+#[cfg(not(test))]
+pub fn wake_parent_waiter(
+    k: &mut aegis_os::Kernel<{ crate::frames::KERNEL_POOL_FRAMES }>,
+    exited: u32,
+) {
+    let Some(parent) = k.procs.get(exited).map(|m| m.parent) else {
+        return; // no meta (a kmain-spawned top run): nobody waits
+    };
+    // SAFETY: single CPU, IF=0 through the dispatcher.
+    let waiters = unsafe { &mut *core::ptr::addr_of_mut!(WAITERS) };
+    for slot in waiters.iter_mut() {
+        if matches!(&*slot, Some(p) if *p == parent) {
+            *slot = None;
+            let _ = k.sched.set_runnable(parent, true);
+            return;
+        }
+    }
+}
+
 #[cfg(not(test))]
 mod boot {
     use super::{parked_from_syscall, record_completed, SyscallImage};
     use crate::arch::syscall_entry;
     use crate::arch::syscall_frame::{
-        OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
+        OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RAX, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
     };
     use crate::hw;
     use crate::sched::context::{self};
@@ -260,6 +331,57 @@ mod boot {
         // corrupted resume slot stranded both runs). Only the
         // OUTERMOST park — a flat-launched run parking for the first
         // time, no level below — starts the dispatcher.
+        if context::park_chain_depth() > 0 {
+            context::resume_kernel();
+        }
+        dispatch_next()
+    }
+
+    /// wait4 (slice 3): the RE-EXECUTE park. Like
+    /// `park_current_from_syscall` but the image resumes ON the
+    /// 2-byte `syscall` instruction (SYSRET's return address minus 2)
+    /// with RAX carrying the ORIGINAL syscall number read from the
+    /// frame's own RAX slot (the number the user spoke, BEFORE any
+    /// translation — the re-executed entry re-translates it exactly
+    /// as the first pass did). Resume re-runs the very arm that
+    /// parked, against the completed world it waited for. The
+    /// argument registers ride the image untouched, so the re-executed
+    /// call sees its original (pid, wstatus, rusage, options) exactly;
+    /// no wake-time post-processing of the image is needed anywhere,
+    /// and the park machinery stays ABI-blind. The caller registers
+    /// itself as a waiter (and leaves the ready queue) BEFORE this is
+    /// reached.
+    pub fn park_current_reexec() -> ! {
+        let base = syscall_entry::syscall_frame_addr();
+        let read = |off: u64| {
+            // SAFETY: as park_current_from_syscall — the frame lives
+            // at the top of the kernel stack for the whole dispatch.
+            unsafe { *((base + off) as *const u64) }
+        };
+        let live = syscall_entry::user_callee_saved();
+        let ctx = parked_from_syscall(SyscallImage {
+            rdi: read(OFF_RDI),
+            rsi: read(OFF_RSI),
+            rdx: read(OFF_RDX),
+            r10: read(OFF_R10),
+            r8: read(OFF_R8),
+            r9: read(OFF_R9),
+            user_rip: read(OFF_RCX) - 2, // ON the syscall instruction
+            user_rflags: read(OFF_R11),  // SYSRET's R11 carrier
+            rbx: read(OFF_RBX),
+            user_rsp: syscall_entry::user_rsp_save(),
+            // RAX at resume: the ORIGINAL nr from the frame's own
+            // RAX slot — the re-executed entry reads and re-translates
+            // the number the user actually spoke (found live: passing
+            // the TRANSLATED nr through the arm parked the image with
+            // the internal number, and the re-executed entry answered
+            // -ENOSYS for a number the whitelist never maps).
+            result: read(OFF_RAX),
+            live,
+        });
+        let run = context::take();
+        context::stash_parked(run, ctx);
+        // ADR-0028's park-unwind rule, as above.
         if context::park_chain_depth() > 0 {
             context::resume_kernel();
         }
@@ -409,6 +531,11 @@ mod boot {
                                 // stays the spawner's drain (kmain).
                                 if let Some(k) = context::kernel_mut() {
                                     let _ = preempt::on_exit(&mut k.sched, exited.domain);
+                                    // wait4 (slice 3): a parent blocked
+                                    // in the wait4 re-execute image
+                                    // wakes NOW — its re-executed arm
+                                    // consumes this entry and reaps.
+                                    super::wake_parent_waiter(k, exited.domain);
                                 }
                             }
                             continue;
@@ -447,7 +574,7 @@ mod boot {
 }
 
 #[cfg(not(test))]
-pub use boot::{park_current_from_syscall, parked_from_current_syscall};
+pub use boot::{park_current_from_syscall, park_current_reexec, parked_from_current_syscall};
 
 #[cfg(test)]
 mod tests {

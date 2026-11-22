@@ -169,14 +169,17 @@ fn build_user_tables<const N: usize>(
     Ok((tables, space))
 }
 
-/// Free every frame the domain owns (tables + pages; the pool scrubs
-/// each one) and withdraw the lib identity. The post-run cleanup,
-/// called from kmain after `resume_kernel`.
+/// The frame half of a teardown: the ADR-0024 D2 shares-aware
+/// reclaim — a frame another address space still maps is RELEASED,
+/// not freed (the last holder frees, under the ORIGINAL owner's
+/// tag); private frames free outright. NO lib-side removal happens
+/// here. `destroy_user` = this + `destroy_domain` (the supervisor
+/// path — the meta goes outright); the wait4 arm = this +
+/// `exit_process` (the zombie stays for the parent to reap —
+/// `destroy_domain` after a reap would kill the meta the parent is
+/// about to read, found live in the slice-3 hunt).
 #[cfg(not(test))]
-pub fn destroy_user<const N: usize>(k: &mut Kernel<N>, pool: &mut FramePool<N>, id: u32) {
-    // ADR-0024 D2: the shares-aware teardown — a frame another address
-    // space still maps is RELEASED, not freed (the last holder frees,
-    // under the ORIGINAL owner's tag); private frames free outright.
+pub fn free_frames_of<const N: usize>(k: &mut Kernel<N>, pool: &mut FramePool<N>, id: u32) {
     // The buffer is sized by the live owned count (no allocation).
     let owned = pool.owned_by(id);
     let mut buf = [const { None }; 1024];
@@ -198,6 +201,17 @@ pub fn destroy_user<const N: usize>(k: &mut Kernel<N>, pool: &mut FramePool<N>, 
         crate::serial::write_str(crate::strutil::dec(owned as u64, &mut b));
         crate::serial::write_str(" owned frames\n");
     }
+}
+
+/// Free every frame the domain owns (tables + pages; the pool scrubs
+/// each one) and withdraw the lib identity. The spawner's full
+/// post-run cleanup, called from kmain after `resume_kernel`: frames,
+/// then the lib removal (the supervisor path — no zombie; the
+/// supervisor opted out of the wait protocol. The wait4 arm uses
+/// `free_frames_of` + `exit_process` instead — the zombie stays).
+#[cfg(not(test))]
+pub fn destroy_user<const N: usize>(k: &mut Kernel<N>, pool: &mut FramePool<N>, id: u32) {
+    free_frames_of(k, pool, id);
     let _ = k.destroy_domain(id);
 }
 

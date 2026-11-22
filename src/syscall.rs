@@ -58,6 +58,7 @@ pub fn linux_nr_to_core(nr: u64) -> Option<u64> {
         33 => Some(SYS_DUP as u64),            // dup2(2)
         35 => Some(SYS_NANOSLEEP as u64),      // nanosleep(2)
         57 => Some(SYS_FORK as u64),           // fork(2)
+        61 => Some(SYS_WAIT as u64),           // wait4(2) — blocks via the rip-2 re-execute park
         60 => Some(SYS_EXIT as u64),           // exit(2)
         62 => Some(SYS_KILL as u64),           // kill(2)
         228 => Some(SYS_CLOCK_GETTIME as u64), // clock_gettime(2)
@@ -439,6 +440,7 @@ mod adr0003_tests {
             (33, SYS_DUP),            // dup2(2)
             (35, SYS_NANOSLEEP),      // nanosleep(2)
             (57, SYS_FORK),           // fork(2)
+            (61, SYS_WAIT),           // wait4(2) — the blocking wait parks rip-2
             (60, SYS_EXIT),           // exit(2)
             (62, SYS_KILL),           // kill(2)
             (228, SYS_CLOCK_GETTIME), // clock_gettime(2)
@@ -452,12 +454,14 @@ mod adr0003_tests {
     /// v1: the whitelist's EDGE — the collisions that must NOT pass
     /// through. Linux 63 is uname; internal 63 is EXIT (a
     /// pass-through would exit a Linux binary on uname). Linux 39 is
-    /// getpid, 59/61/32/293 have no ABI arm. (open — nr 2 — lived on
+    /// getpid, 59/32/293 have no ABI arm. (open — nr 2 — lived on
     /// this edge until slice 2: its O_* word is TRANSLATED now, the
-    /// encoding difference handled at the SYS_OPEN arm.)
+    /// encoding difference handled at the SYS_OPEN arm; wait4 — nr
+    /// 61 — until slice 3: the kernel gained the SYS_WAIT arm the
+    /// ADR-0022 D7 core was waiting for.)
     #[test]
     fn linux_table_refuses_the_collisions() {
-        for nr in [4u64, 5, 12, 14, 32, 39, 59, 61, 63, 64, 293, 1000, u64::MAX] {
+        for nr in [4u64, 5, 12, 14, 32, 39, 59, 63, 64, 293, 1000, u64::MAX] {
             assert_eq!(linux_nr_to_core(nr), None, "nr {nr} must not pass");
         }
     }

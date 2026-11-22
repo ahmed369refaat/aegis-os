@@ -1421,10 +1421,61 @@ pipe_b_got:
     syscall
     test rax, rax
     jz 21f                            /* the child */
-    mov eax, 24                       /* sched_yield() — nr 24: the parked child runs
-                                          (the parent must not exit_group it out of
-                                          the world before it took its turn) */
+    mov r15, rax                      /* the child's pid (r15 is free:
+                                          every file fd is closed) */
+    /* The wstatus target must be a PRIVATE writable page: fork marked
+       every shared page read-only in BOTH tables (CoW), and the
+       kernel's direct write refuses loudly (ADR-0007: a CPL0 fault is
+       a kernel bug) instead of servicing the copy the user's own
+       store would. A fresh mmap after fork is parent-private RW. */
+    mov eax, 9                        /* mmap(0, 4096, RW, 0x22) — nr 9 */
+    xor edi, edi
+    mov esi, 4096
+    mov edx, 3
+    mov r10d, 0x22
     syscall
+    cmp rax, 0x1000
+    jl 226f                           /* the scratch mmap failed */
+    mov r14, rax                      /* the wstatus target */
+    mov eax, 61                       /* wait4(-1, ws, 0, WNOHANG) — nr 61:
+                                          the child is fork-parked, nothing
+                                          is ready -> exactly 0 (the
+                                          non-blocking probe) */
+    mov rdi, -1
+    mov rsi, r14
+    xor edx, edx
+    mov r10d, 1                       /* WNOHANG */
+    syscall
+    test rax, rax
+    jnz 222f
+    mov eax, 61                       /* wait4(-1, ws, 0, 0): the BLOCKING
+                                          wait — the syscall parks (rip-2:
+                                          resume RE-EXECUTES it), the
+                                          dispatcher runs the child, its
+                                          exit(7) wakes this run, and the
+                                          re-executed wait4 reaps it */
+    mov rdi, -1
+    mov rsi, r14
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    cmp rax, 3                        /* a pid, never an errno */
+    jl 223f
+    cmp rax, r15                      /* the reaped pid IS the fork's child */
+    jne 223f
+    cmp dword ptr [r14], 0x0700        /* wstatus == 7 << 8: WIFEXITED,
+                                           WEXITSTATUS == 7 — the status
+                                           crossed the boundary */
+    jne 224f
+    mov eax, 61                       /* after the reap: no children ->
+                                          -ECHILD (Linux 10), even WNOHANG */
+    mov rdi, -1
+    xor esi, esi
+    xor edx, edx
+    mov r10d, 1
+    syscall
+    cmp rax, -10
+    jne 225f
     jmp 20f
 21: /* child: the store into the CoW-shared data page faults and
        takes a private copy (fork/CoW under the Linux ABI too) */
@@ -1436,6 +1487,12 @@ pipe_b_got:
     syscall
     cmp rax, 1
     jne 212f
+    mov eax, 231                      /* exit_group(7) — a NONZERO code on
+                                          purpose: the parent's wstatus
+                                          check (7 << 8) is the proof the
+                                          exit status crossed the boundary */
+    mov edi, 7
+    syscall
 20: mov eax, 231                      /* exit_group(0) — nr 231 (the alias) */
     xor edi, edi
     syscall
@@ -1679,6 +1736,36 @@ pipe_b_got:
     syscall
     mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
     mov edi, 221
+    syscall
+222: mov eax, 231
+    mov edi, 222                      /* wait4 WNOHANG did not answer 0 */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 222
+    syscall
+223: mov eax, 231
+    mov edi, 223                      /* the blocking wait4 gave a wrong pid */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 223
+    syscall
+224: mov eax, 231
+    mov edi, 224                      /* wstatus != 7 << 8 */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 224
+    syscall
+225: mov eax, 231
+    mov edi, 225                      /* no -ECHILD after the reap */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 225
+    syscall
+226: mov eax, 231
+    mov edi, 226                      /* the wstatus scratch mmap failed */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 226
     syscall
 "#,
 );
