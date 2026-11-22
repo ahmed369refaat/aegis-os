@@ -4,6 +4,21 @@ All notable changes to AegisOS. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased] — Stage 1: Ring-3 isolation (in progress)
 
+### Fixed — M3 Phase 4, slice 3 (round "O", ADR-0027): the ADR-0024 D2 exit leak — found live, closed loudly
+
+Every boot since the fork round printed `[MM] teardown domain 27: freed 5 of 9 owned frames` and nobody asked why. A dying domain released the refcounts of frames it POOL-OWNS (the reclaim path) but never the refcounts of frames it MAPS BUT DOES NOT OWN — the fork child's side of every still-shared page: four pages per fork proof leaked (stuck at refs=1 after the parent's death, never returned to the pool). Designing the grant's exit path found it; the fix is the grant's precondition. **The rule**: on SYS_EXIT, walk the dying run's user PTEs and release every frame whose shares entry names another owner (`owner_of(pa) != me` — the borrowed mappings: fork-shared-from-parent, granted-in); release-to-zero frees under the ORIGINAL owner's tag, exactly as reclaim does. The two rules are disjoint (`== me` is reclaim's). **The gate**: boot.sh now FAILS any boot with a `[MM] teardown` line — every future accounting bug is a boot failure, not a log line. A second latent hole closed with it: munmapping a shared page used to pool-free a frame another space still maps — `sys_munmap` now comes through the shares-aware source.
+
+### Added — M3 Phase 4, slice 3 (round "O", ADR-0027): page grants — memory capability transfer over the ADR-0024 accounting
+
+One domain can now CONFER a page on another, explicitly, capability-gated — the bounded first slice of ADR-0024 D4's deferred "shared mappings between live processes".
+
+- **`ipc_grant_frames(dst, va, len)`** (internal nr 29): the caller's `[va, va+len)` mapped RW into the receiver's space through the RECEIVER'S OWN ten-check policy (quota and overlap apply — a grant cannot smuggle memory past a quota), every leaf PTE pointing at the granter's frame, refcount acquired per page immediately before its PTE write (rollback releases exactly the mapped ones). RW-only is HARDWIRED — a granted page never arrives executable. The bound: 1..=64 pages, the refcount table's own `MAX_SHARED`. The return: the VA where the frames landed in the receiver.
+- **The gate** (core, host-tested): a Domain capability with WRITE on dst — the kill pattern — plus a supervisor conferral API `cap_grant_domain_to(sup, holder, target)` (the `ipc_endpoint_grant` shape for domain caps: a privileged, auditable bootstrap; spawned domains have derived non-root uids, so the self-grant API is not their path).
+- **The grant composes with the sync IPC**: the granted VA travels to the receiver as two 6-bit messages (the IPC bound is 64 — a raw address half refuses; the page number fits 12 bits), and the reply confirms the read — grant + call/reply in one proof.
+- **The proof** (blob mode 10, the ninth marker): the granter mmaps a page, writes a pattern, grants it; the grantee — woken by the rendezvous — reads the pattern THROUGH the grant, writes its mark, replies (with a bounded EAGAIN retry: the tick may run the grantee ahead of the caller's park — the transient truth, not an error). The granter's `call` returns the reply and its OWN page carries the mark: bidirectional shared memory, both directions verified. Marker: `[M3] grants: 1 page RW, the grantee read the pattern and the granter saw the reply-write`.
+- **The lifetime invariant** (the fork accounting, unchanged): the refcount counts every reference including the owner's implicit one. Either side may munmap (its release drops one ref); either side may exit (the D2 rule above); the grant OUTLIVES the granter. No revocation, no grant chains tested — documented, not faked.
+- Host tests: the gate (no cap → PermissionDenied with the escalation counted; the conferral passes it), the dead-grantee ESRCH, the length bound (0, unaligned, 1-past-capacity refuse; exactly 64 pages pass).
+
 ### Added — M3 Phase 4, slice 2 (round "N", ADR-0026): sync call/reply over the park machinery — the rendezvous, ring 3 to ring 3
 
 Domains BLOCK on each other now: `call` parks the caller until the owner replies, a blocking `recv` parks the server until a request arrives. One blocking mechanism, three users (sleep, yield, IPC rendezvous) — all through the same `set_runnable` F12-floor path and the same park table.

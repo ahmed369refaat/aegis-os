@@ -42,9 +42,9 @@ pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
 pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
 use aegis_os::sys::{SysRequest, SysValue};
 use aegis_os::syscall::{
-    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_IPC_CALL, SYS_IPC_RECV,
-    SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP,
-    SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_WRITE,
+    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_IPC_CALL, SYS_IPC_GRANT,
+    SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MMAP, SYS_MUNMAP,
+    SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -214,6 +214,21 @@ mod exec {
                 if let Some(k) = context::kernel_mut() {
                     k.tick(crate::hw::read_tsc());
                 }
+                // ADR-0027 (the ADR-0024 D2 fix): release every frame
+                // this domain MAPS BUT DOES NOT OWN — the fork child's
+                // and the grantee's side of each share. Without this,
+                // the dying side's reference leaks and the owner's
+                // later teardown finds refs stuck at 1 (found live:
+                // "teardown domain 27: freed 5 of 9"). The frames the
+                // domain DOES own stay the reclaim path's business.
+                if let (Some(pool), Some(k)) = (context::pool_mut(), context::kernel_mut()) {
+                    let _ = crate::mm::shares::release_borrowed_frames(
+                        &run.tables,
+                        pool,
+                        &mut k.frames,
+                        run.domain,
+                    );
+                }
                 // GS back to the kernel view, then jump to the launch
                 // point — SYSRET never happens for EXIT.
                 hw::swapgs();
@@ -233,6 +248,7 @@ mod exec {
             Decision::Allowed if nr8 == SYS_IPC_CALL => sys_ipc_call(run, a1, a2),
             Decision::Allowed if nr8 == SYS_IPC_RECV_WAIT => sys_ipc_recv_wait(run, a1),
             Decision::Allowed if nr8 == SYS_IPC_REPLY => sys_ipc_reply(run, a1, a2),
+            Decision::Allowed if nr8 == SYS_IPC_GRANT => sys_grant_frames(run, a1, a2, a3),
             // Round J: the file family runs on the LIVE lib kernel —
             // marshaled through sysabi, executed by `Kernel::execute`.
             Decision::Allowed if sysabi::FILE_FAMILY.contains(&nr8) => {
@@ -790,7 +806,6 @@ mod exec {
     /// the ABI. Frames return through the pool (owner-scoped, scrubbed
     /// on free).
     fn sys_munmap(run: &mut crate::sched::context::UserRun, addr: u64, len: u64) -> u64 {
-        use crate::mm::page_table::PoolSource;
         use crate::mm::user_layout;
         const WINDOW_FLOOR: u64 = user_layout::TRAMPOLINE_BASE + 4096;
 
@@ -808,7 +823,17 @@ mod exec {
         let (Some(pool), Some(k)) = (context::pool_mut(), context::kernel_mut()) else {
             return (-ENOMEM) as u64;
         };
-        let mut src = PoolSource::new(pool, &mut k.frames, run.domain);
+        // ADR-0027: the shares-aware source — unmapping a SHARED page
+        // (fork-shared, granted) releases its refcount instead of
+        // pool-freeing a frame another space still maps (a latent
+        // double-free in the fork round, closed with the grant's
+        // accounting).
+        let mut src = crate::mm::page_table::SharesSource {
+            pool,
+            buddy: &mut k.frames,
+            owner: run.domain,
+            shares: context::shares_mut(),
+        };
         match run.tables.unmap_region(&mut run.space, addr, &mut src) {
             Ok(_) => 0,
             Err(_) => (-EINVAL) as u64,
@@ -1030,6 +1055,113 @@ mod exec {
         // The reply woke a caller: patch its image now.
         drain_ipc_wakes();
         r
+    }
+
+    /// ipc_grant_frames(dst, va, len) — ADR-0027: confer
+    /// `[va, va+len)` of the caller's mapped memory on dst, RW-only.
+    /// The core validated (the Domain-capability gate, liveness, the
+    /// page-granular bound); THIS side walks the granter's tables,
+    /// takes the receiver's parked run, maps the frames through the
+    /// receiver's OWN policy (quota and overlap apply), and returns
+    /// the VA where they landed in the receiver — the address the
+    /// caller then passes on through the sync IPC (ADR-0026).
+    fn sys_grant_frames(
+        run: &mut crate::sched::context::UserRun,
+        dst: u64,
+        va: u64,
+        len: u64,
+    ) -> u64 {
+        use crate::mm::page_table::{MapError, SharesSource};
+        use crate::mm::user_layout;
+        const WINDOW_FLOOR: u64 = user_layout::TRAMPOLINE_BASE + 4096;
+
+        if dst > u32::MAX as u64 || va > u32::MAX as u64 || len > u32::MAX as u64 {
+            return (-EINVAL) as u64;
+        }
+        // The whole range must live in the user half (a kernel-half
+        // grant is nonsense; the granter's tables never map it, but
+        // the check is cheap and the refusal explicit).
+        if !va.is_multiple_of(4096) || va + len > crate::mm::pte::USER_LIMIT {
+            return (-EINVAL) as u64;
+        }
+        // The core gate: cap + liveness + the bound (host-tested).
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        match k.execute(
+            run.domain,
+            aegis_os::sys::SysRequest::IpcGrantFrames {
+                dst: dst as u32,
+                va: va as u32,
+                len: len as u32,
+            },
+        ) {
+            Ok(aegis_os::sys::SysValue::Unit) => {}
+            Ok(_) => return 0,
+            Err(e) => return sysabi::errno_of(&e) as u64,
+        }
+        // The source walk: every page in the granter's range must be
+        // present (a grant of unmapped memory is -EFAULT, mapped
+        // nothing, touched nothing).
+        let mut pas = [0u64; aegis_os::frame_share::MAX_SHARED];
+        let pages = (len / 4096) as usize;
+        for (i, slot) in pas.iter_mut().enumerate().take(pages) {
+            match run.tables.translate(va + (i as u64) * 4096) {
+                Some(pa) => *slot = pa,
+                None => return (-EFAULT) as u64,
+            }
+        }
+        // The receiver's parked run: take it, map through ITS policy,
+        // stash it back — the parked image untouched (a run blocked in
+        // recv_wait is as grantable as a runnable one; the PARKED
+        // table holds it either way).
+        let Some((mut brun, bctx)) = context::take_parked(dst as u32) else {
+            // The grantee never entered the world (or already exited):
+            // ESRCH — the same truth the core's liveness check speaks.
+            return (-sysabi::ESRCH) as u64;
+        };
+        let base = match brun
+            .space
+            .find_free_window(pages * 4096, WINDOW_FLOOR as usize)
+        {
+            Some(b) => b as u64,
+            None => {
+                context::stash_parked(brun, bctx);
+                return (-ENOMEM) as u64;
+            }
+        };
+        let (Some(pool), Some(k)) = (context::pool_mut(), context::kernel_mut()) else {
+            context::stash_parked(brun, bctx);
+            return (-ENOMEM) as u64;
+        };
+        {
+            let mut src = SharesSource {
+                pool,
+                buddy: &mut k.frames,
+                owner: dst as u32,
+                shares: context::shares_mut(),
+            };
+            let mut grant = crate::mm::page_table::GrantFrames {
+                pas: &pas[..pages],
+                owner: run.domain,
+                shares: context::shares_mut(),
+            };
+            let r =
+                brun.tables
+                    .grant_map(&mut brun.space, base, pages * 4096, &mut grant, &mut src);
+            if let Err(e) = r {
+                context::stash_parked(brun, bctx);
+                return match e {
+                    MapError::Policy(_) => (-EINVAL) as u64,
+                    MapError::SharesFull => (-sysabi::EAGAIN) as u64,
+                    _ => (-ENOMEM) as u64,
+                };
+            }
+        }
+        // The receiver's run goes back EXACTLY as it came — the same
+        // image, one more region in its tables and space.
+        context::stash_parked(brun, bctx);
+        base
     }
 
     /// SYS_READ(fd, buf, len): the executor fills a KERNEL buffer

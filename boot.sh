@@ -374,6 +374,12 @@ if [ "$MODE" = "verify" ]; then
   grep -qF "[M3] ipc: 8+ messages over 2 channels" "$LOG" || { echo "VERIFY FAIL: M3 ipc marker missing"; ok=0; }
   # ADR-0026: the sync call/reply proof (rendezvous + queued, both).
   grep -qF "[M3] sync: 2 round-trips" "$LOG" || { echo "VERIFY FAIL: M3 sync marker missing"; ok=0; }
+  # ADR-0027: the page-grant proof (bidirectional shared memory).
+  grep -qF "[M3] grants: 1 page RW" "$LOG" || { echo "VERIFY FAIL: M3 grants marker missing"; ok=0; }
+  # ADR-0027 (the ADR-0024 D2 fix): NO domain may leave owned frames
+  # behind at teardown — the mismatch line is the loud accounting
+  # catch (it printed "freed 5 of 9" every boot since the fork round).
+  grep -q "MM ] teardown" "$LOG" && { echo "VERIFY FAIL: frame accounting leaked at teardown"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the

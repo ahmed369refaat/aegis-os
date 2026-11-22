@@ -24,10 +24,10 @@ use crate::signal::{DefaultAction, SignalError};
 use crate::vfs::{Access, InodeKind, Mode, VfsError};
 use crate::{
     syscall::{
-        SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_RECV_WAIT,
-        SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP,
-        SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SCHED_YIELD, SYS_SIGACTION,
-        SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
+        SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV,
+        SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP,
+        SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SCHED_YIELD,
+        SYS_SIGACTION, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
     },
     Kernel, KernelError,
 };
@@ -156,6 +156,19 @@ pub enum SysRequest<'a> {
     /// OLDEST waiting caller (FIFO); returns how many waiters woke.
     IpcReply {
         channel: u32,
+        len: u32,
+    },
+    /// ADR-0027: ipc_grant_frames(dst, va, len) — confer
+    /// `[va, va+len)` of the CALLER's mapped memory on dst, RW-only.
+    /// The core arm validates (the Domain-capability gate, dst
+    /// liveness, the page-granular bound); the kernel side walks the
+    /// granter's tables, maps the frames through the RECEIVER's own
+    /// policy, and returns the VA where they landed (the mmap
+    /// precedent: the core owns the policy identity, the kernel owns
+    /// the PTEs). Unit = validated.
+    IpcGrantFrames {
+        dst: u32,
+        va: u32,
         len: u32,
     },
     Ioctl {
@@ -880,6 +893,31 @@ impl<const N: usize> Kernel<N> {
                     None => Err(SysError::Ipc(crate::ipc::IpcError::QueueEmpty)),
                 }
             }
+            SysRequest::IpcGrantFrames { dst, va: _, len } => {
+                // Length sanity FIRST (the ADR-0004 rule: the
+                // cheapest check before any capability work) —
+                // page-granular, nonzero, bounded by the shares
+                // table itself (MAX_SHARED frames; a bigger ask is
+                // the transient refusal, not a policy stance).
+                if len == 0
+                    || len % 4096 != 0
+                    || (len as usize) > crate::frame_share::MAX_SHARED * 4096
+                {
+                    return Err(SysError::InvalidArgument(u64::from(len)));
+                }
+                // ADR-0027: the grant gate — a Domain capability with
+                // WRITE on dst (the kill pattern: the right to
+                // operate on that domain), refused and counted as an
+                // escalation attempt without it.
+                self.require_domain_cap(domain_id, dst)?;
+                // A dead grantee is ESRCH, not a silent drop.
+                if self.domain(dst).is_none() {
+                    return Err(SysError::UnknownDomain(dst));
+                }
+                // Unit = "validated; the kernel side maps" (the mmap
+                // precedent — the return VA is kernel-side truth).
+                Ok(SysValue::Unit)
+            }
             SysRequest::Ioctl { .. } => Err(SysError::NotImplemented(SYS_IOCTL)),
             SysRequest::NetRecv { .. } => Err(SysError::NotImplemented(SYS_NET_RECV)),
         }
@@ -1091,6 +1129,7 @@ fn syscall_nr(req: &SysRequest<'_>) -> u8 {
         SysRequest::IpcCall { .. } => SYS_IPC_CALL,
         SysRequest::IpcRecvWait { .. } => SYS_IPC_RECV_WAIT,
         SysRequest::IpcReply { .. } => SYS_IPC_REPLY,
+        SysRequest::IpcGrantFrames { .. } => SYS_IPC_GRANT,
         SysRequest::Ioctl { .. } => SYS_IOCTL,
         SysRequest::NetRecv { .. } => SYS_NET_RECV,
     }

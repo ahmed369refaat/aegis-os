@@ -44,6 +44,9 @@ pub enum MapError {
     AlreadyMapped(u64),
     /// No PTE at this VA on unmap.
     NotMapped(u64),
+    /// ADR-0027: the frame-refcount table refused (MAX_SHARED entries
+    /// live) — the transient capacity truth, never a policy stance.
+    SharesFull,
     /// Policy and hardware disagree about a region (should be impossible;
     /// loud rather than silent).
     Desync {
@@ -97,9 +100,54 @@ impl<const N: usize> FrameSource for PoolSource<'_, N> {
     }
 }
 
+/// ADR-0027: the shares-aware frame source. `alloc_frame` is the
+/// pool's (table frames for grant_map's intermediates); `free_frame`
+/// consults the refcount table — a SHARED frame is released (freed
+/// only on the last release, under the ORIGINAL owner's tag, exactly
+/// the reclaim rule), a private frame frees through the pool as
+/// today. munmap and grant_map's rollback both come through here: a
+/// frame another space still maps must never pool-free.
+pub struct SharesSource<'a, const N: usize> {
+    pub pool: &'a mut FramePool<N>,
+    pub buddy: &'a mut BuddyAllocator<N>,
+    pub owner: u32,
+    pub shares: &'a mut aegis_os::frame_share::FrameShares,
+}
+
+impl<const N: usize> FrameSource for SharesSource<'_, N> {
+    fn alloc_frame(&mut self) -> Result<u64, MapError> {
+        self.pool
+            .alloc_for(self.buddy, self.owner)
+            .map_err(MapError::Pool)
+    }
+    fn free_frame(&mut self, pa: u64) -> Result<(), MapError> {
+        if let Some(orig) = self.shares.owner_of(pa) {
+            if matches!(self.shares.release(pa), Ok(true)) {
+                // The last reference: free under the original owner's
+                // tag (the reclaim rule — a cross-tag free would
+                // corrupt the accounting).
+                return self.pool.free(self.buddy, pa, orig).map_err(MapError::Pool);
+            }
+            return Ok(());
+        }
+        self.pool
+            .free(self.buddy, pa, self.owner)
+            .map_err(MapError::Pool)
+    }
+}
+
 /// One domain's page tables, rooted at a PML4 frame.
 pub struct PageTables {
     pml4_pa: u64,
+}
+
+/// ADR-0027: the grant's frame bundle — the granted PAs (in VA
+/// order), the GRANTER's id (the refcount's owner-of-record), and
+/// the shares table itself. One struct, one argument.
+pub struct GrantFrames<'a> {
+    pub pas: &'a [u64],
+    pub owner: u32,
+    pub shares: &'a mut aegis_os::frame_share::FrameShares,
 }
 
 impl PageTables {
@@ -276,6 +324,110 @@ impl PageTables {
             len,
             flags,
         })
+    }
+
+    /// ADR-0027: map EXISTING frames (a grant) into the user half —
+    /// the same ten-check policy gate and the same rollback shape as
+    /// `map_region`, but every leaf PTE points at `pas[i]` (the
+    /// granter's frames). RW-only is HARDWIRED: a granted page never
+    /// arrives executable. No scrub — the page's CONTENT is the
+    /// point. Each page's refcount is acquired immediately before its
+    /// PTE write; the failure paths release exactly what was taken
+    /// (map_user_page's error frees through `src`, whose
+    /// shares-awareness does the release; the rollback does the
+    /// earlier pages the same way).
+    pub fn grant_map(
+        &mut self,
+        space: &mut aegis_os::memory::AddressSpace,
+        base: u64,
+        len: usize,
+        grant: &mut GrantFrames<'_>,
+        src: &mut dyn FrameSource,
+    ) -> Result<aegis_os::memory::Region, MapError> {
+        let GrantFrames { pas, owner, shares } = grant;
+        use aegis_os::memory::MemFlags;
+        if base >= USER_LIMIT || base.saturating_add(len as u64) > USER_LIMIT {
+            return Err(MapError::KernelHalf(base));
+        }
+        // The caller guarantees len == pas.len() * PAGE; a mismatch is
+        // a kernel bookkeeping bug — refuse it loudly, map nothing.
+        if len != pas.len() * PAGE as usize {
+            return Err(MapError::NotAligned(len as u64));
+        }
+        // RW-only, hardwired (ADR-0027: no EXEC on a granted page).
+        let flags = MemFlags(MemFlags::READ.0 | MemFlags::WRITE.0);
+        // The policy gate: the receiver's own ten checks — a grant
+        // cannot smuggle memory past a quota.
+        space
+            .map(base as usize, len, flags)
+            .map_err(MapError::Policy)?;
+        let pf = PteFlags::from_memflags(flags);
+        let end = base + len as u64;
+        let mut va = base;
+        let mut i = 0usize;
+        while va < end {
+            let frame = pas[i];
+            if shares.acquire(frame, *owner).is_err() {
+                // The table is full: the transient refusal. Nothing of
+                // THIS page was taken; the earlier pages unwind.
+                self.rollback(space, base, va, src);
+                return Err(MapError::SharesFull);
+            }
+            match self.map_user_page(va, frame, pf, src) {
+                Ok(()) => {}
+                Err(e) => {
+                    // The acquire of THIS page unwinds through the
+                    // source (shares-aware); the earlier pages through
+                    // the rollback.
+                    let _ = src.free_frame(frame);
+                    self.rollback(space, base, va, src);
+                    return Err(e);
+                }
+            }
+            va += PAGE;
+            i += 1;
+        }
+        Ok(aegis_os::memory::Region {
+            base: base as usize,
+            len,
+            flags,
+        })
+    }
+
+    /// ADR-0027: walk every PRESENT user leaf PTE and report
+    /// (va, pa) — the exit-release rule's eyes. The user half only
+    /// (PML4 slots < 256); kernel-half entries are never visited.
+    pub fn walk_user_frames(&self, f: &mut dyn FnMut(u64, u64)) {
+        for pml4i in 0..256usize {
+            let pml4e = Self::entry(self.pml4_pa, pml4i);
+            if pml4e & pte::PTE_P == 0 {
+                continue;
+            }
+            for pdpti in 0..512usize {
+                let pdpte = Self::entry(pml4e & ADDR_MASK, pdpti);
+                if pdpte & pte::PTE_P == 0 {
+                    continue;
+                }
+                for pdi in 0..512usize {
+                    let pde = Self::entry(pdpte & ADDR_MASK, pdi);
+                    if pde & pte::PTE_P == 0 {
+                        continue;
+                    }
+                    let pt = pde & ADDR_MASK;
+                    for pti in 0..512usize {
+                        let pte = Self::entry(pt, pti);
+                        if pte & pte::PTE_P == 0 || pte & pte::PTE_U == 0 {
+                            continue;
+                        }
+                        let va = ((pml4i as u64) << 39)
+                            | ((pdpti as u64) << 30)
+                            | ((pdi as u64) << 21)
+                            | ((pti as u64) << 12);
+                        f(va, pte & ADDR_MASK);
+                    }
+                }
+            }
+        }
     }
 
     /// Undo a partial `map_region`: unmap every present page in

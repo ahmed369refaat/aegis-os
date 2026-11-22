@@ -84,6 +84,50 @@ impl<const N: usize> FrameSource for SharedSource<'_, N> {
 /// The buffer is caller-owned (no_std, no allocation); size it with
 /// `pool.owned_by(owner)` — a short buffer leaks loudly by count (the
 /// caller checks the return against `owned_by`).
+/// ADR-0027 (the ADR-0024 D2 fix): release every frame the dying
+/// domain MAPS BUT DOES NOT OWN — the borrowed side of each share
+/// (fork-shared-from-parent, granted-in). The owner-owning side is
+/// `reclaim_domain_frames`' business; the two rules are disjoint
+/// (`owner_of(pa) != domain` here, `==` there). Release-to-zero frees
+/// under the ORIGINAL owner's tag, exactly as reclaim does. Returns
+/// how many borrowed references went back.
+pub fn release_borrowed_frames<const N: usize>(
+    tables: &crate::mm::page_table::PageTables,
+    pool: &mut FramePool<N>,
+    buddy: &mut BuddyAllocator<N>,
+    domain: u32,
+) -> usize {
+    // Collect ONLY the borrowed frames, filtering DURING the walk: a
+    // domain may map far more pages than MAX_SHARED, but its borrowed
+    // shares cannot exceed the table (each needs an entry) — so the
+    // buffer cannot truncate a real share.
+    let mut pas = [0u64; aegis_os::frame_share::MAX_SHARED];
+    let mut n = 0usize;
+    tables.walk_user_frames(&mut |_va, pa| {
+        let shares = context::shares_mut();
+        if let Some(orig) = shares.owner_of(pa) {
+            if orig != domain && n < pas.len() {
+                pas[n] = pa;
+                n += 1;
+            }
+        }
+    });
+    let mut released = 0usize;
+    for &pa in pas[..n].iter() {
+        let shares = context::shares_mut();
+        if let Some(orig) = shares.owner_of(pa) {
+            if orig != domain {
+                let last = matches!(shares.release(pa), Ok(true));
+                released += 1;
+                if last {
+                    let _ = pool.free(buddy, pa, orig);
+                }
+            }
+        }
+    }
+    released
+}
+
 pub fn reclaim_domain_frames<const N: usize>(
     pool: &mut FramePool<N>,
     buddy: &mut BuddyAllocator<N>,

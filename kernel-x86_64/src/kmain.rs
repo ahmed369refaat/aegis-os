@@ -1920,6 +1920,145 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
     }
 
+    // ── 21. ADR-0027: the page-grant proof — memory capability
+    //      transfer, ring 3 to ring 3, over the ADR-0024 accounting.
+    //      A granter (uid 0, holding a Domain capability on the
+    //      grantee — the kill pattern) mmaps a page, writes a
+    //      pattern, and grants it RW through the grantee's OWN
+    //      policy (quota and overlap apply; the window is the
+    //      receiver's next free one). The granted VA travels through
+    //      the sync IPC (two u16 halves — the message bound), the
+    //      grantee reads the pattern THROUGH the grant, writes its
+    //      mark, and replies; the granter's call returns the reply
+    //      and its OWN page carries the mark — the bidirectional
+    //      shared-memory proof. The refcount keeps the page alive
+    //      for both; each exit releases its side (the D2 rule this
+    //      round fixed). ──
+    {
+        if let Some((dom, _)) = crate::sched::park::completed_drain() {
+            let mut b = [0u8; 20];
+            crate::serial::write_str("[M3] grants: ERROR: stale mailbox entry dom=");
+            crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+            crate::serial::write_str("; halting\n");
+            hw::halt_forever();
+        }
+        struct GrantRun {
+            run: crate::sched::context::UserRun,
+            ctx: crate::sched::context::UserContext,
+        }
+        let mut runs: [Option<GrantRun>; 2] = [None, None];
+        for (i, dom) in [37u32, 38].iter().enumerate() {
+            // data[1]: 0 = granter, 1 = grantee; data[2..10]: channel
+            // E; data[10]: the grantee's id (the grant's dst).
+            let mut data = [0u8; 0x70];
+            data[0] = 10;
+            data[1] = u8::from(*dom == 38);
+            match mm::user::spawn_user_blob(
+                &mut k,
+                &mut pool,
+                *dom,
+                aegis_os::profile::service_profile(),
+                RING3_PREEMPT,
+                &data,
+            ) {
+                Ok(sp) => {
+                    runs[i] = Some(GrantRun {
+                        run: sp.run,
+                        ctx: sp.ctx,
+                    })
+                }
+                Err(_) => {
+                    line(&mut out, &["[M3] grants: ERROR: spawn failed; halting"]);
+                    hw::halt_forever();
+                }
+            }
+        }
+        // The supervisor 39 (uid 0, never runs — the round-M rule)
+        // creates the endpoint, grants WRITE on it to the granter,
+        // and confers the GRANT GATE: a Domain(38) capability in the
+        // granter's own list (the endpoint-grant shape for domain
+        // caps — a privileged, auditable bootstrap; the spawned
+        // granter's derived uid is never root, so the self-grant API
+        // is not its path).
+        let _ = k.create_domain_with(39, aegis_os::profile::service_profile(), 0, 0, 0);
+        let ep_e = k.ipc_endpoint_create(39, 38).expect("endpoint E");
+        let _ = k.ipc_endpoint_grant(39, ep_e.0, 37, aegis_os::capability::Rights::WRITE);
+        k.cap_grant_domain_to(39, 37, 38)
+            .expect("the granter's Domain cap on the grantee");
+        let _ = k.sched.unregister(39);
+        // Bake: the channel qword + the grantee's id at data[10].
+        let bake = |run: &mut crate::sched::context::UserRun, chan: u64, dst: u8| {
+            if let Some(page) = run.tables.translate(0x00403000) {
+                crate::memops::write_u64(page + 2, chan);
+                crate::memops::write_u16(page + 10, u16::from(dst));
+            }
+        };
+        if let Some(r) = runs[0].as_mut() {
+            bake(&mut r.run, u64::from(ep_e.0), 38);
+        }
+        if let Some(r) = runs[1].as_mut() {
+            bake(&mut r.run, u64::from(ep_e.0), 38);
+        }
+        // The grantee parked-runnable; the granter flat-launched (the
+        // opening yield hands the dispatcher the chain).
+        if let Some(r) = runs[1].take() {
+            crate::sched::context::stash_parked(
+                r.run,
+                crate::sched::context::ParkedContext::from_user_context(&r.ctx),
+            );
+        } else {
+            line(&mut out, &["[M3] grants: ERROR: grantee missing; halting"]);
+            hw::halt_forever();
+        }
+        {
+            let Some(r) = runs[0].take() else {
+                line(&mut out, &["[M3] grants: ERROR: granter missing; halting"]);
+                hw::halt_forever();
+            };
+            let kernel_cr3 = hw::read_cr3();
+            r.run.tables.activate();
+            crate::sched::context::begin(r.run);
+            crate::sched::context::launch(&r.ctx);
+            hw::write_cr3(kernel_cr3);
+        }
+        let mut clean = 0usize;
+        while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            if !matches!(exit, crate::sched::context::ExitKind::Exited(0)) {
+                let mut b = [0u8; 20];
+                crate::serial::write_str("[M3] grants: ERROR: dom=");
+                crate::serial::write_str(strutil::dec(u64::from(dom), &mut b));
+                crate::serial::write_str(" exit=");
+                if let crate::sched::context::ExitKind::Exited(c) = exit {
+                    crate::serial::write_str(strutil::dec(c, &mut b));
+                }
+                crate::serial::write_str(
+                    "
+",
+                );
+                line(
+                    &mut out,
+                    &["[M3] grants: ERROR: a run exited nonzero; halting"],
+                );
+                hw::halt_forever();
+            }
+            clean += 1;
+            mm::user::destroy_user(&mut k, &mut pool, dom);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+        }
+        if clean == 2 {
+            line(
+                &mut out,
+                &["[M3] grants: 1 page RW, the grantee read the pattern and the granter saw the reply-write"],
+            );
+        } else {
+            line(
+                &mut out,
+                &["[M3] grants: ERROR: expected 2 clean exits, saw fewer; halting"],
+            );
+            hw::halt_forever();
+        }
+    }
+
     // ── 13. the terminal guard-page proof: the write must #PF, the
     // dispatch must confirm CR2 is exactly the guard page, print the
     // marker, and power off cleanly (CI greps it). Reached only when

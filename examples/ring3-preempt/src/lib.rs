@@ -59,6 +59,8 @@ _ring3_start:
     je 14f                            /* mode 8: the IPC pair */
     cmp al, 9
     je 15f                            /* mode 9: the sync pair */
+    cmp al, 10
+    je 16f                            /* mode 10: the grant pair */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -175,7 +177,7 @@ _ring3_start:
     call next_instr
 next_instr:
     pop rsi
-    add rsi, 0x416                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
+    add rsi, 0x5DE                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
     mov rdx, 0x0040C000               /* the kernel's trampoline page */
     syscall
     test rax, rax
@@ -520,6 +522,146 @@ sync_callee:
     xor edi, edi
     syscall
 
+16: /* ── mode 10: the grant pair (ADR-0027) ────────────────────── */
+    /* data[1]: 0 = granter, 1 = grantee. data[2..10]: channel E
+       (owned by the grantee, WRITE granted to the granter).
+       data[10]: the grantee's domain id (the grant's dst).
+       The granter mmaps a page, writes a pattern, grants it RW, and
+       passes the granted VA in the receiver through TWO u16 sends
+       (the IPC message bound is 64 bytes — a VA does not fit whole);
+       the sync call/reply then confirms the read. The grantee reads
+       the pattern through the grant, writes its own mark, replies.
+       The granter's own page must then carry the mark — the
+       bidirectional shared-memory proof. */
+    movzx eax, byte ptr [0x00403001]
+    mov rbx, qword ptr [0x00403002]    /* channel E */
+    test eax, eax
+    jnz grant_grantee
+
+    /* ── the granter: mmap, pattern, grant, tell, call, verify ── */
+    mov eax, 24                        /* the opening yield — the
+                                          round-M discipline */
+    syscall
+    mov eax, 4                         /* mmap(NULL, 4096, RW) */
+    xor edi, edi
+    mov rsi, 4096
+    mov edx, 3
+    syscall
+    mov r12, rax                       /* A_va: survives syscalls */
+    cmp rax, 0x0040D000
+    jb 145f
+    mov rax, 0x600D600D                /* the pattern at +0 */
+    mov [r12], rax
+    mov rax, 0xAB12                    /* a second word at +8 */
+    mov [r12+8], rax
+    movzx edi, byte ptr [0x0040300A]   /* dst: the grantee's id */
+    mov rsi, r12                       /* va: my page */
+    mov edx, 4096                      /* len: one page */
+    mov eax, 29                        /* ipc_grant_frames */
+    syscall
+    mov r13, rax                       /* B_va: where it landed */
+    cmp rax, 0x0040D000
+    jb 145f
+    test rax, 0xFFF
+    jnz 145f                           /* not page-aligned: a bug */
+    /* tell the grantee where: the page number in two 6-bit halves
+       (the message bound is 64 — a raw address half would refuse;
+       B_va is page-aligned and the user half is tiny, so the page
+       number fits 12 bits) */
+    mov rax, r13
+    shr rax, 12                        /* the page number */
+    mov r14, rax
+    and r14, 0x3F                      /* lo6 */
+    mov r15, rax
+    shr r15, 6                         /* hi6 */
+    mov eax, 7                         /* ipc_send(E, lo16) */
+    mov rdi, rbx
+    mov rsi, r14
+    syscall
+    cmp rax, 0
+    jl 147f
+    mov eax, 7                         /* ipc_send(E, hi16) */
+    mov rdi, rbx
+    mov rsi, r15
+    syscall
+    cmp rax, 0
+    jl 147f
+    /* the sync confirmation: call(E, 7) -> the grantee's 0x5EED */
+    mov eax, 26
+    mov rdi, rbx
+    mov rsi, 7
+    syscall
+    cmp rax, 42
+    jne 148f
+    /* the mark through MY page: the grant is shared memory */
+    mov rbx, [r12+16]
+    mov rax, 0xF00DF00D
+    cmp rbx, rax
+    jne 149f
+    mov eax, 63
+    xor edi, edi
+    syscall
+
+grant_grantee:
+    /* ── the grantee: two recvs (the VA halves), read the pattern
+       through the grant, write the mark, reply ── */
+    mov eax, 27                        /* recv_wait: lo6 */
+    mov rdi, rbx
+    syscall
+    cmp rax, 0x3F
+    ja 150f
+    mov r12, rax                       /* lo6 */
+    mov eax, 27                        /* recv_wait: hi6 */
+    mov rdi, rbx
+    syscall
+    cmp rax, 0x3F
+    ja 151f
+    shl rax, 6
+    or r12, rax                        /* the page number */
+    shl r12, 12                        /* B_va = page << 12 */
+    /* the granter's pattern, through the grant */
+    mov rax, [r12]
+    cmp rax, 0x600D600D
+    jne 152f
+    mov rax, [r12+8]
+    cmp rax, 0xAB12
+    jne 153f
+    mov rax, 0xF00DF00D                /* my mark at +16 */
+    mov [r12+16], rax
+    mov r14, rax                       /* keep the mark for the check
+                                          (imm32 sign-extends; the
+                                          register form compares) —
+                                          r14, NEVER rbx: rbx is the
+                                          CHANNEL the reply needs */
+    mov rax, [r12+16]
+    cmp rax, r14
+    jne 154f                           /* my write did not stick */
+    /* reply(E, 42) — with the bounded EAGAIN retry: the tick may
+       have run ME ahead of the caller's call (its park had not
+       happened yet when my first reply fired) — the -EAGAIN is the
+       transient truth, not an error; yield so the caller reaches
+       its call, then answer it. */
+    mov r13d, 0                        /* the retry budget */
+grant_reply:
+    mov eax, 28
+    mov rdi, rbx
+    mov rsi, 42
+    syscall
+    cmp rax, 1
+    je grant_reply_done
+    cmp rax, -11                       /* EAGAIN: nobody parked yet */
+    jne 155f
+    inc r13
+    cmp r13, 64
+    jae 155f                           /* starved: a bug */
+    mov eax, 24                        /* yield: let the caller call */
+    syscall
+    jmp grant_reply
+grant_reply_done:
+    mov eax, 63
+    xor edi, edi
+    syscall
+
 sig_handler:                          /* SIGUSR1: set the flag, ret */
     mov rax, 0x51515151
     mov qword ptr [0x00403060], rax
@@ -605,6 +747,39 @@ sig_handler:                          /* SIGUSR1: set the flag, ret */
     syscall
 142: mov eax, 63
     mov edi, 142                      /* a reply did not wake one waiter */
+    syscall
+145: mov eax, 63
+    mov edi, 145                      /* the granter: mmap/grant window failed */
+    syscall
+147: mov eax, 63
+    mov edi, 147                      /* the granter: a send failed */
+    syscall
+148: mov eax, 63
+    mov edi, 148                      /* the granter: the call returned wrong */
+    syscall
+149: mov eax, 63
+    mov edi, 149                      /* the granter: the mark never landed */
+    syscall
+146: mov eax, 63
+    mov edi, 146                      /* the grantee: a granted read/write failed */
+    syscall
+150: mov eax, 63
+    mov edi, 150                      /* the grantee: recv lo6 out of bound */
+    syscall
+151: mov eax, 63
+    mov edi, 151                      /* the grantee: recv hi6 out of bound */
+    syscall
+152: mov eax, 63
+    mov edi, 152                      /* the grantee: the w0 pattern wrong */
+    syscall
+153: mov eax, 63
+    mov edi, 153                      /* the grantee: the w1 pattern wrong */
+    syscall
+154: mov eax, 63
+    mov edi, 154                      /* the grantee: the write did not stick */
+    syscall
+155: mov eax, 63
+    mov edi, 155                      /* the grantee: the reply did not wake */
     syscall
 "#,
 );

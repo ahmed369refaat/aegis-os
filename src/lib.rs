@@ -1294,6 +1294,33 @@ impl<const N: usize> Kernel<N> {
         d.caps.insert(cap).map_err(|_| KernelError::TooManyDomains)
     }
 
+    /// ADR-0027: confer a Domain(target)/WRITE capability on ANOTHER
+    /// holder — the `ipc_endpoint_grant` shape for domain caps (a
+    /// privileged, auditable bootstrap: grants never happen without a
+    /// uid-0 caller). The holder's syscall gates (kill, page grants)
+    /// then pass for that target.
+    pub fn cap_grant_domain_to(
+        &mut self,
+        supervisor_id: u32,
+        holder: u32,
+        target: u32,
+    ) -> Result<crate::capability::CapHandle, KernelError> {
+        if self.domain_mut(supervisor_id)?.uid != 0 {
+            return Err(KernelError::NotAuthorized(supervisor_id));
+        }
+        // Both ends must exist — a capability for (or held by) a
+        // missing domain is meaningless.
+        self.domain_mut(holder)?;
+        self.domain_mut(target)?;
+        let cap = crate::capability::Capability {
+            resource: crate::capability::Resource::Domain(target),
+            rights: crate::capability::Rights::WRITE,
+            generation: 0,
+        };
+        let d = self.domain_mut(holder)?;
+        d.caps.insert(cap).map_err(|_| KernelError::TooManyDomains)
+    }
+
     /// ADR-0004 §2: create an endpoint owned by `owner_id` and mint
     /// the full conferable capability (READ|WRITE|GRANT) into the
     /// OWNER's table. Supervisor only (uid 0): endpoint creation is a
@@ -3670,6 +3697,160 @@ mod adr0026_sync_ipc {
                 }
             ),
             Err(SysError::PermissionDenied)
+        ));
+    }
+}
+
+// ── ADR-0027: page grants — the core gate ─────────────────────
+
+#[cfg(test)]
+mod adr0027_grants {
+    use super::*;
+    use crate::profile::service_profile;
+    use crate::sys::{SysError, SysRequest, SysValue};
+
+    /// The grant frame: domain 2 is the GRANTER (uid 0 —
+    /// cap_grant_domain is the supervisor self-grant API, the kill
+    /// pattern), domain 1 the grantee-side target.
+    fn frame() -> Kernel<{ crate::buddy::FRAME_COUNT }> {
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 101, 0, 0)
+            .unwrap();
+        k.create_domain_with(2, service_profile(), 0, 0, 0).unwrap();
+        k
+    }
+
+    /// The gate: no Domain capability on dst, no grant. The refusal
+    /// is an escalation attempt (the organic monitor signal), like
+    /// every other capability gate.
+    #[test]
+    fn grant_requires_the_domain_capability() {
+        let mut k = frame();
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcGrantFrames {
+                    dst: 1,
+                    va: 0x1000,
+                    len: 4096
+                }
+            ),
+            Err(SysError::PermissionDenied)
+        ));
+        assert_eq!(k.domain_mut(2).unwrap().stats.escalation_attempts, 1);
+        // The granter self-grants the Domain cap (the kill pattern):
+        // the gate passes.
+        k.cap_grant_domain(2, 1).unwrap();
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcGrantFrames {
+                    dst: 1,
+                    va: 0x1000,
+                    len: 4096
+                }
+            ),
+            Ok(SysValue::Unit)
+        ));
+    }
+
+    /// The supervisor's conferral API: a uid-0 caller puts the
+    /// Domain(target) cap in ANOTHER holder's list (the endpoint-grant
+    /// shape); a non-root caller refuses.
+    #[test]
+    fn cap_grant_domain_to_confers_on_the_holder() {
+        let mut k = frame();
+        // Domain 1 (uid 101) holds nothing yet: the gate refuses.
+        assert!(matches!(
+            k.syscall(
+                1,
+                SysRequest::IpcGrantFrames {
+                    dst: 2,
+                    va: 0x1000,
+                    len: 4096
+                }
+            ),
+            Err(SysError::PermissionDenied)
+        ));
+        // A non-root caller cannot confer.
+        assert!(k.cap_grant_domain_to(1, 1, 2).is_err());
+        // The uid-0 granter (2) confers Domain(2) on 1: the gate now
+        // passes from 1's side.
+        k.cap_grant_domain_to(2, 1, 2).unwrap();
+        assert!(matches!(
+            k.syscall(
+                1,
+                SysRequest::IpcGrantFrames {
+                    dst: 2,
+                    va: 0x1000,
+                    len: 4096
+                }
+            ),
+            Ok(SysValue::Unit)
+        ));
+    }
+
+    /// A dead grantee is ESRCH, not a silent drop.
+    #[test]
+    fn grant_to_a_dead_domain_refuses() {
+        let mut k = frame();
+        // The cap exists for a target that DIES holding it — the
+        // liveness check must catch it (an unknown id would need its
+        // own cap, and cap_grant_domain refuses missing targets).
+        k.create_domain(3, service_profile()).unwrap();
+        k.cap_grant_domain(2, 3).unwrap();
+        k.destroy_domain(3).unwrap();
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcGrantFrames {
+                    dst: 3,
+                    va: 0x1000,
+                    len: 4096
+                }
+            ),
+            Err(SysError::UnknownDomain(3))
+        ));
+    }
+
+    /// The bound: page-granular, nonzero, and never above the shares
+    /// table's own capacity (MAX_SHARED pages).
+    #[test]
+    fn grant_len_is_bounded_and_page_granular() {
+        let mut k = frame();
+        k.cap_grant_domain(2, 1).unwrap();
+        for bad in [
+            0u32,
+            1,
+            4097,
+            (crate::frame_share::MAX_SHARED as u32 + 1) * 4096,
+        ] {
+            assert!(
+                matches!(
+                    k.syscall(
+                        2,
+                        SysRequest::IpcGrantFrames {
+                            dst: 1,
+                            va: 0x1000,
+                            len: bad
+                        }
+                    ),
+                    Err(SysError::InvalidArgument(_))
+                ),
+                "len {bad} must refuse"
+            );
+        }
+        // The exact table capacity is fine.
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::IpcGrantFrames {
+                    dst: 1,
+                    va: 0x1000,
+                    len: (crate::frame_share::MAX_SHARED as u32) * 4096
+                }
+            ),
+            Ok(SysValue::Unit)
         ));
     }
 }

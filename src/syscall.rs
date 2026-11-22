@@ -83,6 +83,10 @@ pub const SYS_IPC_RECV_WAIT: u8 = 27;
 /// ipc_reply(2): the owner answers its oldest waiting caller; the
 /// caller's blocked call returns the reply len.
 pub const SYS_IPC_REPLY: u8 = 28;
+/// ADR-0027: ipc_grant_frames(dst, va, len) — confer MY mapped pages
+/// on dst, RW-only, through the receiver's own policy (quota and
+/// overlap apply); the return is the VA where they landed in dst.
+pub const SYS_IPC_GRANT: u8 = 29;
 /// Reserved: domain exit. Always reachable; a mask without it is rejected
 /// by convention (see `profile` tests).
 pub const SYS_EXIT: u8 = 63;
