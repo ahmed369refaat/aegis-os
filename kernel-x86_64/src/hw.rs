@@ -182,8 +182,18 @@ pub fn cpuid1_ecx() -> u64 {
 /// on a CPU without it is #UD).
 static SMAP_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// ADR-0031 section A: the ENTRY CLAC gate — 1 iff SMAP is enabled.
+/// The naked entry stubs (SYSCALL and the exception path) read this
+/// byte RIP-relatively and execute `clac` only when the feature
+/// exists (CLAC without CPUID SMAP support is #UD), so the kernel
+/// never inherits a user-set AC (ring 3 can set AC by plain
+/// pushfq/popfq; POP F at CPL3 may modify it — no signal frame
+/// needed). Set together with SMAP_ACTIVE at boot.
+pub static ENTRY_CLAC_GATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 pub fn set_smap_active(on: bool) {
     SMAP_ACTIVE.store(on, core::sync::atomic::Ordering::SeqCst);
+    ENTRY_CLAC_GATE.store(u8::from(on), core::sync::atomic::Ordering::SeqCst);
 }
 
 #[must_use]

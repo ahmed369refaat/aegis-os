@@ -17,7 +17,7 @@
 
 use super::frame::{vector_name, ExceptionFrame};
 use crate::{hw, serial, strutil};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// IST stacks: 16 KiB each, 16-byte aligned, zero-filled in `.bss` by the
 /// entry stub. Guarded pool-backed stacks (mm/stacks.rs) are the PR-1.2
@@ -86,6 +86,13 @@ static mut SMEP_RESUME: u64 = 0;
 /// (SMAP), not a bug.
 static ARMED_SMAP: AtomicBool = AtomicBool::new(false);
 static SMAP_VA: AtomicU64 = AtomicU64::new(0);
+/// ADR-0031 section A: how many armed SMAP probes actually faulted.
+/// The bootstrap re-runs the probe after a domain deliberately set AC
+/// and made a copy-free syscall excursion: on an entry that inherited
+/// AC, the read would NOT fault (AC suppresses SMAP), the handler
+/// would never run, and this counter would not move — the CI-visible
+/// witness that the entry's gated `clac` held.
+static SMAP_PROBE_HITS: AtomicU32 = AtomicU32::new(0);
 /// F15 (ADR-0006): armed write-permission selftest — the next data #PF
 /// at exactly this address is the deliberate CPL0 write to a read-only
 /// image page (CR0.WP enforced), not a bug.
@@ -424,6 +431,7 @@ fn dispatch(f: &mut ExceptionFrame) {
         // past it (the guard-read pattern).
         f.rip += MOV_LEN;
         ARMED_SMAP.store(false, Ordering::SeqCst);
+        SMAP_PROBE_HITS.fetch_add(1, Ordering::SeqCst);
         serial::write_str("[SEC ] SMAP selftest: kernel read of user page outside STAC faulted\n");
         return;
     }
@@ -762,6 +770,15 @@ pub fn arm_smap_read(va: u64) {
         );
     }
     ARMED_SMAP.store(false, Ordering::SeqCst);
+}
+
+/// ADR-0031 section A: how many armed SMAP probes faulted so far (see
+/// `SMAP_PROBE_HITS`). The bootstrap snapshots this around the
+/// post-AC-setter re-probe: +1 means the fault fired (the entry's
+/// `clac` held); +0 means AC leaked past the entry and SMAP was
+/// silently OFF for the excursion.
+pub fn smap_probe_hits() -> u32 {
+    SMAP_PROBE_HITS.load(Ordering::SeqCst)
 }
 
 pub fn arm_guard_read(va: u64) {

@@ -9,14 +9,18 @@
 //! - **STAR slot arithmetic** is pinned by `gdt`'s host test: SYSCALL
 //!   enters on CS=0x30/SS=0x38, SYSRET leaves on CS=0x2b/SS=0x23
 //!   (RPL 3 added by the instruction itself).
-//! - **SFMASK = IF|TF|DF**: the kernel always starts a syscall with
-//!   interrupts off, no trap flag, no direction flag — SYSRET restores
-//!   the user RFLAGS from R11 untouched. Since ADR-0012 the stub also
-//!   executes an explicit `cli` right after `swapgs`: in this
-//!   environment (QEMU 10.0.13 TCG, `-cpu max`) SYSCALL demonstrably
-//!   does NOT apply FMASK.IF — the dispatch was measured running with
-//!   IF=1 — so the no-nesting invariant is self-enforced, not trusted
-//!   to the MSR.
+//! - **SFMASK = IF|TF|DF|AC**: the kernel always starts a syscall with
+//!   interrupts off, no trap flag, no direction flag, and no alignment
+//!   check (AC — ADR-0031: a user-set AC must never make supervisor
+//!   accesses bypass SMAP) — SYSRET restores the user RFLAGS from R11
+//!   untouched. Since ADR-0012 the stub also executes an explicit
+//!   `cli` right after `swapgs`: in this environment (QEMU 10.0.13
+//!   TCG, `-cpu max`) SYSCALL demonstrably does NOT apply FMASK.IF —
+//!   the dispatch was measured running with IF=1 — so the no-nesting
+//!   invariant is self-enforced, not trusted to the MSR. Since
+//!   ADR-0031 the same self-enforcement covers AC: a gated `clac`
+//!   (on `hw::ENTRY_CLAC_GATE`, i.e. iff SMAP exists) runs before the
+//!   stub's first memory-touching instruction.
 //! - **SYSCALL does not switch stacks.** The stub loads RSP from the
 //!   per-CPU `kstack_top` via `%gs:` right after `swapgs`; the TSS
 //!   RSP0 (same stack) only serves the *interrupt/exception* path.
@@ -56,8 +60,11 @@ const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_FMASK: u32 = 0xC000_0083;
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
-/// RFLAGS bits the kernel clears on entry: IF (9), TF (8), DF (10).
-const FMASK_IF_TF_DF: u64 = 1 << 9 | 1 << 8 | 1 << 10;
+/// RFLAGS bits the kernel clears on SYSCALL entry: IF (9), TF (8),
+/// DF (10), and AC (18, ADR-0031 — a user-set AC must not survive the
+/// transition; the stub's gated `clac` self-enforces the same bit for
+/// environments where the FMASK is not applied).
+const FMASK_IF_TF_DF_AC: u64 = 1 << 9 | 1 << 8 | 1 << 10 | 1 << 18;
 
 /// Last measured SYSCALL→SYSRET round-trip (TSC cycles). Written by the
 /// stub (plain store — single CPU), read by kmain after the run.
@@ -174,7 +181,7 @@ pub fn init() {
     hw::wrmsr(MSR_STAR, star);
     let entry: extern "C" fn() = syscall_entry;
     hw::wrmsr(MSR_LSTAR, entry as usize as u64);
-    hw::wrmsr(MSR_FMASK, FMASK_IF_TF_DF);
+    hw::wrmsr(MSR_FMASK, FMASK_IF_TF_DF_AC);
     // EFER.SCE (bit 0): the instructions exist at all.
     let efer = hw::rdmsr(MSR_EFER);
     hw::wrmsr(MSR_EFER, efer | 1);
@@ -207,6 +214,14 @@ pub extern "C" fn syscall_entry() {
                                        // so the stub enforces the no-nesting
                                        // invariant itself; SYSRET restores the
                                        // user's IF from R11)
+        "cmpb $0, {clacg}(%rip)",      // ADR-0031: never inherit a user-set
+        "je   1f",                     // AC — clear it before the stub's
+        "clac",                        // first memory access, but only when
+        "1:",                          // SMAP exists (else CLAC is #UD). The
+                                       // gate byte is set at boot with
+                                       // SMAP_ACTIVE; swapgs/cli above touch
+                                       // no memory, so nothing has run with
+                                       // the inherited AC.
         "movq %rbp, {ubp}(%rip)",       // ADR-0024: park the user's
         "movq %r12, {ur12}(%rip)",      // callee-saved five BEFORE
         "movq %r13, {ur13}(%rip)",      // anything can clobber them
@@ -290,6 +305,7 @@ pub extern "C" fn syscall_entry() {
         off_rcx = const OFF_RCX,
         off_r11 = const OFF_R11,
         off_rbx = const OFF_RBX,
+        clacg = sym crate::hw::ENTRY_CLAC_GATE,
         options(att_syntax),
     );
 }

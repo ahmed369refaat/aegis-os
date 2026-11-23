@@ -216,6 +216,16 @@ pub extern "C" fn exception_common() {
         // IF=0 from the first instruction; iretq restores the
         // interrupted context's IF bit exactly.
         "cli",
+        // ADR-0031: never inherit a user-set AC on the exception path
+        // either (ring 3 sets it by pushfq/popfq; the CPU does not
+        // clear AC on interrupt delivery) — clear it before the first
+        // push, gated on the boot-time SMAP byte (CLAC without SMAP
+        // support is #UD). cli touches no memory; nothing above ran
+        // with the inherited AC.
+        "cmpb $0, {clacg}(%rip)",
+        "je   1f",
+        "clac",
+        "1:",
         "pushq %rax",
         "pushq %rbx",
         "pushq %rcx",
@@ -253,6 +263,7 @@ pub extern "C" fn exception_common() {
         "popq %rax",
         "addq $16, %rsp", // drop vector + error code
         "iretq",
+        clacg = sym crate::hw::ENTRY_CLAC_GATE,
         options(att_syntax),
     );
 }
