@@ -264,6 +264,7 @@ mod load {
             (*t).ist[2] = tops[2]; // #MC
             (*t).ist[3] = tops[3]; // #SS
             (*t).ist[4] = tops[4]; // #PF (PR-1.4)
+            (*t).ist[5] = tops[5]; // the interrupt family (ADR-0030)
 
             (*gdtr).limit = (8 * 10 - 1) as u16;
             (*gdtr).base = g as u64;

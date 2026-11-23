@@ -28,7 +28,13 @@ pub const EXEC_TARGET_ELF: &[u8] = include_bytes!("../blob/ring3-exec-target.bin
 /// The registry: (absolute path, ELF image). Lookup is exact-match —
 /// no prefix games, no wildcards; a path either names an image or it
 /// does not.
-pub const REGISTRY: &[(&str, &[u8])] = &[("/bin/exec-target", EXEC_TARGET_ELF)];
+pub const EXEC_SH_ELF: &[u8] = include_bytes!("../blob/ring3-sh.bin");
+
+/// Phase 7: the registry's second citizen — the shell init execve's.
+pub const REGISTRY: &[(&str, &[u8])] = &[
+    ("/bin/exec-target", EXEC_TARGET_ELF),
+    ("/bin/sh", EXEC_SH_ELF),
+];
 
 /// Resolve `path` to its image bytes. `None` is `-ENOENT` at the arm.
 #[must_use]

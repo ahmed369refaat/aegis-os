@@ -17,6 +17,12 @@
 #                          boot 1 writes persist.txt (PERSIST:WRITTEN),
 #                          boot 2 must read it back (PERSIST:VERIFIED) —
 #                          the Phase 6 S5 / M3 exit-criterion lane
+#   ./boot.sh --verify-shell
+#                          build + boot the M3 shell session: a lean q35
+#                          with the IRQ-driven TTY, stdin fed from
+#                          scripts/shell-session.txt — PID 1 execve's
+#                          /bin/sh and the shell runs the command set
+#                          (echo/ls/cat/mkdir/rm/cp/mv/exit) live
 #   ./boot.sh --build-only build the image, print its path, don't boot
 #
 # Requirements: rustup target x86_64-unknown-none; binutils (objcopy, ld,
@@ -53,6 +59,14 @@ rustc --edition 2021 --crate-type=lib --emit=obj \
 ld -T "examples/ring3-exec-target/exec.ld" \
    -o "kernel-x86_64/blob/ring3-exec-target.bin" "target/ring3-exec-target.o"
 
+echo "==> [0c/4] linking the shell (a REAL ELF64 — /bin/sh, opt-level=z + gc-sections)"
+rustc --edition 2021 --crate-type=bin -C panic=abort -C opt-level=z -C codegen-units=1 \
+      -C debug-assertions=off -C overflow-checks=off \
+      -C linker=ld -C link-arg=-Texamples/ring3-sh/sh.ld -C link-arg=--gc-sections \
+      -C link-arg=-s -C relocation-model=static \
+      --target x86_64-unknown-none examples/ring3-sh/src/lib.rs \
+      -o kernel-x86_64/blob/ring3-sh.bin
+
 echo "==> [1/4] building the 64-bit kernel (x86_64-unknown-none, release)"
 cargo build -p aegis-kernel --release --target x86_64-unknown-none
 
@@ -86,6 +100,10 @@ fi
 MODE=run
 MACHINE_ARGS=(-machine pc -cpu max -m 128M)
 EXTRA_GREPS=()
+# Every QEMU run's stdin is EXPLICIT: /dev/null unless a lane feeds a
+# session. Hermetic lanes (and CI without a terminal) never hang on a
+# inherited tty, and the shell's idle-exit contract stays honest.
+STDIN_FILE=/dev/null
 case "${1:-}" in
   --verify)
     MODE=verify
@@ -239,6 +257,31 @@ case "${1:-}" in
       "cross-device DMA FAULTED (FSTS.PPF set)"  # the ADR-0018 negative probe still faults with IR on
     )
     ;;
+  --verify-shell)
+    # Phase 7 (M3): the shell session. A lean q35 — the IOMMU so the
+    # full MADT -> IOAPIC -> broker chain runs and the TTY takes its
+    # interrupt (isa irq 4), and NOTHING else: no vblk, no NIC — the
+    # machine exists for the console. stdin IS the session (the typed
+    # commands); every other lane pins stdin to /dev/null so the
+    # shell's idle exit keeps them green.
+    MODE=verify
+    MACHINE_ARGS=(-machine q35 -cpu max -m 128M
+                  -device intel-iommu,intremap=off)
+    STDIN_FILE=scripts/shell-session.txt
+    EXTRA_GREPS=(
+      "[TTY] armed: isa irq 4"  # the IRQ-driven TTY (the interrupt -> ring chain, live)
+      "[SH] up"  # init execve'd /bin/sh; the shell banner
+      "[SH] e hello from aegis-sh"  # echo: write(2) to fd 1
+      "[SH] mkdir /pub/shdir: ok"  # mkdir(83)
+      "[SH] cp /pub/round-j.txt /pub/shdir/copy.txt 21 bytes"  # open+read+write(O_CREAT)
+      "[SH] c /pub/shdir/copy.txt: aegis file roundtrip"  # the copy round-trips byte-exact
+      "[SH] l /pub: "  # getdents64(259): the names line
+      " shdir"  # ...including the directory the shell just made
+      "[SH] mv /pub/shdir/copy.txt /pub/shdir/moved.txt 21 bytes"  # copy + unlink
+      "[SH] rm /pub/shdir/moved.txt: ok"  # unlink(87)
+      "[SH] x"  # the clean session end
+    )
+    ;;
   --verify-persist)
     # Phase 6 S5 (the M3 exit criterion): the two-boot persistence
     # proof. Lean machine — the IOMMU, the demo vblk on bus 0 (its
@@ -385,9 +428,9 @@ if [ "$MODE" = "verify" ]; then
   if [ "${1:-}" = "--verify-q35" ]; then
     TRACE_LOG=$(mktemp)
     timeout "$QEMU_TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" \
-      -trace enable=vtd_* 2>"$TRACE_LOG" | tee "$LOG"
+      -trace enable=vtd_* 2>"$TRACE_LOG" < "$STDIN_FILE" | tee "$LOG"
   else
-    timeout "$QEMU_TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" | tee "$LOG"
+    timeout "$QEMU_TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" < "$STDIN_FILE" | tee "$LOG"
   fi
   END=$(date +%s.%N)
   echo

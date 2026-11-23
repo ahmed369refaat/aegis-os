@@ -113,25 +113,35 @@ const LCR: u16 = COM1 + 3;
 const LSR: u16 = COM1 + 5;
 
 /// Bring the UART up: 8N1, FIFOs on and cleared, the RX interrupt
-/// enabled. Any stale byte in the receiver flushes first so the
-/// interrupt edge is honest. (Target-only: the host has no ports.)
+/// enabled. Bytes the host queued BEFORE the arm move into the ring
+/// (not the void — found live: the shell lane's scripted session lost
+/// its first 15 bytes here, and the shell's first command arrived as
+/// the line's tail). The FIFO still ends empty, so the first
+/// interrupt edge is honest either way. (Target-only: the host has no
+/// ports.)
 #[cfg(not(test))]
 pub fn uart_init() {
-    port_init();
-    // Flush anything the host queued before the arm.
+    // DRAIN FIRST, register games after (found live: the FCR
+    // enable-transition can drop a byte sitting in the receiver —
+    // the scripted session's very first byte died exactly there).
     let mut spins = 0u64;
     while crate::hw::inb(LSR) & 1 != 0 && spins < 1024 {
-        crate::hw::inb(COM1);
+        let b = crate::hw::inb(COM1);
+        push(b);
         spins += 1;
     }
+    port_init();
 }
 
 /// The register writes, split out so the doc can name what the
-/// target half does (the host has no ports).
+/// target half does (the host has no ports). FCR is 0x01 — FIFO
+/// ENABLE ONLY: bits 1..=2 are the CLEAR commands, and clearing the
+/// receiver DISCARDS whatever the host queued before the arm (found
+/// live: the shell lane's first 15 scripted bytes died exactly here).
 #[cfg(not(test))]
 fn port_init() {
     crate::hw::outb(LCR, 0x03); // 8N1, DLAB=0
-    crate::hw::outb(FCR, 0x07); // FIFO enable + clear both
+    crate::hw::outb(FCR, 0x01); // FIFO enable, NO clears
     crate::hw::outb(IER, 0x01); // RX data-available interrupt
 }
 

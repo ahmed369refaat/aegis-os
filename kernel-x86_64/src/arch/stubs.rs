@@ -24,6 +24,18 @@ const fn ist_for(vector: u8) -> u8 {
         18 => 3, // #MC: most severe, its own stack
         12 => 4, // #SS: a stack fault cannot trust that stack
         14 => 5, // #PF: own stack since PR-1.4 (was: none)
+        // ADR-0030's third shape, SOLVED: an interrupt delivered at
+        // CPL0 keeps the CURRENT stack — and in the syscall-entry
+        // window (after SYSCALL switched CPL but before the stub
+        // switched RSP) the current stack is the USER stack, so the
+        // CPU's interrupt-frame push is a supervisor write to a user
+        // page, and SMAP faults it (err=3, cr2 = the stack page's
+        // top qword, rip = the entry's first instruction — the exact
+        // signature the forensics caught live). IST6 gives every
+        // interrupt an unconditional kernel-stack switch; the `cli`
+        // at exception_common's head makes IST6 single-threaded (a
+        // second vector cannot deliver while the first runs).
+        32..=112 | 255 => 6,
         _ => 0,
     }
 }
@@ -198,6 +210,12 @@ vector_stub!(v31, 31, noerr);
 #[unsafe(naked)]
 pub extern "C" fn exception_common() {
     naked_asm!(
+        // ADR-0030: mask delivery BEFORE anything pushes — with every
+        // interrupt on IST6, a second vector arriving mid-handler
+        // would re-enter the SAME IST and overwrite the first frame.
+        // IF=0 from the first instruction; iretq restores the
+        // interrupted context's IF bit exactly.
+        "cli",
         "pushq %rax",
         "pushq %rbx",
         "pushq %rcx",

@@ -1,0 +1,10 @@
+
+echo hello from aegis-sh
+mkdir /pub/shdir
+cp /pub/round-j.txt /pub/shdir/copy.txt
+cat /pub/shdir/copy.txt
+ls /pub
+mv /pub/shdir/copy.txt /pub/shdir/moved.txt
+rm /pub/shdir/moved.txt
+ls /pub/shdir
+exit

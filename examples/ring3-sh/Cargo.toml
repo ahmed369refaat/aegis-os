@@ -1,0 +1,9 @@
+[package]
+name = "ring3-sh"
+version = "0.2.0"
+edition = "2021"
+description = "AegisOS ring-3 example: aegis-sh — the M3 shell. A linked ELF64 image (text RX at 0x400000, data+bss at 0x403000) the init child execve's as /bin/sh; speaks Linux v1 nrs only. Built by boot.sh (rustc --emit=obj + ld -T sh.ld); NOT a workspace member."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"

@@ -73,7 +73,15 @@ impl From<MapError> for ExecMapError {
 /// cannot collide with the stack (0x408000), the trampoline
 /// (0x40C000), or any guard gap; anything else refuses before a
 /// frame is touched.
-pub const EXEC_CAGE_END: u64 = layout::DATA_BASE + (layout::DATA_PAGES * 4096) as u64;
+/// Phase 7 (the shell): the exec cage now reaches the STACK base.
+/// The flat-blob layout (2 code pages + the data page at 0x403000)
+/// stays the spawn path's world — unchanged. An exec image is a REAL
+/// linked program (the shell's Rust codegen is ~10 KiB): it may span
+/// [CODE_BASE, STACK_BASE) with the policy's guard gaps doing the
+/// internal separation (the shell: text 0x400000..0x404000, one guard
+/// page, data at 0x405000). The bound is still explicit and checked —
+/// a child cannot exec into existence anything at or above the stack.
+pub const EXEC_CAGE_END: u64 = layout::STACK_BASE;
 
 /// Everything kmain needs to run one user domain: the lib identity,
 /// the entry context, and the run state to install before launching.

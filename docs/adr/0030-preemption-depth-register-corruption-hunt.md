@@ -2,10 +2,21 @@
 
 ## Status
 
-**The round-X "reproduction on demand" was an instrument artifact —
-round Y proved it and closed the real bug the artifact exposed: a
-fragile hand-measured code delta in the ring3-preempt blob. The
-ORIGINAL rare flake remains unexplained and OPEN — three shapes now
+**SOLVED (round Z2, 2026-11-23 third session): the third shape's
+mechanism IS the original flake's — an interrupt delivered in the
+SYSCALL-entry window (after SYSCALL switched CPL0 but before the
+stub switched RSP off the user stack) pushes its interrupt frame
+ONTO THE USER STACK; the CPU's push is a supervisor write to a user
+page and SMAP faults it (err=3, cr2 = the stack page's top qword,
+rip = the entry's first instruction — every observed signature,
+including the two-year mystery rip=swapgs). The forensics dump
+caught it live (rcx/r11 = the SYSCALL ABI pair, cr2 = 0x408ff8).
+The fix: IST6 for the whole interrupt family (32..=112, 255 — the
+unconditional kernel-stack switch) + `cli` at exception_common's
+head (IST6 cannot nest). The TTY's new UART IRQ made the window
+reproducible-on-demand; the original ~1-in-5 flake was the LAPIC
+timer hitting the same window. — Round X's own history: its
+"reproduction on demand" was an instrument artifact — three shapes now
 on record (the CoW-demo stall, the mode-13 wait4 loss, and the S5
 session's CPL0-fault-in-grants) — with the tick-density lead
 REFUTED, the third shape's quick-draw theories all REFUTED by

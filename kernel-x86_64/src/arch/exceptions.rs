@@ -49,9 +49,15 @@ static mut IST_SS: IstStack = IstStack([0; 0x4000]);
 /// Single CPU, no preemption: no nesting hazard.
 static mut IST_PF: IstStack = IstStack([0; 0x4000]);
 
-/// Top-of-stack addresses for TSS.IST1..IST4, in the order `gdt::load`
-/// writes them (IST1=#DF, IST2=#NMI, IST3=#MC, IST4=#SS).
-pub fn ist_tops() -> [u64; 5] {
+/// ADR-0030's fix: the interrupt family's stack (IST6). Every IRQ
+/// delivers here — the syscall-entry window's user-stack push was
+/// the original flake's mechanism (see stubs::ist_for).
+static mut IST_IRQ: IstStack = IstStack([0; 0x4000]);
+
+/// Top-of-stack addresses for TSS.IST1..IST6, in the order `gdt::load`
+/// writes them (IST1=#DF, IST2=#NMI, IST3=#MC, IST4=#SS, IST5=#PF,
+/// IST6=the interrupt family).
+pub fn ist_tops() -> [u64; 6] {
     // F16: raw pointers into the `static mut` stacks — no references to
     // mutable statics; the tops are pure address arithmetic.
     let top = |s: *const IstStack| (s as usize + core::mem::size_of::<IstStack>()) as u64;
@@ -61,6 +67,7 @@ pub fn ist_tops() -> [u64; 5] {
         top(core::ptr::addr_of!(IST_MC)),
         top(core::ptr::addr_of!(IST_SS)),
         top(core::ptr::addr_of!(IST_PF)),
+        top(core::ptr::addr_of!(IST_IRQ)),
     ]
 }
 

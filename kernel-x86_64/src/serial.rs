@@ -14,7 +14,12 @@ pub fn init() {
     crate::hw::outb(COM1, 0x01); // divisor low = 1 → 115200 baud
     crate::hw::outb(COM1 + 1, 0x00); // divisor high
     crate::hw::outb(COM1 + 3, 0x03); // 8 bits, no parity, 1 stop; DLAB off
-    crate::hw::outb(COM1 + 2, 0xC7); // FIFO enable + clear, 14-byte threshold
+                                     // FIFO enable ONLY — never the clear bits: a scripted stdin (the
+                                     // shell lane) can feed the receiver before this line runs, and the
+                                     // FCR clear would wipe the session's first byte (found live: the
+                                     // 'e' of the first command died exactly here). The UART is fresh
+                                     // from QEMU's reset — there is nothing honest to clear.
+    crate::hw::outb(COM1 + 2, 0x01);
     crate::hw::outb(COM1 + 4, 0x0B); // DTR + RTS + OUT2
 }
 
