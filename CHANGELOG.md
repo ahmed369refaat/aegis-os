@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased] — Phase 6 S5c: --verify-persist — the lane that boots the same disk twice
+
+The M3 exit criterion's proof lane. A lean q35 machine (the IOMMU,
+the demo vblk on bus 0 — its enforcement probe stays OFF the persist
+disk — and the persist disk behind a root port on bus 1,
+`cache=writethrough` so the 256 sector flushes are in the host file
+before boot 2 starts, whatever kills boot 1's QEMU). The lane resets
+and rebuilds the image BEFORE boot 1, then boots the SAME image
+twice, untouched between the boots:
+
+- boot 1 must print `PERSIST:WRITTEN` and must NOT print
+  `PERSIST:VERIFIED` (verifying a file that cannot exist yet means
+  the branch is lying);
+- boot 2 must print `PERSIST:VERIFIED` and must NOT print
+  `PERSIST:WRITTEN` (writing again means the image was reset
+  mid-proof);
+- both boots carry the FULL base marker suite plus the persist
+  session's own greps (claim/own domain, session up, image read,
+  frames freed, the VFS import) — `ok` accumulates across boots.
+
+Mechanically: the verify block wraps its per-boot sequence in a
+`for BOOT in $(seq $RUNS)` loop (RUNS=2 on this lane, 1 elsewhere);
+the body is deliberately NOT re-indented so the diff stays about the
+loop. First live run: PASS on both boots (boot 1 wrote inode 3, 100
+bytes; boot 2 verified byte-exact, nothing flushed) at ~44 s per
+boot under TCG.
+
 ## [Unreleased] — Phase 6 S5b: the persist step — a second vblk session, the image in frames
 
 The M3 exit criterion's kernel half. `drvstack/persist.rs` claims

@@ -12,6 +12,11 @@
 #   ./boot.sh              build + boot (serial on stdio)
 #   ./boot.sh --verify     build + boot + assert the M1 exit-criteria
 #                          markers in the serial log (CI proof mode)
+#   ./boot.sh --verify-persist
+#                          build + boot TWICE on the same persist image:
+#                          boot 1 writes persist.txt (PERSIST:WRITTEN),
+#                          boot 2 must read it back (PERSIST:VERIFIED) —
+#                          the Phase 6 S5 / M3 exit-criterion lane
 #   ./boot.sh --build-only build the image, print its path, don't boot
 #
 # Requirements: rustup target x86_64-unknown-none; binutils (objcopy, ld,
@@ -234,6 +239,34 @@ case "${1:-}" in
       "cross-device DMA FAULTED (FSTS.PPF set)"  # the ADR-0018 negative probe still faults with IR on
     )
     ;;
+  --verify-persist)
+    # Phase 6 S5 (the M3 exit criterion): the two-boot persistence
+    # proof. Lean machine — the IOMMU, the demo vblk on bus 0 (its
+    # enforcement probe stays OFF the persist disk), and the PERSIST
+    # disk behind a root port (bus 1). The same image boots TWICE:
+    # boot 1 writes persist.txt, boot 2 must read it back byte-exact.
+    # cache=writethrough: the 256 sector flushes must be in the host
+    # file before boot 2 starts, whatever kills boot 1's QEMU.
+    MODE=verify
+    MACHINE_ARGS=(-machine q35 -cpu max -m 128M
+                  -device intel-iommu,intremap=off
+                  -drive id=vd0,if=none,format=raw,file=target/vdisk0.img
+                  -device virtio-blk-pci,disable-legacy=on,iommu_platform=on,drive=vd0
+                  -device pcie-root-port,id=rp1,bus=pcie.0
+                  -drive id=vd2,if=none,format=raw,file=target/persist.img,cache=writethrough
+                  -device virtio-blk-pci,bus=rp1,disable-legacy=on,iommu_platform=on,drive=vd2)
+    EXTRA_GREPS=(
+      "[IOMMU] vtd: verdict: available haw=48"  # the broker is live (the persist session rides it)
+      "[VBLK] alive"  # the bus-0 demo disk still drives through the IOMMU
+      "[VBLK] enforcement: PPF=yes"  # translation is REAL on this machine too (ADR-0014)
+      "[PCI ] 1:0.0 "  # the persist disk enumerated behind the root port (ADR-0020)
+      "[PERSIST] claim: bus="  # its OWN IOMMU domain (ADR-0018)
+      "[PERSIST] session up: rings broker-mapped"  # the second vblk handshake
+      "[PERSIST] image read: 256 sectors into 32 frames"  # the whole disk into pool frames
+      "[PERSIST] image frames freed: 32"  # the teardown discipline (every path)
+      "[PERSIST] vfs: /persist.txt imported"  # the file is a node in THIS boot's tree
+    )
+    ;;
 esac
 
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
@@ -258,6 +291,16 @@ if [ "$MODE" = "verify" ] && [ "${1:-}" = "--verify-q35" ]; then
   dd if=/dev/zero of=target/nvme0.img bs=1K count=128 status=none
   dd if=/dev/zero of=target/usb0.img  bs=1K count=64  status=none
 fi
+if [ "$MODE" = "verify" ] && [ "${1:-}" = "--verify-persist" ]; then
+  dd if=/dev/urandom of=target/vdisk0.img bs=1K count=64 status=none
+  # The persist image: reset BEFORE boot 1, then built once — the
+  # two boots that follow share it untouched (regenerating BETWEEN
+  # them would reset the very persistence under proof). The reset
+  # makes the lane repeatable: without it, a second run's boot 1
+  # would VERIFY the file the first run left instead of WRITING it.
+  rm -f target/persist.img
+  python3 "$(dirname "$0")/scripts/mkext2-rw.py"
+fi
 if [ "$MODE" = "verify" ] && { [ "${1:-}" = "--verify-q35" ] || [ "${1:-}" = "--verify-q35-noiommu" ]; }; then
   python3 "$(dirname "$0")/scripts/mkext2.py"
   # The ESP slice: mkfat32.py grows the SAME disk with GPT partition 2
@@ -279,6 +322,9 @@ if [ "$MODE" = "verify" ]; then
     --verify-q35-noiommu)
       echo "==> [4/4] booting in QEMU (TCG, q35, NO iommu) — M1/M2 markers + the fail-closed absent proof"
       ;;
+    --verify-persist)
+      echo "==> [4/4] booting in QEMU (TCG, q35 + intel-iommu) — Phase 6 S5: the two-boot persistence proof"
+      ;;
     *)
       echo "==> [4/4] booting in QEMU (TCG) — M1 exit-criteria + PR-1.1/1.2/1.3 selftests run"
       ;;
@@ -287,6 +333,26 @@ if [ "$MODE" = "verify" ]; then
   # — if a CI runner's QEMU lacks SMEP/SMAP, the failure message below
   # carries the version context right next to it.
   echo "    $(qemu-system-x86_64 --version | head -1)"
+  # Phase 6 S5: the persist lane boots the SAME image twice — boot 1
+  # writes persist.txt, boot 2 verifies it survived. Every other lane
+  # runs once. `ok` accumulates across boots; the loop body below is
+  # the whole per-boot check sequence (delimited by the BOOT loop
+  # comments), unchanged in indentation on purpose — the diff stays
+  # about the loop, not 140 re-indented lines.
+  RUNS=1
+  if [ "${1:-}" = "--verify-persist" ]; then
+    RUNS=2
+  fi
+  ok=1
+  for BOOT in $(seq "$RUNS"); do
+  : > "$LOG"
+  if [ "${1:-}" = "--verify-persist" ]; then
+    if [ "$BOOT" = "1" ]; then
+      echo "── boot 1/$RUNS: this boot WRITES persist.txt ──"
+    else
+      echo "── boot 2/$RUNS: this boot must VERIFY what boot 1 wrote (same image, no regeneration) ──"
+    fi
+  fi
   START=$(date +%s.%N)
   # The q35 lane's host-side driver: marker-driven QMP (send-key once
   # the kernel is armed, screendump after it settles) + a longer
@@ -308,6 +374,11 @@ if [ "$MODE" = "verify" ]; then
   if [ "${1:-}" = "--verify-q35-ir" ]; then
     QEMU_TIMEOUT=600
   fi
+  # The persist lane runs the full M3 suite + the driver stack + the
+  # two-boot proof under TCG with the IOMMU on — same budget as q35.
+  if [ "${1:-}" = "--verify-persist" ]; then
+    QEMU_TIMEOUT=600
+  fi
   # ADR-0014: the q35 lane runs with the VT-d trace on, so the lane
   # can PROVE no device takes the pass-through fast path. The trace
   # (log backend) lands on stderr; the serial log stays on stdout.
@@ -320,8 +391,7 @@ if [ "$MODE" = "verify" ]; then
   fi
   END=$(date +%s.%N)
   echo
-  echo "boot wall-clock: $(awk -v e="$END" -v s="$START" 'BEGIN { printf "%.2f", e - s }') s (QEMU startup included)"
-  ok=1
+  echo "boot $BOOT wall-clock: $(awk -v e="$END" -v s="$START" 'BEGIN { printf "%.2f", e - s }') s (QEMU startup included)"
   grep -q "M1-EXIT-CRITERIA: PASS" "$LOG" || { echo "VERIFY FAIL: exit-criteria verdict missing or failed"; ok=0; }
   grep -q "Hello from AegisOS domain 1" "$LOG" || { echo "VERIFY FAIL: hello-domain marker missing"; ok=0; }
   grep -q "leaked-frames=0" "$LOG" || { echo "VERIFY FAIL: zero-leak assertion missing"; ok=0; }
@@ -466,6 +536,26 @@ grep -qF "(virtio-blk) → dom" "$LOG" || { echo "VERIFY FAIL: the virtio-blk cl
   for g in "${EXTRA_GREPS[@]}"; do
     grep -qF "$g" "$LOG" || { echo "VERIFY FAIL: missing lane marker: $g"; ok=0; }
   done
+  # ── Phase 6 S5: the two-boot proof's own pair. Boot 1 writes, boot
+  # 2 verifies — and each must NOT print the other's marker: boot 1
+  # "verifying" a file that cannot exist yet, or boot 2 "writing"
+  # again, both mean the image was reset or the branch is lying.
+  if [ "${1:-}" = "--verify-persist" ]; then
+    if [ "$BOOT" = "1" ]; then
+      grep -qF "PERSIST:WRITTEN" "$LOG" || { echo "VERIFY FAIL: boot 1 must write persist.txt (PERSIST:WRITTEN)"; ok=0; }
+      if grep -qF "PERSIST:VERIFIED" "$LOG"; then
+        echo "VERIFY FAIL: boot 1 verified a file that cannot exist yet — the branch is lying"
+        ok=0
+      fi
+    else
+      grep -qF "PERSIST:VERIFIED" "$LOG" || { echo "VERIFY FAIL: boot 2 must read back what boot 1 wrote (PERSIST:VERIFIED)"; ok=0; }
+      if grep -qF "PERSIST:WRITTEN" "$LOG"; then
+        echo "VERIFY FAIL: boot 2 re-wrote the file — was the image regenerated between boots?"
+        ok=0
+      fi
+    fi
+  fi
+  done  # ── end of the per-boot block (the persist lane's second iteration starts the verify greps fresh on a truncated LOG) ──
   # ADR-0017's transport made audible: the virtio-console round trip's
   # HOST half — the guest marker above proves the driver, the file
   # below proves the bytes actually LEFT the machine.

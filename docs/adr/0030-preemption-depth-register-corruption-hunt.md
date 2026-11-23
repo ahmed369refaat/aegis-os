@@ -5,9 +5,46 @@
 **The round-X "reproduction on demand" was an instrument artifact —
 round Y proved it and closed the real bug the artifact exposed: a
 fragile hand-measured code delta in the ring3-preempt blob. The
-ORIGINAL rare flake (two occurrences on pristine trees: the CoW demo
-failure and round W's mode-13 wait4 loss) remains unexplained and
-OPEN — with its earlier "tick-density" lead now REFUTED.**
+ORIGINAL rare flake remains unexplained and OPEN — three shapes now
+on record (the CoW-demo stall, the mode-13 wait4 loss, and the S5
+session's CPL0-fault-in-grants) — with the tick-density lead
+REFUTED.**
+
+## The third shape (S5 session, 2026-11-23 — recorded, NOT a reproduction)
+
+One occurrence in four boots of the `--verify-persist` lane (the
+first run was 2/2 green; the second run's boot 2 died). Saved whole:
+`boot-persist-FLAKE-cpl0fault-grants.txt` in the session bundle.
+
+```
+[M3] sync: 2 round-trips, call blocked and returned both replies, ...
+[EXC] #PF vector=14 rip=0xffffffff8000063c cs=0x0030 err=0x0000000000000003 cr2=0x0000000000408ff8
+[EXC] KERNEL BUG: CPL0 fault while a user run is active
+```
+
+The boot halted at that line (no verdict, no further output). Facts
+that constrain any explanation:
+
+- The fault is a SUPERVISOR WRITE (err=3, P=1 W=1 U/S=0) to a
+  PRESENT USER page at `0x408ff8` — the grants demo's shared-page
+  tail, an address the demo itself faults on from ring 3 as part of
+  its normal flow (the green-probe log shows the same cr2 with
+  err=7 at a user rip, handled).
+- The printed rip is `syscall_entry`'s FIRST instruction (`swapgs`).
+  swapgs cannot write memory, so either the frame was read from a
+  stale/parked slot, or the run was parked-and-resumed at exactly
+  that entry (the 3-byte `swapgs; cli` window is the one point where
+  an IRQ can hit between the GS flip and IF=0 — a park there resumes
+  at `swapgs` and flips GS a SECOND time; every later gs-relative
+  access lands through the wrong base).
+- It fired mid-audit-phase, BEFORE the driver stack (the S5 persist
+  step had not run in that boot), in demo code untouched by the S5
+  slices; the same tree booted green twice before and (see the
+  session log) again after. Per this ADR's own rule: one occurrence
+  on a changed tree is an OBSERVATION, not a reproduction — the next
+  hunt round must sample pristine 10 ms boots with capture probes on
+  the syscall-entry park window and the grants write path before
+  claiming anything.
 
 ## Context
 
