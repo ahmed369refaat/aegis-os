@@ -1,5 +1,40 @@
 # Changelog
 
+## [Unreleased] — Phase 6 S4: the ext2 write path (core, host-tested)
+
+`src/ext2.rs` gains a buffer-backed WRITE path over the mkext2
+geometry, with the honesty upgrade the read-only demo never needed:
+the BLOCK and INODE bitmaps carry the REAL occupancy (the demo
+marked only the first 8 of each — a writer would allocate over live
+structures), inode 1 is reserved (the bad-blocks convention), and the
+group's free counters ride the GDT and are maintained for fsck-style
+readers.
+
+- `create_file(img, name)`: allocate an inode bit, init 0o100644
+  with zero size/blocks, and the classic ext2 dirent insert — the
+  root's terminal record shrinks to its real size, the new record
+  takes the remainder; rec_len chain stays walkable (proven: the
+  parser still finds hello.txt after inserts).
+- `write_file(img, ino, offset, bytes)`: direct blocks only (M3
+  scope, 12 KiB ceiling, `TooLarge` past — never a silent truncate);
+  wires any block the span touches (allocating from the bitmap),
+  copies per-block (byte i lands at offset+i), grows i_size.
+- Host tests: a 3-block 2560-byte body at offset 1000 round-trips
+  byte-for-byte through the direct blocks AND reads back through the
+  read-only parser's find_dirent (the round-trip proof); free
+  counters decrement correctly (120→116 blocks, 13→12 inodes); the
+  refusals keep identities (BadName, TooLarge at the ceiling,
+  NoFreeInodes at 13 creates).
+
+Gates: ext2 8/8 green, fmt clean. KNOWN LINT DEBT (flagged for the
+follow-up): `cargo clippy --all-targets` reports `cannot find macro
+vec` inside the core lib's test cfg — `cargo test` compiles and runs
+the identical code (the vec! usage is the pre-existing test-fixture
+pattern); the follow-up must resolve the clippy/test cfg divergence
+before the next full-gate run. The boot lanes are unchanged by S4
+(core-only).
+
+
 ## [Unreleased] — Phase 6 S3: execve materializes argv/envp — the SysV initial stack
 
 The exec'd image no longer starts on a bare stack: the kernel reads

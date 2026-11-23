@@ -186,6 +186,308 @@ pub fn find_dirent(block: &[u8], dir_size: u32, name: &[u8]) -> Result<Option<u3
 }
 
 #[cfg(test)]
+// ═══ Phase 6 S4: the WRITE path — buffer-backed, host-tested ═══
+//
+// The image here is the whole filesystem (FS-relative — the kernel
+// adds the partition base; GPT-wrapping is the builder's business).
+// The geometry is rev-1 dynamic as `mkext2.py` pins it, with ONE
+// honesty upgrade the read-only demo did not need: the BLOCK and
+// INODE bitmaps carry the REAL occupancy (the demo marked only the
+// first 8 of each — harmless for reading, a lie a writer would
+// allocate over). `mkext2-rw.py` and the test fixture below mirror
+// the honest layout: used = {sb 1, gdt 2, bitmaps 3,4, inode table
+// 5,6, root 20, hello 21} and inodes {2, 12}.
+//
+// Scope (M3, documented): DIRECT blocks only (i_block[0..11] — a
+// file caps at 12 KiB), single group, the root directory as the only
+// directory. The bitmaps are the allocation truth; the group's free
+// counts ride the GDT (bg_free_blocks_count/bg_free_inodes_count)
+// and are maintained best-effort for fsck-style readers.
+
+/// Every way the write path refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ext2WriteError {
+    /// The inode bitmap has no clear bit.
+    NoFreeInodes,
+    /// The block bitmap has no clear bit.
+    NoFreeBlocks,
+    /// The root directory block cannot fit another record.
+    DirFull,
+    /// The name is empty, contains '/', or exceeds 255 bytes.
+    BadName,
+    /// offset+len passes the direct-block ceiling (12 * block size).
+    TooLarge,
+    /// A structure the writer maintains is absent/truncated.
+    Truncated,
+    /// The on-disk inode number is out of range.
+    InodeOutOfRange { ino: u32, inodes: u32 },
+}
+
+/// The group descriptor's fields the writer maintains (block 2).
+const GDT_BLOCK_BITMAP: usize = 0;
+const GDT_INODE_BITMAP: usize = 4;
+const GDT_INODE_TABLE: usize = 8;
+const GDT_FREE_BLOCKS: usize = 12; // u16
+const GDT_FREE_INODES: usize = 14; // u16
+
+/// The superblock offsets the writer reads (block 1, byte 1024).
+const SB_INODES_COUNT: usize = 0;
+const SB_BLOCKS_COUNT: usize = 4;
+
+/// The direct-block ceiling (M3 scope: no indirect blocks).
+pub const DIRECT_BLOCKS: u32 = 12;
+
+/// Read one little-endian u32 at a byte offset (truncation-checked).
+fn rd_u32(img: &[u8], off: usize) -> Result<u32, Ext2WriteError> {
+    let b = img.get(off..off + 4).ok_or(Ext2WriteError::Truncated)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Read one little-endian u16 at a byte offset.
+fn rd_u16(img: &[u8], off: usize) -> Result<u16, Ext2WriteError> {
+    let b = img.get(off..off + 2).ok_or(Ext2WriteError::Truncated)?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
+}
+
+/// Write one little-endian u16 at a byte offset.
+fn wr_u16(img: &mut [u8], off: usize, v: u16) -> Result<(), Ext2WriteError> {
+    let b = img.get_mut(off..off + 2).ok_or(Ext2WriteError::Truncated)?;
+    b.copy_from_slice(&v.to_le_bytes());
+    Ok(())
+}
+
+fn wr_u32(img: &mut [u8], off: usize, v: u32) -> Result<(), Ext2WriteError> {
+    let b = img.get_mut(off..off + 4).ok_or(Ext2WriteError::Truncated)?;
+    b.copy_from_slice(&v.to_le_bytes());
+    Ok(())
+}
+
+/// The writer's geometry, read once from the image.
+#[derive(Debug, Clone, Copy)]
+struct RwGeom {
+    bs: usize,
+    inodes: u32,
+    blocks: u32,
+    block_bitmap_blk: u32,
+    inode_bitmap_blk: u32,
+    inode_table_blk: u32,
+}
+
+impl RwGeom {
+    fn parse(img: &[u8]) -> Result<RwGeom, Ext2WriteError> {
+        let sb = Superblock::parse(
+            img.get(1024..)
+                .and_then(|s| s.get(..1024))
+                .ok_or(Ext2WriteError::Truncated)?,
+        )
+        .map_err(|_| Ext2WriteError::Truncated)?;
+        // 1 KiB blocks only (s_log_block_size 0 — the demo geometry;
+        // the writer refuses anything else rather than guessing).
+        let log_bs = rd_u32(img, 1024 + 24)? as usize;
+        if log_bs != 0 {
+            return Err(Ext2WriteError::Truncated);
+        }
+        let gdt = 2048;
+        Ok(RwGeom {
+            bs: 1024,
+            inodes: rd_u32(img, 1024 + SB_INODES_COUNT)?,
+            blocks: rd_u32(img, 1024 + SB_BLOCKS_COUNT)?,
+            block_bitmap_blk: rd_u32(img, gdt + GDT_BLOCK_BITMAP)?,
+            inode_bitmap_blk: rd_u32(img, gdt + GDT_INODE_BITMAP)?,
+            inode_table_blk: rd_u32(img, gdt + GDT_INODE_TABLE)?,
+        })
+    }
+
+    fn inode_byte(&self, ino: u32) -> Result<usize, Ext2WriteError> {
+        if ino == 0 || ino > self.inodes {
+            return Err(Ext2WriteError::InodeOutOfRange {
+                ino,
+                inodes: self.inodes,
+            });
+        }
+        Ok(self.inode_table_blk as usize * self.bs + ((ino - 1) * 128) as usize)
+    }
+}
+
+/// Find and set the first clear bit in a bitmap block. Returns the
+/// bit index (inode numbers are index+1; block numbers ARE the index
+/// for the block bitmap — ext2's block 0 does not exist in 1KiB
+/// geometry, `s_first_data_block=1`, so the bitmap's bit `i` names
+/// block `i` and bit 0 is a fixed-set placeholder).
+fn alloc_bit(
+    img: &mut [u8],
+    geom: &RwGeom,
+    bitmap_blk: u32,
+    limit: u32,
+) -> Result<u32, Ext2WriteError> {
+    let base = bitmap_blk as usize * geom.bs;
+    let words = img
+        .get_mut(base..base + geom.bs)
+        .ok_or(Ext2WriteError::Truncated)?;
+    for i in 0..(geom.bs * 8).min(limit as usize) {
+        let byte = &mut words[i / 8];
+        if *byte & (1 << (i % 8)) == 0 {
+            *byte |= 1 << (i % 8);
+            return Ok(i as u32);
+        }
+    }
+    Err(if limit == geom.inodes {
+        Ext2WriteError::NoFreeInodes
+    } else {
+        Ext2WriteError::NoFreeBlocks
+    })
+}
+
+/// Decrement the group's free counter (best-effort bookkeeping for
+/// fsck-style readers; the bitmap is the truth).
+fn count_allocated(img: &mut [u8], free_off: usize) -> Result<(), Ext2WriteError> {
+    let v = rd_u16(img, free_off)?;
+    wr_u16(img, free_off, v.saturating_sub(1))
+}
+
+/// Create a regular 0o644 empty file in the ROOT directory, with an
+/// honest dirent: the terminal record is shrunk to its real size and
+/// the new record takes the remainder (the classic ext2 insert).
+pub fn create_file(img: &mut [u8], name: &[u8]) -> Result<u32, Ext2WriteError> {
+    if name.is_empty() || name.len() > 255 || name.contains(&b'/') {
+        return Err(Ext2WriteError::BadName);
+    }
+    let geom = RwGeom::parse(img)?;
+    // 1. an inode
+    let bit = alloc_bit(img, &geom, geom.inode_bitmap_blk, geom.inodes)?;
+    let ino = bit + 1; // inode numbers are 1-based
+    count_allocated(img, 2048 + GDT_FREE_INODES)?;
+    // 2. the inode record: mode 0o100644, zero size, zero blocks.
+    let off = geom.inode_byte(ino)?;
+    let rec = img
+        .get_mut(off..off + 128)
+        .ok_or(Ext2WriteError::Truncated)?;
+    rec.fill(0);
+    rec[0..2].copy_from_slice(&0o100_644u16.to_le_bytes());
+    // 3. the dirent: walk the root block to the terminal record.
+    let root_off = geom.inode_byte(ROOT_INO)?;
+    let root_rec = img
+        .get(root_off..root_off + 128)
+        .ok_or(Ext2WriteError::Truncated)?;
+    let dir_blk = u32::from_le_bytes(root_rec[40..44].try_into().unwrap());
+    let dir_base = dir_blk as usize * geom.bs;
+    let dir = img
+        .get_mut(dir_base..dir_base + geom.bs)
+        .ok_or(Ext2WriteError::Truncated)?;
+    let mut off = 0usize;
+    loop {
+        if off + 8 > geom.bs {
+            return Err(Ext2WriteError::DirFull);
+        }
+        let rec_len = u16::from_le_bytes([dir[off + 4], dir[off + 5]]) as usize;
+        if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > geom.bs {
+            return Err(Ext2WriteError::DirFull);
+        }
+        let name_len = dir[off + 6] as usize;
+        let real = (8 + name_len + 3) & !3;
+        // The terminal record: its rec_len reaches the block's end.
+        if off + rec_len == geom.bs {
+            let need = (8 + name.len() + 3) & !3;
+            if rec_len - real < need {
+                return Err(Ext2WriteError::DirFull);
+            }
+            // Shrink the terminal record to its real size.
+            dir[off + 4..off + 6].copy_from_slice(&(real as u16).to_le_bytes());
+            let new_off = off + real;
+            let new_rec = rec_len - real;
+            dir[new_off..new_off + 4].copy_from_slice(&ino.to_le_bytes());
+            dir[new_off + 4..new_off + 6].copy_from_slice(&(new_rec as u16).to_le_bytes());
+            dir[new_off + 6] = name.len() as u8;
+            dir[new_off + 7] = 1; // EXT2_FT_REG_FILE
+            dir[new_off + 8..new_off + 8 + name.len()].copy_from_slice(name);
+            return Ok(ino);
+        }
+        off += rec_len;
+    }
+}
+
+/// Write `bytes` at `offset` into the inode's DIRECT blocks,
+/// allocating and wiring any block the span touches that is not yet
+/// allocated. i_size grows to cover the write end. M3 scope: the
+/// span must fit `DIRECT_BLOCKS * bs` (12 KiB) — past that is
+/// `TooLarge`, never a silent truncate.
+pub fn write_file(
+    img: &mut [u8],
+    ino: u32,
+    offset: u32,
+    bytes: &[u8],
+) -> Result<(), Ext2WriteError> {
+    let geom = RwGeom::parse(img)?;
+    let ceiling = DIRECT_BLOCKS * geom.bs as u32;
+    let end = offset
+        .checked_add(bytes.len() as u32)
+        .ok_or(Ext2WriteError::TooLarge)?;
+    if end == 0 || end > ceiling {
+        return Err(Ext2WriteError::TooLarge);
+    }
+    // Snapshot the direct blocks OUTSIDE the borrow, allocate as
+    // needed (alloc touches the bitmap — a second img borrow), then
+    // write the blocks and the inode back.
+    let inode_off = geom.inode_byte(ino)?;
+    let mut blocks = [0u32; DIRECT_BLOCKS as usize];
+    {
+        let rec = img
+            .get(inode_off..inode_off + 128)
+            .ok_or(Ext2WriteError::Truncated)?;
+        for (b, slot) in blocks.iter_mut().enumerate() {
+            *slot = u32::from_le_bytes(rec[40 + b * 4..44 + b * 4].try_into().unwrap());
+        }
+    }
+    let first_blk = (offset / geom.bs as u32) as usize;
+    let last_blk = ((end - 1) / geom.bs as u32) as usize;
+    let head = (offset % geom.bs as u32) as usize;
+    for b in first_blk..=last_blk {
+        if blocks[b] == 0 {
+            let bit = alloc_bit(img, &geom, geom.block_bitmap_blk, geom.blocks)?;
+            count_allocated(img, 2048 + GDT_FREE_BLOCKS)?;
+            blocks[b] = bit;
+        }
+        let in_off = if b == first_blk { head } else { 0 };
+        let in_end = if b == last_blk {
+            ((end - 1) % geom.bs as u32) as usize + 1
+        } else {
+            geom.bs
+        };
+        let n = in_end - in_off;
+        // Byte i lands at absolute offset+i: block b's [in_off,
+        // in_end) maps to bytes[(b*bs + in_off) - offset .. +n].
+        let from = (b * geom.bs + in_off).saturating_sub(offset as usize);
+        let src = bytes.get(from..from + n).unwrap_or(&[]);
+        let dst_base = blocks[b] as usize * geom.bs + in_off;
+        let dst = img
+            .get_mut(dst_base..dst_base + n)
+            .ok_or(Ext2WriteError::Truncated)?;
+        dst.copy_from_slice(src);
+    }
+    // Write the wired blocks and the grown i_size back.
+    let rec = img
+        .get_mut(inode_off..inode_off + 128)
+        .ok_or(Ext2WriteError::Truncated)?;
+    for (b, slot) in blocks.iter().enumerate() {
+        rec[40 + b * 4..44 + b * 4].copy_from_slice(&slot.to_le_bytes());
+    }
+    let size = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+    if end > size {
+        rec[4..8].copy_from_slice(&end.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// The group's free-block count (for fsck-style readers and tests).
+pub fn free_blocks(img: &[u8]) -> Result<u32, Ext2WriteError> {
+    Ok(u32::from(rd_u16(img, 2048 + GDT_FREE_BLOCKS)?))
+}
+
+/// The group's free-inode count.
+pub fn free_inodes(img: &[u8]) -> Result<u32, Ext2WriteError> {
+    Ok(u32::from(rd_u16(img, 2048 + GDT_FREE_INODES)?))
+}
+
 mod tests {
     use super::*;
 
@@ -236,6 +538,108 @@ mod tests {
         put(&mut img, 20 * 1024, &d);
         put(&mut img, 21 * 1024, b"HELLO-AEGIS-EXT2\n");
         img
+    }
+
+    /// The HONEST write-path fixture: the mkext2 layout with the real
+    /// occupancy the read-only demo never needed — block bitmap
+    /// {1..6, 20, 21}, inode bitmap {2, 12}, GDT free counts set.
+    fn build_rw_image() -> Vec<u8> {
+        let mut img = build_image();
+        let put = |img: &mut Vec<u8>, off: usize, bytes: &[u8]| {
+            img[off..off + bytes.len()].copy_from_slice(bytes);
+        };
+        // Bitmaps at blocks 3/4 (per the GDT). Mark honestly.
+        let mut bb = vec![0u8; 1024];
+        for b in [1u32, 2, 3, 4, 5, 6, 20, 21] {
+            bb[(b / 8) as usize] |= 1 << (b % 8);
+        }
+        put(&mut img, 3 * 1024, &bb);
+        let mut ib = vec![0u8; 1024];
+        for i in [0u32, 1, 11] {
+            // bit i = inode i+1: 1 reserved (bad-blocks inode), 2 root, 12 hello
+            ib[(i / 8) as usize] |= 1 << (i % 8);
+        }
+        put(&mut img, 4 * 1024, &ib);
+        // GDT free counts: blocks 128-8 used = 120 free; inodes 16-2 = 14.
+        let mut gdt = vec![0u8; 32];
+        gdt[0..4].copy_from_slice(&3u32.to_le_bytes());
+        gdt[4..8].copy_from_slice(&4u32.to_le_bytes());
+        gdt[8..12].copy_from_slice(&5u32.to_le_bytes());
+        gdt[12..14].copy_from_slice(&120u16.to_le_bytes());
+        gdt[14..16].copy_from_slice(&13u16.to_le_bytes());
+        put(&mut img, 2048, &gdt);
+        img
+    }
+
+    /// Phase 6 S4: create + multi-block write + parser read-back, with
+    /// the free counters and the dirent honestly maintained.
+    #[test]
+    fn rw_create_write_and_read_back() {
+        let mut img = build_rw_image();
+        let ino = create_file(&mut img, b"persist.txt").unwrap();
+        assert_ne!(ino, ROOT_INO);
+        assert_ne!(ino, 12); // hello.txt stays live
+        assert_eq!(free_inodes(&img).unwrap(), 12);
+        // A 3-block body crossing every boundary (256 bytes short of
+        // 3 KiB, offset past 1 KiB to prove the head math).
+        let body: Vec<u8> = (0..2560).map(|i| (i % 241) as u8).collect();
+        write_file(&mut img, ino, 1000, &body).unwrap();
+        assert_eq!(free_blocks(&img).unwrap(), 120 - 4); // blocks 22..25
+                                                         // Read back through the READ-ONLY parser (the round-trip proof).
+        let sb = Superblock::parse(&img[1024..]).unwrap();
+        let root_off = sb.inode_byte(5, ROOT_INO).unwrap() as usize;
+        let root_rec = &img[root_off..root_off + 128];
+        let dir_blk = u32::from_le_bytes(root_rec[40..44].try_into().unwrap());
+        let found = find_dirent(
+            &img[dir_blk as usize * 1024..][..1024],
+            1024,
+            b"persist.txt",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(found, ino);
+        let f_off = sb.inode_byte(5, ino).unwrap() as usize;
+        let f_rec = &img[f_off..f_off + 128];
+        let size = u32::from_le_bytes(f_rec[4..8].try_into().unwrap());
+        assert_eq!(size, 1000 + 2560);
+        // Verify the body byte-for-byte through the direct blocks.
+        for i in 0..body.len() {
+            let abs = 1000 + i;
+            let b = (abs / 1024) as usize;
+            let blk = u32::from_le_bytes(f_rec[40 + b * 4..44 + b * 4].try_into().unwrap());
+            let byte = img[blk as usize * 1024 + (abs % 1024)];
+            assert_eq!(byte, body[i], "byte {i}");
+        }
+        // The root's dirent walk still parses clean (rec_len chain).
+        let _ = find_dirent(&img[dir_blk as usize * 1024..][..1024], 1024, b"hello.txt")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Phase 6 S4: the refusals keep their identities.
+    #[test]
+    fn rw_refuses_bad_names_and_ceiling() {
+        let mut img = build_rw_image();
+        assert_eq!(create_file(&mut img, b""), Err(Ext2WriteError::BadName));
+        assert_eq!(create_file(&mut img, b"a/b"), Err(Ext2WriteError::BadName));
+        let ino = create_file(&mut img, b"ok").unwrap();
+        // Past the direct-block ceiling: 12 KiB - 1 is fine, +1 is not.
+        write_file(&mut img, ino, 0, &vec![0u8; 12 * 1024 - 1]).unwrap();
+        let mut img2 = build_rw_image();
+        let ino2 = create_file(&mut img2, b"big").unwrap();
+        assert_eq!(
+            write_file(&mut img2, ino2, 0, &vec![0u8; 12 * 1024 + 1]),
+            Err(Ext2WriteError::TooLarge)
+        );
+        // Filling the inode bitmap: NoFreeInodes.
+        let mut img3 = build_rw_image();
+        for i in 0..13 {
+            create_file(&mut img3, format!("f{i}").as_bytes()).unwrap();
+        }
+        assert_eq!(
+            create_file(&mut img3, b"one-too-many"),
+            Err(Ext2WriteError::NoFreeInodes)
+        );
     }
 
     #[test]
