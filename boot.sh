@@ -494,6 +494,13 @@ if [ "$MODE" = "verify" ]; then
   # ADR-0023 (M3 Phase 2): the ungated two-run preemption proof —
   # two ring-3 processes interleaved, the CPU-hog starved nobody.
   grep -qF "[M3] preempt: 2 runs interleaved" "$LOG" || { echo "VERIFY FAIL: M3 preemption-interleave marker missing"; ok=0; }
+  # ADR-0031 section A: the flag-forge proof — a REAL delivered frame
+  # rewritten to IF=0+AC=1 must restore sanitized (IF forced on, AC
+  # stripped), the forger must stay preemptible (the slow writer
+  # finishes first), and a plain AC-set + copy-free syscall excursion
+  # must not weaken the SMAP self-test (the re-probe still faults).
+  grep -qF "[SEC ] ADR-0031 forge: IF=0+AC=1 frame sanitized" "$LOG" || { echo "VERIFY FAIL: ADR-0031 flag-forge marker missing"; ok=0; }
+  grep -qF "[SEC ] ADR-0031 AC-setter: entry clac held — the SMAP re-probe still faulted" "$LOG" || { echo "VERIFY FAIL: ADR-0031 AC-setter/SMAP re-probe marker missing"; ok=0; }
   # ADR-0023: the sleep/idle proof (self-park + guarded idle + the
   # calibrated clock read from ring 3).
   grep -qF "[M3] sleep: idle engaged" "$LOG" || { echo "VERIFY FAIL: M3 sleep/idle marker missing"; ok=0; }

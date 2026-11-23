@@ -1679,6 +1679,286 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
     }
 
+    // ── 16b. ADR-0031 section A: the flag-forge proof — the restored
+    //      context is ALWAYS preemptible and never carries AC. The
+    //      FORGER (30, mode 14) arms a handler and sleeps 200 ms; the
+    //      KILLER (31, mode 16 — the parameterized shape) strikes
+    //      mid-sleep; the handler rewrites the REAL frame's saved
+    //      rflags word (AC on, IF off) and returns through the
+    //      trampoline. The whitelist sanitizer must restore IF=1/AC=0
+    //      (the blob proves it on its own pushfq image; exit 252/253
+    //      would name a surviving forge), then the forger spins 400M
+    //      pure-compute iterations — the SLOW WRITER (32, mode 17)
+    //      must STILL finish first: a restored IF=0 would starve the
+    //      timer and everyone else (the ADR-0023 guarantee holds
+    //      against the forge, not just by default). ──
+    {
+        static FORGE_VICTIM_DATA: [u8; 0x70] = {
+            let mut d = [0u8; 0x70];
+            d[0] = 14; // mode 14: the flag forger
+            let msg: &[u8; 14] = b"forger armed!\n";
+            let mut i = 0;
+            while i < 14 {
+                d[0x10 + i] = msg[i];
+                i += 1;
+            }
+            d
+        };
+        static FORGE_KILLER_DATA: [u8; 2] = [16, 30]; // mode 16, target pid 30
+        static SLOW_WRITER_DATA: [u8; 0x90] = {
+            let mut d = [0u8; 0x90];
+            d[0] = 17; // mode 17: the slow writer
+            let msgs: [&[u8; 22]; 4] = [
+                b"[F] writer round 0\n   ",
+                b"[F] writer round 1\n   ",
+                b"[F] writer round 2\n   ",
+                b"[F] writer round 3\n   ",
+            ];
+            let mut i = 0;
+            while i < 4 {
+                let mut j = 0;
+                while j < 22 {
+                    d[0x10 + i * 0x20 + j] = msgs[i][j];
+                    j += 1;
+                }
+                i += 1;
+            }
+            d
+        };
+        let forger = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            30,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &FORGE_VICTIM_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(
+                    &mut out,
+                    &["[SEC ] ADR-0031 forge: ERROR: forger spawn failed; halting"],
+                );
+                hw::halt_forever();
+            }
+        };
+        let killer = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            31,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &FORGE_KILLER_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(
+                    &mut out,
+                    &["[SEC ] ADR-0031 forge: ERROR: killer spawn failed; halting"],
+                );
+                hw::halt_forever();
+            }
+        };
+        let slow_writer = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            32,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &SLOW_WRITER_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(
+                    &mut out,
+                    &["[SEC ] ADR-0031 forge: ERROR: writer spawn failed; halting"],
+                );
+                hw::halt_forever();
+            }
+        };
+        // The strike needs the same authority as the signal proof: the
+        // killer gets Domain(30) WRITE and uid 0 (the capability gate
+        // still applies; uid 0 never bypasses it).
+        {
+            let d = k.domain_mut(31).expect("forge killer domain");
+            let _ = d.caps.insert(aegis_os::capability::Capability {
+                resource: aegis_os::capability::Resource::Domain(30),
+                rights: aegis_os::capability::Rights::WRITE,
+                generation: 0,
+            });
+            d.uid = 0;
+        }
+        let switches_before = crate::sched::preempt::switches();
+        let kernel_cr3 = hw::read_cr3();
+        crate::sched::context::stash_parked(
+            killer.run,
+            crate::sched::context::ParkedContext::from_user_context(&killer.ctx),
+        );
+        crate::sched::context::stash_parked(
+            slow_writer.run,
+            crate::sched::context::ParkedContext::from_user_context(&slow_writer.ctx),
+        );
+        forger.run.tables.activate();
+        crate::sched::context::begin(forger.run);
+        crate::sched::context::launch(&forger.ctx);
+        // kmain resumes when the nested dispatcher empties: all three
+        // runs exited. The forger's nanosleep park routes the exits
+        // through the completion mailbox (the same shape as the
+        // ADR-0023 signal proof — a strict take() here hits the empty
+        // USER_RUN slot, the try_take() lesson documented on
+        // context.rs), so the drain is the reaper. The drain ORDER is
+        // the starvation witness: the writer's entry must arrive while
+        // the forger's is still outstanding (the forger's post-forge
+        // 400M spin never parks voluntarily — outstanding means
+        // spinning under the timer).
+        hw::write_cr3(kernel_cr3);
+        let mut forger_code: Option<u64> = None;
+        let mut killer_code: Option<u64> = None;
+        let mut writer_code: Option<u64> = None;
+        let mut writer_before_forger = false;
+        while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            let code = match exit {
+                crate::sched::context::ExitKind::Exited(c) => c,
+                crate::sched::context::ExitKind::Running => 0,
+                crate::sched::context::ExitKind::Fault { vector, .. } => {
+                    let mut bv = [0u8; 20];
+                    let mut bv2 = [0u8; 20];
+                    line(
+                        &mut out,
+                        &[
+                            "[SEC ] ADR-0031 forge: ERROR: domain ",
+                            strutil::dec(dom as u64, &mut bv),
+                            " faulted (vector ",
+                            strutil::dec(vector as u64, &mut bv2),
+                            ") — halting",
+                        ],
+                    );
+                    hw::halt_forever();
+                }
+            };
+            match dom {
+                30 => forger_code = Some(code),
+                31 => killer_code = Some(code),
+                32 => {
+                    writer_code = Some(code);
+                    // The writer completed while the forger's exit was
+                    // still outstanding: the forger was alive (and,
+                    // given its pure-compute spin, on the CPU under
+                    // the timer) when the writer finished.
+                    writer_before_forger = forger_code.is_none();
+                }
+                _ => {}
+            }
+            mm::user::destroy_user(&mut k, &mut pool, dom);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+        }
+        let forge_switches = crate::sched::preempt::switches() - switches_before;
+        let forge_pass = forger_code == Some(0)
+            && killer_code == Some(0)
+            && writer_code == Some(0)
+            && writer_before_forger
+            && forge_switches >= 2;
+        if forge_pass {
+            let mut b = [0u8; 20];
+            line(
+                &mut out,
+                &[
+                    "[SEC ] ADR-0031 forge: IF=0+AC=1 frame sanitized, writer (32) finished while forger (30) spun (switches=",
+                    strutil::dec(forge_switches, &mut b),
+                    ")",
+                ],
+            );
+        } else {
+            let mut b1 = [0u8; 20];
+            let mut b2 = [0u8; 20];
+            let mut b3 = [0u8; 20];
+            let mut b4 = [0u8; 20];
+            let mut b5 = [0u8; 20];
+            let fc = forger_code.unwrap_or(0xFFFF_FFFF);
+            let kc = killer_code.unwrap_or(0xFFFF_FFFF);
+            let wc = writer_code.unwrap_or(0xFFFF_FFFF);
+            line(
+                &mut out,
+                &[
+                    "[SEC ] ADR-0031 forge: ERROR: forger_code=",
+                    strutil::dec(fc, &mut b4),
+                    " killer_code=",
+                    strutil::dec(kc, &mut b3),
+                    " writer_code=",
+                    strutil::dec(wc, &mut b2),
+                    " writer_before_forger=",
+                    strutil::dec(writer_before_forger as u64, &mut b1),
+                    " switches=",
+                    strutil::dec(forge_switches, &mut b5),
+                    " — halting",
+                ],
+            );
+            hw::halt_forever();
+        }
+
+        // ── 16c. ADR-0031 section A: the AC setter + the SMAP
+        //      re-probe. The SETTER (33, mode 15) sets AC by plain
+        //      pushfq/popfq (ring 3's own right — no signal frame
+        //      needed), makes a copy-free syscall excursion
+        //      (sched_yield), and exits with AC still set in its own
+        //      image. The kernel's entry `clac` must have kept ITS
+        //      view clear: the armed SMAP probe on the still-live
+        //      setter tables must STILL fault (the probe counter is
+        //      the witness — an inherited AC suppresses the fault and
+        //      the counter does not move). ──
+        static AC_SETTER_DATA: [u8; 1] = [15]; // mode 15: the AC setter
+        let setter = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            33,
+            aegis_os::profile::service_profile(),
+            RING3_PREEMPT,
+            &AC_SETTER_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(
+                    &mut out,
+                    &["[SEC ] ADR-0031 AC-setter: ERROR: setter spawn failed; halting"],
+                );
+                hw::halt_forever();
+            }
+        };
+        let kernel_cr3 = hw::read_cr3();
+        setter.run.tables.activate();
+        crate::sched::context::begin(setter.run);
+        crate::sched::context::launch(&setter.ctx);
+        let run = crate::sched::context::take();
+        hw::write_cr3(kernel_cr3);
+        let setter_ok = matches!(run.exit, crate::sched::context::ExitKind::Exited(0));
+        // The re-probe runs on the setter's STILL-LIVE tables (before
+        // destroy_user, so nothing on the exit path can clear AC first)
+        // and only under SMAP (the gate byte itself proves the feature).
+        let reprobe_faulted = if hw::smap_active() {
+            run.tables.activate();
+            let hits0 = arch::exceptions::smap_probe_hits();
+            arch::exceptions::arm_smap_read(0x0040_3000); // the setter's data page
+            hw::write_cr3(kernel_cr3);
+            arch::exceptions::smap_probe_hits() == hits0 + 1
+        } else {
+            true // no SMAP in this environment: nothing to re-probe
+        };
+        mm::user::destroy_user(&mut k, &mut pool, 33);
+        let _ = crate::sched::preempt::on_exit(&mut k.sched, 33);
+        if setter_ok && reprobe_faulted {
+            line(
+                &mut out,
+                &["[SEC ] ADR-0031 AC-setter: entry clac held — the SMAP re-probe still faulted after the AC excursion"],
+            );
+        } else {
+            line(
+                &mut out,
+                &["[SEC ] ADR-0031 AC-setter: ERROR: the SMAP re-probe did NOT fault (or the setter exited wrong) — AC leaked past the entry; halting"],
+            );
+            hw::halt_forever();
+        }
+    }
+
     // ── 19. ADR-0025: the IPC proof — capability-mediated endpoints,
     //      reached from ring 3 at last. The bootstrap (a uid-0
     //      supervisor domain) creates three endpoints — A owned by

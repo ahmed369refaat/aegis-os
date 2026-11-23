@@ -25,6 +25,25 @@
 //!   mode 5 — **forger**: rt_sigreturn with a garbage stack and no
 //!     delivery in flight — the kernel MUST refuse (nonzero RAX);
 //!     exit(0) only if it did.
+//!   mode 14 — **flag forger** (ADR-0031): arms a handler, sleeps, and
+//!     the handler rewrites word 5 of the REAL delivered frame — AC on,
+//!     IF off — through the kernel's own trampoline. The resumed code
+//!     proves by pushfq that it runs with IF=1 and AC=0 (exit 252/253
+//!     names a surviving forge), then spins 400M iterations: the
+//!     co-running writer must still finish first (the timer still
+//!     preempts a forged IF=0).
+//!   mode 15 — **AC setter** (ADR-0031): sets AC by plain
+//!     pushfq/popfq (no signal frame needed — POP F at CPL3 may modify
+//!     it), makes a copy-free syscall excursion (sched_yield), and
+//!     exits with AC still set: the kernel's entry must have cleared
+//!     its OWN view, so the bootstrap's SMAP re-probe still faults.
+//!   mode 16 — **parameterized killer**: the mode-4 shape with the
+//!     target pid read from the data page byte 1 (the old
+//!     hard-coded-pid ABI stays untouched).
+//!   mode 17 — **slow writer**: the mode-1 shape with a 10x burst per
+//!     round (40M) — a co-runner still alive inside the flag forger's
+//!     post-sigreturn spin, so the "finished first" check is a real
+//!     starvation proof, not a vacuous one.
 //!
 //! Register discipline (ADR-0012): live loop state lives in R12/R13 —
 //! the interrupt-frame switch preserves every GPR, but a *handover*
@@ -67,6 +86,14 @@ _ring3_start:
     je 18f                            /* mode 12: the pipe pair */
     cmp al, 13
     je 19f                            /* mode 13: the Linux-ABI blob */
+    cmp al, 14
+    je 25f                            /* mode 14: the flag forger */
+    cmp al, 15
+    je 26f                            /* mode 15: the AC setter */
+    cmp al, 16
+    je 27f                            /* mode 16: the parameterized killer */
+    cmp al, 17
+    je 28f                            /* mode 17: the slow writer */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -1613,6 +1640,170 @@ pipe_b_got:
     syscall
 240: mov eax, 231
     mov edi, 240                      /* the S1 path family failed */
+    syscall
+
+forge_handler:                          /* ADR-0031: rewrite word 5 (the
+       saved rflags) of the REAL delivered frame — set AC, clear IF —
+       the round-A1 exploit with a REAL cookie. Same placement
+       discipline as sig_handler: immediately before mode 14, so the
+       pinned delta spans only mode 14's own prologue. */
+    mov rax, [rsp+40]                 /* word 5 of the frame the kernel pushed */
+    or  rax, 0x40000                  /* AC on: SMAP bypass if restored */
+    mov rcx, 0xFFFFFDFF               /* sign-extended = every bit except IF */
+    and rax, rcx                      /* IF off: timer starvation if restored */
+    mov [rsp+40], rax
+    ret                               /* -> the trampoline -> rt_sigreturn */
+
+25: /* ── mode 14: the flag forger (ADR-0031) ──────────────────── */
+    mov eax, 25                       /* rt_sigaction(SIGUSR1=10, handler, trampoline) */
+    mov edi, 10
+    call next_instr14
+next_instr14:
+    pop rsi
+    sub rsi, 0x2D                     /* forge_handler sits this many bytes BEFORE
+                                          next_instr14 (objdump-pinned:
+                                          scripts/check-blob-deltas.py asserts it) */
+    mov rdx, 0x0040C000               /* the kernel's trampoline page */
+    syscall
+    test rax, rax
+    jnz 250f
+    /* write "forger armed\n" (fd 1, 14 bytes @0x403010) */
+    mov eax, 1
+    mov edi, 1
+    mov rsi, 0x00403010
+    mov edx, 14
+    syscall
+    /* nanosleep 200 ms — the killer strikes mid-sleep */
+    mov qword ptr [0x00403030], 0
+    mov rax, 200000000
+    mov qword ptr [0x00403038], rax
+    mov eax, 35
+    mov rdi, 0x00403030
+    mov rsi, 0x00403040
+    syscall
+    test rax, rax
+    jnz 251f
+    /* The round-M discipline (mode 3's belt): a kernel->user boundary
+       that is ALWAYS crossed. If the wake came through the tick path,
+       delivery defers to the NEXT syscall — without this yield that
+       would be the exit below, and the checks would never run (found
+       live: the first green run passed VACUOUSLY — the delivery landed
+       on the exit, the forged context never executed). With the yield
+       the handler+sigreturn always run BEFORE the checks, whatever
+       the wake path. */
+    mov eax, 24
+    syscall
+    test rax, rax
+    jnz 256f
+    /* Resumed after the forged sigreturn: prove on our OWN flags
+       image that the whitelist floor held. */
+    pushfq
+    pop rax
+    test rax, 0x200                   /* IF */
+    jz 252f                           /* IF=0 restored: the forge won */
+    test rax, 0x40000                 /* AC */
+    jnz 253f                          /* AC=1 restored: SMAP bypass */
+    /* The starvation proof: 400M pure-compute iterations, no
+       syscalls — exactly like mode 0's spinner. If the forged IF=0
+       had survived, the timer could never take the CPU back and the
+       co-running writer could never finish first. */
+    mov r13, 400000000
+forge_spin:
+    sub r13, 1
+    jnz forge_spin
+    mov eax, 63                       /* SYS_EXIT */
+    xor edi, edi                      /* 0: every step verified */
+    syscall
+
+26: /* ── mode 15: the AC setter (ADR-0031) ────────────────────── */
+    pushfq
+    or qword ptr [rsp], 0x40000       /* AC on in the pushed image */
+    popfq                             /* AC=1 — ring 3's own right
+                                          (POP F at CPL3 may set it;
+                                          no signal frame needed) */
+    mov eax, 24                       /* sched_yield: a full kernel
+                                          excursion with NO user-copy
+                                          window on the path — an
+                                          entry that inherited the AC
+                                          would keep it for the whole
+                                          dispatch and hand it back */
+    syscall
+    test rax, rax
+    jnz 254f
+    mov eax, 63                       /* exit 0 with AC still set in
+                                          OUR image — the kernel's
+                                          entry clac must have kept ITS
+                                          view clear (the bootstrap's
+                                          SMAP re-probe proves it) */
+    xor edi, edi
+    syscall
+
+27: /* ── mode 16: the parameterized killer (ADR-0031) ──────────── */
+    mov r13, 30000000                 /* a compute burst well INSIDE the
+                                          victim's 200 ms sleep */
+killer16_spin:
+    sub r13, 1
+    jnz killer16_spin
+    movzx edi, byte ptr [0x00403001]  /* the target pid from the data page */
+    mov eax, 62                       /* kill(target, SIGUSR1) */
+    mov esi, 10
+    syscall
+    test rax, rax
+    jnz 255f
+    mov eax, 63
+    xor edi, edi
+    syscall
+
+250: mov eax, 63
+    mov edi, 250                      /* the forger's sigaction failed */
+    syscall
+251: mov eax, 63
+    mov edi, 251                      /* the forger's nanosleep failed */
+    syscall
+252: mov eax, 63
+    mov edi, 252                      /* IF=0 SURVIVED the restore — the forge won */
+    syscall
+253: mov eax, 63
+    mov edi, 253                      /* AC=1 SURVIVED the restore — SMAP bypass */
+    syscall
+254: mov eax, 63
+    mov edi, 254                      /* the AC setter's yield failed */
+    syscall
+255: mov eax, 63
+    mov edi, 255                      /* the parameterized killer's kill failed */
+    syscall
+256: mov eax, 63
+    mov edi, 256                      /* the forger's post-sleep yield failed */
+    syscall
+
+28: /* ── mode 17: the slow writer (ADR-0031) ──────────────────── */
+    /* The mode-1 shape with a 10x compute burst per round (40M): the
+       forger's post-sigreturn 400M spin needs a co-runner that is
+       STILL ALIVE when it starts, or the "writer finished first"
+       check would hold vacuously (everybody already exited). 4x40M
+       outlasts the forger's sleep but loses to its 400M spin — the
+       interleave is real, not scheduled by accident. */
+    xor r12d, r12d                    /* round counter (R12: survives
+                                         syscalls AND preemption AND
+                                         handover resumes) */
+slow_wr_loop:
+    mov rax, r12
+    shl rax, 5
+    mov rsi, 0x00403010
+    add rsi, rax
+    mov eax, 1                        /* SYS_WRITE */
+    mov edi, 1                        /* fd: console */
+    mov edx, 22
+    syscall
+    mov r13d, 40000000
+slow_wr_spin:
+    sub r13d, 1
+    jnz slow_wr_spin
+    add r12d, 1
+    cmp r12d, 4
+    jb slow_wr_loop
+    mov eax, 63                       /* SYS_EXIT */
+    xor edi, edi
     syscall
 
 140: mov eax, 63
