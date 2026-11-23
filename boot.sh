@@ -30,7 +30,7 @@ STUB_OBJ=target/stub.o
 IMAGE=target/aegis-boot.elf
 
 echo "==> [0/4] building the ring-3 example blobs (rustc --emit=obj + objcopy)"
-for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files; do
+for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init; do
     rustc --edition 2021 --crate-type=lib --emit=obj \
           --target x86_64-unknown-none -O "examples/$b/src/lib.rs" \
           -o "target/$b.o"
@@ -476,6 +476,7 @@ if [ "$MODE" = "verify" ]; then
   # refusals, and the rerouted fd path.
   grep -qF "[M3] pipe: 64 bytes cross-domain byte-exact" "$LOG" || { echo "VERIFY FAIL: M3 pipe marker missing"; ok=0; }
   grep -qF "[M3] linux-abi: v1 entry live" "$LOG" || { echo "VERIFY FAIL: M3 linux-abi marker missing"; ok=0; }
+  grep -qF "[M3] init: PID 1's wait4 loop drained" "$LOG" || { echo "VERIFY FAIL: init wait4-loop marker missing (Phase 7)"; ok=0; }
   # Slice 4: the exec'd image's OWN serial marker — printed by the
   # ELF's code through the SURVIVING fd-1 console alias (fds cross
   # exec by design, ADR-0022 D4), parsed by the loader, mapped at its

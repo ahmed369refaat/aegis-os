@@ -1,0 +1,9 @@
+[package]
+name = "ring3-init"
+version = "0.2.0"
+edition = "2021"
+description = "AegisOS ring-3 example: PID 1's init — fork, the orphan's reparenting, and the blocking wait4 loop drained to ECHILD. Built to a flat blob by boot.sh (rustc --emit=obj + objcopy); NOT a workspace member."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"

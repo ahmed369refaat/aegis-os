@@ -55,6 +55,8 @@ static RING3_PREEMPT: &[u8] = include_bytes!("../blob/ring3-preempt.bin");
 /// open/write/read-back through an independent cursor, and the errno
 /// refusals, all from CPL=3 through the LIVE lib kernel.
 static RING3_FILES: &[u8] = include_bytes!("../blob/ring3-files.bin");
+/// Phase 7 (M3): PID 1's init blob — the fork/wait4/reparent proof.
+static RING3_INIT: &[u8] = include_bytes!("../blob/ring3-init.bin");
 
 /// Round J: the files blob's data page. The blob's literal addresses
 /// (0x403000..) are the contract — this builds the matching array.
@@ -2515,6 +2517,98 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             line(
                 &mut out,
                 &["[M3] linux-abi: ERROR: expected 1 clean exit (the child is consumed by the wait), saw a different count; halting"],
+            );
+            hw::halt_forever();
+        }
+    }
+
+    // ── Phase 7, slice 1 (M3): PID 1 — the init pattern. A dedicated
+    //    blob speaks Linux v1 from the REAL init pid: fork A; A forks
+    //    the orphan B and exit_group(7)s; B exit_group(33)s. The
+    //    kernel reparents B to PID 1 (ADR-0022 D7's reparent_children,
+    //    live in the lib since round K), and init's BLOCKING wait4(-1)
+    //    loop reaps both — 7<<8 and the adopted orphan's 33<<8 — until
+    //    -ECHILD drains it. The blob verifies every answer in itself;
+    //    exit(0) is the drained-and-verified proof.
+    {
+        static INIT_DATA: [u8; 1] = [0]; // no modes — the fork branches are the roles
+        let sp = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            aegis_os::proc::INIT_PID,
+            aegis_os::profile::service_profile(),
+            RING3_INIT,
+            &INIT_DATA,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(&mut out, &["[M3] init: ERROR: spawn failed; halting"]);
+                hw::halt_forever();
+            }
+        };
+        // v1: PID 1 speaks Linux numbers — the supervisor's
+        // declaration; the fork children inherit it (ADR-0003).
+        let _ = k.set_domain_abi(aegis_os::proc::INIT_PID, aegis_os::syscall::Abi::Linux);
+        let kernel_cr3 = hw::read_cr3();
+        sp.run.tables.activate();
+        crate::sched::context::begin(sp.run);
+        crate::sched::context::launch(&sp.ctx);
+        hw::write_cr3(kernel_cr3);
+        let mut clean = 0usize;
+        let mut bad: Option<(u32, u64)> = None;
+        // Both exit paths leave the run in the slot (round U's lesson):
+        // try_take first, then the parked mailbox.
+        if let Some(run) = crate::sched::context::try_take() {
+            match run.exit {
+                crate::sched::context::ExitKind::Exited(0) => clean += 1,
+                crate::sched::context::ExitKind::Exited(c) => bad = Some((run.domain, c)),
+                _ => bad = Some((run.domain, u64::MAX)),
+            }
+            mm::user::destroy_user(&mut k, &mut pool, run.domain);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, run.domain);
+        }
+        while let Some((dom, exit)) = crate::sched::park::completed_drain() {
+            match exit {
+                crate::sched::context::ExitKind::Exited(0) => clean += 1,
+                crate::sched::context::ExitKind::Exited(c) => bad = bad.or(Some((dom, c))),
+                _ => bad = bad.or(Some((dom, u64::MAX))),
+            }
+            mm::user::destroy_user(&mut k, &mut pool, dom);
+            let _ = crate::sched::preempt::on_exit(&mut k.sched, dom);
+        }
+        if let Some((dom, c)) = bad {
+            let mut b1 = [0u8; 20];
+            let mut b2 = [0u8; 20];
+            line(
+                &mut out,
+                &[
+                    "[M3] init: ERROR: dom=",
+                    strutil::dec(u64::from(dom), &mut b1),
+                    " exit=",
+                    strutil::dec(c, &mut b2),
+                    "; halting",
+                ],
+            );
+            hw::halt_forever();
+        }
+        // Exactly ONE clean exit — init's own. The wait4 loop consumed
+        // BOTH children (A's and the adopted orphan's completions); a
+        // stray mailbox entry here is the round-W failure shape — fail
+        // loudly, never absorb it.
+        if clean == 1 {
+            line(
+                &mut out,
+                &["[M3] init: PID 1's wait4 loop drained — 2 children reaped (exit 7 + the reparented orphan's 33), ECHILD ended the loop (Phase 7)"],
+            );
+        } else {
+            let mut b1 = [0u8; 20];
+            line(
+                &mut out,
+                &[
+                    "[M3] init: ERROR: expected 1 clean exit (the wait4 loop consumed both children), saw ",
+                    strutil::dec(clean as u64, &mut b1),
+                    "; halting",
+                ],
             );
             hw::halt_forever();
         }

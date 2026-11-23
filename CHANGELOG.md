@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased] — Phase 7 slice 1: PID 1 — the init pattern, proven at CPL=3
+
+`examples/ring3-init`: the smallest honest init. PID 1 speaks Linux
+v1 (the supervisor declares it; fork children inherit it — ADR-0003)
+and runs the job description: fork child A; A forks the grandchild B
+and `exit_group(7)`s; B — orphaned the moment A dies — is reparented
+to PID 1 by the ADR-0022 D7 core (`reparent_children`, live in the
+lib since round K) and `exit_group(33)`s. Whichever order the
+dispatcher picks, init's BLOCKING `wait4(-1)` loop reaps BOTH — the
+wstatus values are the identity proof (7<<8 is A, 33<<8 is the
+adopted orphan) — and only `-ECHILD` ends the loop. Exactly one
+child of each, or the blob dies naming its step (90..95); a clean
+drain is exit(0).
+
+- The wstatus target is a PRIVATE mmap made AFTER the fork (the CoW
+  rule mode 13 pinned: fork marks shared pages read-only in both
+  tables).
+- kmain spawns the blob AT `proc::INIT_PID` (domain 1 — the hello
+  domain created and destroyed it back in the M1 stage), sets the
+  ABI, and accepts exactly ONE clean exit: the wait4 loop consumed
+  both children's completions, and a stray mailbox entry is the
+  round-W failure shape — fail loudly, never absorb it.
+- The marker, base-grepped on every lane:
+  `[M3] init: PID 1's wait4 loop drained — 2 children reaped (exit 7
+  + the reparented orphan's 33), ECHILD ended the loop (Phase 7)`.
+  Live green on the first boot (pc lane, 38.9 s).
+
+Gates: boot-target clippy -D warnings clean, kernel host 283/283,
+lib 430/430, fmt, unsafe 125/125, asm guard, no-binaries PASS.
+
 ## [Unreleased] — Phase 6 S5c: --verify-persist — the lane that boots the same disk twice
 
 The M3 exit criterion's proof lane. A lean q35 machine (the IOMMU,
