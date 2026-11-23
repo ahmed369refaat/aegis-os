@@ -7,16 +7,16 @@
 //! - Plugins get read + IPC only.
 //! - Network egress is brokered: `netd_profile` is the ONLY profile that
 //!   carries NET_* rights, and its sends are kernel rate-limited per client.
-//! - The Linux-like process syscalls (PIPE/DUP/KILL/CHROOT/MKDIR/UNLINK)
-//!   belong to the service profile exclusively.
+//! - The Linux-like process syscalls (PIPE/DUP/KILL/CHROOT/MKDIR/UNLINK/
+//!   LISTDIR) belong to the service profile exclusively.
 
 use crate::capability::Rights;
 use crate::syscall::{
     SyscallMask, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK,
     SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY,
-    SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_NET_RECV,
-    SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_READ, SYS_SCHED_YIELD,
-    SYS_SIGACTION, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
+    SYS_IPC_SEND, SYS_KILL, SYS_LISTDIR, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP,
+    SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_READ,
+    SYS_SCHED_YIELD, SYS_SIGACTION, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
 };
 
 /// The surface a domain of this class keeps while *degraded* (the
@@ -73,6 +73,7 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_CHROOT)
                 | (1u64 << SYS_MKDIR)
                 | (1u64 << SYS_UNLINK)
+                | (1u64 << SYS_LISTDIR)
                 | (1u64 << SYS_MMAP)
                 | (1u64 << SYS_MUNMAP)
                 | (1u64 << SYS_FORK)
@@ -525,7 +526,13 @@ mod tests {
     fn service_holds_the_linux_like_syscalls_exclusively() {
         let s = service_profile();
         for allowed in [
-            SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT, SYS_MKDIR, SYS_UNLINK,
+            SYS_PIPE,
+            SYS_DUP,
+            SYS_KILL,
+            SYS_CHROOT,
+            SYS_MKDIR,
+            SYS_UNLINK,
+            SYS_LISTDIR,
         ] {
             assert!(
                 s.syscalls.is_allowed(allowed).unwrap(),
@@ -540,7 +547,13 @@ mod tests {
             netd_profile(),
         ] {
             for denied in [
-                SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT, SYS_MKDIR, SYS_UNLINK,
+                SYS_PIPE,
+                SYS_DUP,
+                SYS_KILL,
+                SYS_CHROOT,
+                SYS_MKDIR,
+                SYS_UNLINK,
+                SYS_LISTDIR,
             ] {
                 assert!(
                     !p.syscalls.is_allowed(denied).unwrap(),

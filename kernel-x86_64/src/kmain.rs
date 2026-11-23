@@ -80,7 +80,7 @@ const fn ring3_files_data() -> [u8; 4096] {
     let mut d = [0u8; 4096];
     put4096(&mut d, 0x000, b"pipe bytes from cpl3\n"); // MSG1 (21)
     put4096(&mut d, 0x040, b"dup keeps ends alive\n"); // MSG2 (21)
-    put4096(&mut d, 0x080, b"aegis file roundtrip\n"); // FMSG (21)
+    put4096(&mut d, 0x080, ROUND_J_MSG); // FMSG (21)
     put4096(&mut d, 0x0C0, b"/pub/round-j.txt\0"); // PATH (17)
     put4096(&mut d, 0x100, b"/no/such/file\0"); // NXPATH (14)
     put4096(&mut d, 0x140, b"J:pipe ok\n"); // M1 (10)
@@ -104,6 +104,10 @@ static FILES_DATA: [u8; 4096] = ring3_files_data();
 /// The exact message the hello blob writes from ring-3 (its length is
 /// baked into the blob's `mov edx, 26`).
 const RING3_MSG: &[u8] = b"hello from ring 3 (CPL=3)\n";
+/// Round J's file message — the one source of truth for the fixture
+/// the shell session's cp reads (FMSG at data offset 0x080; the K13
+/// probe re-seeds exactly these bytes, so the literal lives ONCE).
+const ROUND_J_MSG: &[u8] = b"aegis file roundtrip\n";
 use crate::runtime::{self, HelloReport, M1Error, MonitorReport, StressReport};
 use crate::{hw, memops, mm, multiboot, serial, strutil};
 use aegis_os::memory::MemFlags;
@@ -2519,6 +2523,136 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 &["[M3] linux-abi: ERROR: expected 1 clean exit (the child is consumed by the wait), saw a different count; halting"],
             );
             hw::halt_forever();
+        }
+    }
+
+    // ── Phase 7 (K13): the shell's two boot-time contracts, set before
+    //    init ever forks.
+    //
+    //    (a) The exec-policy surface for /bin/sh. The exec arm
+    //    intersects THE MASK, never the capabilities (ADR-0022 D5):
+    //    an unlisted binary lands on the app default, which carries
+    //    no MKDIR/UNLINK/LISTDIR — and the session's first mkdir
+    //    answered -EPERM, the exact errno a missing FsNode capability
+    //    would have produced. The capability theory died under the
+    //    static anatomy: Domain::new seeds FsNode(ROOT) on init, fork
+    //    clones the capability table into the child, and exec never
+    //    touches it — the grant was there all along; the MASK was
+    //    what the exec boundary ate. Declared here, the shell keeps
+    //    the service surface it actually speaks: file I/O, fork/exec/
+    //    wait for the init relationship, MKDIR/UNLINK/LISTDIR for the
+    //    session's own commands. Monitoring follows the kernel-global
+    //    mode (None) — a surface declaration is not a monitoring
+    //    decision.
+    let _ = k.exec_policy_declare(
+        "/bin/sh",
+        &aegis_os::profile::service_profile().syscalls,
+        None,
+    );
+    //    (b) The session source fixture probe — every boot, right
+    //    before init forks. The session's cp reads /pub/round-j.txt;
+    //    round J wrote it, but "an earlier phase left it" is an
+    //    assumption, and a lane that goes red because a fixture went
+    //    missing is a red lane that lies about why. Present → say so
+    //    with the byte count; absent or wrong → the supervisor
+    //    re-seeds the same 21 bytes round J writes (FMSG at 0x080).
+    {
+        const FMSG: &[u8] = ROUND_J_MSG;
+        let probe = matches!(
+            k.create_domain_with(13, aegis_os::profile::service_profile(), 0, 0, 0),
+            Ok(())
+        );
+        // Some(n): the fixture read back as the exact n bytes; None:
+        // absent or wrong, the re-seed path decides what happens.
+        let mut present: Option<usize> = None;
+        let mut reseeded = false;
+        if probe {
+            present = 'probe: {
+                let Ok(aegis_os::sys::SysValue::Fd(fd)) = k.syscall(
+                    13,
+                    aegis_os::sys::SysRequest::Open {
+                        path: "/pub/round-j.txt",
+                        mode: aegis_os::vfs::Mode(0o644),
+                        create: false,
+                        read: true,
+                        write: false,
+                        truncate: false,
+                    },
+                ) else {
+                    break 'probe None;
+                };
+                let mut buf = [0u8; 32];
+                let n = match k.syscall(13, aegis_os::sys::SysRequest::Read { fd, buf: &mut buf }) {
+                    Ok(aegis_os::sys::SysValue::Count(n)) => n,
+                    _ => {
+                        let _ = k.syscall(13, aegis_os::sys::SysRequest::Close { fd });
+                        break 'probe None;
+                    }
+                };
+                let _ = k.syscall(13, aegis_os::sys::SysRequest::Close { fd });
+                if n == FMSG.len() && &buf[..n] == FMSG {
+                    Some(n)
+                } else {
+                    None
+                }
+            };
+            if present.is_none() {
+                // Absent or wrong: re-seed — O_CREAT|O_TRUNC|O_WRONLY,
+                // then the same 21 bytes round J writes.
+                reseeded = 'reseed: {
+                    let Ok(aegis_os::sys::SysValue::Fd(fd)) = k.syscall(
+                        13,
+                        aegis_os::sys::SysRequest::Open {
+                            path: "/pub/round-j.txt",
+                            mode: aegis_os::vfs::Mode(0o644),
+                            create: true,
+                            read: false,
+                            write: true,
+                            truncate: true,
+                        },
+                    ) else {
+                        break 'reseed false;
+                    };
+                    let wrote = matches!(
+                        k.syscall(13, aegis_os::sys::SysRequest::Write { fd, bytes: FMSG },),
+                        Ok(aegis_os::sys::SysValue::Count(_))
+                    );
+                    let _ = k.syscall(13, aegis_os::sys::SysRequest::Close { fd });
+                    wrote
+                };
+            }
+        }
+        let _ = k.destroy_domain(13);
+        match (present, reseeded) {
+            (Some(n), _) => {
+                let mut b = [0u8; 20];
+                line(
+                    &mut out,
+                    &[
+                        "[M3] init: session source /pub/round-j.txt present (",
+                        strutil::dec(n as u64, &mut b),
+                        " bytes)",
+                    ],
+                );
+            }
+            (None, true) => {
+                let mut b = [0u8; 20];
+                line(
+                    &mut out,
+                    &[
+                        "[M3] init: session source /pub/round-j.txt re-seeded (",
+                        strutil::dec(FMSG.len() as u64, &mut b),
+                        " bytes)",
+                    ],
+                );
+            }
+            (None, false) => {
+                line(
+                    &mut out,
+                    &["[M3] init: ERROR: session source fixture unavailable; halting"],
+                );
+                hw::halt_forever();
+            }
         }
     }
 

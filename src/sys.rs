@@ -350,13 +350,22 @@ impl<const N: usize> Kernel<N> {
                         .vfs
                         .resolve(root, cwd, path, creds)
                         .map_err(SysError::Vfs)?;
-                    // Phase 6 S2: only a DIRECTORY refuses to open —
-                    // device and proc nodes open like files (their
+                    // Phase 7 (K13): a directory OPENS for read — the
+                    // ListDir arm needs an fd on a directory, and
+                    // before this no caller could produce one (Open
+                    // refused every directory with EISDIR, so the
+                    // arm's own input shape was unreachable from any
+                    // ring-3 path). The Unix refusals stay exactly
+                    // where they were: opening with write or truncate
+                    // still answers EISDIR here, and read(2) on the
+                    // fd still dies in read_by_id_at's IsADirectory —
+                    // the fd is a listing handle, never a byte stream.
+                    // Device and proc nodes open like files (their
                     // read/write semantics are the VFS's and the
                     // executor's; an O_TRUNC on them dies at the
                     // truncate step below with the same refusal it
                     // always had).
-                    if self.vfs.kind_of(found) == Some(InodeKind::Dir) {
+                    if self.vfs.kind_of(found) == Some(InodeKind::Dir) && (write || truncate) {
                         return Err(SysError::Vfs(VfsError::IsADirectory));
                     }
                     found

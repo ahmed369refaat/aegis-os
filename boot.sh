@@ -161,7 +161,7 @@ case "${1:-}" in
       "[VCON] virtio-console alive: tx qsize="  # port 0's transmit queue through the broker
       "[VCON] TX complete: "  # the guest half of the round trip (the host file is the other half)
       "[VBAL] virtio-balloon alive: config num_pages="  # the memory device's config layout
-      "[VBAL] cycle done: inflated=NO (budget) deflated=yes"  # round I, honest: the deflate round trip is proven (actual returns home); the inflate's host-side discard path times out under this QEMU — open, recorded in the checklist
+      "[VBAL] cycle done: inflated=yes deflated=yes"  # K13, closed: the buffer is a real 4-byte PFN list (not 4096 zero bytes), the used ring is the completion, and `actual` is the DRIVER's field — QEMU's set_config only reads it. Both halves green
       "[IVRS] absent (no AMD-Vi on this machine"  # the honest AMD-Vi absence (QEMU does not emulate it)
       "[VNET] alive: MAC="
       "[VNET] dbg q1 readback:"  # the device holds exactly the frames we mapped
@@ -420,6 +420,14 @@ if [ "$MODE" = "verify" ]; then
   # The persist lane runs the full M3 suite + the driver stack + the
   # two-boot proof under TCG with the IOMMU on — same budget as q35.
   if [ "${1:-}" = "--verify-persist" ]; then
+    QEMU_TIMEOUT=600
+  fi
+  # The shell lane carries the SAME kernel image as every other lane
+  # (all the kmain phases, the ~390k-line syscall audit) before init
+  # ever forks the shell — the 60s default killed QEMU mid-session
+  # once (K13, live): the shell had printed [SH] up and was executing
+  # commands when the budget expired. Same 600s budget as q35/persist.
+  if [ "${1:-}" = "--verify-shell" ]; then
     QEMU_TIMEOUT=600
   fi
   # ADR-0014: the q35 lane runs with the VT-d trace on, so the lane

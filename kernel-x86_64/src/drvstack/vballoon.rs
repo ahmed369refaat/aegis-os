@@ -1,14 +1,22 @@
 //! virtio-balloon (the virtio row's memory device): a REAL one-page
 //! inflate/deflate cycle through the broker — a frame the pool owns
-//! is handed to the device (the host drops its backing), the config's
-//! `actual` count advances, then the SAME page is deflated back and
-//! returned to the pool. Device ids: modern 0x1045, legacy 0x1005.
+//! is offered to the device by its PFN (the host drops its backing,
+//! the completion lands on the used ring), the driver then writes
+//! the config's `actual` count (the guest's own report of the
+//! balloon size), and the SAME page is deflated back and returned to
+//! the pool. Device ids: modern 0x1045, legacy 0x1005.
 //!
-//! Config layout (virtio-balloon spec): num_pages u32 LE at +0 (the
-//! TARGET the guest sets), actual u32 LE at +4 (what the device
-//! reports). The queues: 0 = inflate, 1 = deflate (the stats vq is
-//! not negotiated in this slice). Both queues carry device-READABLE
-//! pages: the guest offers PFNs, the host manipulates their backing.
+//! Config layout (virtio-balloon spec — and QEMU 10's own
+//! `virtio_balloon_set_config`, read off the wire in the K13
+//! forensics): num_pages u32 LE at +0 (the guest's TARGET — host
+//! tools set it via QMP; no QEMU device path reads the guest's
+//! copy), actual u32 LE at +4 (the balloon size — QEMU READS this
+//! field on every config write, meaning it is THE GUEST'S to keep
+//! current; no device path ever advances it). The queues: 0 =
+//! inflate, 1 = deflate (the stats vq is not negotiated in this
+//! slice). Both queues carry device-READABLE pages: the guest offers
+//! a PFN LIST (u32 LE each — one 4-byte entry per ballooned page),
+//! the host manipulates those pages' backing.
 //!
 //! The safety rule that makes this CI-safe: exactly ONE page, freshly
 //! allocated from the frame pool (scrubbed, unowned by anything
@@ -36,7 +44,11 @@ pub const VIRTIO_BALLOON_LEGACY: u16 = 0x1005;
 
 /// Config offset: num_pages (u32 LE) — the guest's target.
 pub const CFG_NUM_PAGES: u64 = 0;
-/// Config offset: actual (u32 LE) — the device's report.
+/// Config offset: actual (u32 LE) — the guest's own report of the
+/// balloon size. QEMU's set_config READS this field (the K13
+/// forensics: `virtio_balloon_set_config actual: 0 oldactual: 0` on
+/// every config write); no device path ever writes it — keeping
+/// `actual` current is the DRIVER's job, one write per completion.
 pub const CFG_ACTUAL: u64 = 4;
 
 /// Does this device id name the virtio balloon?
@@ -226,8 +238,15 @@ pub(crate) fn balloon_step<const N: usize>(
     // ── the one-page inflate ──
     // The offered page: a fresh pool frame, mapped for the device,
     // device-READABLE (the host takes its backing away — the guest
-    // must not touch it until deflated).
-    v::write_desc(i_desc, page, 4096, 0, 0);
+    // must not touch it until deflated). The buffer is a PFN LIST:
+    // ONE u32 LE entry — the page's own PFN — and the descriptor's
+    // length is 4, the list's byte size. (The K13 forensics caught
+    // this frame's first draft: a 4096-byte descriptor over the
+    // scrubbed frame offered 1024 ZERO PFNs — QEMU's handle_output
+    // dutifully processed the zeros while the trace showed the real
+    // gpa's backing gone and `actual` never moving.)
+    crate::memops::write_u32(page, (page >> 12) as u32);
+    v::write_desc(i_desc, page, 4, 0, 0);
     let avail_idx = v::read_u16_pa(i_avail + 2);
     v::write_u16_pa(v::avail_slot_addr(i_avail, avail_idx % i_qsize), 0);
     v::write_u16_pa(i_avail + 2, avail_idx.wrapping_add(1));
@@ -238,7 +257,10 @@ pub(crate) fn balloon_step<const N: usize>(
         );
         return;
     }
-    // The new target: actual + 1 page (checked).
+    // The new target: actual + 1 page (checked). num_pages is the
+    // guest's TARGET field — written for the config's honesty, and
+    // read by host-side tooling (QMP); no QEMU device path reads the
+    // guest's copy.
     let Some(target) = inflate_target(actual0, 1) else {
         line(
             out,
@@ -247,23 +269,26 @@ pub(crate) fn balloon_step<const N: usize>(
         return;
     };
     crate::memops::write_u32(dcfg + CFG_NUM_PAGES, target);
-    // Bounded wait: the completion on the inflate queue AND the
-    // config's actual advancing to the target.
+    // Bounded wait: the COMPLETION on the inflate queue's used ring.
+    // `actual` is not part of the wait — the device never advances it
+    // (QEMU's set_config only READS the field); the DRIVER writes it
+    // below, once the completion lands.
     let want = avail_idx.wrapping_add(1);
     let budget = 20_000_000u64;
     let mut spins = 0u64;
-    while !(v::used_idx(i_used) == want && crate::memops::read_u32(dcfg + CFG_ACTUAL) == target)
-        && spins < budget
-    {
+    while v::used_idx(i_used) != want && spins < budget {
         spins += 1;
     }
-    let inflated =
-        v::used_idx(i_used) == want && crate::memops::read_u32(dcfg + CFG_ACTUAL) == target;
+    let inflated = v::used_idx(i_used) == want;
+    if inflated {
+        crate::memops::write_u32(dcfg + CFG_ACTUAL, target);
+    }
 
     // ── the deflate: the SAME page on queue 1, the target back to
     // the original count — the host restores the page's backing and
-    // the config's actual falls home.
-    v::write_desc(d_desc, page, 4096, 0, 0);
+    // the completion lands on the deflate queue's used ring; the
+    // driver then writes `actual` home.
+    v::write_desc(d_desc, page, 4, 0, 0);
     let d_idx = v::read_u16_pa(d_avail + 2);
     v::write_u16_pa(v::avail_slot_addr(d_avail, d_idx % d_qsize), 0);
     v::write_u16_pa(d_avail + 2, d_idx.wrapping_add(1));
@@ -277,13 +302,13 @@ pub(crate) fn balloon_step<const N: usize>(
     crate::memops::write_u32(dcfg + CFG_NUM_PAGES, deflate_target(actual0));
     let d_want = d_idx.wrapping_add(1);
     let mut spins2 = 0u64;
-    while !(v::used_idx(d_used) == d_want && crate::memops::read_u32(dcfg + CFG_ACTUAL) == actual0)
-        && spins2 < budget
-    {
+    while v::used_idx(d_used) != d_want && spins2 < budget {
         spins2 += 1;
     }
-    let deflated =
-        v::used_idx(d_used) == d_want && crate::memops::read_u32(dcfg + CFG_ACTUAL) == actual0;
+    let deflated = v::used_idx(d_used) == d_want;
+    if deflated {
+        crate::memops::write_u32(dcfg + CFG_ACTUAL, actual0);
+    }
 
     let mut c1 = [0u8; 20];
     let mut c2 = [0u8; 20];

@@ -2049,6 +2049,209 @@ mod tests {
         ));
     }
 
+    /// K13 (the live session's EPERM, reproduced in a test tube): the
+    /// exec boundary intersects THE MASK, never the capabilities. A
+    /// service-profile domain exec's an UNLISTED binary — the arm
+    /// applies the app default, which carries no MKDIR — and the next
+    /// mkdir dies at the mask with exactly the -EPERM shape the shell
+    /// session showed live. The FsNode(ROOT) grant every domain gets
+    /// at creation never moved: this is the mask, and only the mask.
+    #[test]
+    fn exec_policy_unlisted_binary_loses_mkdir_at_the_mask() {
+        use crate::sys::{SysError, SysRequest};
+        use crate::syscall::SYS_MKDIR;
+        use crate::vfs::Mode;
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        // What sys_exec does for an unlisted path: the app default.
+        let (dfl, monitor) = k.exec_policy_declared_for("/bin/unlisted");
+        k.exec_replace(1, &dfl, monitor).unwrap();
+        // The mask — not a capability — refuses the session's first
+        // command. DeniedByMask is the -EPERM the lane saw live.
+        match k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub/shdir",
+                mode: Mode(0o755),
+            },
+        ) {
+            Err(SysError::Masked(nr)) => assert_eq!(nr, SYS_MKDIR),
+            other => panic!(
+                "the unlisted-exec mask must refuse the mkdir, saw {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+
+    /// K13 (the reversal): declare the binary's real surface and the
+    /// same exec boundary keeps the session's commands alive — mkdir,
+    /// unlink, and the LISTDIR the shell's ls speaks all cross intact.
+    #[test]
+    fn exec_policy_declared_surface_keeps_the_session_commands() {
+        use crate::sys::{SysRequest, SysValue};
+        use crate::syscall::SYS_LISTDIR;
+        use crate::vfs::Mode;
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        // The supervisor's declaration — kmain's /bin/sh line.
+        k.exec_policy_declare("/bin/sh", &service_profile().syscalls, None)
+            .unwrap();
+        let (declared, monitor) = k.exec_policy_declared_for("/bin/sh");
+        assert!(declared.is_allowed(SYS_LISTDIR).unwrap());
+        k.exec_replace(1, &declared, monitor).unwrap();
+        // The session's commands, in order: mkdir, ls (dir open +
+        // list), rm (unlink) — every one across the exec boundary.
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub/shdir",
+                mode: Mode(0o755),
+            },
+        )
+        .unwrap();
+        let fd = match k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/pub/shdir",
+                mode: Mode(0o755),
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+            },
+        ) {
+            Ok(SysValue::Fd(fd)) => fd,
+            other => panic!(
+                "the declared surface must open the directory, saw {:?}",
+                other.map(|_| ())
+            ),
+        };
+        let mut names = [0u8; 64];
+        match k.syscall(
+            1,
+            SysRequest::ListDir {
+                fd,
+                buf: &mut names,
+            },
+        ) {
+            Ok(SysValue::Count(_)) => {}
+            other => panic!(
+                "the declared surface must list the directory, saw {:?}",
+                other.map(|_| ())
+            ),
+        }
+        k.syscall(1, SysRequest::Unlink { path: "/pub/shdir" })
+            .unwrap();
+    }
+
+    /// K13 (the directory-open fix): a directory OPENS for read — that
+    /// is the only shape ListDir accepts, and before the fix Open
+    /// refused every directory, so the arm's input was unreachable
+    /// from ring 3. The Unix refusals keep their errno: open-for-write
+    /// is EISDIR at open time, and read(2) on the listing fd is EISDIR
+    /// at the VFS layer — the fd lists, it never streams.
+    #[test]
+    fn directories_open_for_read_and_refuse_every_writing_shape() {
+        use crate::sys::{SysError, SysRequest, SysValue};
+        use crate::vfs::{Mode, VfsError};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        // Read-only open: the listing handle.
+        let fd = match k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/pub",
+                mode: Mode(0o755),
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+            },
+        ) {
+            Ok(SysValue::Fd(fd)) => fd,
+            other => panic!(
+                "a directory must open for read, saw {:?}",
+                other.map(|_| ())
+            ),
+        };
+        // getdents64's engine consumes exactly that fd.
+        let mut names = [0u8; 64];
+        match k.syscall(
+            1,
+            SysRequest::ListDir {
+                fd,
+                buf: &mut names,
+            },
+        ) {
+            Ok(SysValue::Count(_)) => {}
+            other => panic!(
+                "ListDir must consume the directory fd, saw {:?}",
+                other.map(|_| ())
+            ),
+        }
+        // read(2) on the listing fd: the Unix refusal, unchanged.
+        let mut buf = [0u8; 8];
+        assert!(matches!(
+            k.syscall(1, SysRequest::Read { fd, buf: &mut buf }),
+            Err(SysError::Vfs(VfsError::IsADirectory))
+        ));
+        let _ = k.syscall(1, SysRequest::Close { fd });
+        // Open-for-write on a directory: EISDIR at open time, both the
+        // plain write shape and the truncate shape.
+        assert!(matches!(
+            k.syscall(
+                1,
+                SysRequest::Open {
+                    path: "/pub",
+                    mode: Mode(0o755),
+                    create: false,
+                    read: false,
+                    write: true,
+                    truncate: false,
+                },
+            ),
+            Err(SysError::Vfs(VfsError::IsADirectory))
+        ));
+        assert!(matches!(
+            k.syscall(
+                1,
+                SysRequest::Open {
+                    path: "/pub",
+                    mode: Mode(0o755),
+                    create: false,
+                    read: true,
+                    write: true,
+                    truncate: true,
+                },
+            ),
+            Err(SysError::Vfs(VfsError::IsADirectory))
+        ));
+    }
+
     /// F11(b)+(c): Open takes read/write flags and checks permission at
     /// open time; Write writes at the fd offset; truncation is an
     /// explicit Open flag, not a side effect of every write.

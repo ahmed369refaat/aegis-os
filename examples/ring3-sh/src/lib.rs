@@ -95,6 +95,23 @@ fn eq(a: &[u8], b: &[u8]) -> bool {
     a == b
 }
 
+/// zpath: a NUL-terminated STACK copy of one path. The kernel reads
+/// to the NUL, and the line buffer is reused without clearing — a
+/// slice into it carries whatever the longer previous command left
+/// behind ("mkdir /pub/shdir" once "succeeded" by creating
+/// /pub/shdiraegis-sh, and the cp after it died on ENOENT for a
+/// file the supervisor's probe could see present). One copy per
+/// path, bounded by the line buffer's own 96 bytes, zeroed tail —
+/// the cage budget stays honest.
+const ZPATH_MAX: usize = 96;
+
+fn zpath(src: &[u8]) -> [u8; ZPATH_MAX] {
+    let mut z = [0u8; ZPATH_MAX];
+    let n = src.len().min(ZPATH_MAX - 1);
+    z[..n].copy_from_slice(&src[..n]);
+    z
+}
+
 /// echo: the args, one space between, one newline after.
 fn cmd_echo(c: &Cmd) -> bool {
     let mut buf = [0u8; 128];
@@ -127,7 +144,8 @@ fn cmd_ls(c: &Cmd) -> bool {
     } else {
         b"/"
     };
-    let fd = sys3(2, path.as_ptr() as u64, 0, 0); // O_RDONLY
+    let zp = zpath(path);
+    let fd = sys3(2, zp.as_ptr() as u64, 0, 0); // O_RDONLY
     if fd < 0 {
         fail(b"ls open", path, fd);
         return false;
@@ -165,7 +183,8 @@ fn cmd_cat(c: &Cmd) -> bool {
         return false;
     }
     let path = c.args[1];
-    let fd = sys3(2, path.as_ptr() as u64, 0, 0);
+    let zp = zpath(path);
+    let fd = sys3(2, zp.as_ptr() as u64, 0, 0);
     if fd < 0 {
         fail(b"cat open", path, fd);
         return false;
@@ -197,7 +216,8 @@ fn cmd_mkdir(c: &Cmd) -> bool {
         return false;
     }
     let path = c.args[1];
-    let r = sys3(83, path.as_ptr() as u64, 0o755, 0);
+    let zp = zpath(path);
+    let r = sys3(83, zp.as_ptr() as u64, 0o755, 0);
     if r != 0 {
         fail(b"mkdir", path, r);
         return false;
@@ -213,7 +233,8 @@ fn cmd_rm(c: &Cmd) -> bool {
         return false;
     }
     let path = c.args[1];
-    let r = sys3(87, path.as_ptr() as u64, 0, 0);
+    let zp = zpath(path);
+    let r = sys3(87, zp.as_ptr() as u64, 0, 0);
     if r != 0 {
         fail(b"rm", path, r);
         return false;
@@ -230,13 +251,15 @@ fn cmd_cp(c: &Cmd, label: &[u8]) -> bool {
     }
     let src = c.args[1];
     let dst = c.args[2];
-    let sfd = sys3(2, src.as_ptr() as u64, 0, 0);
+    let zsrc = zpath(src);
+    let zdst = zpath(dst);
+    let sfd = sys3(2, zsrc.as_ptr() as u64, 0, 0);
     if sfd < 0 {
         fail(b"cp open src", src, sfd);
         return false;
     }
     // O_WRONLY|O_CREAT = 0x41 (the v1-translated word).
-    let dfd = sys3(2, dst.as_ptr() as u64, 0x41, 0o644);
+    let dfd = sys3(2, zdst.as_ptr() as u64, 0x41, 0o644);
     if dfd < 0 {
         let _ = sys3(3, sfd as u64, 0, 0);
         fail(b"cp open dst", dst, dfd);
@@ -263,7 +286,7 @@ fn cmd_cp(c: &Cmd, label: &[u8]) -> bool {
     let _ = sys3(3, sfd as u64, 0, 0);
     let _ = sys3(3, dfd as u64, 0, 0);
     if eq(label, b"mv") {
-        let r = sys3(87, src.as_ptr() as u64, 0, 0);
+        let r = sys3(87, zsrc.as_ptr() as u64, 0, 0);
         if r != 0 {
             fail(b"mv unlink", src, r);
             return false;
@@ -273,6 +296,8 @@ fn cmd_cp(c: &Cmd, label: &[u8]) -> bool {
     write_out(label);
     write_out(b" ");
     write_out(src);
+    write_out(b" ");
+    write_out(dst);
     write_out(b" ");
     write_dec(total);
     write_out(b" bytes\n");

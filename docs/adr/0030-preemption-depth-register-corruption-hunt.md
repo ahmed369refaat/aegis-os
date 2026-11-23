@@ -67,6 +67,101 @@ a one-line mystery.** A reproduction amplifier (a grants-region
 syscall loop blob — a NEW example, no hand-measured deltas) is the
 follow-up if a sample of pristine boots does not fire it first.
 
+## Round Z2 (2026-11-23, third session): the window, caught live and closed
+
+Round Z's first conclusion — "the swapgs-to-cli interrupt window cannot
+exist, SYSCALL applies the FMASK atomically" — was the wrong premise.
+The SFMASK MSR is never programmed on this kernel (ADR-0012's
+measurement: the boot's SYSCALL MSR write leaves the mask at its reset
+value), so **IF crosses the SYSCALL boundary alive**. The entry's first
+three bytes (`swapgs; cli`) are therefore a REAL interrupt window, and
+the TTY slice's new UART IRQ (IRQ4, fed by the shell lane's typed
+session) made it reproducible **on demand**: type during the audit
+phase and the interrupts rain on the entry.
+
+The forensic capture (the `pf_forensics` round Z merged, doing exactly
+the job it was built for) caught the event live:
+
+- `rcx`/`r11` = the SYSCALL ABI pair — the CPU was mid-SYSCALL, the
+  return rip/flags not yet stashed;
+- `cr2 = 0x408ff8` — the user stack page's TOP QWORD, exactly where a
+  push from the entry's still-user RSP lands;
+- `err = 3` — a supervisor WRITE to a present user page: SMAP's
+  signature, not the stub's (the stub never writes user memory, as
+  round Z's disassembly correctly showed).
+
+The mechanism, four steps, every one pinned by the capture:
+
+1. **SYSCALL does not switch RSP.** Unlike an interrupt through an IST
+   gate, the SYSCALL entry's first instructions run on the USER stack
+   — RSP only moves when the stub's own load switches it, several
+   instructions in.
+2. **IF is alive at entry** (SFMASK unprogrammed, above) — so an
+   interrupt CAN land inside those first instructions.
+3. **The interrupt pushes its frame ON THE USER STACK** — the CPU
+   switches CPL and CS but the push goes wherever RSP points.
+4. **That push is a supervisor write to a user page — SMAP faults it**
+   (err=3), with rip = the entry's first instruction: every observed
+   signature, including the two-year `rip=swapgs` mystery (swapgs
+   faults on the NEXT instruction's pending push effects attribution,
+   and the frame's rip is the entry either way).
+
+The fix, two parts, each load-bearing on its own:
+
+- **IST6 for the whole interrupt family (32..=112, 255)** — the
+  unconditional kernel-stack switch. Every interrupt, window or no
+  window, lands on the IST6 stack; a user-stack push becomes
+  structurally impossible, not merely unlikely.
+- **`cli` at exception_common's head** — IST6 CANNOT NEST: an
+  exception arriving inside the IST6 handler would re-enter the same
+  stack and run it off its guard. The explicit mask closes that; the
+  stub's own `cli` remains the belt-and-braces it always was.
+
+The lane evidence after the fix: the shell session — the most
+interrupt-dense workload this kernel has ever run (a typed line feeds
+IRQ4 per character through the whole audit phase) — booted green end
+to end, and the ~1-in-5 boot flake has not been observed since.
+
+## K13 (2026-11-23, fourth session): the shell goes green — four live deaths on the way
+
+The `--verify-shell` lane's road to green killed four bugs in one
+session; each one is a lesson in refusing the first diagnosis.
+
+1. **The capability theory dies (the EPERM re-diagnosis).** The
+   session's first `mkdir /pub/shdir` answered -EPERM, and K12's
+   handoff blamed a missing FsNode capability on /pub. Static anatomy
+   killed the theory: `Domain::new` seeds FsNode(ROOT) on init, fork
+   CLONES the capability table into the child, and exec never touches
+   capabilities — the grant was there all along. The exec boundary
+   intersects **the MASK** (ADR-0022 D5): `/bin/sh` was unlisted in
+   the exec policy table, so the shell landed on the app default
+   (no MKDIR/UNLINK/LISTDIR) and `DeniedByMask` surfaced as the same
+   -EPERM a missing capability would have printed. The fix: kmain
+   declares /bin/sh's real surface (the service profile's, now
+   including SYS_LISTDIR) before init ever forks — plus two host
+   tests, one reproducing the mask-shaped refusal, one proving the
+   declared surface keeps the session's commands across the boundary.
+2. **Un-NUL-terminated path slices (zpath).** The kernel reads paths
+   to the NUL; the shell passed slices into its REUSED line buffer,
+   so `mkdir /pub/shdir` "succeeded" — by creating
+   `/pub/shdiraegis-sh` (the previous, longer line's tail), and the
+   next `cp` died on ENOENT for a file the supervisor's probe could
+   see PRESENT. The fix: `zpath` — a zeroed 96-byte stack copy per
+   path, one per syscall argument.
+3. **Directories refused to open.** The ListDir arm waits for an fd
+   on a directory — and Open refused EVERY directory (EISDIR). No
+   ring-3 path could produce the arm's own input shape. The fix: a
+   directory opens for READ (the listing handle getdents64 consumes);
+   open-for-write/truncate and read(2) on the fd keep their Unix
+   EISDIR refusals, host-tested both ways.
+4. **The 60s lane budget.** The shell lane carries the same kernel
+   image as every other lane (the whole kmain phase suite, the ~390k
+   audited syscall lines) before init ever forks — the 60s default
+   killed QEMU mid-session once, the shell alive and mid-command. The
+   lane joins the 600s group, and a source-fixture probe re-seeds the
+   session's cp source every boot so a missing fixture can never
+   masquerade as a kernel bug.
+
 ## The third shape (S5 session, 2026-11-23 — recorded, NOT a reproduction)
 
 One occurrence in four boots of the `--verify-persist` lane (the

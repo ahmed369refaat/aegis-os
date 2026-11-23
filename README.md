@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml/badge.svg)](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests: 715](https://img.shields.io/badge/tests-715%20passing-brightgreen.svg)](tests/)
+[![Tests: 718](https://img.shields.io/badge/tests-718%20passing-brightgreen.svg)](tests/)
 [![Boot](https://img.shields.io/badge/boots%20in%20QEMU-ring--3%20isolation%20live%20%F0%9F%9F%A2-brightgreen.svg)](#quick-start)
 
 > The name: **Aegis** (the shield). One rule shapes the whole design: everything runs inside an isolated `Domain`, and every privilege is granted once and can only ever shrink.
@@ -15,7 +15,7 @@
 
 **Done and proven (M0 + M1 + Stage 1 / PR-1.1..1.4 + M2-W1/W2):**
 
-- The full policy kernel as a library: attenuation-only syscall masks, capability generations, W^X memory policy, VFS with Unix DAC + chroot, pipes/signals/fd tables, CFS scheduling, rate-limited brokered sockets, capability-endpoint async IPC (ADR-0004), behavior monitor with graduated response. **431 tests.**
+- The full policy kernel as a library: attenuation-only syscall masks, capability generations, W^X memory policy, VFS with Unix DAC + chroot, pipes/signals/fd tables, CFS scheduling, rate-limited brokered sockets, capability-endpoint async IPC (ADR-0004), behavior monitor with graduated response. **434 tests.**
 - A bootable x86_64 system, two-stage (QEMU's `-kernel` loader rejects ELF64 — discovered on the first CI boot run): a pure-asm ELF32 multiboot stub (`boot-x86_64/`) sets up identity paging and long mode, then runs the 64-bit kernel (`kernel-x86_64/`, embedded at its 2 MiB link base) over real RAM: a physical frame pool (4096 × 4 KiB at 16..32 MiB, grown for per-domain page tables in PR-1.3) behind the policy core's buddy allocator with **scrub-on-free verified by read-back**, and the M1 exit-criteria sequence running on boot: a hello domain scheduled by CFS, the monitor escalating an attacker across five windows while the healthy neighbor keeps running, and 1000 create/destroy cycles with zero frame leaks.
 - **SYSCALL/SYSRET entry + ring-3 machinery (Stage 1 / PR-1.4 + M2-W2/ADR-0010 + round J)**: the GDT carries the STAR slot arithmetic (host-test-pinned), the naked SYSCALL entry (swapgs, dedicated guarded stack, 12-quadword SysV-aligned frame, TSC round-trip, the user-RSP park/restore — SYSRET reloads only RIP/RFLAGS, so the stub carries the user's stack pointer itself; hidden since PR-1.4, exposed by the first `call` in ring-3 history), the shared policy gate in `syscall::gate` (one door for kernel-resident and ring-3 domains, full-width nr bounds check), SYS_WRITE with per-page user-pointer validation, and the CPL3-fault record/resume path. **Ring-3 isolation is fully live**: the eight-run sequence (hello / NX exec / kernel-VA read / forged syscall / tail-of-page + crossing writes / live-monitor quarantine / audit-only / the file lifecycle) boots green in QEMU TCG and `boot.sh --verify` asserts every marker — the earlier "environment-blocked" verdict was retired when its four root causes (stray IRQ at the IF boundary, mirror-inverted stub offsets, the launch/resume register hole, an `iretq` regression) were all found and fixed locally (ADR-0010).
 - **The ring-3 file lifecycle (round J)**: OPEN, READ, WRITE, CLOSE, PIPE and DUP execute on the LIVE lib kernel — marshaled through the host-tested `sysabi` layer (the open-flag decoding, the complete SysError→errno table, the pipe fd-pair packing) and run by `Kernel::execute` on the same state the monitor reads, after the runtime's own gate pass. The stdio triplet (fds 0/1/2) is reserved at spawn Unix-style so the console device alias behind fd 1 can never collide with a real descriptor; user pointers are validated page-by-page through the domain's own tables in BOTH directions (the copy-out primitive and the page-check-as-you-go path reader are new), and the `ring3-files` blob proves the whole dance from CPL=3 with in-blob verification: pipe round-trip, dup keeping a pipe end alive past its original's close, file create/write/read-back through an independent cursor, and the -EBADF/-ENOENT refusals. The register tables — v0.4's internal surface and v1's Linux entry — are specified in `docs/ABI-VERSION.md`.
@@ -36,7 +36,7 @@
 ./boot.sh           # build the kernel and boot it in QEMU (needs qemu-system-x86)
 ./boot.sh --verify  # same, plus assert the M1 + exception-selftest markers
 
-cargo test                       # 431 policy-core tests
+cargo test                       # 434 policy-core tests
 cargo test -p aegis-kernel       # 284 host tests: boot + arch/mm/gate/ring-3/sysabi/file-ABI encodings
 cargo build --target thumbv7em-none-eabihf   # the core still builds for bare-metal ARM
 ```
