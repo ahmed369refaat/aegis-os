@@ -8,7 +8,53 @@ fragile hand-measured code delta in the ring3-preempt blob. The
 ORIGINAL rare flake remains unexplained and OPEN — three shapes now
 on record (the CoW-demo stall, the mode-13 wait4 loss, and the S5
 session's CPL0-fault-in-grants) — with the tick-density lead
-REFUTED.**
+REFUTED, the third shape's quick-draw theories all REFUTED by
+static analysis (round Z below), and the hunt's eyes merged: every
+KernelBug halt now carries full #PF forensics.**
+
+## Round Z (2026-11-23, second session): the quick-draw theories die; the eyes go in
+
+Static analysis of the third shape's frame (`rip = syscall_entry's
+swapgs`, `cs = 0x30`, `err = 3`, `cr2 = 0x408ff8`) against the
+flake-era build (31e972a — the address verified by disassembly, not
+assumed):
+
+- **The swapgs-to-cli interrupt window cannot exist.** SYSCALL
+  applies the FMASK (IF|TF|DF) atomically at the transition — the
+  entry runs with IF=0 from its first instruction; the stub's `cli`
+  is belt-and-braces, not the barrier. No tick can land inside the
+  entry.
+- **A parked run cannot resume at CPL0.** Every ring-3 return path
+  (`enter_ring3`, `enter_ring3_parked`) uses `sysretq`, whose CS
+  comes from the STAR user arithmetic (0x2b) — a corrupted
+  `ParkedContext.cs` is inert. The only `iretq` is the tick path's,
+  from a CPL3 frame.
+- **A double-swapgs cannot write user memory.** The kernel has no
+  gs-relative addressing at all: `PerCpu::get()` reads the MSR (a
+  register read, immune to which side of the swap pair is active);
+  SYSCALL_RSP/SYSCALL_FRAME and the stub's saves are RIP-relative.
+- **The stub never writes user memory.** The full disassembly of
+  `syscall_entry`: swapgs, cli, six RIP-relative saves into kernel
+  .bss, the RSP switch, eleven pushes onto the kernel stack, rdtsc,
+  then `call syscall_dispatch`. Nothing touches a user VA.
+- **The frame cannot be stale.** `exception_common` passes RSP
+  directly as the frame pointer; every word in the struct was pushed
+  by the CPU or the stub for THIS event.
+
+What survives: the fault IS a supervisor write (err=3, SMAP-shaped)
+to a present user page in the grants-demo region, inside a CPL0 run,
+and the printed RIP is either (a) a QEMU/TCG #PF-delivery artifact
+(the frame content contradicts every reachable instruction), or (b)
+something genuinely exotic the register file will name. The deciding
+instrument is now merged: `pf_forensics` (arch/exceptions.rs, +1
+unsafe in the count, ADR-0030-referenced) dumps all fifteen GPRs,
+RFLAGS, CR2/CR3, and the four words above RFLAGS on BOTH loud-halt
+KernelBug paths before halting. The GPRs name the code path, CR3
+discriminates the wrong-address-space theory, the tail shows what
+the CPU actually pushed. **The next natural occurrence is no longer
+a one-line mystery.** A reproduction amplifier (a grants-region
+syscall loop blob — a NEW example, no hand-measured deltas) is the
+follow-up if a sample of pristine boots does not fire it first.
 
 ## The third shape (S5 session, 2026-11-23 — recorded, NOT a reproduction)
 

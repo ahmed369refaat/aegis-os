@@ -113,6 +113,78 @@ static mut NX_RESUME: u64 = 0;
 static ARMED_DG: AtomicBool = AtomicBool::new(false);
 static DG_VA: AtomicU64 = AtomicU64::new(0);
 
+/// ADR-0030 (third shape): full #PF forensics for the loud-halt kernel
+/// bug paths — every GPR, RFLAGS, CR2/CR3, and the four words above
+/// RFLAGS (for a CPL0 frame: the scrubbed stack below them; for CPL3:
+/// the CPU-pushed rsp/ss tail). One occurrence prints the whole crime
+/// scene: the GPRs name the code path (a user-copy helper holds the
+/// buffer in rsi/rdi), CR3 discriminates the wrong-address-space
+/// theory (the active run's tables vs another domain's), and the tail
+/// words show exactly what the CPU pushed.
+fn pf_forensics(f: &ExceptionFrame, cr2: u64) {
+    let gprs: [(&str, u64); 15] = [
+        ("rax", f.rax),
+        ("rbx", f.rbx),
+        ("rcx", f.rcx),
+        ("rdx", f.rdx),
+        ("rsi", f.rsi),
+        ("rdi", f.rdi),
+        ("rbp", f.rbp),
+        ("r8", f.r8),
+        ("r9", f.r9),
+        ("r10", f.r10),
+        ("r11", f.r11),
+        ("r12", f.r12),
+        ("r13", f.r13),
+        ("r14", f.r14),
+        ("r15", f.r15),
+    ];
+    for chunk in gprs.chunks(3) {
+        let mut bufs = [[0u8; 18]; 3];
+        serial::write_str("[EXC]  ");
+        for (i, (name, v)) in chunk.iter().enumerate() {
+            serial::write_str(name);
+            serial::write_str("=");
+            serial::write_str(strutil::hex(*v, &mut bufs[i]));
+            serial::write_str(" ");
+        }
+        serial::write_str("\n");
+    }
+    let mut brf = [0u8; 18];
+    let mut bc2 = [0u8; 18];
+    let mut bc3 = [0u8; 18];
+    serial::write_str("[EXC]  rflags=");
+    serial::write_str(strutil::hex(f.rflags, &mut brf));
+    serial::write_str(" cr2=");
+    serial::write_str(strutil::hex(cr2, &mut bc2));
+    serial::write_str(" cr3=");
+    serial::write_str(strutil::hex(hw::read_cr3(), &mut bc3));
+    serial::write_str("\n");
+    // SAFETY: the reads start one word above rflags and walk upward
+    // through words the CPU pushed (a CPL3 frame's rsp/ss) or the
+    // mapped stack above a CPL0 frame — the same argument the #DF
+    // walk makes; every read lands on the mapped stack page.
+    let tail: [u64; 4] = unsafe {
+        let base = core::ptr::addr_of!(f.rflags);
+        let mut w = [0u64; 4];
+        let mut i = 0;
+        while i < 4 {
+            w[i] = base.add(1 + i).read();
+            i += 1;
+        }
+        w
+    };
+    for (i, w) in tail.iter().enumerate() {
+        let mut bw = [0u8; 18];
+        let mut bi = [0u8; 20];
+        serial::write_str("[EXC]  tail w");
+        serial::write_str(strutil::dec(i as u64, &mut bi));
+        serial::write_str("=");
+        serial::write_str(strutil::hex(*w, &mut bw));
+        serial::write_str("\n");
+    }
+}
+
 /// Called from `exception_common` (never from Rust).
 #[unsafe(no_mangle)]
 extern "C" fn aegis_exception_dispatch(frame: *mut ExceptionFrame) {
@@ -401,6 +473,7 @@ fn dispatch(f: &mut ExceptionFrame) {
         ) {
             super::fault_class::FaultOwner::KernelBugUserCopy => {
                 serial::write_str("[SEC ] KERNEL BUG: #PF inside the user-copy routine (copy escaped the validated span)\n");
+                pf_forensics(f, cr2);
                 serial::write_str(
                     "[EXC] halting: this is unreachable by construction (ADR-0007)\n",
                 );
@@ -408,6 +481,13 @@ fn dispatch(f: &mut ExceptionFrame) {
             }
             super::fault_class::FaultOwner::KernelBug => {
                 serial::write_str("[EXC] KERNEL BUG: CPL0 fault while a user run is active\n");
+                // ADR-0030's third shape (the grants-region CPL0 fault,
+                // 2026-11-23) halted with ONE line — the hunt's missing
+                // eyes. Every occurrence from here on carries the full
+                // register file + CR3 + the frame tail: the GPRs name
+                // the code path, CR3 discriminates the wrong-CR3 theory,
+                // and the tail words show what the CPU pushed.
+                pf_forensics(f, cr2);
                 hw::halt_forever()
             }
             super::fault_class::FaultOwner::LaunchRelayLimitation => {

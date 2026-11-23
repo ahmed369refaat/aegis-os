@@ -138,3 +138,12 @@
 # registry pair, park_current_reexec's frame reads — the unsafe
 # stays in park.rs, the module that owns it; wait.rs and the arm
 # are unsafe-free).
+# 126 (from 125): ADR-0030 (third shape, the forensics round) —
+# pf_forensics in arch/exceptions.rs: the four-word tail walk above
+# rflags (the #DF-walk pattern applied to the CPL0-bug #PF path).
+# The hunt was blind: the KernelBug halt printed one line while the
+# frame's rip named syscall_entry's swapgs — an instruction that
+# cannot write memory. Every occurrence now dumps the full register
+# file + CR3 + the tail before halting; the next natural fire names
+# the faulting instruction.
+126
