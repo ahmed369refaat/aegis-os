@@ -43,16 +43,17 @@ pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
 use aegis_os::sys::{SysRequest, SysValue};
 use aegis_os::syscall::Abi;
 use aegis_os::syscall::{
-    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXIT, SYS_FORK, SYS_IPC_CALL, SYS_IPC_GRANT,
-    SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MMAP, SYS_MUNMAP,
-    SYS_NANOSLEEP, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN,
-    SYS_WAIT, SYS_WRITE,
+    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_IPC_CALL,
+    SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL,
+    SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_SCHED_YIELD,
+    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT, SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
 pub const EPERM: i64 = 1;
 pub const EBADF: i64 = 9;
 pub const EFAULT: i64 = 14;
+pub const ENOEXEC: i64 = 8;
 pub const EINVAL: i64 = 22;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
@@ -310,6 +311,7 @@ mod exec {
             Decision::Allowed if nr8 == SYS_MMAP => sys_mmap(run, a1, a2, a3, _a4, linux_abi),
             Decision::Allowed if nr8 == SYS_MUNMAP => sys_munmap(run, a1, a2),
             Decision::Allowed if nr8 == SYS_FORK => sys_fork(run),
+            Decision::Allowed if nr8 == SYS_EXEC => sys_exec(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_WAIT => sys_wait(run, a1, a2, a3, _a4),
             Decision::Allowed if nr8 == SYS_IPC_SEND => sys_ipc_send(run, a1, a2),
             Decision::Allowed if nr8 == SYS_IPC_RECV => sys_ipc_recv(run, a1),
@@ -1017,6 +1019,148 @@ mod exec {
         let ctx = crate::sched::park::parked_from_current_syscall(0);
         crate::sched::context::stash_parked(child_run, ctx);
         child as u64
+    }
+
+    /// execve(2) — ADR-0003 v1 slice 4: the image replacement.
+    /// The Linux shape is execve(path, argv, envp); the internal ABI
+    /// serves the same positions. argv/envp are ACCEPTED and not
+    /// materialized (the wait4-rusage discipline: no faking an
+    /// initializer block the kernel does not build) — the fresh image
+    /// starts with a clean stack and ZERO general registers; argv
+    /// arrives when the Phase-6 VFS can pass a real file's arguments.
+    ///
+    /// The path resolves against the kernel's exec registry (the
+    /// compiled-in ELF images — no filesystem yet; a path with no
+    /// image is -ENOENT, exactly what Linux answers for a path no
+    /// filesystem resolves). The image is parsed by the slice-4
+    /// loader (`aegis_os::elf`), mapped at its DECLARED vaddrs
+    /// inside the exec cage, and entered at `e_entry`.
+    ///
+    /// The frame story (the order is load-bearing):
+    /// 1. parse/resolve/plan — pure refusals, zero side effects;
+    /// 2. `exec_replace` (ADR-0022 D4): mask INTERSECTION with the
+    ///    path's declared profile (unlisted = app default, D5),
+    ///    cloexec fds close, caught handlers reset (D8), the region
+    ///    ledger clears — the point of no return;
+    /// 3. the new image builds UNDER THE EXEC SCRATCH TAG while the
+    ///    old image's frames are still live — a build failure answers
+    ///    -ENOMEM and the OLD IMAGE CONTINUES (Linux parity), with
+    ///    the mask honestly narrowed (never widened — a tightened
+    ///    exec caller stays tightened; documented ABI divergence);
+    /// 4. on success the old image's borrowed frames release, its
+    ///    owned frames free (the scratch tag splits the two images'
+    ///    ownership apart — free-by-owner-id cannot reach the new
+    ///    one), and the finished image's frames re-tag to the domain
+    ///    so every later teardown (wait4's reap, the drain) reclaims
+    ///    them exactly like a spawned image's;
+    /// 5. the run swaps to the new tables and parks with a SYNTHETIC
+    ///    image: rip = e_entry, rsp = the fresh stack top, every GP
+    ///    register ZERO (a fresh image reading a stale register
+    ///    would read the old image's data across the exec boundary —
+    ///    the register contents at process start are unspecified by
+    ///    Unix; we specify zero). The park never returns.
+    fn sys_exec(
+        run: &mut crate::sched::context::UserRun,
+        path_va: u64,
+        argv: u64,
+        envp: u64,
+    ) -> u64 {
+        use crate::sched::context::ParkedContext;
+        use aegis_os::syscall::SyscallMask;
+
+        // argv must be a canonical user pointer (Linux answers EFAULT
+        // for a NULL argv — there is no argv-less exec); envp may be
+        // NULL (an empty environment is legal), non-NULL must be
+        // canonical.
+        let user_top = 1u64 << 47;
+        if argv == 0 || argv >= user_top || (envp != 0 && envp >= user_top) {
+            return (-EFAULT) as u64;
+        }
+        // 1. The path: bounded, page-checked, SMAP-blessed copy-in.
+        let mut pathbuf = [0u8; sysabi::MAX_PATH];
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        let len = match read_user_path(run, k, path_va, &mut pathbuf) {
+            Ok(n) => n,
+            Err(e) => return e as u64,
+        };
+        let Ok(path) = core::str::from_utf8(&pathbuf[..len]) else {
+            return (-EINVAL) as u64;
+        };
+        let Some(image) = crate::exec_registry::resolve(path) else {
+            return (-sysabi::ENOENT) as u64;
+        };
+        let Ok(plan) = aegis_os::elf::build_exec_plan(image) else {
+            return (-ENOEXEC) as u64;
+        };
+        // 2. The point of no return: the declared profile (the
+        // exec policy table, unlisted = app default) intersects the
+        // live mask; cloexec fds close; handlers and regions reset.
+        let (declared, monitor) = k.exec_policy_declared_for(path);
+        if let Err(aegis_os::proc::ProcError::UnknownProcess(_)) =
+            k.exec_replace(run.domain, &declared, monitor)
+        {
+            return (-sysabi::ESRCH) as u64;
+        }
+        // 3. The new image builds under the scratch tag — the old
+        // image's frames are untouched, so a failure here is a
+        // plain refusal the old image survives.
+        let build = {
+            let Some(pool) = context::pool_mut() else {
+                return (-ENOMEM) as u64;
+            };
+            crate::mm::user::exec_tables(
+                k,
+                pool,
+                crate::exec_registry::EXEC_SCRATCH_OWNER,
+                &plan,
+                image,
+            )
+        };
+        let (tables, space) = match build {
+            Ok(b) => b,
+            Err(_) => {
+                // Roll the partial build back (scrubbed on free) and
+                // continue the old image — narrowed, documented.
+                if let Some(pool) = context::pool_mut() {
+                    let _ = pool
+                        .free_all_owned(&mut k.frames, crate::exec_registry::EXEC_SCRATCH_OWNER);
+                }
+                return (-ENOMEM) as u64;
+            }
+        };
+        // 4. THE ORDER THE FIRST GREEN BOOT TAUGHT: the arm runs ON
+        // THE OLD TABLES' CR3 (the SYSCALL entry never switches CR3 —
+        // the kernel half lives inside the user PML4), so freeing the
+        // old image's frames before the new tables are LIVE scrubs
+        // the very PML4 the next instruction fetch walks — a silent
+        // triple fault, an instant QEMU exit, no diagnosis line.
+        // Swap first, ACTIVATE the new tables (the same
+        // `run.tables.activate()` take_parked does — its kernel half
+        // was installed by exec_tables), and only then tear the old
+        // image down, from the safety of the new one.
+        let old_tables = core::mem::replace(&mut run.tables, tables);
+        run.space = space;
+        run.tables.activate();
+        if let Some(pool) = context::pool_mut() {
+            let _ = crate::mm::shares::release_borrowed_frames(
+                &old_tables,
+                pool,
+                &mut k.frames,
+                run.domain,
+            );
+            crate::mm::user::free_frames_of(k, pool, run.domain);
+            let moved = pool.retag_owner(crate::exec_registry::EXEC_SCRATCH_OWNER, run.domain);
+            debug_assert!(moved > 0, "the built image must own its frames");
+        }
+        // 5. The narrowed mask and the synthetic park: fresh ledger,
+        // a zeroed register file.
+        run.mask = SyscallMask::from_bits(run.mask.bits() & declared.bits());
+        let entry_ctx =
+            crate::sched::context::UserContext::new(plan.entry, crate::mm::user_layout::STACK_TOP);
+        let parked = ParkedContext::from_user_context(&entry_ctx);
+        crate::sched::park::park_current_exec_image(parked)
     }
 
     /// wait4(2) — ADR-0003 v1 slice 3: the Linux wait lands on the

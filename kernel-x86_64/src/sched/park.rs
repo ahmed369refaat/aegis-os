@@ -388,6 +388,36 @@ mod boot {
         dispatch_next()
     }
 
+    /// execve (slice 4): park the current run with a PREBUILT image —
+    /// the fresh image `ParkedContext::from_user_context` builds from
+    /// the validated plan (rip = e_entry, rsp = the fresh stack top,
+    /// EVERY GP register zero). Zeroing is the exec contract, not a
+    /// convenience: a fresh image reading a stale register would read
+    /// the OLD image's data across the exec boundary — a leak no ABI
+    /// should offer, and no Unix program may rely on (the register
+    /// contents at process start are unspecified; we specify zero).
+    pub fn park_current_exec_image(ctx: crate::sched::context::ParkedContext) -> ! {
+        let run = context::take();
+        // Exec is a context SWAP, not a block: the run must be
+        // picked again IMMEDIATELY. pick_next removes the entity it
+        // returned from the runnable set (nanosleep pins the same
+        // rule in the other direction: set_runnable(false) before
+        // its park, because its wake is the timer's), so the
+        // parked-swapped image re-enters the ready set HERE —
+        // without this the dispatcher idles forever with a
+        // perfectly valid image parked (found live in the first
+        // green boot: silence after the child's CoW store).
+        if let Some(k) = context::kernel_mut() {
+            let _ = k.sched.set_runnable(run.domain, true);
+        }
+        context::stash_parked(run, ctx);
+        // ADR-0028's park-unwind rule, as above.
+        if context::park_chain_depth() > 0 {
+            context::resume_kernel();
+        }
+        dispatch_next()
+    }
+
     /// ADR-0023 D8: deliver one pending caught signal to a run being
     /// resumed from parked — the twin of the syscall-path delivery in
     /// syscall.rs, rewriting the ParkedContext instead of the stub
@@ -574,7 +604,10 @@ mod boot {
 }
 
 #[cfg(not(test))]
-pub use boot::{park_current_from_syscall, park_current_reexec, parked_from_current_syscall};
+pub use boot::{
+    park_current_exec_image, park_current_from_syscall, park_current_reexec,
+    parked_from_current_syscall,
+};
 
 #[cfg(test)]
 mod tests {

@@ -147,6 +147,24 @@ impl<const N: usize> FramePool<N> {
         released
     }
 
+    /// execve (slice 4): move every frame owned by `from` to `to` —
+    /// the new image builds under the EXEC scratch tag so the OLD
+    /// image's `free_frames_of` (freed by plain owner id) cannot
+    /// touch it, then the finished image's frames re-tag to the
+    /// domain so every LATER teardown (wait4's reap, the drain)
+    /// reclaims them exactly like a spawned image's. Returns how
+    /// many frames moved.
+    pub fn retag_owner(&mut self, from: u32, to: u32) -> usize {
+        let mut moved = 0;
+        for slot in &mut self.owner {
+            if *slot == Some(from) {
+                *slot = Some(to);
+                moved += 1;
+            }
+        }
+        moved
+    }
+
     #[must_use]
     /// ADR-0024 D2: gather every frame index currently owned by
     /// `owner` into `out` (stopping at the buffer's end — the caller
@@ -190,6 +208,23 @@ impl<const N: usize> FramePool<N> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn retag_moves_only_the_from_owner() {
+        // exec's split: the new image builds under the scratch tag,
+        // the old image frees under the plain id — retag is the
+        // handover. Two owners coexist; retag moves EXACTLY one.
+        let mut pool = FramePool::<256>::new(0x1000_0000, memops::scrub_frame);
+        let mut buddy = BuddyAllocator::<256>::default();
+        let a = pool.alloc_for(&mut buddy, 7).unwrap();
+        let b = pool.alloc_for(&mut buddy, 0x5AFE_0E0E).unwrap();
+        assert_eq!(pool.retag_owner(0x5AFE_0E0E, 7), 1);
+        assert_eq!(pool.owned_by(7), 2);
+        assert_eq!(pool.owned_by(0x5AFE_0E0E), 0);
+        let _ = (a, b);
+    }
+
     use super::*;
     use crate::memops;
 

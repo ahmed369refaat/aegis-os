@@ -32,6 +32,17 @@ for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files; do
     objcopy -O binary -j .text.ring3 "target/$b.o" "kernel-x86_64/blob/$b.bin"
 done
 
+echo "==> [0b/4] linking the exec target (a REAL ELF64 — not a flat blob)"
+# execve's first image: PT_LOADs at their declared vaddrs (text RX at
+# 0x400000, data RW at 0x403000 with the bss tail at 0x403800), entry
+# _start from e_entry. The kernel's exec registry embeds THESE bytes;
+# the slice-4 loader parses them at runtime (see exec_registry.rs).
+rustc --edition 2021 --crate-type=lib --emit=obj \
+      --target x86_64-unknown-none -O "examples/ring3-exec-target/src/lib.rs" \
+      -o "target/ring3-exec-target.o"
+ld -T "examples/ring3-exec-target/exec.ld" \
+   -o "kernel-x86_64/blob/ring3-exec-target.bin" "target/ring3-exec-target.o"
+
 echo "==> [1/4] building the 64-bit kernel (x86_64-unknown-none, release)"
 cargo build -p aegis-kernel --release --target x86_64-unknown-none
 
@@ -390,6 +401,11 @@ if [ "$MODE" = "verify" ]; then
   # refusals, and the rerouted fd path.
   grep -qF "[M3] pipe: 64 bytes cross-domain byte-exact" "$LOG" || { echo "VERIFY FAIL: M3 pipe marker missing"; ok=0; }
   grep -qF "[M3] linux-abi: v1 entry live" "$LOG" || { echo "VERIFY FAIL: M3 linux-abi marker missing"; ok=0; }
+  # Slice 4: the exec'd image's OWN serial marker — printed by the
+  # ELF's code through the SURVIVING fd-1 console alias (fds cross
+  # exec by design, ADR-0022 D4), parsed by the loader, mapped at its
+  # declared vaddrs, entered at e_entry, bss zero-filled.
+  grep -qF "[M3] exec-target: bss-clean entry live" "$LOG" || { echo "VERIFY FAIL: M3 exec slice marker missing (execve/ELF path)"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the

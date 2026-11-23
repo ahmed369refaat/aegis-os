@@ -57,6 +57,7 @@ pub mod boot;
 // functions stay #[cfg(not(test))] inside their modules.
 pub mod clock;
 pub mod drvstack;
+pub mod exec_registry;
 pub mod ipc_mmio;
 #[cfg(not(test))]
 pub mod kmain;

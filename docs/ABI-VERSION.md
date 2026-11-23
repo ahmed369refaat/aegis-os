@@ -38,20 +38,21 @@ live domain (ADR-0003's refuse rule).
 | 33 dup2 | 13 | |
 | 35 nanosleep | 20 | |
 | 57 fork | 18 | child speaks the parent's ABI (inherited) |
+| 59 execve | 19 | **the image replacement (slice 4)**: the path resolves against the kernel's exec registry (the compiled-in ELF64 images — no filesystem until Phase 6; a miss is `-ENOENT` exactly as Linux answers a path no filesystem resolves). The image parses through `aegis_os::elf::build_exec_plan` — every header this loader cannot honor refuses `-ENOEXEC` (PIE/`ET_DYN`, `PT_INTERP`/`PT_DYNAMIC`, unknown header types AND unknown flag bits, W+X, non-congruent vaddr/offset, two segments sharing a page, entry outside the PT_LOADs). argv/envp are validated canonical (`argv` NULL is `-EFAULT` as in Linux; envp may be NULL) and accepted but NOT materialized — the wait4-rusage discipline; a real argv arrives with the Phase-6 VFS. The fresh image starts at `e_entry` with a fresh stack and EVERY GP REGISTER ZERO (register contents at process start are unspecified by Unix; we specify zero — a fresh image cannot read the old image's registers). fds, pid, parent, credentials, cwd, chroot and the Linux-ABI mode survive exec (ADR-0022 D4); the mask INTERSECTS with the path's declared profile (unlisted = the app default, D5 — exec only ever narrows, never widens; a FAILED execve that got past `exec_replace` leaves the mask narrowed, documented divergence). The frame order is load-bearing: the arm runs on the OLD tables' CR3 (the SYSCALL entry never switches), so the new tables ACTIVATE before the old image's frames free — freeing first scrubs the very PML4 the next instruction fetch walks (a silent triple fault, found live in the first green boot) |
 | 60 exit / 231 exit_group | 63 | the alias |
 | 61 wait4 | 20 | **blocks via the rip-2 re-execute park** (slice 3): not-ready parks with rip ON the 2-byte `syscall` instruction and rax = the ORIGINAL nr read from the frame's RAX slot — resume re-runs the very arm (the park machinery stays ABI-blind; found live: parking with the TRANSLATED nr made the re-executed entry answer -ENOSYS for a number the whitelist never maps). The child's completion wakes the parent through the waiter registry (`set_runnable` — the same block/wake primitive nanosleep and the IPC rendezvous use). WNOHANG (0x1) honored: nothing-ready answers 0; every other option bit refuses -EINVAL (WUNTRACED/WCONTINUED report job-control states we do not have — the slice-2 open discipline). rusage is accepted and ignored (no accounting yet — documented, not faked). pid: >0 = that child, -1/0 = any, other negatives -ECHILD; no/not-a child -ECHILD. **The reaped child's completed-mailbox entry is consumed BY the arm** — its teardown runs there (frames via `free_frames_of`, then `exit_process` records the zombie `wait_process` reaps; `destroy_domain` is never used: the supervisor removal erases the meta the zombie needs — found live in the slice-3 hunt), so the spawner's drain never sees it. **The wstatus target must be writable in the caller's OWN tables (P+U+W)**: a fork-CoW-shared page is read-only in both tables and the kernel's direct write answers -EFAULT loudly (ADR-0007: a CPL0 fault is a kernel bug — Linux services the CoW for put_user; we refuse — a careful program passes a private page, as the blob does with a post-fork mmap) |
 | 62 kill | 14 | |
 | 228 clock_gettime | 23 | |
 
-**Deliberately NOT mapped (slice 3):** `execve` (59) — the internal
-`SYS_EXEC` id exists in the policy space but the kernel has no ELF
-loading machinery yet; the translation lands with the exec slice, not
-as a stub that answers wrong. `dup` (32), `pipe2` (293): no ABI arm
+**Deliberately NOT mapped:** `dup` (32), `pipe2` (293): no ABI arm
 yet. Each answers `-ENOSYS` today. (`open` — nr 2 — lived on this edge
 until slice 2: the encoding difference is handled by translating at
 the SYS_OPEN arm; `wait4` — nr 61 — until slice 3: the kernel gained
 the SYS_WAIT arm the ADR-0022 D7 core was waiting for, with the
-rip-2 re-execute park for its blocking path.)
+rip-2 re-execute park for its blocking path; `execve` — nr 59 — until
+slice 4: the ELF loader + the SYS_EXEC arm landed as one atomic
+change, mapped and implemented in the same commit, never half-mapped
+to answer a wrong thing first.)
 
 Lane proof: blob mode 13 (`[M3] linux-abi:` marker) — one domain
 speaking ONLY Linux nrs: console write, the pipe split, the byte
@@ -66,7 +67,17 @@ the WNOHANG probe (the fork-parked child is not ready -> exactly 0),
 the BLOCKING wait on a private scratch page (the syscall parks
 rip-2; the dispatcher runs the child, whose exit(7) wakes the parent
 through the waiter registry; the re-executed wait reaps: pid == the
-fork's child, wstatus == 7 << 8), then -ECHILD after the reap** — the
+fork's child, wstatus == 7 << 8), then -ECHILD after the reap**,
+**execve (59) — slice 4: a second child builds "/bin/exec-target" +
+argv in its CoW copy, execve NEVER RETURNS — the run resumes at the
+image's e_entry with zero registers; the exec'd image proves the
+loader live on its own serial line ("bss-clean entry live": the ELF
+headers honored AND the bss tail zero-filled — written through fd 1,
+which SURVIVES exec), exits `exit_group(11)`, and the parent's
+blocking wait4 reaps THIS exec'd child (wstatus == 11 << 8; the
+wstatus page is a fresh post-fork mmap — the fork marked the old
+scratch page CoW read-only and the arm's own write-range validation
+refuses it, found live)** — the
 child exits `exit_group(7)` (a nonzero code on purpose: the wstatus
 word is the proof the status crossed the boundary), the parent
 `exit_group(0)`. Red: pre-change, nr 22 hit internal SCHED_YIELD and

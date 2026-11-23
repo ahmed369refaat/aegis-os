@@ -1476,7 +1476,78 @@ pipe_b_got:
     syscall
     cmp rax, -10
     jne 225f
+
+    /* execve (nr 59) — slice 4: a SECOND child execs the kernel's
+       compiled-in ELF64 image. The registry path is built in the
+       child's CoW copy of the data page ("/bin/exec-target"), the
+       argv array points at it (the arm validates it canonical, the
+       kernel does not materialize argv yet — documented), envp is
+       NULL. Success: execve NEVER RETURNS — the run resumes at the
+       image's e_entry with ZERO registers; the image writes its own
+       serial marker ("bss-clean entry live": the loader honored the
+       ELF headers AND zero-filled the bss tail) and exit_group(11).
+       The parent's blocking wait4 reaps THIS exec'd child: pid ==
+       the second fork's, wstatus == 11 << 8. */
+    mov eax, 57                       /* fork() — nr 57 */
+    syscall
+    test rax, rax
+    js 227f                           /* fork refused */
+    jz 22f                           /* the child */
+    mov r15, rax                      /* the exec child's pid */
+    /* The wstatus target must be PRIVATE: fork just marked every
+       page shared with child 106 read-only in BOTH tables (CoW) —
+       including slice-3's scratch page, which lives in r14. Reusing
+       it would -EFAULT at the arm's own validation (found live in
+       the first green boot: exit 228, the wait never even parked).
+       A fresh mmap AFTER this fork is parent-private RW — the same
+       rule slice 3's comment pinned, forgotten by slice 4's probe. */
+    mov eax, 9                        /* mmap(0, 4096, RW, 0x22) — nr 9 */
+    xor edi, edi
+    mov esi, 4096
+    mov edx, 3
+    mov r10d, 0x22
+    syscall
+    cmp rax, 0x1000
+    jl 230f                           /* the wstatus mmap failed */
+    mov r14, rax                      /* the fresh wstatus target */
+    mov eax, 61                       /* wait4(-1, ws, 0, 0) — blocks while
+                                          the dispatcher runs the child
+                                          through its execve */
+    mov rdi, -1
+    mov rsi, r14
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    cmp rax, 3
+    jl 228f                           /* an errno, not a pid */
+    cmp rax, r15                      /* the reaped pid IS the exec child */
+    jne 228f
+    cmp dword ptr [r14], 0x0B00        /* wstatus == 11 << 8: the exec'd
+                                           image's exit_group(11) crossed
+                                           the whole boundary */
+    jne 229f
     jmp 20f
+22: /* child: build the registry path + argv in the private CoW copy
+       ("/bin/exec-target\0" at 0x4033c0, argv = (path, NULL) at
+       0x4033e0), then execve. */
+    mov rax, 0x6578652f6e69622f       /* "/bin/exe" */
+    mov qword ptr [0x004033c0], rax
+    mov rax, 0x7465677261742d63       /* "c-target" */
+    mov qword ptr [0x004033c8], rax
+    mov qword ptr [0x004033d0], 0      /* the NUL terminator */
+    mov qword ptr [0x004033e0], 0x004033c0
+    mov qword ptr [0x004033e8], 0
+    mov eax, 59                       /* execve(path, argv, NULL) — nr 59 */
+    mov rdi, 0x004033c0
+    mov rsi, 0x004033e0
+    xor edx, edx
+    syscall
+    /* execve never returns on success; a returned value is a typed
+       refusal (-ENOENT registry miss, -ENOEXEC a refused header, ...)
+       — report it and die. */
+23: mov eax, 231
+    mov edi, 59
+    syscall
 21: /* child: the store into the CoW-shared data page faults and
        takes a private copy (fork/CoW under the Linux ABI too) */
     mov byte ptr [0x00403301], 0x43   /* 'C' */
@@ -1766,6 +1837,30 @@ pipe_b_got:
     syscall
     mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
     mov edi, 226
+    syscall
+227: mov eax, 231
+    mov edi, 227                      /* the exec fork refused */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 227
+    syscall
+228: mov eax, 231
+    mov edi, 228                      /* the exec child's wait4 went wrong */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 228
+    syscall
+229: mov eax, 231
+    mov edi, 229                      /* the exec'd exit status != 11<<8 */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 229
+    syscall
+230: mov eax, 231
+    mov edi, 230                      /* the exec wstatus mmap failed */
+    syscall
+    mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
+    mov edi, 230
     syscall
 "#,
 );

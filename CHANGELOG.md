@@ -1,5 +1,98 @@
 # Changelog
 
+## [Unreleased] — ADR-0003 v1 slice 4: execve(59) lands — the image replacement, ELF loader and all
+
+### The slice
+
+`execve(2)` — nr 59 — joins the Linux entry, mapped in the core
+whitelist and implemented in the kernel arm in ONE atomic commit
+(the slice-3 edge's own rule: never half-map a number to answer a
+wrong thing first). What the whole chain does now, live on all three
+boot lanes:
+
+- **The registry**: `exec_registry.rs` — the kernel's compiled-in
+  executable images, keyed by absolute path (no filesystem until
+  Phase 6; a miss answers `-ENOENT` exactly as Linux answers a path
+  no filesystem resolves). The first entry is `ring3-exec-target`: a
+  REAL linked ELF64 — PT_LOADs at declared vaddrs (text RX at
+  0x400000, data RW at 0x403000 with a bss tail at 0x403800), entry
+  `_start` from `e_entry` — built by boot.sh (rustc --emit=obj + ld -T
+  exec.ld), embedded as ELF bytes, planned at runtime by the host-tested
+  core loader (11 elf tests + a registry test that plans the EMBEDDED
+  bytes exactly as the kernel will).
+- **The arm** (`sys_exec`): read_user_path -> registry resolve ->
+  `build_exec_plan` (-ENOEXEC with a typed refusal for every header
+  the loader cannot honor) -> `exec_replace` (ADR-0022 D4: mask
+  INTERSECTION with the path's declared profile, unlisted = the app
+  default; cloexec closes; handlers and regions reset) -> build the
+  new image's tables under a SCRATCH OWNERSHIP TAG (`FramePool::retag_owner`,
+  host-tested, moves the finished image's frames to the domain so
+  every later teardown reclaims them) -> on failure -ENOMEM and the
+  OLD IMAGE CONTINUES (Linux parity; the mask stays honestly
+  narrowed, documented) -> the new tables ACTIVATE, the old image's
+  frames free -> park with a SYNTHETIC image (rip = e_entry, rsp =
+  the fresh stack, EVERY GP REGISTER ZERO — a fresh image cannot read
+  the old image's registers) -> the dispatcher resumes the exec'd
+  image. argv/envp validated canonical, accepted, NOT materialized
+  (the wait4-rusage discipline).
+- **The lane proof**: the mode-13 linux-abi run now forks a second
+  child that execve("/bin/exec-target"); the exec'd image prints its
+  own serial marker through fd 1 (which SURVIVES exec), probes its
+  own bss byte (zero-filled = the loader's contract, live), and
+  exit_group(11); the parent's blocking wait4 reaps it with
+  wstatus == 11 << 8. Red pre-change: nr 59 answered -ENOSYS
+  (whitelist flip-off), the child died exit(59), the parent's wait
+  went wrong (exit 228), the lane halted at the ERROR line.
+
+### Found live, fixed in the hunt
+
+1. **The CR3 order** (the first green boot died SILENTLY): the arm
+   runs ON the old tables' CR3 (the SYSCALL entry never switches CR3
+   — the kernel half lives inside the user PML4), so freeing the old
+   image's frames before the new tables are live scrubs the very
+   PML4 the next instruction fetch walks — a triple fault, an
+   instant QEMU exit, no diagnosis line, wall-clock varying with
+   host load to hide it. The fix swaps + ACTIVATES the new tables
+   first, then tears the old image down from the safety of the new
+   ones. The instrumented zone prints that found it are stripped;
+   the order's comment in the arm carries the story.
+2. **The probe's CoW blind spot**: slice 4's probe first reused
+   slice-3's wstatus scratch page (r14) — but the SECOND fork marked
+   it CoW read-only in the PARENT's own tables, and the wait arm's
+   write-range validation refused -EFAULT (exactly the guard slice 3's
+   own comment pinned: "a fresh mmap after fork is parent-private").
+   The probe now mmaps its own page after its fork (the same rule,
+   this time followed by its author).
+3. **The parked-swapped image was never re-picked**: exec parks the
+   CURRENT run — and pick_next removes the entity it returned from
+   the ready set, so the swapped-in image sat parked-runnable-never:
+   silence after the child's CoW store. The park re-arms the domain
+   runnable itself (nanosleep pins the same rule in the opposite
+   direction: set_runnable(false) before ITS park because its wake
+   is the timer's).
+
+### Open item (measured, honest — NOT claimed fixed)
+
+**A ~1-in-5 lane flake in the slice-3/preempt interplay, exposed by
+slice-4's timing shift** (the +9KB registry blob moved the mode-13
+stage's tick phase). Five post-fix pc boots: 4 green, 1 failed at
+slice-3's OWN first-fork reap (the child's exit code 7 surfaced
+unconsumed by kmain's drain — the parent's wait4 never reaped it;
+the failure shape fits a lost wake or a lost completion record in a
+rare tick interleaving, NOT any slice-4 code path: every slice-4
+step printed green in the failing boot up to the halt). The ADR-0012
+ABI note rules out the corrupt-RAX theory (SYSRET costs only the
+RCX/R11 pair); the exact interleaving needs its own instrumented
+hunt round — the three formal lane logs in the session archive are
+green runs; the flake stays on the books until that hunt closes it.
+
+### Gates
+
+fmt/clippy x2 clean; 9 host suites green (346 lib + 11 elf + the new
+registry + retag pool test — 368 kernel-side); unsafe 125/125; the
+kernel lane boots green on pc, q35, and q35-noiommu with the exec
+marker asserted by boot.sh --verify (a new VERIFY gate line).
+
 ## [Unreleased] — ADR-0003 v1 slice 4, part 1: the ELF64 loader the kernel arm was waiting for
 
 ### Why

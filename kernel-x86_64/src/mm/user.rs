@@ -47,6 +47,34 @@ impl From<MapError> for SpawnError {
     }
 }
 
+/// Why building the exec image's tables failed. `CageViolation` is the
+/// address policy: an exec'd image lives in the SAME user cage every
+/// spawned blob lives in (code+data, below the guards) — the ELF
+/// machinery honors every header it was given, and the kernel's
+/// layout policy holds where it always held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecMapError {
+    /// A PT_LOAD sits (even partially) outside the code/data cage —
+    /// the stack, trampoline, guard gaps, and everything above are
+    /// kernel-provisioned and non-negotiable.
+    CageViolation { vaddr: u64 },
+    /// The ten-check policy or the page-table walk refused a region.
+    Map(MapError),
+}
+
+impl From<MapError> for ExecMapError {
+    fn from(e: MapError) -> Self {
+        ExecMapError::Map(e)
+    }
+}
+
+/// The exec cage: [CODE_BASE, DATA_END) — the same region a flat
+/// blob's code+data pages occupy. An image whose PT_LOADs stay here
+/// cannot collide with the stack (0x408000), the trampoline
+/// (0x40C000), or any guard gap; anything else refuses before a
+/// frame is touched.
+pub const EXEC_CAGE_END: u64 = layout::DATA_BASE + (layout::DATA_PAGES * 4096) as u64;
+
 /// Everything kmain needs to run one user domain: the lib identity,
 /// the entry context, and the run state to install before launching.
 pub struct UserSpawn {
@@ -167,6 +195,90 @@ fn build_user_tables<const N: usize>(
     copy_into_frame(&tables, layout::DATA_BASE, data);
     copy_into_frame(&tables, layout::TRAMPOLINE_BASE, &layout::TRAMPOLINE);
     Ok((tables, space))
+}
+
+/// execve (ADR-0022 D4 / ADR-0003 slice 4): build the REPLACEMENT
+/// image's tables from a validated ELF64 plan. The spawn twin for a
+/// live domain: fresh PML4 with the kernel half shared in, every
+/// PT_LOAD mapped AT ITS DECLARED vaddr with the header's
+/// permissions, the fresh stack and signal trampoline provisioned at
+/// their fixed addresses. The whole extent is zeroed EXPLICITLY
+/// before the file bytes copy over its front — the pool scrubs freed
+/// frames, but "bss is zero" is the syscall's CONTRACT, not a pool
+/// implementation detail (the exec-target blob probes it live).
+///
+/// Every frame allocates under the caller's id via the same
+/// `PoolSource` the spawn path uses, so a later `free_frames_of`
+/// reclaims the new image exactly like the old one.
+pub fn exec_tables<const N: usize>(
+    k: &mut Kernel<N>,
+    pool: &mut FramePool<N>,
+    id: u32,
+    plan: &aegis_os::elf::ExecPlan,
+    image: &[u8],
+) -> Result<(PageTables, AddressSpace), ExecMapError> {
+    let cage_end = EXEC_CAGE_END;
+    for seg in &plan.segments[..plan.n_segments] {
+        let (first, last) = seg.page_range();
+        if first < layout::CODE_BASE || last > cage_end {
+            return Err(ExecMapError::CageViolation { vaddr: seg.vaddr });
+        }
+    }
+    let mut src = PoolSource::new(pool, &mut k.frames, id);
+    let mut tables = PageTables::new(&mut src)?;
+    tables.install_kernel_entries();
+    let mut space = AddressSpace::new(16);
+    for seg in &plan.segments[..plan.n_segments] {
+        let (first, last) = seg.page_range();
+        let flags = if seg.writable {
+            layout::data_flags()
+        } else if seg.executable {
+            layout::code_flags()
+        } else {
+            // Read-only data (rodata): PF_R alone — the validator
+            // already refused W+X and zero-perm shapes.
+            aegis_os::memory::MemFlags::READ
+        };
+        tables.map_region(&mut space, first, (last - first) as usize, flags, &mut src)?;
+        zero_extent(&tables, first, last);
+        let seg_bytes = &image[seg.offset as usize..(seg.offset + seg.filesz) as usize];
+        copy_into_frame(&tables, seg.vaddr, seg_bytes);
+    }
+    tables.map_region(
+        &mut space,
+        layout::STACK_BASE,
+        layout::STACK_PAGES * 4096,
+        layout::stack_flags(),
+        &mut src,
+    )?;
+    tables.map_region(
+        &mut space,
+        layout::TRAMPOLINE_BASE,
+        layout::TRAMPOLINE_PAGES * 4096,
+        layout::code_flags(),
+        &mut src,
+    )?;
+    copy_into_frame(&tables, layout::TRAMPOLINE_BASE, &layout::TRAMPOLINE);
+    Ok((tables, space))
+}
+
+/// Zero `[first, last)` — every page of the fresh image's segments,
+/// INCLUDING the mid-page tails (bss). Called before the file bytes
+/// copy over the front, so a segment's zero-fill does not depend on
+/// the pool's scrub discipline: the zeroing is the loader's own act.
+fn zero_extent(tables: &PageTables, first: u64, last: u64) {
+    let mut page = first;
+    while page < last {
+        let Some(pa) = tables.translate(page) else {
+            return; // unreachable: map_region just mapped this page
+        };
+        let mut off = 0u64;
+        while off < 4096 {
+            memops::write_u64(pa + off, 0);
+            off += 8;
+        }
+        page += 4096;
+    }
 }
 
 /// The frame half of a teardown: the ADR-0024 D2 shares-aware

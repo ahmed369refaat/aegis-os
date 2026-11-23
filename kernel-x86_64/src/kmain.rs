@@ -2474,7 +2474,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         if clean == 1 {
             line(
                 &mut out,
-                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, open(2) O_* translated (O_EXCL/O_APPEND refused), wait4(61) WNOHANG/block/reap (wstatus 7<<8, then ECHILD), uname(63) -> -ENOSYS"],
+                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, open(2) O_* translated (O_EXCL/O_APPEND refused), wait4(61) WNOHANG/block/reap (wstatus 7<<8, then ECHILD), execve(59) -> the compiled-in ELF64 image (bss-clean entry, wstatus 11<<8), uname(63) -> -ENOSYS"],
             );
         } else {
             line(
