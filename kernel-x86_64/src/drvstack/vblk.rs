@@ -23,14 +23,14 @@ pub const VBLK_OWNER: u32 = 43;
 /// phases 3/4) consumes; today's teardown goes through revoke_all,
 /// which does not read them.
 #[allow(dead_code)]
-struct VblkQueue {
-    qsize: u16,
-    notify_off: u16,
-    desc_pa: u64,
-    avail_pa: u64,
-    used_pa: u64,
-    ctrl_pa: u64,
-    cookies: [u64; 4],
+pub(crate) struct VblkQueue {
+    pub(crate) qsize: u16,
+    pub(crate) notify_off: u16,
+    pub(crate) desc_pa: u64,
+    pub(crate) avail_pa: u64,
+    pub(crate) used_pa: u64,
+    pub(crate) ctrl_pa: u64,
+    pub(crate) cookies: [u64; 4],
 }
 
 /// The shared submission path: build the 3-descriptor chain, publish
@@ -38,7 +38,7 @@ struct VblkQueue {
 /// the device reads (OUT) or writes (IN). The queue travels as an
 /// argument — no statics, no unsafe (the Phase-1 driver-domain model
 /// owns per-domain state when multiple devices exist).
-fn submit(q: &VblkQueue, data_pa: u64, sector: u64, req_type: u32) -> u16 {
+pub(crate) fn submit(q: &VblkQueue, data_pa: u64, sector: u64, req_type: u32) -> u16 {
     use crate::virtio as v;
     v::write_blk_header(q.ctrl_pa, req_type, sector);
     // desc 0: the 16-byte header, device reads.
@@ -66,14 +66,14 @@ fn submit(q: &VblkQueue, data_pa: u64, sector: u64, req_type: u32) -> u16 {
 /// never run past what was submitted nor jump by more than the queue
 /// depth, and the completion's id/length must match the request.
 #[cfg(not(test))]
-enum UsedOutcome {
+pub(crate) enum UsedOutcome {
     Completed,
     Timeout,
     Poisoned(&'static str),
 }
 
 #[cfg(not(test))]
-fn poll_used(q: &VblkQueue, want: u16) -> UsedOutcome {
+pub(crate) fn poll_used(q: &VblkQueue, want: u16) -> UsedOutcome {
     use crate::virtio as v;
     let budget = 20_000_000u64; // bounded: ADR-0013's no-infinite-spin rule
     let mut spins = 0u64;

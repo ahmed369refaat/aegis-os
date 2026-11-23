@@ -29,6 +29,7 @@ mod legacy;
 mod netutil;
 mod nvme;
 mod pci;
+mod persist;
 mod vballoon;
 mod vblk;
 mod vcon;
@@ -44,6 +45,7 @@ pub use ahci::AHCI_OWNER;
 pub use e1k::E1K_OWNER;
 pub use ext2::EXT2_OWNER;
 pub use nvme::NVME_OWNER;
+pub use persist::PERSIST_OWNER;
 pub use vblk::VBLK_OWNER;
 pub use vnet::VNET_OWNER;
 pub use xhci::XHCI_OWNER;
@@ -117,7 +119,7 @@ pub fn driver_stack_step<const N: usize>(
                 // ADR-0018: kernel-allocated, one IOMMU domain per
                 // device (domain 0 stays the kernel's own).
                 let mut domains = crate::session::DomainIds::new();
-                let inv = pci::pci_step(out, dir_pa, &dmar, &mut broker, &mut domains);
+                let mut inv = pci::pci_step(out, dir_pa, &dmar, &mut broker, &mut domains);
                 // ADR-0019 + the platform slice: entropy sources before
                 // storage drivers — the pool needs no device at all,
                 // the bus source rides the broker.
@@ -130,6 +132,9 @@ pub fn driver_stack_step<const N: usize>(
                 e1k::e1k_cross_device_probe_step(k, pool, out, &mut broker, &inv);
                 nvme::nvme_step(k, pool, out, &mut broker, &inv);
                 ahci::ahci_step(k, pool, out, &mut broker, &inv);
+                // Phase 6 S5: the M3 exit criterion — files that survive
+                // the reboot (after the AHCI file demos, its own disk).
+                persist::persist_step(k, pool, out, &mut broker, &mut inv, &mut domains, &dmar);
                 xhci::xhci_step(k, pool, out, &mut broker, &inv);
                 xhci::xhci_cmdring_step(k, pool, out, &mut broker, &inv);
                 let madt_view = acpi::acpi_hpet_step(out, dir_pa);

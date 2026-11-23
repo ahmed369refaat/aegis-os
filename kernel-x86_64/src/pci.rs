@@ -281,6 +281,24 @@ impl Inventory {
         }
     }
 
+    /// ADR-0018 + Phase 6 S5: record a claimed device's domain by its
+    /// BUS/DEV/FN coordinates — the persist lane's virtio-blk sits
+    /// behind a root port and shares vendor+device (even class) with
+    /// the first one pci_step claimed, so every id-based matcher
+    /// names the wrong device. Returns false when absent.
+    pub fn set_dom_bdf(&mut self, bus: u8, dev: u8, func: u8, dom: u32) -> bool {
+        match self.devices[..self.count]
+            .iter()
+            .position(|d| d.bus == bus && d.dev == dev && d.func == func)
+        {
+            Some(i) => {
+                self.devices[i].dom = dom;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// ADR-0018: record the claimed device's IOMMU domain.
     pub fn set_dom(&mut self, vendor: u16, class_hi: u8, dom: u32) -> bool {
         match self.devices[..self.count]
@@ -920,6 +938,43 @@ mod tests {
         // A clean miss changes nothing and reports false.
         assert!(!inv.set_dom_dev(0x1AF4, 0x9999, 9));
         assert_eq!(inv.devices[0].dom, 7);
+    }
+
+    /// Phase 6 S5: `set_dom_bdf` is the coordinate-matched claim
+    /// recording — the persist lane's virtio-blk sits behind a root
+    /// port and is IDENTICAL in vendor/device/class to the one
+    /// pci_step already claimed, so only bus/dev/fn can name it.
+    #[test]
+    fn set_dom_bdf_names_the_second_identical_vblk() {
+        let mk = |bus: u8, dev: u8| PciDev {
+            bus,
+            dev,
+            func: 0,
+            vendor: 0x1AF4,
+            device: 0x1042, // both modern virtio-blk
+            class: 0x0180,
+            header: 0,
+            bars: [None; 6],
+            dom: 0,
+            bar_count: 0,
+            cap_ids: [0; MAX_CAPS],
+            cap_ptrs: [0; MAX_CAPS],
+            cap_count: 0,
+        };
+        let mut inv = Inventory::empty();
+        inv.devices[0] = mk(0, 0); // the demo disk pci_step claimed
+        inv.devices[1] = mk(1, 0); // the persist disk behind rp1
+        inv.count = 2;
+        assert!(inv.set_dom_dev(0x1AF4, 0x1042, 2)); // pci_step's call
+        assert_eq!(inv.devices[0].dom, 2, "id matching names the FIRST");
+        assert_eq!(inv.devices[1].dom, 0, "the persist disk is untouched");
+        // The persist claim names its own coordinates.
+        assert!(inv.set_dom_bdf(1, 0, 0, 3));
+        assert_eq!(inv.devices[1].dom, 3, "the second vblk takes its own");
+        assert_eq!(inv.devices[0].dom, 2, "the first keeps pci_step's");
+        // A clean miss changes nothing and reports false.
+        assert!(!inv.set_dom_bdf(4, 2, 0, 9));
+        assert_eq!(inv.devices[1].dom, 3);
     }
 
     /// F9 (review round 4): the command-register discipline, modeled.

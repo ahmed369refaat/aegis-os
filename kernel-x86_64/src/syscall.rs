@@ -166,7 +166,11 @@ mod tests {
                                                     // with the re-execute image (rip-2) and reaps through the
                                                     // ADR-0022 D7 core.
         assert_eq!(translate_nr(61, true), Some(SYS_WAIT as u64)); // wait4 -> SYS_WAIT
-        for nr in [4u64, 12, 32, 39, 59, 63, 64, 293] {
+                                                                   // Slice 4: execve(59) joined the mapped set with
+                                                                   // the image-replacement arm — the stale "must be
+                                                                   // None" entry below was the slice-4 miss.
+        assert_eq!(translate_nr(59, true), Some(SYS_EXEC as u64)); // execve -> SYS_EXEC
+        for nr in [4u64, 12, 32, 39, 63, 64, 293] {
             assert_eq!(translate_nr(nr, true), None, "nr {nr}");
         }
     }
@@ -1407,11 +1411,11 @@ mod exec {
         img: &mut [u8; EXEC_STACK_IMG],
     ) -> (usize, u64) {
         let mut strings = 0usize;
-        for i in 0..args.argc {
-            strings += args.argv_len[i] + 1;
+        for &len in args.argv_len.iter().take(args.argc) {
+            strings += len + 1;
         }
-        for j in 0..args.envc {
-            strings += args.envp_len[j] + 1;
+        for &len in args.envp_len.iter().take(args.envc) {
+            strings += len + 1;
         }
         // argc + argv + NULL + envp + NULL + auxv (AT_NULL alone)
         let vec_len = 8 * (1 + args.argc + 1 + args.envc + 1 + 2);
@@ -1421,18 +1425,26 @@ mod exec {
         let base = stack_top - total as u64; // the entry rsp: argc here
         let mut off = vec_len;
         let mut argv_ptrs = [0u64; MAX_EXEC_ARGS];
-        for i in 0..args.argc {
-            argv_ptrs[i] = base + off as u64;
-            img[off..off + args.argv_len[i]].copy_from_slice(&args.argv[i][..args.argv_len[i]]);
-            img[off + args.argv_len[i]] = 0;
-            off += args.argv_len[i] + 1;
+        for (slot, (buf, len)) in argv_ptrs
+            .iter_mut()
+            .zip(args.argv.iter().zip(args.argv_len.iter()))
+            .take(args.argc)
+        {
+            *slot = base + off as u64;
+            img[off..off + *len].copy_from_slice(&buf[..*len]);
+            img[off + *len] = 0;
+            off += len + 1;
         }
         let mut envp_ptrs = [0u64; MAX_EXEC_ARGS];
-        for j in 0..args.envc {
-            envp_ptrs[j] = base + off as u64;
-            img[off..off + args.envp_len[j]].copy_from_slice(&args.envp[j][..args.envp_len[j]]);
-            img[off + args.envp_len[j]] = 0;
-            off += args.envp_len[j] + 1;
+        for (slot, (buf, len)) in envp_ptrs
+            .iter_mut()
+            .zip(args.envp.iter().zip(args.envp_len.iter()))
+            .take(args.envc)
+        {
+            *slot = base + off as u64;
+            img[off..off + *len].copy_from_slice(&buf[..*len]);
+            img[off + *len] = 0;
+            off += len + 1;
         }
         debug_assert_eq!(off, vec_len + strings);
         let mut vec = 0usize;
@@ -1441,12 +1453,12 @@ mod exec {
             *vec += 8;
         }
         push_word(img, &mut vec, args.argc as u64);
-        for i in 0..args.argc {
-            push_word(img, &mut vec, argv_ptrs[i]);
+        for &p in argv_ptrs.iter().take(args.argc) {
+            push_word(img, &mut vec, p);
         }
         push_word(img, &mut vec, 0); // argv NULL
-        for j in 0..args.envc {
-            push_word(img, &mut vec, envp_ptrs[j]);
+        for &p in envp_ptrs.iter().take(args.envc) {
+            push_word(img, &mut vec, p);
         }
         push_word(img, &mut vec, 0); // envp NULL
         push_word(img, &mut vec, 0); // auxv AT_NULL

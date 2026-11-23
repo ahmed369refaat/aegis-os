@@ -1,5 +1,51 @@
 # Changelog
 
+## [Unreleased] — Phase 6 S5b: the persist step — a second vblk session, the image in frames
+
+The M3 exit criterion's kernel half. `drvstack/persist.rs` claims
+the virtio-blk BEHIND a root port (bus != 0 — the bus-0 disk belongs
+to virtio_step's demo and its enforcement probe; the persist image
+must never be the disk that probe writes its pattern into), gives it
+its OWN IOMMU domain (ADR-0018; `Inventory::set_dom_bdf` records it
+— the second vblk is indistinguishable by vendor/device/class, so
+only coordinates can name it), and runs virtio_step's proven
+handshake against it.
+
+- The image lives in 32 pool frames (PERSIST_OWNER=50) behind the
+  S5b-1 `ImageStore` impl over PA accessors — no contiguous buffer,
+  and the step is unsafe-free (drvstack sits outside the allowlist).
+  DMA moves one sector at a time through the mapped data page; the
+  copies are u64-chunked (both ends 8-aligned by construction).
+- ONE branch, no build flag: `persist.txt` absent → boot 1 —
+  `create_file` + `write_file` (the S4 core, now on the frame
+  store), an in-RAM round trip through the READ-ONLY parser BEFORE
+  any disk byte moves, then a whole-image flush (256 sectors — the
+  writer reports no dirty map; the honest bound). Present → boot 2 —
+  byte-for-byte verify, flush NOTHING. The lane greps
+  `PERSIST:WRITTEN` then `PERSIST:VERIFIED`.
+- The verified content is imported into THIS boot's VFS tree through
+  the live syscall path (the supervisor pattern: uid 0 opens, writes,
+  reads back byte-exact, then dies) — the file the previous boot
+  wrote is a node this boot's tree can see.
+- Every exit path frees the image frames; the session block scopes
+  the k/pool/broker borrows so `pool.free` is reachable after it.
+
+The debt this exposed and paid: `cargo clippy -p aegis-kernel
+--target x86_64-unknown-none` had NOT been run since S3 — the
+argv/envp materialization shipped with 4 needless_range_loop lints
+(now genuine iterators: zip/take chains over the parallel argv/
+argv_len arrays) and the v1-whitelist test still demanded execve(59)
+translate to None after slice 4 mapped it to SYS_EXEC. Kernel host
+tests 282 → 283 (`set_dom_bdf` pins that only coordinates name the
+second identical vblk); README counts refreshed (658 → 713 — the S3/
+S4 sessions had let them drift). Five unused-import warnings remain
+in the kernel's host-test cfg — pre-existing, in a configuration no
+gate lints; left for a dedicated pass.
+
+Gates: boot-target clippy -D warnings clean (first time since S3),
+kernel host tests 283/283, lib 430/430, fmt, unsafe 125/125, asm,
+no-binaries, IST all PASS.
+
 ## [Unreleased] — the S4 lint debt paid: the write path was production code
 
 The S4 lint debt was misdiagnosed as a clippy/cargo-test cfg

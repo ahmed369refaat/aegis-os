@@ -643,7 +643,7 @@ fn cap_name(id: u8) -> &'static str {
     }
 }
 
-fn describe_claim_error(e: crate::pci::ClaimError) -> &'static str {
+pub(crate) fn describe_claim_error(e: crate::pci::ClaimError) -> &'static str {
     match e {
         crate::pci::ClaimError::NotEndpoint => "bridge header",
         crate::pci::ClaimError::BridgeClass => "bridge class",
