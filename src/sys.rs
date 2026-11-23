@@ -25,8 +25,8 @@ use crate::vfs::{Access, Credentials, InodeKind, Mode, ProcNode, VfsError};
 use crate::{
     syscall::{
         SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV,
-        SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP,
-        SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_PIPE_READ,
+        SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_LISTDIR, SYS_MKDIR, SYS_MMAP,
+        SYS_MUNMAP, SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_PIPE_READ,
         SYS_PIPE_WRITE, SYS_READ, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
     },
     Kernel, KernelError,
@@ -106,6 +106,16 @@ pub enum SysRequest<'a> {
     /// unlink(path) — files and *empty* directories.
     Unlink {
         path: &'a str,
+    },
+    /// list_dir(fd, buf) — Phase 7: the shell's `ls`. The fd must be
+    /// an open descriptor on a directory (the open's capability gate
+    /// already ran); the children's names land NUL-separated, the
+    /// byte count returns. v1 maps getdents64(259) here with the
+    /// documented subset semantics (names + count, not dirent64
+    /// structs).
+    ListDir {
+        fd: u8,
+        buf: &'a mut [u8],
     },
     /// send(len) — bytes through the domain's brokered socket, rate-limited.
     NetSend {
@@ -814,6 +824,25 @@ impl<const N: usize> Kernel<N> {
                     .map_err(SysError::Vfs)?;
                 Ok(SysValue::Unit)
             }
+            SysRequest::ListDir { fd, buf } => {
+                // The fd's open already gated the path (an FsNode READ
+                // capability on the directory); listing adds no right
+                // beyond the names of what the caller can already name.
+                let target = self
+                    .domain_mut(domain_id)
+                    .map_err(into_sys)?
+                    .fds
+                    .get(fd)
+                    .ok_or(SysError::BadFd(fd))?
+                    .target;
+                match target {
+                    FdTarget::File(r) => {
+                        let n = self.vfs.list_dir(r.id, buf).map_err(SysError::Vfs)?;
+                        Ok(SysValue::Count(n))
+                    }
+                    _ => Err(SysError::BadFd(fd)),
+                }
+            }
             SysRequest::NetSend { len } => {
                 // F18 (ADR-0009): the brokered NIC needs the Device
                 // capability with WRITE, before any socket work.
@@ -1272,6 +1301,7 @@ fn syscall_nr(req: &SysRequest<'_>) -> u8 {
         SysRequest::Chroot { .. } => SYS_CHROOT,
         SysRequest::Mkdir { .. } => SYS_MKDIR,
         SysRequest::Unlink { .. } => SYS_UNLINK,
+        SysRequest::ListDir { .. } => SYS_LISTDIR,
         SysRequest::NetSend { .. } => SYS_NET_SEND,
         SysRequest::Mmap { .. } => SYS_MMAP,
         SysRequest::Munmap { .. } => SYS_MUNMAP,

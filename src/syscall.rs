@@ -67,7 +67,8 @@ pub fn linux_nr_to_core(nr: u64) -> Option<u64> {
         83 => Some(SYS_MKDIR as u64),          // mkdir(2) — the Phase-6 ring-3 arm
         87 => Some(SYS_UNLINK as u64),         // unlink(2) — unlink+rmdir folded, errno-exact
         161 => Some(SYS_CHROOT as u64),        // chroot(2) — the cwd moves with the root
-        _ => None,                             // the whitelist's edge
+        259 => Some(SYS_LISTDIR as u64), // getdents64(2) — names NUL-separated, count returned
+        _ => None,                       // the whitelist's edge
     }
 }
 
@@ -160,6 +161,11 @@ pub const SYS_PIPE_READ: u8 = 30;
 pub const SYS_PIPE_WRITE: u8 = 31;
 /// Reserved: domain exit. Always reachable; a mask without it is rejected
 /// by convention (see `profile` tests).
+/// list_dir(fd, buf): a directory's children as NUL-separated names.
+/// v1 maps getdents64(259) here — the documented subset semantics:
+/// names + count, not dirent64 structs.
+pub const SYS_LISTDIR: u8 = 32;
+
 pub const SYS_EXIT: u8 = 63;
 
 /// Number of syscall slots (mask width).

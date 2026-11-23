@@ -694,6 +694,40 @@ impl Vfs {
         Ok(())
     }
 
+    /// List a directory's children as NUL-separated names into `out`
+    /// (the write stops when `out` fills — a partial name is a lie, so
+    /// a child that does not fit whole is skipped and later siblings
+    /// with it). Returns the byte count written. Phase 7: the shell's
+    /// `ls` surface; the bound discipline is the syscall arm's (the
+    /// span is validated before this runs).
+    pub fn list_dir(&self, dir: u32, out: &mut [u8]) -> Result<usize, VfsError> {
+        let node = self.inode(dir)?;
+        if node.kind != InodeKind::Dir {
+            return Err(VfsError::NotADirectory);
+        }
+        let mut n = 0usize;
+        for (i, slot) in self.inodes.iter().enumerate() {
+            // The root is its own parent (Vfs::new): listing a
+            // directory never lists the directory itself.
+            if i as u32 == dir {
+                continue;
+            }
+            if let Some(child) = slot {
+                if child.parent != dir {
+                    continue;
+                }
+                let need = child.name_len + 1;
+                if n + need > out.len() {
+                    break;
+                }
+                out[n..n + child.name_len].copy_from_slice(&child.name[..child.name_len]);
+                out[n + child.name_len] = 0;
+                n += need;
+            }
+        }
+        Ok(n)
+    }
+
     /// All children ids of a directory (test/introspection helper).
     #[cfg(test)]
     pub fn children_of(&self, dir: u32) -> Vec<u32> {
@@ -761,6 +795,51 @@ mod tests {
             fs.resolve(ROOT_REF, ROOT_REF, "/..", ROOT_CREDS),
             Ok(ROOT_REF)
         );
+    }
+
+    /// Phase 7: `list_dir` — the shell's `ls` surface. Names land
+    /// NUL-separated, the root never lists itself (it is its own
+    /// parent), the bound stops whole children, and a file fd's inode
+    /// refuses with NotADirectory.
+    #[test]
+    fn list_dir_names_children_nul_separated() {
+        let mut fs = Vfs::new();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/pub", ROOT_CREDS, Mode(0o777))
+            .unwrap();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/tmp", ROOT_CREDS, Mode(0o777))
+            .unwrap();
+        fs.create(ROOT_REF, ROOT_REF, "/pub/data.txt", USER, Mode(0o644))
+            .unwrap();
+        let mut out = [0u8; 64];
+        let n = fs.list_dir(ROOT_ID, &mut out).unwrap();
+        let listing = &out[..n];
+        // NUL-separated: "pub\0tmp\0" (creation order is not promised —
+        // both names must appear, each exactly once, whole).
+        assert_eq!(n, 8, "two 3-char names + two NULs: {listing:?}");
+        let mut names: Vec<&[u8]> = listing.split(|b| *b == 0).collect();
+        names.pop(); // the trailing NUL's empty tail
+        let mut got: Vec<Vec<u8>> = names.iter().map(|s| s.to_vec()).collect();
+        got.sort();
+        assert_eq!(got, vec![b"pub".to_vec(), b"tmp".to_vec()]);
+
+        // The children of /pub: exactly data.txt.
+        let pub_id = fs
+            .resolve(ROOT_REF, ROOT_REF, "/pub", ROOT_CREDS)
+            .unwrap()
+            .id;
+        let n2 = fs.list_dir(pub_id, &mut out).unwrap();
+        assert_eq!(&out[..n2], b"data.txt\0");
+
+        // The bound: an out that cannot hold a child whole skips it —
+        // never a partial name. "data.txt\0" needs 9; give it 8.
+        let mut small = [0u8; 8];
+        assert_eq!(fs.list_dir(pub_id, &mut small).unwrap(), 0);
+
+        // A file's inode refuses (the arm translates ENOTDIR).
+        let f = fs
+            .resolve(ROOT_REF, ROOT_REF, "/pub/data.txt", USER)
+            .unwrap();
+        assert_eq!(fs.list_dir(f.id, &mut out), Err(VfsError::NotADirectory));
     }
 
     #[test]

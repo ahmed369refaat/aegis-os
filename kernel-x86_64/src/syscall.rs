@@ -51,13 +51,13 @@ use aegis_os::syscall::Abi;
 use aegis_os::syscall::{
     SYSCALL_COUNT, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_IPC_CALL,
     SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL,
-    SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_SCHED_YIELD,
-    SYS_SIGACTION, SYS_SIGRETURN, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
+    SYS_LISTDIR, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_PIPE_READ, SYS_PIPE_WRITE,
+    SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
 };
 #[cfg(test)]
 use aegis_os::syscall::{
-    SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_KILL, SYS_NANOSLEEP,
-    SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_WAIT, SYS_WRITE,
+    SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_KILL, SYS_LISTDIR,
+    SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_WAIT, SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -181,6 +181,9 @@ mod tests {
                                                                    // the image-replacement arm — the stale "must be
                                                                    // None" entry below was the slice-4 miss.
         assert_eq!(translate_nr(59, true), Some(SYS_EXEC as u64)); // execve -> SYS_EXEC
+                                                                   // Phase 7: getdents64(259) joins — the
+                                                                   // shell's ls over the internal ListDir.
+        assert_eq!(translate_nr(259, true), Some(SYS_LISTDIR as u64)); // getdents64 -> SYS_LISTDIR
         for nr in [4u64, 12, 32, 39, 63, 64, 293] {
             assert_eq!(translate_nr(nr, true), None, "nr {nr}");
         }
@@ -329,6 +332,7 @@ mod exec {
             // the arms arrive with the boot root).
             Decision::Allowed if nr8 == SYS_MKDIR => sys_mkdir(run, a1, a2),
             Decision::Allowed if nr8 == SYS_UNLINK => sys_unlink(run, a1),
+            Decision::Allowed if nr8 == SYS_LISTDIR => sys_listdir(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_CHROOT => sys_chroot(run, a1),
             Decision::Allowed if nr8 == SYS_MMAP => sys_mmap(run, a1, a2, a3, _a4, linux_abi),
             Decision::Allowed if nr8 == SYS_MUNMAP => sys_munmap(run, a1, a2),
@@ -818,6 +822,53 @@ mod exec {
         };
         match k.execute(run.domain, SysRequest::Unlink { path }) {
             Ok(v) => sysabi::rax_of(v),
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// SYS_LISTDIR(fd, buf, len) — Phase 7: the shell's `ls`. The
+    /// executor fills a kernel buffer once (no double-fetch), the
+    /// names copy out byte-exact under the blessed SMAP window — the
+    /// `sys_pipe_read` shape over the VFS's directory walk.
+    fn sys_listdir(run: &mut crate::sched::context::UserRun, fd: u64, buf: u64, len: u64) -> u64 {
+        use crate::mm::user_range::copy_out_bytes;
+        if len as usize > sysabi::MAX_READ {
+            return (-EINVAL) as u64;
+        }
+        if !validate_user_range(run, buf, len, sysabi::MAX_READ as u64) {
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_fault(run.domain);
+            }
+            return (-EFAULT) as u64;
+        }
+        let fd = match fd_arg(fd) {
+            Ok(fd) => fd,
+            Err(e) => return e as u64,
+        };
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        let mut kbuf = [0u8; sysabi::MAX_READ];
+        match k.execute(
+            run.domain,
+            SysRequest::ListDir {
+                fd,
+                buf: &mut kbuf[..len as usize],
+            },
+        ) {
+            Ok(SysValue::Count(n)) => {
+                IN_USER_COPY.store(true, Ordering::SeqCst);
+                if crate::hw::smap_active() {
+                    crate::hw::stac();
+                }
+                let wrote = copy_out_bytes(buf, &kbuf[..n], &|va, b| memops::write_u8_va(va, b));
+                if crate::hw::smap_active() {
+                    crate::hw::clac();
+                }
+                IN_USER_COPY.store(false, Ordering::SeqCst);
+                wrote
+            }
+            Ok(_) => 0,
             Err(e) => sysabi::errno_of(&e) as u64,
         }
     }

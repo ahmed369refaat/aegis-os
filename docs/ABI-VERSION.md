@@ -47,6 +47,10 @@ live domain (ADR-0003's refuse rule).
 | 62 kill | 14 | |
 | 228 clock_gettime | 23 | |
 
+`getdents64` (259) → `SYS_LISTDIR`: the shell's `ls` — names
+NUL-separated into the caller's buffer, the byte count returned (the
+documented v1 subset: names + count, not dirent64 structs).
+
 **Deliberately NOT mapped:** `dup` (32), `pipe2` (293): no ABI arm
 yet. Each answers `-ENOSYS` today. (`open` — nr 2 — lived on this edge
 until slice 2: the encoding difference is handled by translating at
