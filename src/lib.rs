@@ -44,6 +44,7 @@ pub mod capability;
 pub mod dma;
 pub mod dmar;
 pub mod domain;
+pub mod elf;
 pub mod ext2;
 pub mod fat32;
 pub mod fd;

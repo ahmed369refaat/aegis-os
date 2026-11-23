@@ -1,5 +1,59 @@
 # Changelog
 
+## [Unreleased] — ADR-0003 v1 slice 4, part 1: the ELF64 loader the kernel arm was waiting for
+
+### Why
+
+ABI-VERSION's slice-3 edge names execve(59) as deliberately unmapped:
+"the kernel has no ELF loading machinery yet; the translation lands
+with the exec slice, not as a stub that answers wrong." The arm needs
+something that does not exist in this kernel: validation of a real
+ELF64 static image into an executable mapping plan. The validation is
+POLICY, not mechanics — which headers an image may present, which
+program headers carry mapping semantics, where every byte must sit —
+so it lives in the host-tested core where every refusal gets a test,
+and the kernel's arm (next part) only executes the plan.
+
+### The design (src/elf.rs — 11 host tests)
+
+`build_exec_plan(image) -> ExecPlan | ElfError` — pure, no_std, no
+allocation, fixed-capacity plans. The open(2) slice-2 discipline: a
+feature this loader cannot honor is REFUSED with a typed error, never
+silently dropped.
+
+- Accepted: `ET_EXEC` + `EM_X86_64` + 64-bit + LSB; `PT_LOAD`
+  segments with page-congruent (vaddr ≡ offset mod PAGE) extents;
+  `PT_NULL`/`PT_PHDR`/`PT_NOTE`/`PT_GNU_*` ignored as carrying no
+  mapping semantics for a static image.
+- Refused, each with its own variant: PIE (`ET_DYN` — the loader
+  does not compute relocation bases, and "it would work at the right
+  base" is the most tempting wrong answer); `PT_INTERP`/
+  `PT_DYNAMIC` (dynamic linkage we do not perform); unknown program
+  header types AND unknown p_flag bits (the O_EXCL rule — a future
+  ELF feature is not silently dropped); `p_filesz > p_memsz`; segments
+  past EOF; zero-memsz loads (reservation is mmap's job, not exec's);
+  W+X (the kernel's W^X invariant, refused at load time); zero-perm;
+  vaddr 0 and the kernel half; entry outside every PT_LOAD; two
+  segments sharing a page (x86 cannot hold two permission sets in one
+  page — no correctly-linked static ELF64 asks it); more than
+  MAX_SEGMENTS=8 loads (refused, not truncated).
+- `ExecPlan.map_bytes` sums the PAGE-ROUNDED extents, not memsz — the
+  kernel checks quota before touching a frame, so ENOMEM lands at the
+  gate, not mid-copy.
+
+### What is NOT in this part (on purpose)
+
+The Linux whitelist entry (59 -> SYS_EXEC) lands ATOMICALLY with the
+kernel arm — mapping the number while the arm answers -ENOSYS would be
+exactly the half-ABI the slice-3 note refuses. The arm's chosen route:
+the proven parked handover (park the in-flight run with a SYNTHETIC
+image — rip = e_entry, rsp = STACK_TOP, every GP register ZERO so the
+fresh image cannot read the old image's registers), teardown of the
+old image's frames, fresh tables mapped from the plan, and
+`Kernel::exec_replace` (ADR-0022 D4: mask intersection, cloexec
+closes, regions reset — in the core since round K) for the policy
+half.
+
 ## [Unreleased] — Phase 0 (round V): the toolchain doctor — three recycles, three truncation modes, one diagnosis command
 
 ### Why
