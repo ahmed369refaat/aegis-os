@@ -193,6 +193,14 @@ pub fn deliver(vector: u8) {
     // A pending in-service interrupt must never wedge the APIC behind
     // bookkeeping: acknowledge before the mailbox runs.
     crate::arch::lapic::eoi();
+    // Phase 7 (the TTY): EOI done, mailbox next — and the serial's
+    // FIFO drains into the ring RIGHT HERE, at delivery time, so the
+    // 16550 never overruns while a shell session types ahead. The
+    // read path drains opportunistically too; this is the
+    // interrupt-driven half.
+    if _dev_tag == crate::tty::TTY_OWNER {
+        crate::tty::drain_uart();
+    }
     let slot = &SLOTS[(vector - DEVICE_VECTOR_BASE) as usize];
     bump_mailbox(slot);
     LAST_DELIVERED.store(vector, Ordering::SeqCst);

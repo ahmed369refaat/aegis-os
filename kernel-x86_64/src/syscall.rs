@@ -826,6 +826,41 @@ mod exec {
         }
     }
 
+    /// The console-in device path (Phase 7): drain the UART
+    /// opportunistically — the service-time half of the TTY; the IRQ
+    /// bottom half may already have taken everything — then move up
+    /// to `len` bytes from the ring out under the blessed SMAP
+    /// window. 0 = nothing typed yet (the shell's poll signal; this
+    /// TTY has no EOF — the idle shell exits on its own timer).
+    fn sys_read_console(run: &mut crate::sched::context::UserRun, buf: u64, len: u64) -> u64 {
+        use crate::mm::user_range::copy_out_bytes;
+        if len as usize > sysabi::MAX_READ {
+            return (-EINVAL) as u64;
+        }
+        if !validate_user_range(run, buf, len, sysabi::MAX_READ as u64) {
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_fault(run.domain);
+            }
+            return (-EFAULT) as u64;
+        }
+        crate::tty::drain_uart();
+        let mut kbuf = [0u8; sysabi::MAX_READ];
+        let n = crate::tty::drain(&mut kbuf[..len as usize]);
+        if n == 0 {
+            return 0;
+        }
+        IN_USER_COPY.store(true, Ordering::SeqCst);
+        if crate::hw::smap_active() {
+            crate::hw::stac();
+        }
+        let _ = copy_out_bytes(buf, &kbuf[..n], &|va, b| memops::write_u8_va(va, b));
+        if crate::hw::smap_active() {
+            crate::hw::clac();
+        }
+        IN_USER_COPY.store(false, Ordering::SeqCst);
+        n as u64
+    }
+
     /// SYS_LISTDIR(fd, buf, len) — Phase 7: the shell's `ls`. The
     /// executor fills a kernel buffer once (no double-fetch), the
     /// names copy out byte-exact under the blessed SMAP window — the
@@ -2017,6 +2052,20 @@ mod exec {
         if !validate_user_range(run, buf, len, sysabi::MAX_READ as u64) {
             let _ = k.report_fault(run.domain);
             return (-EFAULT) as u64;
+        }
+        // Phase 7: fd 0 is the TTY's console-in alias exactly while
+        // the fd table holds it Reserved (the spawn-time stdio
+        // triplet) — the read-side twin of SYS_WRITE's fd-1 alias. A
+        // closed or replaced fd 0 routes into the live lib executor.
+        let console_in = fd == 0
+            && match k.domain_mut(run.domain) {
+                Ok(d) => {
+                    matches!(d.fds.get(0), Some(e) if e.target == aegis_os::fd::FdTarget::Reserved)
+                }
+                Err(_) => false,
+            };
+        if console_in {
+            return sys_read_console(run, buf, len);
         }
         let fd = match fd_arg(fd) {
             Ok(fd) => fd,

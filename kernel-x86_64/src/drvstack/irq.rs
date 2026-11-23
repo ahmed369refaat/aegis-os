@@ -127,6 +127,54 @@ pub(crate) fn irq_step(out: &mut dyn FnMut(&str), madt: Option<&crate::drvstack:
             " (edge, active-high, dest 0, RTE read-back ok)",
         ],
     );
+
+    // ── Phase 7: the TTY — the same chain for ISA IRQ 4 (COM1), the
+    // serial the shell session types on. The UART itself comes up
+    // FIRST (IER RX-interrupt + FIFOs): the RTE going live with the
+    // device deaf would arm a line that can never fire. Refuses
+    // closed like the keyboard above; on refusal the read path's
+    // service-time drain keeps the TTY alive (documented polling).
+    crate::tty::uart_init();
+    let tgsi = m.gsi_of_isa_irq(crate::tty::TTY_ISA_IRQ);
+    let Some(tvec) = irq::alloc(crate::tty::TTY_OWNER, 0, tgsi) else {
+        line(
+            out,
+            &["[TTY] broker refused the serial (table full or duplicate) — poll mode"],
+        );
+        return;
+    };
+    let tre = ioapic::rte_encode(tvec, 0, ioapic::TRIGGER_EDGE, false);
+    if !ioapic.program(tgsi, tre) {
+        line(
+            out,
+            &["[TTY] ioapic refused the RTE (gsi out of range) — poll mode"],
+        );
+        irq::release(crate::tty::TTY_OWNER);
+        return;
+    }
+    if ioapic.read_rte(tgsi) != Some(tre) {
+        line(out, &["[TTY] RTE read-back mismatch — poll mode"]);
+        let _ = ioapic.mask(tgsi);
+        irq::release(crate::tty::TTY_OWNER);
+        return;
+    }
+    let mut tv = [0u8; 18];
+    let mut tg = [0u8; 20];
+    let mut tb = [0u8; 20];
+    let mut td = [0u8; 20];
+    line(
+        out,
+        &[
+            "[TTY] armed: isa irq 4 → gsi ",
+            strutil::dec(u64::from(tgsi), &mut tg),
+            " → vector 0x",
+            strutil::hex(u64::from(tvec), &mut tv),
+            " — RX by interrupt, ring 256B, buffered=",
+            strutil::dec(crate::tty::buffered() as u64, &mut tb),
+            " dropped=",
+            strutil::dec(crate::tty::dropped() as u64, &mut td),
+        ],
+    );
 }
 
 /// The IR bring-up half (ADR-0019): allocate the IRTE frame and turn

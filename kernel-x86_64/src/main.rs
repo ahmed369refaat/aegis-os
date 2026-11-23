@@ -89,6 +89,7 @@ pub mod wait;
 // module.
 pub mod sysabi;
 pub mod syscall;
+pub mod tty;
 pub mod virtio;
 
 /// Boot-path panic handler: print what we can over serial and halt.
