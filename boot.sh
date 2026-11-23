@@ -31,6 +31,11 @@ for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files; do
           -o "target/$b.o"
     objcopy -O binary -j .text.ring3 "target/$b.o" "kernel-x86_64/blob/$b.bin"
 done
+# ADR-0030's lesson: ring3-preempt registers its signal handler via a
+# hand-pinned code delta — assert the landing at EVERY build so a silent
+# layout shift fails the build instead of delivering SIGUSR1 into
+# arbitrary code.
+python3 scripts/check-blob-deltas.py || exit 1
 
 echo "==> [0b/4] linking the exec target (a REAL ELF64 — not a flat blob)"
 # execve's first image: PT_LOADs at their declared vaddrs (text RX at

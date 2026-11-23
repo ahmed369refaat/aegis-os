@@ -1,116 +1,115 @@
-# ADR-0030: The preemption-depth register-corruption hunt (round X) — status: OPEN, reproduction on demand
-
-## Context
-
-The ~1-in-5 boot flake recorded in the slice-4 changelog ("a lane flake in
-the slice-3/preempt interplay") was picked up as the next round's target.
-Two distinct failure shapes had been observed once each at the default
-10 ms tick: the CoW demo failing with `parent_ok=0 child_ok=0 copies=1`
-(the parent's store never faulting — it never ran — and the child's
-read-back mismatching), and round W's mode-13 wait4 failure (a child's
-completion entry surfacing unconsumed in kmain's drain).
-
-## The reproduction (the round's first win)
-
-**Shrinking the tick interval 8× (10 ms → 1.25 ms,
-`set_tick_interval(hz/800)` + the `TICK_INTERVAL_TSC` fallback) makes the
-failure fire on EVERY boot** — 3/3 boots failed with the signal demo's
-verdict (`[M3] signal: ERROR: victim/killer exit wrong`), always with
-`completed dom=23 code=fault`. The trigger is the tick density alone:
-boots with the switch-path debug prints removed still failed 3/3, and
-boots at 10 ms with the prints stayed green 18 consecutive times. The
-original flake is this bug in the narrow window; dense ticks widen the
-window to certainty.
-
-(A false trail worth recording: "boots under host CPU contention"
-produced what looked like hangs — those were QEMU slowness, the rogue
-demo needing 150k strikes finishing ~50k in 300 s, NOT the bug. The
-rogue strike count told the truth: green boots print exactly 150,000
-domain-12 audits.)
-
-## The evidence (the dying register file)
-
-The victim (dom 23, the signal demo) dies at `mov %al,(%rdi)` —
-`rdi=0xA`, i.e. **the SIGUSR1 argument value** — inside the hex-print
-helper the victim's handler calls. The full register file at death:
-
-```
-r15=0x102000   r14=0x23        r13=0x202       r12=0x2b
-r11=0x246      r10=0x400000    r9=0x2          r8=0
-rbp=0x409000   rdi=0xA         rsi=0x4030400   rdx=0xD
-rcx=0x400b1b   rbx=0x400000    rax=0x30 ('0')
-rip=0x400b17   rsp=0x408f70
-```
-
-Decode: `rax=0x30` and `rcx=0x400b1b` mean the helper was mid-format
-(the victim was alive and running INSIDE its handler); `rdi=0xA` means
-the helper was entered with the handler-ENTRY rdi (the signal number)
-instead of the output buffer. And the callee-saved set carries
-**user-context-STRUCT fields, not user values**: `r12=0x2b` is the user
-CS, `r13=0x202` is USER_RFLAGS, `r14=0x23` is the domain id, `r15=0x102000`
-is a physical address, `rbp=0x409000` is STACK_TOP. The handler was
-entered with a register file that is not any legitimate interrupted-user
-state — its registers hold fields of a context structure.
-
-## The diagnosis (narrowed, not yet pinned)
-
-A user run is resumed with a corrupted register file — values that
-belong to context STRUCTS (cs/rflags/domain/pa) landing in the
-callee-saved slots — and dies on first use (the handler's helper writes
-through rdi=0xA). The corrupting event happens somewhere in the
-park/resume pipeline, and the pipeline has four register-capture sites:
-
-1. `park_from_frame` (the tick) — reads the IRQ frame via `gpr_at`,
-   symmetric with `unpark_into_frame`'s `set_gpr_at`; the
-   spinner/writer demo survives 9+ switches/boot, so this pair is
-   probably sound.
-2. `parked_from_current_syscall` (yield/nanosleep/IPC/wait arms) —
-   reads the stub frame slots (`frame_word(OFF_*)`) and the stub's
-   callee-saved slots (`user_callee_saved()`).
-3. `deliver_to_parked` (the signal path) — builds `InterruptedImage`
-   from the ctx gprs and rewrites rip/rsp/rdi/rax only; verified
-   correct by reading.
-4. `sys_sigreturn` — validated the cookie/address, refused NOTHING in
-   the failing boots (probe-verified: no refusal prints fired).
-
-This is the **third member of the ADR-0010 family** (the mirror-inverted
-stub offsets; the yield path's garbage r12 "found live"; the
-rip-read-from-RSI-slot "found live"). Every prior member was a
-slot/offset misalignment between an asm stub and its Rust reader. The
-prime suspects are the per-excursion shared slots: `user_callee_saved()`
-and the `PARK_RBX..PARK_R15` resume slots — at a NESTED park depth
-(a dispatcher-resumed run parking again under tick pressure) some reader
-picks up slots written by a different excursion than the one it belongs
-to. Dense ticks multiply the nesting frequency; that is exactly why the
-window opens.
-
-Two sibling observations that now belong to this hunt:
-- Round X's first captured CoW failure (`copies=1`, parent stranded)
-  fits the same class: a parked image corrupted → the child's
-  post-CoW read-back mismatched (its r12-class registers corrupted
-  on resume), and the parent never resumed (its parked image or its
-  runnable bit lost).
-- Round W's mode-13 wait4 failure (a completion unconsumed) is
-  plausibly the same corruption killing a waiter/park transition in a
-  rare interleaving.
-
-## The next moves (the next round's opening)
-
-1. Read `arch/syscall_entry.rs`'s `user_callee_saved()` and the
-   `PARK_*` slot writers/readers; map WHICH slots the dying values
-   {0x2b, 0x202, 0x23, 0x102000} physically come from — the struct
-   whose fields they are is the struct a reader is mis-indexing.
-2. Add a debug probe at every `parked_from_current_syscall` capture:
-   print the captured `live` five; if {0x2b/0x202/0x23-class} values
-   appear at capture time (not just at death), the capture is the
-   corrupter; if they appear only later, the stash/restore is.
-3. Keep the 8× density as the reproduction knob until fixed; the fix
-   must turn 3/3 failures into 3/3 greens at 1.25 ms, then hold across
-   ≥10 boots at 10 ms.
+# ADR-0030: The preemption-depth register-corruption hunt — round X's "reproduction" was an artifact; round Y pinned the real bug it exposed (RESOLVED for the delta; the original flake remains OPEN)
 
 ## Status
 
-OPEN. No production code changed in round X — all instrumentation
-(tick density, blob amplifier loop, probe prints, the dying-register
-dump) was reverted; the evidence logs are archived in the session
-bundle. The hunt dossier is this document.
+**The round-X "reproduction on demand" was an instrument artifact —
+round Y proved it and closed the real bug the artifact exposed: a
+fragile hand-measured code delta in the ring3-preempt blob. The
+ORIGINAL rare flake (two occurrences on pristine trees: the CoW demo
+failure and round W's mode-13 wait4 loss) remains unexplained and
+OPEN — with its earlier "tick-density" lead now REFUTED.**
+
+## Context
+
+The ~1-in-5 boot flake recorded in the slice-4 changelog ("a lane
+flake in the slice-3/preempt interplay") was picked up as round X's
+target. Two distinct failure shapes had been observed once each at
+the default 10 ms tick on pristine trees: the CoW demo failing with
+`parent_ok=0 child_ok=0 copies=1` (the parent's store never
+faulting — it never ran — and the child's read-back mismatching),
+and round W's mode-13 wait4 failure (a child's completion entry
+surfacing unconsumed in kmain's drain).
+
+## Round X, corrected
+
+Round X reported: "8x tick density fires the failure on every boot
+(3/3), always the signal-demo victim dying inside its handler with
+rdi=0xA." Round Y audited that claim against the build that actually
+ran those boots and found it false:
+
+- The failing boots (iso4-6, sig1-5) ran the **amplifier blob** —
+  round X's temporary edit added a 50-iteration loop to mode 7,
+  which sits between mode 3 and `sig_handler` in the flat blob. The
+  handler address is registered as `next_instr + 0x947` — a
+  HAND-MEASURED constant pinned against the old layout. The edit
+  moved `sig_handler` by +0xC; the stale delta then delivered
+  SIGUSR1 twelve bytes short — into the hex-print helper's tail.
+- The victim entered at `dec %ecx` with `rdi=0xA` (the handler-entry
+  signal argument), looped, and died at `mov %al,(%rdi)` with
+  cr2=0xA. The dying register file confirmed it: `rsi=0x4030400` is
+  the victim's `rem` pointer ROLed by the helper's `rol $0x4,%rsi`,
+  and `rax=0x30` ('0') is the helper's nibble-to-ASCII mid-loop —
+  the victim was executing HELPER code, not handler code.
+- The "user-context struct fields in the callee-saved registers"
+  (r12=0x2b the CS, r13=0x202 RFLAGS, r14=0x23 the domain id,
+  r15=0x102000 a physical address) that round X read as the smoking
+  gun are **launch-stub scratch leftovers** — `enter_ring3` loads
+  the context fields through the callee-saved registers on its way
+  to SYSRET and never zeroes them. Mode 3 (like most blobs) never
+  reads a callee-saved register, so they survive untouched for the
+  run's whole life. Harmless.
+- The pristine tree does NOT fail at 8x density: dense1-4 (density
+  knob only, pristine blob) were green 4/4, and 18 consecutive
+  pristine boots at 10 ms were green. The original flake is not
+  tick-density-correlated.
+
+Every kernel capture site round X audited was individually clean on
+re-read: `park_from_frame` (IRQ frame, symmetric gpr_at/set_gpr_at),
+`parked_from_current_syscall` (stub slots + OFF_* frame table),
+`from_user_context` (zeroed gprs), `deliver_to_parked` (correct
+img mapping + rewrite), `sys_sigreturn` (probe-verified: no refusal
+fired in any failing boot), `pop_catchable_signal` (reads the
+registered table directly), and the syscall-entry stub's slot
+discipline (one global USER_RBP/R12-15 set, written at entry, read
+at park — snapshot-copied before any other excursion can overwrite).
+
+## The real bug (round Y, FIXED)
+
+`examples/ring3-preempt/src/lib.rs` mode 3 registers its SIGUSR1
+handler as `next_instr + 0x947` because the toolchain's global_asm
+pre-parser rejects rip-relative forms. `sig_handler` sat ~770 lines
+LATER in the flat blob — the delta spanned every mode from 4 to 13.
+Any code insertion in those modes silently moved the handler and the
+stale delta delivered SIGUSR1 into arbitrary code — exactly what
+round X's amplifier did by accident, and a trap for every future
+round.
+
+The fix, landed and gated:
+
+1. **`sig_handler` relocated to sit IMMEDIATELY before mode 3's
+   label.** The delta now spans only mode 3's own prologue
+   (`next_instr − 0x1f`), so later-mode edits can never shift it,
+   and a mode-3 edit is review-visible next to its own handler.
+2. **A build pin: `scripts/check-blob-deltas.py`**, wired into
+   `boot.sh` right after the blob rebuild. It objdumps the built
+   blob, finds `next_instr`, and asserts the landing
+   (`next_instr − 0x1f`) is exactly the flag-writer
+   `mov $0x51515151,%rax; mov %rax,0x403060`. A stale delta now
+   fails the BUILD instead of killing the victim at runtime.
+
+Gates after the fix: 3/3 verify boots green with the pin running in
+the build ("CHECK-BLOB-DELTA OK" in every boot log), the signal demo
+green in all three, `cargo fmt --check` clean, clippy `-D warnings`
+clean, host tests 425/0.
+
+## The original flake — what actually remains
+
+Two real failures on pristine trees, never reproduced since:
+
+1. Round X run-1: the CoW demo failed `parent_ok=0 child_ok=0
+   copies=1` — only the child's store faulted (its CoW served), the
+   parent's store never ran, and both verdicts came out non-clean.
+2. Round W: the mode-13 wait4 failure — a child's completion entry
+   surfaced unconsumed in kmain's drain.
+
+The tick-density lead is refuted (dense1-4 green). What varies
+between boots remains: the HPET/TSC calibration, the wall-clock
+position of stages (the rogue demo's 150k-strike escalation under
+host load — the round-X "loaded boot hangs" were QEMU slowness, not
+the bug), and host scheduling bursts. The next hunt should start
+from the CoW failure's exact semantics (the parent's yield-resume
+never happened) with capture probes on a pristine tree, sampling
+many 10 ms boots — and must distinguish BUILD changes from BOOT
+nondeterminism before claiming any reproduction (round X's central
+mistake: its "3/3" was per-BUILD determinism misread as per-boot
+randomness).

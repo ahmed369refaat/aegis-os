@@ -168,6 +168,20 @@ _ring3_start:
     mov edi, 99                       /* the wake landed early */
     syscall
 
+sig_handler:                          /* SIGUSR1: set the flag, ret.
+       Lives IMMEDIATELY before mode 3: the handler address is a
+       hand-pinned delta FROM next_instr (no rip-relative forms in
+       this pre-parser), and any code inserted between next_instr
+       and the handler would silently shift the landing — the
+       round-X hunt artifact was exactly that (a debug loop added to
+       mode 7 moved the handler +0xC; the stale delta delivered
+       SIGUSR1 into the hex helper and the victim died writing
+       through rdi=0xA). Adjacent-to-mode-3 keeps the span that the
+       delta covers inside mode 3 itself — review-visible. */
+    mov rax, 0x51515151
+    mov qword ptr [0x00403060], rax
+    ret                               /* -> the trampoline -> sigreturn */
+
 7:  /* ── mode 3: the victim (ADR-0023 D8) ──────────────────────── */
     /* rt_sigaction(SIGUSR1=10, handler, trampoline) — called at the
        INTERNAL number 25 (the Linux nr 13 collides with the round-J
@@ -183,7 +197,7 @@ _ring3_start:
     call next_instr
 next_instr:
     pop rsi
-    add rsi, 0x947                    /* measured: sig_handler - next_instr (objdump-pinned) */              /* measured: sig_handler - next_instr */
+    sub rsi, 0x1f                     /* sig_handler sits 0x1f bytes BEFORE next_instr (objdump-pinned: scripts/check-blob-deltas.py asserts it at build) */
     mov rdx, 0x0040C000               /* the kernel's trampoline page */
     syscall
     test rax, rax
@@ -938,11 +952,6 @@ bench_fmt_store:
     mov [rdi], al
     inc rdi
     ret
-
-sig_handler:                          /* SIGUSR1: set the flag, ret */
-    mov rax, 0x51515151
-    mov qword ptr [0x00403060], rax
-    ret                               /* -> the trampoline -> sigreturn */
 
 103: mov eax, 63
     mov edi, 103                      /* sigaction failed */

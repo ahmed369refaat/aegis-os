@@ -1,5 +1,53 @@
 # Changelog
 
+## [Unreleased] — ADR-0030 round Y: the fragile handler delta found, relocated and pinned
+
+### The correction that mattered
+
+Round X shipped a dossier claiming the ~1-in-5 lane flake was
+"reproducible on demand" at 8x tick density. Round Y disproved it:
+every failing round-X boot ran the hunt's own amplifier blob, whose
+50-iteration loop (inserted in mode 7) moved `sig_handler` +0xC
+while the blob's hand-measured `0x947` delta stayed stale — the
+kernel delivered SIGUSR1 twelve bytes short, into the hex helper's
+tail, and the victim died writing through rdi=0xA. The pristine tree
+at 8x density is green (4/4), as are 18 consecutive pristine boots
+at 10 ms. The dying register file's "context struct fields" were
+launch-stub scratch leftovers (harmless — mode 3 never reads a
+callee-saved register). ADR-0030 is rewritten to say all of this
+out loud, including the methodological lesson: **per-BUILD
+determinism misread as per-boot randomness** — every future hunt
+must pin the blob identity before claiming a reproduction.
+
+### The fix that the artifact exposed (a real bug)
+
+`ring3-preempt` mode 3 registers its SIGUSR1 handler as
+`next_instr + 0x947` — hand-measured, because the global_asm
+pre-parser rejects rip-relative forms. The handler sat ~770 lines
+later, so the delta spanned every mode from 4 to 13: ANY code
+insertion there silently delivered SIGUSR1 into arbitrary code.
+Now: `sig_handler` lives IMMEDIATELY before mode 3 (the delta is
+`next_instr - 0x1f`, spanning only mode 3's own prologue), and
+`scripts/check-blob-deltas.py` objdumps every built blob and fails
+the build unless the landing is exactly the flag-writer
+(`mov $0x51515151,%rax; mov %rax,0x403060`). Wired into boot.sh
+right after the blob rebuild; every boot log now carries
+"CHECK-BLOB-DELTA OK".
+
+### Gates
+
+3/3 verify boots green with the pin in the build (signal demo green
+in all three), `cargo fmt --check` clean, clippy `-D warnings`
+clean, host tests 425/0.
+
+### Still open
+
+The original flake — two pristine-tree occurrences (round X's CoW
+`parent_ok=0 child_ok=0 copies=1` and round W's mode-13 wait4
+loss) — is unexplained, NOT tick-density-correlated, and remains
+the next hunt's target (the plan is in ADR-0030's closing section).
+
+
 ## [Unreleased] — ADR-0003 v1 slice 4: execve(59) lands — the image replacement, ELF loader and all
 
 ### The slice
