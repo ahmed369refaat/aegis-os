@@ -1,5 +1,38 @@
 # Changelog
 
+## [Unreleased] — Phase 6 S3: execve materializes argv/envp — the SysV initial stack
+
+The exec'd image no longer starts on a bare stack: the kernel reads
+the caller's argv/envp (bounded like Linux answers E2BIG: 8 entries
+per table, MAX_PATH bytes each) BEFORE the point of no return — the
+strings live in the old image's pages — and builds the SysV x86-64
+initial stack: `[rsp] = argc`, argv pointers, NULL, envp pointers,
+NULL, a minimal AT_NULL auxv, then the strings; the entry RSP is
+16-byte aligned and every GP register still enters ZERO (the stack
+is the one thing a fresh image may read). Red->green: the
+exec-target grew an argc/argv probe that exits 12 on a bare-stack
+entry — the red boot reaped 12<<8 and the parent refused loudly.
+
+Three live findings, each caught by the probe and pinned in the
+code comments: (1) the materialization must run BETWEEN the new
+tables' activation and the old image's teardown — a post-teardown
+-EFAULT answers into a destroyed image (the child's next instruction
+fetch faulted through the new tables at its own exit path);
+(2) `validate_user_range`'s 4th argument is the LENGTH BOUND (the
+sigframe/nanosleep idiom), not an alignment — 16 for an 80-byte
+image is an unconditional refusal; (3) the SysV layout is
+[vector][strings][pad] — argc at the image's BASE — the first draft
+put the vector at the top and the target's probe read the pad as
+argc=0 (the kernel-side readback probe pinned it before removal).
+
+The probe expects argc=1 — the mode-13 child passes argv =
+(path, NULL): argv[0] alone. Host tests 428/0, fmt, clippy clean,
+pc + q35 lanes PASS; the noiommu lane hit a timing flake once
+(the mode-13 wait4-wake family, round-W's signature — dom 105
+exit 7) and passed twice on re-run; recorded for the flake hunt's
+ledger.
+
+
 ## [Unreleased] — Phase 6 S2: devfs + procfs — /dev/null, /dev/zero and /proc/self
 
 The inode model grows two kinds beyond File/Dir: `Device(DevKind)` and

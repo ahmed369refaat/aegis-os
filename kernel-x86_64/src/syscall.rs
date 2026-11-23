@@ -51,6 +51,7 @@ use aegis_os::syscall::{
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
 pub const EPERM: i64 = 1;
+pub const E2BIG: i64 = 7;
 pub const EBADF: i64 = 9;
 pub const EFAULT: i64 = 14;
 pub const ENOEXEC: i64 = 8;
@@ -1111,11 +1112,14 @@ mod exec {
 
     /// execve(2) — ADR-0003 v1 slice 4: the image replacement.
     /// The Linux shape is execve(path, argv, envp); the internal ABI
-    /// serves the same positions. argv/envp are ACCEPTED and not
-    /// materialized (the wait4-rusage discipline: no faking an
-    /// initializer block the kernel does not build) — the fresh image
-    /// starts with a clean stack and ZERO general registers; argv
-    /// arrives when the Phase-6 VFS can pass a real file's arguments.
+    /// serves the same positions. Phase 6 S3: argv/envp are now
+    /// MATERIALIZED — the kernel reads the caller's strings (bounded:
+    /// 8 args / 8 env entries, MAX_PATH bytes each; anything past is
+    /// -E2BIG exactly like Linux), and builds the SysV initial stack
+    /// before the synthetic park: [rsp] = argc, the argv pointers,
+    /// NULL, the envp pointers, NULL, a minimal AT_NULL auxv, the
+    /// strings above. Every GP register still enters ZERO — the
+    /// stack is the only thing a fresh image may read.
     ///
     /// The path resolves against the kernel's exec registry (the
     /// compiled-in ELF images — no filesystem yet; a path with no
@@ -1164,6 +1168,18 @@ mod exec {
         if argv == 0 || argv >= user_top || (envp != 0 && envp >= user_top) {
             return (-EFAULT) as u64;
         }
+        // Phase 6 S3: read the caller's argv/envp NOW — the strings
+        // live in the OLD image's pages, which are only guaranteed
+        // while this arm runs on the old CR3 (steps 2..4 below are
+        // the point of no return; the materialized copy must precede
+        // them).
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        let args = match read_exec_args(run, k, argv, envp) {
+            Ok(a) => a,
+            Err(e) => return e as u64,
+        };
         // 1. The path: bounded, page-checked, SMAP-blessed copy-in.
         let mut pathbuf = [0u8; sysabi::MAX_PATH];
         let Some(k) = context::kernel_mut() else {
@@ -1231,6 +1247,42 @@ mod exec {
         let old_tables = core::mem::replace(&mut run.tables, tables);
         run.space = space;
         run.tables.activate();
+        // ── Phase 6 S3: materialize the initial stack — BETWEEN the
+        // activation and the teardown, so every possible failure is
+        // answered while the old image is still alive: a refusal
+        // landing after the old frames free answers into a destroyed
+        // image (found live: a post-teardown validate answered -EFAULT
+        // and the child's next instruction fetch faulted through the
+        // new tables at its own exit path). The fresh stack page is
+        // mapped by exec_tables; validate's 4th argument is the
+        // LENGTH BOUND (the sigframe/nanosleep calls pin the idiom) —
+        // the whole image, never an alignment. ──
+        let entry_rsp = {
+            let mut stack_img = [0u8; EXEC_STACK_IMG];
+            let (total, entry_rsp) =
+                build_initial_stack(&args, crate::mm::user_layout::STACK_TOP, &mut stack_img);
+            debug_assert!(total <= EXEC_STACK_IMG);
+            if !validate_user_range(run, entry_rsp, total as u64, EXEC_STACK_IMG as u64) {
+                // Unreachable by construction (exec_tables maps the
+                // stack; the image is bounded) — but if it ever fires,
+                // the old image below is still ALIVE, so returning is
+                // honest: the caller survives with -EFAULT.
+                return (-EFAULT) as u64;
+            }
+            IN_USER_COPY.store(true, Ordering::SeqCst);
+            if crate::hw::smap_active() {
+                crate::hw::stac();
+            }
+            let _ =
+                crate::mm::user_range::copy_out_bytes(entry_rsp, &stack_img[..total], &|va, b| {
+                    memops::write_u8_va(va, b)
+                });
+            if crate::hw::smap_active() {
+                crate::hw::clac();
+            }
+            IN_USER_COPY.store(false, Ordering::SeqCst);
+            entry_rsp
+        };
         if let Some(pool) = context::pool_mut() {
             let _ = crate::mm::shares::release_borrowed_frames(
                 &old_tables,
@@ -1243,12 +1295,164 @@ mod exec {
             debug_assert!(moved > 0, "the built image must own its frames");
         }
         // 5. The narrowed mask and the synthetic park: fresh ledger,
-        // a zeroed register file.
+        // a zeroed register file — and the one thing a fresh image
+        // may read: the materialized argc/argv/envp stack.
         run.mask = SyscallMask::from_bits(run.mask.bits() & declared.bits());
-        let entry_ctx =
-            crate::sched::context::UserContext::new(plan.entry, crate::mm::user_layout::STACK_TOP);
+        let entry_ctx = crate::sched::context::UserContext::new(plan.entry, entry_rsp);
         let parked = ParkedContext::from_user_context(&entry_ctx);
         crate::sched::park::park_current_exec_image(parked)
+    }
+
+    /// ── Phase 6 S3: the exec argument block ── bounded like Linux
+    /// answers E2BIG: at most 8 argv entries and 8 envp entries, each
+    /// a NUL-terminated string of at most MAX_PATH bytes.
+    const MAX_EXEC_ARGS: usize = 8;
+    const EXEC_STACK_IMG: usize = 2560;
+
+    #[derive(Clone, Copy)]
+    struct ExecArgs {
+        argv: [[u8; sysabi::MAX_PATH]; MAX_EXEC_ARGS],
+        argv_len: [usize; MAX_EXEC_ARGS],
+        argc: usize,
+        envp: [[u8; sysabi::MAX_PATH]; MAX_EXEC_ARGS],
+        envp_len: [usize; MAX_EXEC_ARGS],
+        envc: usize,
+    }
+
+    impl ExecArgs {
+        const fn zeroed() -> Self {
+            ExecArgs {
+                argv: [[0; sysabi::MAX_PATH]; MAX_EXEC_ARGS],
+                argv_len: [0; MAX_EXEC_ARGS],
+                argc: 0,
+                envp: [[0; sysabi::MAX_PATH]; MAX_EXEC_ARGS],
+                envp_len: [0; MAX_EXEC_ARGS],
+                envc: 0,
+            }
+        }
+    }
+
+    /// Read one page-checked u64 from user memory (the argv/envp
+    /// array slots) — the nanosleep idiom, eight bytes wide.
+    fn read_user_slot(run: &crate::sched::context::UserRun, va: u64) -> Result<u64, i64> {
+        if !validate_user_range(run, va, 8, 8) {
+            return Err(-EFAULT);
+        }
+        IN_USER_COPY.store(true, Ordering::SeqCst);
+        if crate::hw::smap_active() {
+            crate::hw::stac();
+        }
+        let mut v = 0u64;
+        for off in 0..8 {
+            v |= u64::from(memops::read_u8_va(va + off)) << (8 * off);
+        }
+        if crate::hw::smap_active() {
+            crate::hw::clac();
+        }
+        IN_USER_COPY.store(false, Ordering::SeqCst);
+        Ok(v)
+    }
+
+    /// The bounded argv/envp read (Phase 6 S3). `argv` must name a
+    /// NULL-terminated pointer array; `envp` may be NULL (an empty
+    /// environment is legal). Every string rides the SAME page-
+    /// checked copy-in as SYS_OPEN's path.
+    fn read_exec_args(
+        run: &crate::sched::context::UserRun,
+        k: &mut aegis_os::Kernel<{ crate::frames::KERNEL_POOL_FRAMES }>,
+        argv: u64,
+        envp: u64,
+    ) -> Result<ExecArgs, i64> {
+        let user_top = 1u64 << 47;
+        let mut blk = ExecArgs::zeroed();
+        let mut read_table = |base: u64,
+                              strs: &mut [[u8; sysabi::MAX_PATH]; MAX_EXEC_ARGS],
+                              lens: &mut [usize; MAX_EXEC_ARGS],
+                              count: &mut usize|
+         -> Result<(), i64> {
+            for i in 0..=MAX_EXEC_ARGS {
+                let slot = read_user_slot(run, base + 8 * i as u64)?;
+                if slot == 0 {
+                    *count = i;
+                    return Ok(());
+                }
+                if i == MAX_EXEC_ARGS {
+                    return Err(-E2BIG); // the table is not NUL-terminated
+                }
+                if slot >= user_top {
+                    return Err(-EFAULT);
+                }
+                let len = read_user_path(run, k, slot, &mut strs[i])?;
+                lens[i] = len;
+            }
+            unreachable!("the loop returns at the NULL or the bound")
+        };
+        read_table(argv, &mut blk.argv, &mut blk.argv_len, &mut blk.argc)?;
+        if envp != 0 {
+            read_table(envp, &mut blk.envp, &mut blk.envp_len, &mut blk.envc)?;
+        }
+        Ok(blk)
+    }
+
+    /// Build the SysV x86-64 initial stack image (Phase 6 S3): the
+    /// VECTOR (argc, argv pointers, NULL, envp pointers, NULL, the
+    /// AT_NULL auxv) at the BOTTOM — argc sits at the entry RSP —
+    /// then the strings, then padding so the image's last byte lands
+    /// at `stack_top - 1` and the entry RSP (the image's base) is
+    /// 16-byte aligned. The first draft put the vector at the TOP;
+    /// the exec-target's probe caught it live (argc read the pad).
+    fn build_initial_stack(
+        args: &ExecArgs,
+        stack_top: u64,
+        img: &mut [u8; EXEC_STACK_IMG],
+    ) -> (usize, u64) {
+        let mut strings = 0usize;
+        for i in 0..args.argc {
+            strings += args.argv_len[i] + 1;
+        }
+        for j in 0..args.envc {
+            strings += args.envp_len[j] + 1;
+        }
+        // argc + argv + NULL + envp + NULL + auxv (AT_NULL alone)
+        let vec_len = 8 * (1 + args.argc + 1 + args.envc + 1 + 2);
+        let pad = (16 - ((strings + vec_len) % 16)) % 16;
+        let total = pad + strings + vec_len;
+        debug_assert!(total <= img.len());
+        let base = stack_top - total as u64; // the entry rsp: argc here
+        let mut off = vec_len;
+        let mut argv_ptrs = [0u64; MAX_EXEC_ARGS];
+        for i in 0..args.argc {
+            argv_ptrs[i] = base + off as u64;
+            img[off..off + args.argv_len[i]].copy_from_slice(&args.argv[i][..args.argv_len[i]]);
+            img[off + args.argv_len[i]] = 0;
+            off += args.argv_len[i] + 1;
+        }
+        let mut envp_ptrs = [0u64; MAX_EXEC_ARGS];
+        for j in 0..args.envc {
+            envp_ptrs[j] = base + off as u64;
+            img[off..off + args.envp_len[j]].copy_from_slice(&args.envp[j][..args.envp_len[j]]);
+            img[off + args.envp_len[j]] = 0;
+            off += args.envp_len[j] + 1;
+        }
+        debug_assert_eq!(off, vec_len + strings);
+        let mut vec = 0usize;
+        fn push_word(img: &mut [u8; EXEC_STACK_IMG], vec: &mut usize, w: u64) {
+            img[*vec..*vec + 8].copy_from_slice(&w.to_le_bytes());
+            *vec += 8;
+        }
+        push_word(img, &mut vec, args.argc as u64);
+        for i in 0..args.argc {
+            push_word(img, &mut vec, argv_ptrs[i]);
+        }
+        push_word(img, &mut vec, 0); // argv NULL
+        for j in 0..args.envc {
+            push_word(img, &mut vec, envp_ptrs[j]);
+        }
+        push_word(img, &mut vec, 0); // envp NULL
+        push_word(img, &mut vec, 0); // auxv AT_NULL
+        push_word(img, &mut vec, 0);
+        debug_assert_eq!(vec, vec_len);
+        (total, base)
     }
 
     /// wait4(2) — ADR-0003 v1 slice 3: the Linux wait lands on the
