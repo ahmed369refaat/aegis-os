@@ -1,5 +1,41 @@
 # Changelog
 
+## [Unreleased] — Phase 0 (round V): the toolchain doctor — three recycles, three truncation modes, one diagnosis command
+
+### Why
+
+The build sandbox is recycled between work sessions, and each recycle
+has truncated a DIFFERENT subset of the toolchain: (1) the cargo
+binary vanished while clippy stayed; (2) cargo AND the extracted
+QEMU root vanished; (3) cargo LOOKED intact but every host-std rlib
+was a metadata stub — the first `cargo test` on a CLEAN checkout
+failed with 2956 errors. Each hunt cost real time before a single
+line of kernel work; the failure never announces which piece broke.
+
+### The fix
+
+- **`scripts/toolchain-doctor.sh`** — the baseline ritual as one
+  command. It SELF-DISCOVERS the toolchain (sources the tools env,
+  falls back to the rustup toolchain bin, prefers the QEMU wrapper
+  — a recycled sandbox starts with a bare PATH, and a doctor that
+  needs the env pre-set reports a healthy environment as broken),
+  then probes: the four rust binaries answer --version; the HOST
+  std actually compiles, LINKS, and runs a Vec-using hello (the
+  metadata-stub mode passes any file-existence check — the probe
+  that would have named failure #3 in seconds); a #![no_std]
+  staticlib for the kernel target links (the lanes' first hard
+  stop); QEMU answers --version and both seabios blobs exist.
+  `--fix` attempts the proven repairs from the dist components and
+  the cached debs. Exit 0 iff every probe is green — wire it ahead
+  of any gate in CI or on any fresh sandbox.
+
+### Doc truth, verified
+
+- `wait4` consistency after slice 3: zero stale "not mapped / no
+  arm" claims left in ABI-VERSION; README/ROADMAP/CHANGELOG all
+  describe slice 3 as landed. (The lane logs and the bundle for
+  round U already sit in the session archive.)
+
 ## [Unreleased] — ADR-0003 slice 3 (v1): wait4(2) joins the Linux entry — the blocking syscall lands (rip-2 re-execute), on the ADR-0022 D7 core
 
 ### The feature
