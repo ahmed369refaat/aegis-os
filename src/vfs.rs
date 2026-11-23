@@ -10,8 +10,19 @@
 //!   (classic `chroot(2)` clamping), so a confined domain cannot escape.
 //! - `chmod` is allowed only for the file owner (or uid 0).
 
-pub const MAX_INODES: usize = 32;
-pub const FILE_DATA_MAX: usize = 128;
+/// Phase 6 S1: the boot root's inode budget. The kernel is
+/// no_std — the table is a fixed BSS array, sized for the M3 boot
+/// tree (/pub, /tmp, /dev, /bin, /proc + their files) with slack for
+/// the file demos and the persistence round-trip.
+pub const MAX_INODES: usize = 64;
+/// Phase 6 S1: a tmpfs file's inline data window — one full ext2
+/// block (1 KiB, the persistence round's unit). No dynamic allocation
+/// exists anywhere in the core: each inode carries its window inline
+/// and `NoSpace` is the honest ENOSPC at the edge. Sizing note: the
+/// VFS is inline in `Kernel<P>` and every host test builds a `Kernel`
+/// on its stack — 64 x 1 KiB keeps the struct ~68 KiB (a 4 KiB window
+/// measurably overflowed the deep-park host tests' stacks).
+pub const FILE_DATA_MAX: usize = 1024;
 pub const NAME_MAX: usize = 28;
 pub const ROOT_ID: u32 = 0;
 
@@ -1014,5 +1025,38 @@ mod tests {
             fs.write_at(home, ROOT_CREDS, 0, b"x"),
             Err(VfsError::IsADirectory)
         );
+    }
+
+    /// Phase 6 S1: a tmpfs file is a real file — a full 1 KiB block of
+    /// content round-trips byte-for-byte (the round-J cap was 128
+    /// bytes — a real boot root holds files that do not fit in a
+    /// serial line; the pin is ABSOLUTE so shrinking the window is a
+    /// red test, not a silent regression).
+    #[test]
+    fn block_sized_file_roundtrips() {
+        const BLOCK: usize = 1024;
+        let mut fs = Vfs::new();
+        let id = fs
+            .create(ROOT_REF, ROOT_REF, "/big", ROOT_CREDS, Mode(0o644))
+            .unwrap();
+        let body: Vec<u8> = (0..BLOCK).map(|i| (i % 251) as u8).collect();
+        assert_eq!(fs.write_at(id, ROOT_CREDS, 0, &body).unwrap(), BLOCK);
+        let mut back = [0u8; BLOCK];
+        assert_eq!(
+            fs.read_by_id_at(id, ROOT_CREDS, 0, &mut back).unwrap(),
+            BLOCK
+        );
+        assert_eq!(&back, body.as_slice());
+        // EOF past the end; offset reads inside.
+        assert_eq!(
+            fs.read_by_id_at(id, ROOT_CREDS, BLOCK, &mut back).unwrap(),
+            0
+        );
+        assert_eq!(
+            fs.read_by_id_at(id, ROOT_CREDS, BLOCK - 10, &mut back[..5])
+                .unwrap(),
+            5
+        );
+        assert_eq!(fs.size_of(id), Some(BLOCK));
     }
 }

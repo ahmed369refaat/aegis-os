@@ -43,10 +43,10 @@ pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
 use aegis_os::sys::{SysRequest, SysValue};
 use aegis_os::syscall::Abi;
 use aegis_os::syscall::{
-    gate, SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_IPC_CALL,
+    gate, SYSCALL_COUNT, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_IPC_CALL,
     SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL,
-    SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_SCHED_YIELD,
-    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT, SYS_WRITE,
+    SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_SCHED_YIELD,
+    SYS_SIGACTION, SYS_SIGRETURN, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -308,6 +308,12 @@ mod exec {
             Decision::Allowed if nr8 == SYS_CLOCK_GETTIME => sys_clock_gettime(run, a1, a2),
             Decision::Allowed if nr8 == SYS_SIGACTION => sys_sigaction(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_KILL => sys_kill(run, a1, a2),
+            // Phase 6 S1: the path family — mkdir/unlink/chroot from
+            // ring 3 (the core executors were live since round F11;
+            // the arms arrive with the boot root).
+            Decision::Allowed if nr8 == SYS_MKDIR => sys_mkdir(run, a1, a2),
+            Decision::Allowed if nr8 == SYS_UNLINK => sys_unlink(run, a1),
+            Decision::Allowed if nr8 == SYS_CHROOT => sys_chroot(run, a1),
             Decision::Allowed if nr8 == SYS_MMAP => sys_mmap(run, a1, a2, a3, _a4, linux_abi),
             Decision::Allowed if nr8 == SYS_MUNMAP => sys_munmap(run, a1, a2),
             Decision::Allowed if nr8 == SYS_FORK => sys_fork(run),
@@ -738,6 +744,88 @@ mod exec {
                 let _ = k.report_fault(run.domain);
                 Err(-EFAULT)
             }
+        }
+    }
+
+    // ── Phase 6 S1: the path family — mkdir/unlink/chroot from
+    // ring 3. The core executors (round F11, host-tested) were
+    // waiting for arms; the boot root is what makes them real.
+    // All three read the path through the SAME bounded, page-checked
+    // copy-in as SYS_OPEN (read_user_path) — no second path reader
+    // exists to get wrong. ──
+
+    /// SYS_MKDIR(path, mode): mode is masked to 0o777 exactly like
+    /// SYS_OPEN's O_CREAT mode argument.
+    fn sys_mkdir(run: &mut crate::sched::context::UserRun, path_va: u64, mode: u64) -> u64 {
+        use aegis_os::sys::SysRequest;
+        use aegis_os::vfs::Mode;
+        let Some(k) = context::kernel_mut() else {
+            return (-ENOSYS) as u64;
+        };
+        let mut pathbuf = [0u8; sysabi::MAX_PATH];
+        let len = match read_user_path(run, k, path_va, &mut pathbuf) {
+            Ok(l) => l,
+            Err(e) => return e as u64,
+        };
+        let Ok(path) = core::str::from_utf8(&pathbuf[..len]) else {
+            return (-EINVAL) as u64;
+        };
+        match k.execute(
+            run.domain,
+            SysRequest::Mkdir {
+                path,
+                mode: Mode((mode & 0o777) as u16),
+            },
+        ) {
+            Ok(v) => sysabi::rax_of(v),
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// SYS_UNLINK(path): unlink(2) and rmdir(2) folded — the core's
+    /// unlink refuses a non-empty directory with ENOTEMPTY and
+    /// unlinks an empty directory, which is exactly the rmdir(2)
+    /// contract (the internal ABI documents the fold; the Linux
+    /// entry maps both nrs 87 and 84's story through this arm).
+    fn sys_unlink(run: &mut crate::sched::context::UserRun, path_va: u64) -> u64 {
+        use aegis_os::sys::SysRequest;
+        let Some(k) = context::kernel_mut() else {
+            return (-ENOSYS) as u64;
+        };
+        let mut pathbuf = [0u8; sysabi::MAX_PATH];
+        let len = match read_user_path(run, k, path_va, &mut pathbuf) {
+            Ok(l) => l,
+            Err(e) => return e as u64,
+        };
+        let Ok(path) = core::str::from_utf8(&pathbuf[..len]) else {
+            return (-EINVAL) as u64;
+        };
+        match k.execute(run.domain, SysRequest::Unlink { path }) {
+            Ok(v) => sysabi::rax_of(v),
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// SYS_CHROOT(path): the confinement change — resolve against the
+    /// CURRENT root, then re-root (the cwd moves with the root, the
+    /// ADR-0023 close of the historical chroot+cwd escape). One-way
+    /// for every caller: no arm widens a root.
+    fn sys_chroot(run: &mut crate::sched::context::UserRun, path_va: u64) -> u64 {
+        use aegis_os::sys::SysRequest;
+        let Some(k) = context::kernel_mut() else {
+            return (-ENOSYS) as u64;
+        };
+        let mut pathbuf = [0u8; sysabi::MAX_PATH];
+        let len = match read_user_path(run, k, path_va, &mut pathbuf) {
+            Ok(l) => l,
+            Err(e) => return e as u64,
+        };
+        let Ok(path) = core::str::from_utf8(&pathbuf[..len]) else {
+            return (-EINVAL) as u64;
+        };
+        match k.execute(run.domain, SysRequest::Chroot { path }) {
+            Ok(v) => sysabi::rax_of(v),
+            Err(e) => sysabi::errno_of(&e) as u64,
         }
     }
 

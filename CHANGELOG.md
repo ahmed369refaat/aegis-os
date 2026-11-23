@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased] — Phase 6 S1: the boot root grows — mkdir/unlink/chroot reach ring 3
+
+The tmpfs core gets its first M3-sized window: 64 inodes (was 32),
+1 KiB per file — a full ext2 block, the persistence round's unit (was
+128 bytes). Sizing note pinned in the source: the VFS is inline in
+`Kernel<P>` and every host test builds one on its stack; a 4 KiB
+window measurably overflowed the deep-park host tests' stacks, 1 KiB
+keeps the struct ~68 KiB. The boot tree grows from the lone /pub to
+the M3 tree: /pub, /tmp (world-writable), /dev, /proc (S2's homes),
+/bin — prepared by the same uid-0-then-dies supervisor pattern.
+
+Three ring-3 arms arrive: SYS_MKDIR(16), SYS_UNLINK(17) (the
+unlink+rmdir fold, `-ENOTEMPTY` on a non-empty directory), and
+SYS_CHROOT(15) — all reading paths through the SAME bounded,
+page-checked copy-in as SYS_OPEN. The Linux whitelist gains
+mkdir(83), unlink(87), chroot(161). **The collision hunt, live**: the
+first blob probe of internal chroot(15) died silently after every
+answer checked correct — internal slot 15 is rt_sigreturn's legacy
+home in the frozen v0.4 hybrid table (the signal trampolines in the
+field call it), so the kernel translated chroot(15) into a sigreturn
+refusal. Resolution, documented in ABI-VERSION: ring-3 chroot is
+Linux-entry-only (nr 161); the internal files blob keeps the
+mkdir/unlink dance (EEXIST, rmdir fold, ENOENT, ENOTEMPTY — with the
+ENOTEMPTY probe moved INSIDE /pub after /'s 0o755 answered EACCES
+first, POSIX order); the Linux-ABI blob (mode 13) gains the full
+path-family probe — mkdir(83), unlink(87), chroot(161), then inside
+the jail the escaped absolute path answers ENOENT.
+
+Gates: red->green (the 1 KiB absolute pin went red on the 128-byte
+cap; the translate table went red on 83/87/161), fmt clean, clippy
+`-D warnings` clean, host tests 426/0, all three boot lanes PASS with
+the files blob's new Phase M and mode-13's S1 probes live.
+
+
 ## [Unreleased] — ADR-0030 round Y: the fragile handler delta found, relocated and pinned
 
 ### The correction that mattered

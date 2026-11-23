@@ -64,6 +64,9 @@ pub fn linux_nr_to_core(nr: u64) -> Option<u64> {
         62 => Some(SYS_KILL as u64),           // kill(2)
         228 => Some(SYS_CLOCK_GETTIME as u64), // clock_gettime(2)
         231 => Some(SYS_EXIT as u64),          // exit_group(2) — the alias
+        83 => Some(SYS_MKDIR as u64),          // mkdir(2) — the Phase-6 ring-3 arm
+        87 => Some(SYS_UNLINK as u64),         // unlink(2) — unlink+rmdir folded, errno-exact
+        161 => Some(SYS_CHROOT as u64),        // chroot(2) — the cwd moves with the root
         _ => None,                             // the whitelist's edge
     }
 }
@@ -447,6 +450,9 @@ mod adr0003_tests {
             (62, SYS_KILL),           // kill(2)
             (228, SYS_CLOCK_GETTIME), // clock_gettime(2)
             (231, SYS_EXIT),          // exit_group(2) — the alias
+            (83, SYS_MKDIR),          // mkdir(2) — the Phase-6 ring-3 arm
+            (87, SYS_UNLINK),         // unlink(2) — unlink+rmdir folded
+            (161, SYS_CHROOT),        // chroot(2) — confinement, cwd moves with the root
         ];
         for &(nr, op) in cases {
             assert_eq!(linux_nr_to_core(nr), Some(u64::from(op)), "nr {nr}");

@@ -22,6 +22,11 @@
 //! 0x403160  M2     "J:dup ok\n"                   (9)
 //! 0x403180  M3     "J:file ok\n"                 (10)
 //! 0x4031A0  M4     "J:neg ok\n"                   (9)
+//! 0x4031C0  D1P    "/pub/d1\0"                    (8)   mkdir target (S1)
+//! 0x4031E0  FIP    "/pub/d1/in.txt\0"             (15)  file inside it
+//! 0x403200  RP     "round-j.txt\0"                (12)  relative, post-chroot
+//! 0x403220  M5     "J:mkdir ok\n"                (11)   S1 marker
+//! 0x403240  PUBP   "/pub\0"                       (5)   the chroot jail
 //! 0x403800  RBUF1  read destinations (64 bytes, zeroed by kmain)
 //! 0x403900  RBUF2
 //! 0x403A00  RBUF3
@@ -199,6 +204,96 @@ _ring3_start:
     mov edx, 9
     syscall
     cmp rax, 9
+    jne 9f
+
+    /* ── Phase M (Phase 6 S1): mkdir/unlink from CPL=3 — the whole
+       directory lifecycle with exact answers (EEXIST, rmdir fold,
+       ENOENT, ENOTEMPTY). No chroot here: the internal ABI's slot 15
+       is rt_sigreturn's legacy home (ABI-VERSION v0.4, frozen — the
+       signal trampolines in the field use it), so the ring-3 chroot
+       proof lives in the Linux-ABI blob, as chroot(2) nr 161. ── */
+    mov eax, 16                /* SYS_MKDIR "/pub/d1", 0o755 */
+    mov edi, 0x004031C0
+    mov esi, 493
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 16                /* again -> -EEXIST */
+    mov edi, 0x004031C0
+    mov esi, 493
+    syscall
+    cmp rax, -17
+    jne 9f
+    mov eax, 2                 /* open("/pub/d1/in.txt", WRITE|CREAT, 0o644) */
+    mov edi, 0x004031E0
+    mov esi, 6
+    mov edx, 420
+    syscall
+    test rax, rax
+    js 9f
+    mov r8, rax                /* the fd survives syscalls (only rax/rcx/r11 clobber) */
+    mov eax, 1                 /* write the content in */
+    mov rdi, r8
+    mov esi, 0x00403080        /* FMSG */
+    mov edx, 21
+    syscall
+    cmp rax, 21
+    jne 9f
+    mov eax, 3                 /* close */
+    mov rdi, r8
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 17                /* SYS_UNLINK the file */
+    mov edi, 0x004031E0
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 17                /* the now-empty dir unlinks (rmdir fold) */
+    mov edi, 0x004031C0
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 17                /* gone -> -ENOENT */
+    mov edi, 0x004031C0
+    syscall
+    cmp rax, -2
+    jne 9f
+    mov eax, 16                /* re-make /pub/d1 for the ENOTEMPTY probe */
+    mov edi, 0x004031C0
+    mov esi, 493
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 16                /* a child DIRECTORY inside it */
+    mov edi, 0x004031E0        /* "/pub/d1/in.txt" — now as a dir */
+    mov esi, 493
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 17                /* non-empty dir -> -ENOTEMPTY (parent /pub
+                                  is 0o777: the ANSWER is the emptiness
+                                  fact, not /'s 0o755 W bit) */
+    mov edi, 0x004031C0
+    syscall
+    cmp rax, -39
+    jne 9f
+    mov eax, 17                /* clean the child, rmdir the dir */
+    mov edi, 0x004031E0
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 17
+    mov edi, 0x004031C0
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 1                /* M5 "J:mkdir ok" */
+    mov edi, 1
+    mov esi, 0x00403220
+    mov edx, 11
+    syscall
+    cmp rax, 11
     jne 9f
 
     mov eax, 63                /* SYS_EXIT */

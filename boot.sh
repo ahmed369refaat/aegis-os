@@ -363,8 +363,8 @@ if [ "$MODE" = "verify" ]; then
     grep -qF "[SEC ] ring3 NX-exec blocked: #PF (I/D)" "$LOG" || { echo "VERIFY FAIL: ring-3 NX security marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 kernel-VA read blocked: #PF (U/S)" "$LOG" || { echo "VERIFY FAIL: ring-3 U/S security marker missing"; ok=0; }
     grep -qF "[SEC ] ring3 unauthorized syscall refused (-ENOSYS, audited)" "$LOG" || { echo "VERIFY FAIL: ring-3 syscall gate marker missing"; ok=0; }
-    grep -qF "[RING3] files domain exited(42): pipe+dup+file lifecycle verified from CPL=3" "$LOG" || { echo "VERIFY FAIL: round-J files marker missing"; ok=0; }
-    grep -qF "[RING3] ring-3 syscall surface: OPEN/READ/WRITE/CLOSE/PIPE/DUP live on the lib kernel" "$LOG" || { echo "VERIFY FAIL: round-J syscall-surface marker missing"; ok=0; }
+    grep -qF "[RING3] files domain exited(42): pipe+dup+file lifecycle + the S1 directory dance verified from CPL=3" "$LOG" || { echo "VERIFY FAIL: round-J files marker missing"; ok=0; }
+    grep -qF "[RING3] ring-3 syscall surface: OPEN/READ/WRITE/CLOSE/PIPE/DUP + the Phase-6 MKDIR/UNLINK arms live on the lib kernel" "$LOG" || { echo "VERIFY FAIL: round-J syscall-surface marker missing"; ok=0; }
     grep -qF "J:pipe ok" "$LOG" || { echo "VERIFY FAIL: round-J pipe marker (from CPL=3) missing"; ok=0; }
     grep -qF "J:dup ok" "$LOG" || { echo "VERIFY FAIL: round-J dup marker (from CPL=3) missing"; ok=0; }
     grep -qF "J:file ok" "$LOG" || { echo "VERIFY FAIL: round-J file marker (from CPL=3) missing"; ok=0; }

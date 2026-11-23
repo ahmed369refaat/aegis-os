@@ -1573,8 +1573,46 @@ pipe_b_got:
                                           exit status crossed the boundary */
     mov edi, 7
     syscall
+    /* ── Phase 6 S1: the Linux path family — mkdir(83), unlink(87),
+       chroot(161), all through the v1 whitelist. The strings are
+       self-built (this blob writes its data, never relies on a
+       kmain-planted page for them). The chroot probe is LAST and
+       one-way (the cwd moves with the root — ADR-0022's escape
+       close): after it the run can only exit; inside /pub the
+       escaped absolute path must answer ENOENT. ── */
+    mov rax, 0x33316c2f6275702f       /* "/pub/l13" */
+    mov qword ptr [0x00403500], rax
+    mov qword ptr [0x00403508], 0
+    mov rax, 0x000000006275702f       /* "/pub\0" */
+    mov qword ptr [0x00403520], rax
+    mov eax, 83                       /* mkdir("/pub/l13", 0o755) */
+    mov edi, 0x00403500
+    mov esi, 493
+    syscall
+    test rax, rax
+    jnz 240f
+    mov eax, 87                       /* unlink — the rmdir fold */
+    mov edi, 0x00403500
+    syscall
+    test rax, rax
+    jnz 240f
+    mov eax, 161                      /* chroot("/pub") */
+    mov edi, 0x00403520
+    syscall
+    test rax, rax
+    jnz 240f
+    mov eax, 2                        /* inside the jail, the escaped
+                                          absolute path is ENOENT */
+    mov edi, 0x00403500               /* "/pub/l13" -> /pub/pub/l13 */
+    xor esi, esi                      /* O_RDONLY */
+    syscall
+    cmp rax, -2
+    jne 240f
 20: mov eax, 231                      /* exit_group(0) — nr 231 (the alias) */
     xor edi, edi
+    syscall
+240: mov eax, 231
+    mov edi, 240                      /* the S1 path family failed */
     syscall
 
 140: mov eax, 63

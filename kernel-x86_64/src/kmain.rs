@@ -85,6 +85,11 @@ const fn ring3_files_data() -> [u8; 4096] {
     put4096(&mut d, 0x160, b"J:dup ok\n"); // M2 (9)
     put4096(&mut d, 0x180, b"J:file ok\n"); // M3 (10)
     put4096(&mut d, 0x1A0, b"J:neg ok\n"); // M4 (9)
+    put4096(&mut d, 0x1C0, b"/pub/d1\0"); // D1P — the mkdir target (8)
+    put4096(&mut d, 0x1E0, b"/pub/d1/in.txt\0"); // FIP — file inside it (15)
+    put4096(&mut d, 0x200, b"round-j.txt\0"); // RP — relative, post-chroot (12)
+    put4096(&mut d, 0x220, b"J:mkdir ok\n"); // M5 (11)
+    put4096(&mut d, 0x240, b"/pub\0"); // PUBP — the chroot jail (5)
     d
 }
 
@@ -1125,18 +1130,31 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     // dup reading EOF — and the three errno refusals (EBADF, ENOENT,
     // EBADF). Every answer is checked IN THE BLOB; exit 42 means all
     // of them verified, 99 means the first wrong answer. ──
+    // Phase 6 S1: the boot root grows from the lone /pub to the M3
+    // tree — /tmp (world-writable scratch), /dev and /proc (S2's
+    // device and proc homes, plain dirs until then), /bin (the exec
+    // registry's path home). Same supervisor pattern: uid 0 prepares,
+    // then dies before ring 3 ever runs.
+    const BOOT_TREE: [(&str, u16); 5] = [
+        ("/pub", 0o777),
+        ("/tmp", 0o777),
+        ("/dev", 0o755),
+        ("/proc", 0o755),
+        ("/bin", 0o755),
+    ];
     let supervisor_ok = matches!(
         k.create_domain_with(13, aegis_os::profile::service_profile(), 0, 0, 0),
         Ok(())
-    ) && k
-        .syscall(
+    ) && BOOT_TREE.iter().all(|&(path, m)| {
+        k.syscall(
             13,
             aegis_os::sys::SysRequest::Mkdir {
-                path: "/pub",
-                mode: aegis_os::vfs::Mode(0o777),
+                path,
+                mode: aegis_os::vfs::Mode(m),
             },
         )
-        .is_ok();
+        .is_ok()
+    });
     let _ = k.destroy_domain(13);
     if !supervisor_ok {
         line(
@@ -1171,16 +1189,17 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let run = crate::sched::context::take();
     hw::write_cr3(kernel_cr3);
     match run.exit {
-        // 101 = the markers (38) + both pipe writes + the file write
-        // (21 each): every byte the run contributed, counted.
-        crate::sched::context::ExitKind::Exited(42) if run.write_bytes == 101 => {
+        // 133 = the markers (49) + both pipe writes + the round-J
+        // file write + the S1 mkdir-phase file write (21 each) + the
+        // M5 marker (11): every byte the run contributed, counted.
+        crate::sched::context::ExitKind::Exited(42) if run.write_bytes == 133 => {
             line(
                 &mut out,
-                &["[RING3] files domain exited(42): pipe+dup+file lifecycle verified from CPL=3"],
+                &["[RING3] files domain exited(42): pipe+dup+file lifecycle + the S1 directory dance verified from CPL=3"],
             );
             line(
                 &mut out,
-                &["[RING3] ring-3 syscall surface: OPEN/READ/WRITE/CLOSE/PIPE/DUP live on the lib kernel"],
+                &["[RING3] ring-3 syscall surface: OPEN/READ/WRITE/CLOSE/PIPE/DUP + the Phase-6 MKDIR/UNLINK arms live on the lib kernel"],
             );
         }
         crate::sched::context::ExitKind::Fault {
@@ -2474,7 +2493,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         if clean == 1 {
             line(
                 &mut out,
-                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, open(2) O_* translated (O_EXCL/O_APPEND refused), wait4(61) WNOHANG/block/reap (wstatus 7<<8, then ECHILD), execve(59) -> the compiled-in ELF64 image (bss-clean entry, wstatus 11<<8), uname(63) -> -ENOSYS"],
+                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, open(2) O_* translated (O_EXCL/O_APPEND refused), wait4(61) WNOHANG/block/reap (wstatus 7<<8, then ECHILD), execve(59) -> the compiled-in ELF64 image (bss-clean entry, wstatus 11<<8), uname(63) -> -ENOSYS, Phase-6 S1: mkdir(83)/unlink(87, rmdir-fold ENOTEMPTY)/chroot(161, the escaped path answers ENOENT inside the jail)"],
             );
         } else {
             line(
