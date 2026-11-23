@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased] — the S4 lint debt paid: the write path was production code
+
+The S4 lint debt was misdiagnosed as a clippy/cargo-test cfg
+divergence. It was simpler and worse: `src/ext2.rs`'s `mod tests`
+shipped WITHOUT its `#[cfg(test)]` gate (every sibling module has
+one), so the no-test lib build compiled the std-only test fixtures
+— 48 `cannot find Vec/vec!` errors — while `cargo test` passed
+because the harness injects std. One stray `#[cfg(test)]` also sat
+orphaned above the S4 comment header, gating `Ext2WriteError` (and
+only it) out of non-test builds: the write path was compiled as
+dead test scaffolding, unreachable from the kernel. S5's persist
+lane needs `create_file`/`write_file` from kmain — the gate now
+matches the sibling-module pattern and the writer is real
+production code again.
+
+- `write_file`'s block loop restructured onto
+  `blocks[first..=last].iter_mut().enumerate()` (a genuine iterator
+  fix, not an allow): the slot borrow replaces the `blocks[b]`
+  index clippy flagged.
+- The rest are one-liners: `Superblock::parse` validation-only
+  (binding dropped), `wr_u32` deleted (zero callers — dead code),
+  `!rec_len.is_multiple_of(4)`, and a `usize` self-cast in the
+  byte-verify test.
+- `scripts/toolchain-doctor.sh` learns truncation mode 4 (the
+  2026-11-23 recycle): the durable QEMU wrapper survived while the
+  qemu-root under it was wiped — the wrapper's existence masked the
+  missing extraction, and the rust-std-for-target repair cp'd into
+  a libdir that did not exist yet. Both fixes are in the doctor
+  now; the mode-4 sandbox came back green end-to-end from `--fix`.
+
+Gates: clippy --all-targets -D warnings clean, fmt clean, 430/430
+tests green (the 8 ext2 host tests among them). No behavior change
+on any boot lane.
+
 ## [Unreleased] — Phase 6 S4: the ext2 write path (core, host-tested)
 
 `src/ext2.rs` gains a buffer-backed WRITE path over the mkext2

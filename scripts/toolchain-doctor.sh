@@ -129,9 +129,13 @@ else
         if curl -sSL -o "$probe_dir/tstd.tar.xz" \
             "$DIST_BASE/rust-std-$RUST_VER-x86_64-unknown-none.tar.xz" \
             && tar -xf "$probe_dir/tstd.tar.xz" -C "$probe_dir"; then
-            tsrc="$probe_dir/rust-std-$RUST_VER-x86_64-unknown-none/rust-std-x86_64-unknown-none/lib/rustlib/x86_64-unknown-none/lib"
-            tlibdir="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-none/lib"
-            cp -f "$tsrc"/*.rlib "$tsrc"/*.rmeta "$tlibdir"/ 2>/dev/null
+        tsrc="$probe_dir/rust-std-$RUST_VER-x86_64-unknown-none/rust-std-x86_64-unknown-none/lib/rustlib/x86_64-unknown-none/lib"
+        tlibdir="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-none/lib"
+        # The dir does not exist until the target has been installed once
+        # (mode 4: the whole target dir was wiped with the recycle) — cp
+        # into a missing dir fails silently under the 2>/dev/null below.
+        mkdir -p "$tlibdir"
+        cp -f "$tsrc"/*.rlib "$tsrc"/*.rmeta "$tlibdir"/ 2>/dev/null
             if rustc --edition 2024 --crate-type staticlib --target x86_64-unknown-none \
                 "$probe_dir/kern.rs" -o "$probe_dir/kern.rlib"; then
                 pass "kernel target repaired from the dist component"
@@ -150,6 +154,19 @@ if [ -x "$QEMU_BIN" ]; then
         pass "qemu at tools/qemu-root answers --version"
     else
         bad "qemu binary exists but does not run (loader/libs?)"
+        # Truncation mode 4 (2026-11-23): the durable wrapper survived
+        # but the qemu-root it execs into was wiped. The wrapper's
+        # existence must not mask the missing extraction — re-extract
+        # here too, not only on the binary-missing branch below.
+        [ "${1:-}" = "--fix" ] && {
+            echo "  ..fix: qemu-root gone under the wrapper — re-extracting the debs"
+            rm -rf "$QEMU_ROOT"
+            mkdir -p "$QEMU_ROOT"
+            for d in "$TOOLS"/qemu-pkgs/*.deb; do dpkg-deb -x "$d" "$QEMU_ROOT/"; done
+            "$QEMU_BIN" --version >/dev/null 2>&1 \
+                && pass "qemu re-extracted from the cached debs" \
+                || bad "re-extraction failed (are the debs present?)"
+        }
     fi
 else
     bad "qemu binary missing at $QEMU_BIN"

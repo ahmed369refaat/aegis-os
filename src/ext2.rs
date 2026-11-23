@@ -185,7 +185,6 @@ pub fn find_dirent(block: &[u8], dir_size: u32, name: &[u8]) -> Result<Option<u3
     Ok(None)
 }
 
-#[cfg(test)]
 // ═══ Phase 6 S4: the WRITE path — buffer-backed, host-tested ═══
 //
 // The image here is the whole filesystem (FS-relative — the kernel
@@ -256,12 +255,6 @@ fn wr_u16(img: &mut [u8], off: usize, v: u16) -> Result<(), Ext2WriteError> {
     Ok(())
 }
 
-fn wr_u32(img: &mut [u8], off: usize, v: u32) -> Result<(), Ext2WriteError> {
-    let b = img.get_mut(off..off + 4).ok_or(Ext2WriteError::Truncated)?;
-    b.copy_from_slice(&v.to_le_bytes());
-    Ok(())
-}
-
 /// The writer's geometry, read once from the image.
 #[derive(Debug, Clone, Copy)]
 struct RwGeom {
@@ -275,7 +268,8 @@ struct RwGeom {
 
 impl RwGeom {
     fn parse(img: &[u8]) -> Result<RwGeom, Ext2WriteError> {
-        let sb = Superblock::parse(
+        // Validation-only parse: a bad superblock is a truncated image.
+        Superblock::parse(
             img.get(1024..)
                 .and_then(|s| s.get(..1024))
                 .ok_or(Ext2WriteError::Truncated)?,
@@ -380,7 +374,7 @@ pub fn create_file(img: &mut [u8], name: &[u8]) -> Result<u32, Ext2WriteError> {
             return Err(Ext2WriteError::DirFull);
         }
         let rec_len = u16::from_le_bytes([dir[off + 4], dir[off + 5]]) as usize;
-        if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > geom.bs {
+        if rec_len < 8 || !rec_len.is_multiple_of(4) || off + rec_len > geom.bs {
             return Err(Ext2WriteError::DirFull);
         }
         let name_len = dir[off + 6] as usize;
@@ -441,11 +435,12 @@ pub fn write_file(
     let first_blk = (offset / geom.bs as u32) as usize;
     let last_blk = ((end - 1) / geom.bs as u32) as usize;
     let head = (offset % geom.bs as u32) as usize;
-    for b in first_blk..=last_blk {
-        if blocks[b] == 0 {
+    for (i, slot) in blocks[first_blk..=last_blk].iter_mut().enumerate() {
+        let b = first_blk + i;
+        if *slot == 0 {
             let bit = alloc_bit(img, &geom, geom.block_bitmap_blk, geom.blocks)?;
             count_allocated(img, 2048 + GDT_FREE_BLOCKS)?;
-            blocks[b] = bit;
+            *slot = bit;
         }
         let in_off = if b == first_blk { head } else { 0 };
         let in_end = if b == last_blk {
@@ -458,7 +453,7 @@ pub fn write_file(
         // in_end) maps to bytes[(b*bs + in_off) - offset .. +n].
         let from = (b * geom.bs + in_off).saturating_sub(offset as usize);
         let src = bytes.get(from..from + n).unwrap_or(&[]);
-        let dst_base = blocks[b] as usize * geom.bs + in_off;
+        let dst_base = *slot as usize * geom.bs + in_off;
         let dst = img
             .get_mut(dst_base..dst_base + n)
             .ok_or(Ext2WriteError::Truncated)?;
@@ -488,6 +483,7 @@ pub fn free_inodes(img: &[u8]) -> Result<u32, Ext2WriteError> {
     Ok(u32::from(rd_u16(img, 2048 + GDT_FREE_INODES)?))
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -603,12 +599,12 @@ mod tests {
         let size = u32::from_le_bytes(f_rec[4..8].try_into().unwrap());
         assert_eq!(size, 1000 + 2560);
         // Verify the body byte-for-byte through the direct blocks.
-        for i in 0..body.len() {
+        for (i, want) in body.iter().enumerate() {
             let abs = 1000 + i;
-            let b = (abs / 1024) as usize;
+            let b = abs / 1024;
             let blk = u32::from_le_bytes(f_rec[40 + b * 4..44 + b * 4].try_into().unwrap());
             let byte = img[blk as usize * 1024 + (abs % 1024)];
-            assert_eq!(byte, body[i], "byte {i}");
+            assert_eq!(byte, *want, "byte {i}");
         }
         // The root's dirent walk still parses clean (rec_len chain).
         let _ = find_dirent(&img[dir_blk as usize * 1024..][..1024], 1024, b"hello.txt")
