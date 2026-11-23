@@ -225,7 +225,6 @@ mod tests {
         let _ = (a, b);
     }
 
-    use super::*;
     use crate::memops;
 
     /// A real 1 MiB host buffer standing in for the pool's physical memory.

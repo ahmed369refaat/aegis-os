@@ -687,12 +687,14 @@ impl PageTables {
                             let pa = pte_v & ADDR_MASK;
                             let flags = pte_v & !ADDR_MASK;
                             Self::set_entry(pt_pa, pti, pa | (flags & !pte::PTE_W));
-                            let va = ((pml4i as u64) << 39)
-                                | ((pdpti as u64) << 30)
-                                | ((pdi as u64) << 21)
-                                | ((pti as u64) << 12);
                             #[cfg(not(test))]
-                            pte::flush_tlb_page(va);
+                            {
+                                let va = ((pml4i as u64) << 39)
+                                    | ((pdpti as u64) << 30)
+                                    | ((pdi as u64) << 21)
+                                    | ((pti as u64) << 12);
+                                pte::flush_tlb_page(va);
+                            }
                         }
                     }
                 }

@@ -40,13 +40,24 @@ pub static IN_USER_COPY: AtomicBool = AtomicBool::new(false);
 /// active run — a CPL0 fault *before* this is the documented
 /// launch-relay limitation; after it, a CPL0 fault is a kernel bug.
 pub static SYSCALLS_SERVED: AtomicBool = AtomicBool::new(false);
+// The dispatch arms below are boot-only (cfg(not(test))); only the
+// constants the host tests pin stay unconditionally imported.
+#[cfg(not(test))]
 use aegis_os::sys::{SysRequest, SysValue};
+use aegis_os::syscall::gate;
+#[cfg(not(test))]
 use aegis_os::syscall::Abi;
+#[cfg(not(test))]
 use aegis_os::syscall::{
-    gate, SYSCALL_COUNT, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_IPC_CALL,
+    SYSCALL_COUNT, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_IPC_CALL,
     SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL,
     SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_SCHED_YIELD,
     SYS_SIGACTION, SYS_SIGRETURN, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
+};
+#[cfg(test)]
+use aegis_os::syscall::{
+    SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_KILL, SYS_NANOSLEEP,
+    SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_WAIT, SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
