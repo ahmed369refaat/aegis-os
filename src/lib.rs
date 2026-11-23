@@ -708,6 +708,42 @@ impl<const N: usize> Kernel<N> {
         }
     }
 
+    /// Phase 6 S2: install a devfs node (SUPERVISOR API — kmain and
+    /// the Phase-7 init; deliberately not a SysRequest, so no ring-3
+    /// caller can mint a device). Mode 0o666; the flavor's semantics
+    /// do the rest.
+    pub fn install_device(
+        &mut self,
+        path: &str,
+        dev: crate::vfs::DevKind,
+    ) -> Result<(), crate::vfs::VfsError> {
+        self.vfs.create_device(
+            crate::vfs::ROOT_REF,
+            crate::vfs::ROOT_REF,
+            path,
+            crate::vfs::Credentials { uid: 0, gid: 0 },
+            dev,
+        )?;
+        Ok(())
+    }
+
+    /// Phase 6 S2: install a procfs node (SUPERVISOR API, as above).
+    /// Mode 0o444: world-readable, never writable.
+    pub fn install_proc_node(
+        &mut self,
+        path: &str,
+        node: crate::vfs::ProcNode,
+    ) -> Result<(), crate::vfs::VfsError> {
+        self.vfs.create_proc_node(
+            crate::vfs::ROOT_REF,
+            crate::vfs::ROOT_REF,
+            path,
+            crate::vfs::Credentials { uid: 0, gid: 0 },
+            node,
+        )?;
+        Ok(())
+    }
+
     /// ADR-0022 D5: declare an executable's surface in init's policy
     /// table (supervisor API — never a child-held syscall).
     pub fn exec_policy_declare(

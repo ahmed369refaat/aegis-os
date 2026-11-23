@@ -21,7 +21,7 @@ use crate::memory::MemFlags;
 use crate::net::{NetError, TokenBucket, DEFAULT_BURST_BYTES, DEFAULT_RATE_BYTES_PER_WINDOW};
 use crate::pipe::PipeError;
 use crate::signal::{DefaultAction, SignalError};
-use crate::vfs::{Access, InodeKind, Mode, VfsError};
+use crate::vfs::{Access, Credentials, InodeKind, Mode, ProcNode, VfsError};
 use crate::{
     syscall::{
         SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV,
@@ -340,7 +340,13 @@ impl<const N: usize> Kernel<N> {
                         .vfs
                         .resolve(root, cwd, path, creds)
                         .map_err(SysError::Vfs)?;
-                    if self.vfs.kind_of(found) != Some(InodeKind::File) {
+                    // Phase 6 S2: only a DIRECTORY refuses to open —
+                    // device and proc nodes open like files (their
+                    // read/write semantics are the VFS's and the
+                    // executor's; an O_TRUNC on them dies at the
+                    // truncate step below with the same refusal it
+                    // always had).
+                    if self.vfs.kind_of(found) == Some(InodeKind::Dir) {
                         return Err(SysError::Vfs(VfsError::IsADirectory));
                     }
                     found
@@ -386,6 +392,30 @@ impl<const N: usize> Kernel<N> {
                             .get(fd)
                             .ok_or(SysError::BadFd(fd))?
                             .pos as usize;
+                        // Phase 6 S2: procfs content is CALLER-DEPENDENT
+                        // (whose domain, whose credentials) — the VFS
+                        // names the node, and THIS layer is the one that
+                        // knows the reading domain. Single-shot: pos 0
+                        // answers the status, anything past answers EOF
+                        // (the VFS's own proc read is the defensive
+                        // refusal — every live path is intercepted
+                        // here, at any pos).
+                        if self.vfs.kind_of(inode) == Some(InodeKind::Proc(ProcNode::Status)) {
+                            let n = if pos == 0 {
+                                proc_status(domain_id, creds, buf)
+                            } else {
+                                0
+                            };
+                            if let Some(e) = self
+                                .domain_mut(domain_id)
+                                .map_err(into_sys)?
+                                .fds
+                                .get_mut(fd)
+                            {
+                                e.pos = e.pos.saturating_add(n as u32);
+                            }
+                            return Ok(SysValue::Count(n));
+                        }
                         let n = self
                             .vfs
                             .read_by_id_at(inode, creds, pos, buf)
@@ -1277,4 +1307,43 @@ fn into_sys(e: KernelError) -> SysError {
         // where the stdio slots were already spoken for.
         KernelError::StdioSlotOccupied(fd) => SysError::Reserved(fd),
     }
+}
+
+/// Phase 6 S2: the /proc/self status line — hand-built decimal (the
+/// core is no_std; no fmt machinery). One honest answer per caller:
+/// `domain <id> uid <uid> gid <gid>\n`.
+fn proc_status(domain: u32, creds: Credentials, buf: &mut [u8]) -> usize {
+    fn push_bytes(out: &mut [u8], n: &mut usize, s: &[u8]) {
+        for &b in s {
+            if *n < out.len() {
+                out[*n] = b;
+                *n += 1;
+            }
+        }
+    }
+    fn push_dec(out: &mut [u8], n: &mut usize, v: u64) {
+        let mut scratch = [0u8; 20];
+        let mut i = scratch.len();
+        let mut v = v;
+        if v == 0 {
+            i -= 1;
+            scratch[i] = b'0';
+        } else {
+            while v > 0 && i > 0 {
+                i -= 1;
+                scratch[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+            }
+        }
+        push_bytes(out, n, &scratch[i..]);
+    }
+    let mut n = 0usize;
+    push_bytes(buf, &mut n, b"domain ");
+    push_dec(buf, &mut n, u64::from(domain));
+    push_bytes(buf, &mut n, b" uid ");
+    push_dec(buf, &mut n, u64::from(creds.uid));
+    push_bytes(buf, &mut n, b" gid ");
+    push_dec(buf, &mut n, u64::from(creds.gid));
+    push_bytes(buf, &mut n, b"\n");
+    n
 }

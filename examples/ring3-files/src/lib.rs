@@ -27,6 +27,11 @@
 //! 0x403200  RP     "round-j.txt\0"                (12)  relative, post-chroot
 //! 0x403220  M5     "J:mkdir ok\n"                (11)   S1 marker
 //! 0x403240  PUBP   "/pub\0"                       (5)   the chroot jail
+//! 0x403260  M6     "J:dev ok\n"                    (9)   S2 marker
+//! 0x403280  DNUL   "/dev/null\0"                  (11)  devfs probes (S2)
+//! 0x4032A0  DZERO  "/dev/zero\0"                  (11)
+//! 0x4032C0  DPROC  "/proc/self\0"                 (11)  procfs probe
+//! 0x4032E0  PSTAT  "domain 14 uid 1014 gid 100\n" (27)  the expected status
 //! 0x403800  RBUF1  read destinations (64 bytes, zeroed by kmain)
 //! 0x403900  RBUF2
 //! 0x403A00  RBUF3
@@ -294,6 +299,106 @@ _ring3_start:
     mov edx, 11
     syscall
     cmp rax, 11
+    jne 9f
+
+    /* ── Phase D (Phase 6 S2): devfs + procfs from CPL=3 — /dev/null
+       discards and answers EOF, /dev/zero zero-fills, /proc/self
+       answers THE CALLER's identity (uid 1014 = the derived scheme),
+       single-shot then EOF ── */
+    mov eax, 2                 /* open /dev/null READ|WRITE */
+    mov edi, 0x00403280
+    mov esi, 3
+    xor edx, edx
+    syscall
+    test rax, rax
+    js 9f
+    mov r8, rax
+    mov eax, 1                 /* write 21 bytes into the void -> 21 */
+    mov rdi, r8
+    mov esi, 0x00403080        /* FMSG */
+    mov edx, 21
+    syscall
+    cmp rax, 21
+    jne 9f
+    mov eax, 0                 /* read: instant EOF */
+    mov rdi, r8
+    mov esi, 0x00403A00        /* RBUF3 */
+    mov edx, 4
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 3
+    mov rdi, r8
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 2                 /* open /dev/zero READ */
+    mov edi, 0x004032A0
+    mov esi, 1
+    xor edx, edx
+    syscall
+    test rax, rax
+    js 9f
+    mov r8, rax
+    mov eax, 0                 /* read 16 bytes: all zero */
+    mov rdi, r8
+    mov esi, 0x00403A00
+    mov edx, 16
+    syscall
+    cmp rax, 16
+    jne 9f
+    mov rsi, 0x00403A00        /* byte-scan: every byte must be 0 */
+    mov rcx, 16
+1:  mov al, [rsi]
+    test al, al
+    jnz 9f
+    inc rsi
+    dec rcx
+    jnz 1b
+    mov eax, 3
+    mov rdi, r8
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 2                 /* open /proc/self READ */
+    mov edi, 0x004032C0
+    mov esi, 1
+    xor edx, edx
+    syscall
+    test rax, rax
+    js 9f
+    mov r8, rax
+    mov eax, 0                 /* read the status line */
+    mov rdi, r8
+    mov esi, 0x00403A00
+    mov edx, 64
+    syscall
+    cmp rax, 27                /* "domain 14 uid 1014 gid 100\n" */
+    jne 9f
+    mov rsi, 0x004032E0        /* cmp_bytes(PSTAT, RBUF3, 27) */
+    mov rdi, 0x00403A00
+    mov rcx, 27
+    call cmp_bytes
+    test rax, rax
+    jnz 9f
+    mov eax, 0                 /* single-shot: the re-read is EOF */
+    mov rdi, r8
+    mov esi, 0x00403A00
+    mov edx, 64
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 3
+    mov rdi, r8
+    syscall
+    test rax, rax
+    jnz 9f
+    mov eax, 1                /* M6 "J:dev ok" */
+    mov edi, 1
+    mov esi, 0x00403260
+    mov edx, 9
+    syscall
+    cmp rax, 9
     jne 9f
 
     mov eax, 63                /* SYS_EXIT */

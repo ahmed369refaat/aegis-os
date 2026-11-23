@@ -1113,3 +1113,152 @@ fn files_blob_phase_f_on_the_host() {
         Ok(SysValue::Count(0))
     );
 }
+
+/// Phase 6 S2: devfs — /dev/null discards writes and answers EOF;
+/// /dev/zero discards writes and reads an endless stream of zeros.
+#[test]
+fn devfs_null_and_zero_semantics() {
+    use aegis_os::vfs::DevKind;
+    let mut k = kernel_with_tree();
+    k.syscall(
+        SUPERVISOR,
+        SysRequest::Mkdir {
+            path: "/dev",
+            mode: Mode(0o755),
+        },
+    )
+    .unwrap();
+    k.install_device("/dev/null", DevKind::Null).unwrap();
+    k.install_device("/dev/zero", DevKind::Zero).unwrap();
+
+    let fd = match k
+        .syscall(
+            SERVICE,
+            SysRequest::Open {
+                path: "/dev/null",
+                mode: Mode(0o666),
+                create: false,
+                read: true,
+                write: true,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    {
+        SysValue::Fd(fd) => fd,
+        other => panic!("{:?}", other),
+    };
+    // Write 12 bytes into the void: all of them "land".
+    match k
+        .syscall(
+            SERVICE,
+            SysRequest::Write {
+                fd,
+                bytes: b"lost to null",
+            },
+        )
+        .unwrap()
+    {
+        SysValue::Count(n) => assert_eq!(n, 12),
+        other => panic!("{:?}", other),
+    }
+    // Read back: instant EOF.
+    let mut buf = [7u8; 8];
+    match k
+        .syscall(SERVICE, SysRequest::Read { fd, buf: &mut buf })
+        .unwrap()
+    {
+        SysValue::Count(n) => assert_eq!(n, 0),
+        other => panic!("{:?}", other),
+    }
+    let _ = k.syscall(SERVICE, SysRequest::Close { fd }).unwrap();
+
+    let fd = match k
+        .syscall(
+            SERVICE,
+            SysRequest::Open {
+                path: "/dev/zero",
+                mode: Mode(0o666),
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    {
+        SysValue::Fd(fd) => fd,
+        other => panic!("{:?}", other),
+    };
+    let mut buf = [0xFFu8; 16];
+    match k
+        .syscall(SERVICE, SysRequest::Read { fd, buf: &mut buf })
+        .unwrap()
+    {
+        SysValue::Count(n) => assert_eq!(n, 16),
+        other => panic!("{:?}", other),
+    }
+    assert!(buf.iter().all(|&b| b == 0), "zero must zero-fill: {buf:?}");
+    let _ = k.syscall(SERVICE, SysRequest::Close { fd }).unwrap();
+}
+
+/// Phase 6 S2: procfs — one shared /proc/self node, one honest answer
+/// per caller (the READING domain's identity), single-shot then EOF,
+/// and never writable.
+#[test]
+fn procfs_self_names_the_caller() {
+    use aegis_os::vfs::ProcNode;
+    let mut k = kernel_with_tree();
+    k.syscall(
+        SUPERVISOR,
+        SysRequest::Mkdir {
+            path: "/proc",
+            mode: Mode(0o755),
+        },
+    )
+    .unwrap();
+    k.install_proc_node("/proc/self", ProcNode::Status).unwrap();
+
+    let fd = match k
+        .syscall(
+            SERVICE,
+            SysRequest::Open {
+                path: "/proc/self",
+                mode: Mode(0o444),
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    {
+        SysValue::Fd(fd) => fd,
+        other => panic!("{:?}", other),
+    };
+    let mut buf = [0u8; 64];
+    match k
+        .syscall(SERVICE, SysRequest::Read { fd, buf: &mut buf })
+        .unwrap()
+    {
+        SysValue::Count(n) => assert_eq!(
+            &buf[..n],
+            format!("domain {SERVICE} uid 1001 gid 100\n").as_bytes()
+        ),
+        other => panic!("{:?}", other),
+    }
+    // Single-shot: the next read is EOF.
+    match k
+        .syscall(SERVICE, SysRequest::Read { fd, buf: &mut buf })
+        .unwrap()
+    {
+        SysValue::Count(n) => assert_eq!(n, 0),
+        other => panic!("{:?}", other),
+    }
+    // And the node refuses writes outright.
+    assert_eq!(
+        k.syscall(SERVICE, SysRequest::Write { fd, bytes: b"x" }),
+        Err(SysError::Vfs(VfsError::IsADirectory))
+    );
+    let _ = k.syscall(SERVICE, SysRequest::Close { fd }).unwrap();
+}

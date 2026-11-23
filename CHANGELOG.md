@@ -1,5 +1,40 @@
 # Changelog
 
+## [Unreleased] — Phase 6 S2: devfs + procfs — /dev/null, /dev/zero and /proc/self
+
+The inode model grows two kinds beyond File/Dir: `Device(DevKind)` and
+`Proc(ProcNode)`. Device semantics are caller-independent and live in
+the VFS (`Null`: writes discard, reads EOF; `Zero`: writes discard,
+reads an endless stream of zeros — the fd cursor is meaningless on an
+endless stream). Proc content is CALLER-DEPENDENT, so the VFS only
+names the node and the policy EXECUTOR generates the text at read time
+(the one component that knows the reading domain): `/proc/self`
+answers `domain <id> uid <uid> gid <gid>\n`, single-shot then EOF,
+hand-built decimal (the core is no_std). The VFS's own proc read is a
+defensive refusal — every live path is intercepted above it, at any
+pos (found in the red test: a pos>0 read fell past the intercept).
+
+Installation is a SUPERVISOR API (`Kernel::install_device` /
+`install_proc_node`) — deliberately not SysRequests, so no ring-3
+caller can mint a device or a proc node. Modes are honest: devices
+0o666, proc 0o444 (world-readable, never writable; a write answers
+EACCES through the VFS's refusal). The Open gate now refuses only
+directories — device and proc nodes open like files (O_TRUNC on them
+still dies at the truncate step with the refusal it always had).
+
+kmain installs /dev/null, /dev/zero, /proc/self right after the boot
+tree. The files blob's Phase D proves the whole surface from CPL=3:
+21 bytes into /dev/null, EOF read-back, 16 zero-filled bytes from
+/dev/zero byte-scanned, the exact 27-byte status line verified
+(`domain 14 uid 1014 gid 100` — the derived-uid scheme), the single-
+shot re-read EOF — marker "J:dev ok", exit 42, write_bytes 163
+(/dev/null's discard still counts at the write() boundary).
+
+Gates: two red->green host tests (devfs semantics, procfs per-caller
+identity through `k.syscall`), fmt clean, clippy `-D warnings` clean,
+host tests 428/0, all three boot lanes PASS.
+
+
 ## [Unreleased] — Phase 6 S1: the boot root grows — mkdir/unlink/chroot reach ring 3
 
 The tmpfs core gets its first M3-sized window: 64 inodes (was 32),

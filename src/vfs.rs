@@ -48,6 +48,32 @@ pub const ROOT_REF: InodeRef = InodeRef {
 pub enum InodeKind {
     File,
     Dir,
+    /// Phase 6 S2: a device node (devfs) — caller-INDEPENDENT
+    /// semantics, owned here: Null discards writes and reads EOF;
+    /// Zero discards writes and reads an endless stream of zeros.
+    Device(DevKind),
+    /// Phase 6 S2: a procfs node — the CONTENT is caller-dependent
+    /// (whose domain, whose credentials), so the VFS only names the
+    /// node; the policy EXECUTOR generates the text at read time
+    /// (it is the component that knows the reading domain).
+    Proc(ProcNode),
+}
+
+/// devfs device flavors (Phase 6 S2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevKind {
+    /// /dev/null: writes discard, reads answer EOF.
+    Null,
+    /// /dev/zero: writes discard, reads answer zeros forever.
+    Zero,
+}
+
+/// procfs node flavors (Phase 6 S2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcNode {
+    /// /proc/self: the READING domain's identity (id, uid, gid) —
+    /// one shared node, one honest answer per caller.
+    Status,
 }
 
 /// Unix permission bits (0o000..=0o777): rwx for owner, group, other.
@@ -473,8 +499,27 @@ impl Vfs {
     ) -> Result<usize, VfsError> {
         let id = self.live(r)?;
         let inode = self.inode(id)?;
-        if inode.kind != InodeKind::File {
-            return Err(VfsError::IsADirectory);
+        match inode.kind {
+            InodeKind::File => {}
+            // Phase 6 S2: device reads — Null is an instant EOF, Zero
+            // fills whatever the caller asked (the fd cursor is
+            // meaningless on an endless stream; it advances by n).
+            InodeKind::Device(DevKind::Null) => {
+                self.check_access(id, creds, Access::Read)?;
+                return Ok(0);
+            }
+            InodeKind::Device(DevKind::Zero) => {
+                self.check_access(id, creds, Access::Read)?;
+                buf.fill(0);
+                return Ok(buf.len());
+            }
+            // Proc content is caller-dependent: the EXECUTOR
+            // intercepts Proc reads before this layer (the VFS does
+            // not know the reading domain). Reaching here means a
+            // caller bypassed the intercept — refuse, never fabricate.
+            InodeKind::Proc(_) | InodeKind::Dir => {
+                return Err(VfsError::IsADirectory);
+            }
         }
         self.check_access(id, creds, Access::Read)?;
         if offset >= inode.size {
@@ -497,8 +542,18 @@ impl Vfs {
         bytes: &[u8],
     ) -> Result<usize, VfsError> {
         let id = self.live(r)?;
-        if self.inode(id)?.kind != InodeKind::File {
-            return Err(VfsError::IsADirectory);
+        match self.inode(id)?.kind {
+            InodeKind::File => {}
+            // Phase 6 S2: both device flavors discard writes — the
+            // answer is the byte count (the write "succeeded").
+            InodeKind::Device(_) => {
+                self.check_access(id, creds, Access::Write)?;
+                return Ok(bytes.len());
+            }
+            // procfs is read-only: a write answers EACCES.
+            InodeKind::Proc(_) | InodeKind::Dir => {
+                return Err(VfsError::IsADirectory);
+            }
         }
         self.check_access(id, creds, Access::Write)?;
         let end = offset.saturating_add(bytes.len());
@@ -511,6 +566,71 @@ impl Vfs {
             inode.size = end;
         }
         Ok(bytes.len())
+    }
+
+    /// F11(c): explicit truncation (Open with the truncate flag).
+    /// Phase 6 S2: install a device node (supervisor API — kmain /
+    /// the Phase-7 init; never a SysRequest, so no ring-3 caller can
+    /// mint a device). Mode 0o666: any caller may read or write the
+    /// device flavors; the flavor's semantics do the rest.
+    pub fn create_device(
+        &mut self,
+        root: InodeRef,
+        cwd: InodeRef,
+        path: &str,
+        creds: Credentials,
+        dev: DevKind,
+    ) -> Result<InodeRef, VfsError> {
+        self.create_kind(root, cwd, path, creds, Mode(0o666), InodeKind::Device(dev))
+    }
+
+    /// Phase 6 S2: install a procfs node (supervisor API, as above).
+    /// Mode 0o444: world-readable, never writable.
+    pub fn create_proc_node(
+        &mut self,
+        root: InodeRef,
+        cwd: InodeRef,
+        path: &str,
+        creds: Credentials,
+        node: ProcNode,
+    ) -> Result<InodeRef, VfsError> {
+        self.create_kind(root, cwd, path, creds, Mode(0o444), InodeKind::Proc(node))
+    }
+
+    /// The shared creator behind create/create_device/create_proc_node.
+    fn create_kind(
+        &mut self,
+        root: InodeRef,
+        cwd: InodeRef,
+        path: &str,
+        creds: Credentials,
+        mode: Mode,
+        kind: InodeKind,
+    ) -> Result<InodeRef, VfsError> {
+        let (parent, name) = self.resolve_parent(root, cwd, path, creds)?;
+        self.check_access(parent, creds, Access::Write)?;
+        self.check_access(parent, creds, Access::Exec)?;
+        if self.child_by_name(parent, name).is_some() {
+            return Err(VfsError::Exists);
+        }
+        let id = self.alloc_id()?;
+        self.generations[id as usize] = self.generations[id as usize].saturating_add(1);
+        let generation = self.generations[id as usize];
+        let mut nb = [0u8; NAME_MAX];
+        nb[..name.len()].copy_from_slice(name.as_bytes());
+        self.inodes[id as usize] = Some(Inode {
+            generation,
+            kind,
+            uid: creds.uid,
+            gid: creds.gid,
+            mode,
+            parent,
+            name: nb,
+            name_len: name.len(),
+            data: [0; FILE_DATA_MAX],
+            size: 0,
+        });
+        Ok(InodeRef { id, generation })
     }
 
     /// F11(c): explicit truncation (Open with the truncate flag).

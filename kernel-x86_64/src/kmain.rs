@@ -90,6 +90,11 @@ const fn ring3_files_data() -> [u8; 4096] {
     put4096(&mut d, 0x200, b"round-j.txt\0"); // RP — relative, post-chroot (12)
     put4096(&mut d, 0x220, b"J:mkdir ok\n"); // M5 (11)
     put4096(&mut d, 0x240, b"/pub\0"); // PUBP — the chroot jail (5)
+    put4096(&mut d, 0x260, b"J:dev ok\n"); // M6 (9)
+    put4096(&mut d, 0x280, b"/dev/null\0"); // DNUL (11)
+    put4096(&mut d, 0x2A0, b"/dev/zero\0"); // DZERO (11)
+    put4096(&mut d, 0x2C0, b"/proc/self\0"); // DPROC (11)
+    put4096(&mut d, 0x2E0, b"domain 14 uid 1014 gid 100\n"); // PSTAT (27)
     d
 }
 
@@ -1156,6 +1161,15 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         .is_ok()
     });
     let _ = k.destroy_domain(13);
+    // Phase 6 S2: devfs + procfs — the supervisor API installs the
+    // nodes (deliberately NOT SysRequests: no ring-3 caller can mint
+    // a device or a proc node).
+    k.install_device("/dev/null", aegis_os::vfs::DevKind::Null)
+        .unwrap();
+    k.install_device("/dev/zero", aegis_os::vfs::DevKind::Zero)
+        .unwrap();
+    k.install_proc_node("/proc/self", aegis_os::vfs::ProcNode::Status)
+        .unwrap();
     if !supervisor_ok {
         line(
             &mut out,
@@ -1189,10 +1203,12 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     let run = crate::sched::context::take();
     hw::write_cr3(kernel_cr3);
     match run.exit {
-        // 133 = the markers (49) + both pipe writes + the round-J
-        // file write + the S1 mkdir-phase file write (21 each) + the
-        // M5 marker (11): every byte the run contributed, counted.
-        crate::sched::context::ExitKind::Exited(42) if run.write_bytes == 133 => {
+        // 163 = the markers (49 + 9 = 58: M1..M6) + both pipe writes
+        // + the round-J file write + the S1 file write + the
+        // /dev/null write (21 each) + the M5 marker (11): every byte
+        // the run contributed, counted — /dev/null's discard still
+        // counts at the write() boundary.
+        crate::sched::context::ExitKind::Exited(42) if run.write_bytes == 163 => {
             line(
                 &mut out,
                 &["[RING3] files domain exited(42): pipe+dup+file lifecycle + the S1 directory dance verified from CPL=3"],
