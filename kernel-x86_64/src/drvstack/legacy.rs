@@ -222,7 +222,14 @@ pub(crate) fn ps2_step(out: &mut dyn FnMut(&str)) {
             ],
         );
     } else {
-        line(out, &["[KBD] no key arrived within the poll budget"]);
+        // The honest shape on this lane: with a USB HID keyboard
+        // attached, QEMU's input layer routes send-key to the USB
+        // device (measured: the PS/2 IRQ chain stays armed and the
+        // negotiated protocol proof below still passes; the QMP key
+        // lands in the USB keyboard's report instead — that round
+        // trip is the [USBH] HID marker). The PS/2 bottom half stays
+        // live for real hardware keyboards.
+        line(out, &["[KBD] no PS/2 key this window (send-key routes to the USB keyboard here); the bottom half stays armed"]);
     }
     // THEN the real scancode-set negotiation (0xF0/0x02 → ACK 0xFA)
     // — after the capture, so the delivery path stays exactly the

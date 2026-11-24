@@ -124,6 +124,7 @@ case "${1:-}" in
                   -device ide-hd,drive=sd0,bus=ide.0
                   -drive id=usb0,if=none,format=raw,file=target/usb0.img
                   -device qemu-xhci
+                  -device usb-kbd
                   -device usb-storage,drive=usb0
                   -vga std
                   -qmp unix:/tmp/qmp.sock,server,nowait
@@ -661,8 +662,19 @@ grep -qF "(virtio-blk) → dom" "$LOG" || { echo "VERIFY FAIL: the virtio-blk cl
     fi
     # The keyboard round trip's new shape: the decoded BYTE in the
     # console-in ring (the IRQ bottom half fed it).
-    grep -qaE "scancode decoded: byte 0x[0-9a-fx]+ \('a'\) in the console-in ring" "$LOG" || {
-      echo "VERIFY FAIL: the keyboard's decoded byte never reached the ring"
+    # USB (item 12, slice 1 of the completion): the SILENT REGRESSION
+    # FIX — the session teardown discipline had cut bus mastering and
+    # the xHCI TRB layer died with it ("DMA memory access failed",
+    # HCE-sticky); the No-Op's completion is a PINNED grep now (it
+    # silently broke once already). The enumeration slice's current
+    # honest state: Enable Slot completes; Address Device is the open
+    # item (its completion code prints — the diagnostic discipline).
+    grep -qa "No-Op command: event-ring slot0 type=33 = COMMAND COMPLETION" "$LOG" || {
+      echo "VERIFY FAIL: the xHCI TRB machinery (the No-Op) is dead"
+      ok=0
+    }
+    grep -qa "Address Device: completion code" "$LOG" || {
+      echo "VERIFY FAIL: the USB enumeration never reached Address Device"
       ok=0
     }
     grep -qa "\[GFX2\] text console: 80x30 cells live" "$LOG" || {

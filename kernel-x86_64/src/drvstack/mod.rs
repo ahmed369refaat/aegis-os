@@ -139,6 +139,11 @@ pub fn driver_stack_step<const N: usize>(
                 persist::persist_step(k, pool, out, &mut broker, &mut inv, &mut domains, &dmar);
                 xhci::xhci_step(k, pool, out, &mut broker, &inv);
                 xhci::xhci_cmdring_step(k, pool, out, &mut broker, &inv);
+                // Item 12's completion: enumeration + the HID keyboard
+                // (Enable Slot → Address Device → Get Descriptor →
+                // Configure → SET_CONFIGURATION → the interrupt-IN
+                // report, with the QMP key window).
+                xhci::xhci_enum_step(k, pool, out, &mut broker, &inv);
                 let madt_view = acpi::acpi_hpet_step(out, dir_pa);
                 irq::irq_step(out, madt_view.as_ref());
                 wdt::wdt_step(out, &inv);

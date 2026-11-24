@@ -64,6 +64,13 @@ if not wait_marker("[KBD] armed"):
     sys.exit("kernel never armed the keyboard poll")
 cmd("send-key", {"keys": [{"type": "qcode", "data": "a"}], "hold-time": 300})
 print("qmp-drive: key sent", flush=True)
+# The USB HID keyboard's own window: the kernel posts the interrupt-IN
+# report request and arms; the second key press lands in the report.
+if wait_marker("[USBH] HID armed"):
+    cmd("send-key", {"keys": [{"type": "qcode", "data": "a"}], "hold-time": 500})
+    print("qmp-drive: usb key sent", flush=True)
+else:
+    print("qmp-drive: no USB HID window (the keyboard device absent?)", flush=True)
 # Phase 4 (the text console): the console arms at the END of the
 # driver phase — wait for its marker, let the banner settle, and
 # capture the text plane for the pixel check.
