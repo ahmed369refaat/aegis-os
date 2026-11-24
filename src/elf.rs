@@ -178,6 +178,15 @@ pub enum ElfError {
     OverlappingPages,
     /// `e_entry` falls outside every `PT_LOAD`.
     EntryOutsideSegments,
+    /// ADR-0033: `e_entry` lies inside a loadable segment that is NOT
+    /// executable — the first instruction faults on NX. The
+    /// mutation-fuzz finding (600k mutations, 118 accepted images of
+    /// exactly this shape).
+    EntryNotExecutable,
+    /// ADR-0033: `e_phoff != 64`. The fixed-layout reader walks the
+    /// table from the header end; a different offset is not a shape
+    /// this kernel builds — refused, not guessed.
+    BadPhoff,
 }
 
 /// Validate `image` and produce the kernel's load plan.
@@ -222,6 +231,13 @@ pub fn build_exec_plan(image: &[u8]) -> Result<ExecPlan, ElfError> {
     let e_phnum = le16(image, 56);
     if e_phentsize != PHENTSIZE {
         return Err(ElfError::BadPhentsize);
+    }
+    // ADR-0033: the table sits at exactly the header end. The reader
+    // below walks from EHDR_SIZE unconditionally; a header claiming a
+    // different offset would be parsed at the wrong place.
+    let e_phoff = le64(image, 32);
+    if e_phoff != EHDR_SIZE as u64 {
+        return Err(ElfError::BadPhoff);
     }
     let e_phnum = e_phnum as usize;
     let table_end = EHDR_SIZE + e_phnum * PHENTSIZE as usize;
@@ -324,11 +340,19 @@ pub fn build_exec_plan(image: &[u8]) -> Result<ExecPlan, ElfError> {
     if n_segments == 0 {
         return Err(ElfError::NoLoadableSegments);
     }
+    let inside_any = segments[..n_segments]
+        .iter()
+        .any(|s| s.vaddr <= e_entry && e_entry < s.vaddr + s.memsz);
+    if !inside_any {
+        return Err(ElfError::EntryOutsideSegments);
+    }
+    // ADR-0033: loadable is not enough — the entry must lie inside an
+    // EXECUTABLE segment, or the first instruction faults on NX.
     if !segments[..n_segments]
         .iter()
-        .any(|s| s.vaddr <= e_entry && e_entry < s.vaddr + s.memsz)
+        .any(|s| s.executable && s.vaddr <= e_entry && e_entry < s.vaddr + s.memsz)
     {
-        return Err(ElfError::EntryOutsideSegments);
+        return Err(ElfError::EntryNotExecutable);
     }
     let map_bytes = segments[..n_segments]
         .iter()
@@ -422,6 +446,7 @@ mod tests {
             b[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
             b[20..24].copy_from_slice(&1u32.to_le_bytes());
             b[24..32].copy_from_slice(&entry.to_le_bytes());
+            b[32..40].copy_from_slice(&(EHDR_SIZE as u64).to_le_bytes()); // e_phoff (ADR-0033)
             b[52..54].copy_from_slice(&(EHDR_SIZE as u16).to_le_bytes()); // e_ehsize
             b[54..56].copy_from_slice(&PHENTSIZE.to_le_bytes());
             b[56..58].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
@@ -436,6 +461,49 @@ mod tests {
             }
             Image { bytes: b }
         }
+    }
+
+    /// ADR-0033: the entry inside a NON-executable segment is
+    /// refused — the mutation-fuzz finding (118 accepted images of
+    /// exactly this shape: the first instruction faults on NX).
+    #[test]
+    fn an_entry_inside_the_rw_segment_is_refused() {
+        // The entry points into the DATA segment (RW, not RX).
+        let img = Image::new(0x401040, &[PhdrSpec::text(), PhdrSpec::data()]);
+        assert_eq!(
+            build_exec_plan(&img.bytes),
+            Err(ElfError::EntryNotExecutable)
+        );
+    }
+
+    #[test]
+    fn an_entry_inside_a_read_only_segment_is_refused() {
+        // A PF_R-only segment: loadable, not executable.
+        let ro = PhdrSpec {
+            p_type: PT_LOAD,
+            p_flags: PF_R,
+            p_offset: 0x3000,
+            p_vaddr: 0x402000,
+            p_filesz: 0x100,
+            p_memsz: 0x100,
+        };
+        let img = Image::new(0x402040, &[PhdrSpec::text(), ro]);
+        assert_eq!(
+            build_exec_plan(&img.bytes),
+            Err(ElfError::EntryNotExecutable)
+        );
+    }
+
+    #[test]
+    fn a_table_offset_other_than_the_header_end_is_refused() {
+        let mut img = Image::new(0x400040, &[PhdrSpec::text(), PhdrSpec::data()]);
+        // e_phoff = 128: the reader walks from 64 unconditionally —
+        // a different offset is not a shape this kernel builds.
+        img.bytes[32..40].copy_from_slice(&128u64.to_le_bytes());
+        assert_eq!(build_exec_plan(&img.bytes), Err(ElfError::BadPhoff));
+        // The canonical 64 still plans.
+        img.bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        assert!(build_exec_plan(&img.bytes).is_ok());
     }
 
     #[test]
@@ -461,7 +529,7 @@ mod tests {
             0x400800,
             &[PhdrSpec {
                 p_type: PT_LOAD,
-                p_flags: PF_R,
+                p_flags: PF_R | PF_X,
                 p_offset: 0x800,
                 p_vaddr: 0x400800,
                 p_filesz: 0x100,
@@ -720,9 +788,26 @@ mod tests {
             Err(ElfError::EntryOutsideSegments)
         );
         // Entry inside the bss TAIL (filesz..memsz) is still inside
-        // the segment — accepted (data: filesz 0x100, memsz 0x300).
-        let img2 = Image::new(0x401000 + 0x200, &[PhdrSpec::data()]);
+        // the segment — accepted for an EXECUTABLE segment with a
+        // tail (filesz 0x80, memsz 0x300). Since ADR-0033 the entry
+        // must be executable-side; the old RW-data variant is refused.
+        let img2 = Image::new(
+            0x400200,
+            &[PhdrSpec {
+                p_type: PT_LOAD,
+                p_flags: PF_R | PF_X,
+                p_offset: 0x1000,
+                p_vaddr: 0x400000,
+                p_filesz: 0x80,
+                p_memsz: 0x300,
+            }],
+        );
         assert!(build_exec_plan(&img2.bytes).is_ok());
+        let img3 = Image::new(0x401000 + 0x200, &[PhdrSpec::data()]);
+        assert_eq!(
+            build_exec_plan(&img3.bytes),
+            Err(ElfError::EntryNotExecutable)
+        );
     }
 
     #[test]
@@ -734,7 +819,7 @@ mod tests {
                 p_filesz: 0x10,
                 p_memsz: 0x10,
                 p_type: PT_LOAD,
-                p_flags: PF_R,
+                p_flags: PF_R | PF_X,
             })
             .collect();
         let img = Image::new(0x400000, &nine);
