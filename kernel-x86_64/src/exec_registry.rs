@@ -124,3 +124,97 @@ mod adr0032_tests {
         );
     }
 }
+
+/// ADR round N2 (the exec image quota): the typed refusal of the
+/// pure pre-check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecQuotaError {
+    /// The image's mapped pages + stack + trampoline exceed the
+    /// caller's LIVE quota. Checked before the point of no return —
+    /// zero side effects (the old image keeps running, the mask
+    /// untouched, no frame spent).
+    OverQuota { need: usize, quota: usize },
+}
+
+/// ADR round N2: can this image exec under this quota? Pure
+/// arithmetic, host-tested: `map_bytes` is the plan's page-rounded
+/// byte count; the stack and trampoline pages ride with every image.
+pub fn exec_quota_check(
+    map_bytes: u64,
+    stack_pages: usize,
+    trampoline_pages: usize,
+    quota_pages: usize,
+) -> Result<(), ExecQuotaError> {
+    // Checked end to end: a hostile map_bytes near u64::MAX must
+    // refuse, never wrap.
+    let image_pages = map_bytes
+        .checked_add(4095)
+        .and_then(|rounded| rounded.checked_div(4096))
+        .ok_or(ExecQuotaError::OverQuota {
+            need: usize::MAX,
+            quota: quota_pages,
+        })?;
+    let need = image_pages as usize + stack_pages + trampoline_pages;
+    if need > quota_pages {
+        return Err(ExecQuotaError::OverQuota {
+            need,
+            quota: quota_pages,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod n2_tests {
+    use super::*;
+
+    /// The round's exact numbers: a 20-page image.
+    const P20: u64 = 20 * 4096;
+
+    #[test]
+    fn a_20_page_image_fits_quota_64() {
+        assert_eq!(exec_quota_check(P20, 1, 1, 64), Ok(()));
+        // The boundary is exact: need = 22.
+        assert_eq!(exec_quota_check(P20, 1, 1, 22), Ok(()));
+    }
+
+    #[test]
+    fn a_20_page_image_is_refused_under_quota_8() {
+        assert_eq!(
+            exec_quota_check(P20, 1, 1, 8),
+            Err(ExecQuotaError::OverQuota { need: 22, quota: 8 })
+        );
+        // One page short is still refused.
+        assert_eq!(
+            exec_quota_check(P20, 1, 1, 21),
+            Err(ExecQuotaError::OverQuota {
+                need: 22,
+                quota: 21
+            })
+        );
+    }
+
+    #[test]
+    fn a_hostile_map_bytes_refuses_instead_of_wrapping() {
+        assert_eq!(
+            exec_quota_check(u64::MAX, 1, 1, 64),
+            Err(ExecQuotaError::OverQuota {
+                need: usize::MAX,
+                quota: 64
+            })
+        );
+    }
+
+    #[test]
+    fn the_real_registry_images_pass_their_own_spawn_footprints() {
+        // The embedded images' plans, checked against the quotas the
+        // boot actually runs them under (service = 256).
+        for (image, name) in [(EXEC_TARGET_ELF, "exec-target"), (EXEC_SH_ELF, "sh")] {
+            let plan = aegis_os::elf::build_exec_plan(image).unwrap();
+            assert!(
+                exec_quota_check(plan.map_bytes, 1, 1, 256).is_ok(),
+                "{name} must exec under the service quota"
+            );
+        }
+    }
+}

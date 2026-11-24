@@ -137,7 +137,7 @@ pub fn spawn_user_blob<const N: usize>(
     // the lib domain registered and frames owned by the id. Every
     // failure now rolls back every frame AND the lib identity (which
     // also clears the monitor state, F7) before returning.
-    match build_user_tables(k, pool, id, blob, data) {
+    match build_user_tables(k, pool, id, blob, data, profile.quota_pages) {
         Ok((tables, space)) => {
             // Gate snapshot: the live mask starts as the profile's
             // mask, and a freshly created domain is never quarantined.
@@ -166,11 +166,15 @@ fn build_user_tables<const N: usize>(
     id: u32,
     blob: &[u8],
     data: &[u8],
+    quota_pages: usize,
 ) -> Result<(PageTables, AddressSpace), SpawnError> {
     let mut src = PoolSource::new(pool, &mut k.frames, id);
     let mut tables = PageTables::new(&mut src)?;
     tables.install_kernel_entries();
-    let mut space = AddressSpace::new(16);
+    // Round N2: the spawn twin of the exec fix — the domain's quota is
+    // its PROFILE's, not a hard-coded 16 (the same shape the round
+    // flagged on the exec side; found while wiring that fix).
+    let mut space = AddressSpace::new(quota_pages);
     tables.map_region(
         &mut space,
         layout::CODE_BASE,
@@ -224,6 +228,7 @@ pub fn exec_tables<const N: usize>(
     id: u32,
     plan: &aegis_os::elf::ExecPlan,
     image: &[u8],
+    quota_pages: usize,
 ) -> Result<(PageTables, AddressSpace), ExecMapError> {
     let cage_end = EXEC_CAGE_END;
     for seg in &plan.segments[..plan.n_segments] {
@@ -235,7 +240,10 @@ pub fn exec_tables<const N: usize>(
     let mut src = PoolSource::new(pool, &mut k.frames, id);
     let mut tables = PageTables::new(&mut src)?;
     tables.install_kernel_entries();
-    let mut space = AddressSpace::new(16);
+    // Round N2: the image's quota is the CALLER's live quota, not a
+    // hard-coded 16 — every program was capped at 16 pages including
+    // stack and trampoline, ignoring its profile.
+    let mut space = AddressSpace::new(quota_pages);
     for seg in &plan.segments[..plan.n_segments] {
         let (first, last) = seg.page_range();
         let flags = if seg.writable {

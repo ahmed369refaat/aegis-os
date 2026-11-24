@@ -52,6 +52,10 @@
 //!     byte-exact, and the TF rogue dies by its own trap in either
 //!     reading (entry-window resume or a ring-3 trap) — never a
 //!     kernel halt.
+//!   mode 19 — **quota-refused exec** (round N2): a five-page domain
+//!     execs /bin/sh (needs six): the pre-check must refuse, and the
+//!     OLD image proves it survived by writing its 40-byte marker and
+//!     exiting clean.
 //!
 //! Register discipline (ADR-0012): live loop state lives in R12/R13 —
 //! the interrupt-frame switch preserves every GPR, but a *handover*
@@ -104,6 +108,8 @@ _ring3_start:
     je 28f                            /* mode 17: the slow writer */
     cmp al, 18
     je 29f                            /* mode 18: the flag rogues */
+    cmp al, 19
+    je 40f                            /* mode 19: the quota-refused exec */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -1879,6 +1885,39 @@ slow_wr_spin:
     xor edi, edi
     syscall
 38:
+
+40: /* ── mode 19: the quota-refused exec (round N2) ────────────── */
+    /* Build "/bin/sh\0" at 0x4033c0 + argv at 0x4033e0 (the mode-13
+       shape), then execve. The spawner gives this domain a quota of
+       FIVE pages (exactly its own footprint); the sh image needs four
+       mapped pages + stack + trampoline = six — the pre-check must
+       refuse with -ENOMEM and the OLD image (this code) must keep
+       running: write the marker and exit 0. */
+    mov rax, 0x0068732f6e69622f       /* "/bin/sh\0" */
+    mov qword ptr [0x004033c0], rax
+    mov qword ptr [0x004033e0], 0x004033c0
+    mov qword ptr [0x004033e8], 0
+    mov eax, 59                       /* execve(path, argv, NULL) */
+    mov rdi, 0x004033c0
+    mov rsi, 0x004033e0
+    xor edx, edx
+    syscall
+    test rax, rax
+    jz 259f                           /* accepted?! the check failed to refuse */
+    /* The refusal is negative; the OLD image writes its marker and
+       exits clean — the proof it survived untouched. */
+    mov eax, 1
+    mov edi, 1
+    mov rsi, 0x00403010
+    mov edx, 40
+    syscall
+    mov eax, 63
+    xor edi, edi
+    syscall
+259: mov eax, 63
+    mov edi, 259                      /* the over-quota exec was ACCEPTED */
+    syscall
+
 258: mov eax, 63
     mov edi, 258                      /* the rogue's excursion failed */
     syscall

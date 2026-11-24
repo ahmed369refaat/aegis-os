@@ -512,6 +512,11 @@ if [ "$MODE" = "verify" ]; then
   grep -qF "ROGUE-DF: the kernel copy must run forwards, byte-exact !!!!!!!" "$LOG" || { echo "VERIFY FAIL: ADR-0031 DF payload not byte-exact"; ok=0; }
   grep -qF "ROGUE-TF: the trap must never reach the kernel death path !!!!!" "$LOG" || { echo "VERIFY FAIL: ADR-0031 TF payload not byte-exact"; ok=0; }
   grep -qF "ROGUE-AC: the SMAP window must hold with AC in user image !!!!!" "$LOG" || { echo "VERIFY FAIL: ADR-0031 AC payload not byte-exact"; ok=0; }
+  # round N2: the exec image quota — a five-page domain's exec of the
+  # six-page sh image is refused before the point of no return, and
+  # the old image proves it survived (marker + clean exit).
+  grep -qF "[SEC] N2: the over-quota exec refused, the old image intact, pool conserved" "$LOG" || { echo "VERIFY FAIL: N2 quota-refused-exec marker missing"; ok=0; }
+  grep -qF "quota-refused exec: the old image lives" "$LOG" || { echo "VERIFY FAIL: N2 old-image marker not byte-exact"; ok=0; }
   # ADR-0023: the sleep/idle proof (self-park + guarded idle + the
   # calibrated clock read from ring 3).
   grep -qF "[M3] sleep: idle engaged" "$LOG" || { echo "VERIFY FAIL: M3 sleep/idle marker missing"; ok=0; }

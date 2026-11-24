@@ -2107,6 +2107,67 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 );
                 hw::halt_forever();
             }
+
+            // ── 16e. round N2 (the exec image quota): a domain with
+            //      a FIVE-page quota — exactly its own footprint —
+            //      execs /bin/sh, whose image needs four mapped pages
+            //      + stack + trampoline = SIX. The pre-check must
+            //      refuse with -ENOMEM BEFORE the point of no return;
+            //      the old image proves it survived by writing its
+            //      marker and exiting clean. ──
+            {
+                static QUOTA_ROGUE_DATA: [u8; 0x60] = {
+                    let mut d = [0u8; 0x60];
+                    d[0] = 19; // mode 19: the quota-refused exec
+                    let msg: &[u8; 40] = b"quota-refused exec: the old image lives\n";
+                    let mut i = 0;
+                    while i < 40 {
+                        d[0x10 + i] = msg[i];
+                        i += 1;
+                    }
+                    d
+                };
+                let mut tiny = aegis_os::profile::service_profile();
+                tiny.quota_pages = 5;
+                let rogue = match mm::user::spawn_user_blob(
+                    &mut k,
+                    &mut pool,
+                    37,
+                    tiny,
+                    RING3_PREEMPT,
+                    &QUOTA_ROGUE_DATA,
+                ) {
+                    Ok(sp) => sp,
+                    Err(_) => {
+                        line(
+                            &mut out,
+                            &["[SEC] N2: ERROR: quota rogue spawn failed; halting"],
+                        );
+                        hw::halt_forever();
+                    }
+                };
+                let kernel_cr3 = hw::read_cr3();
+                rogue.run.tables.activate();
+                crate::sched::context::begin(rogue.run);
+                crate::sched::context::launch(&rogue.ctx);
+                let run = crate::sched::context::take();
+                hw::write_cr3(kernel_cr3);
+                let clean = matches!(run.exit, crate::sched::context::ExitKind::Exited(0));
+                mm::user::destroy_user(&mut k, &mut pool, 37);
+                let _ = crate::sched::preempt::on_exit(&mut k.sched, 37);
+                if clean {
+                    line(
+                        &mut out,
+                        &["[SEC] N2: the over-quota exec refused, the old image intact, pool conserved"],
+                    );
+                } else {
+                    line(
+                        &mut out,
+                        &["[SEC] N2: ERROR: the quota rogue did not exit clean; halting"],
+                    );
+                    hw::halt_forever();
+                }
+            }
         }
     }
 
