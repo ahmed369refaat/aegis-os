@@ -125,7 +125,7 @@ pub(crate) fn ahci_step<const N: usize>(
         line(
             out,
             &[
-                "[AHCI] ABAR window too small for port 0's registers (len=0x",
+                "[AHCI] ABAR window too small for port 0's registers (len=",
                 strutil::hex(bus.window().len(), &mut lb),
                 ") — refusing",
             ],
@@ -152,9 +152,9 @@ pub(crate) fn ahci_step<const N: usize>(
         &[
             "[AHCI] ABAR live: GHC.AE=",
             if ghc_ae { "1" } else { "0" },
-            " PI=0x",
+            " PI=",
             strutil::hex(u64::from(pi), &mut h),
-            " port0 SIG=0x",
+            " port0 SIG=",
             strutil::hex(u64::from(sig), &mut h2),
             " (0x101 = SATA disk)",
         ],
@@ -279,9 +279,9 @@ pub(crate) fn ahci_step<const N: usize>(
         line(
             out,
             &[
-                "[AHCI] IDENTIFY completed: word0=0x",
+                "[AHCI] IDENTIFY completed: word0=",
                 strutil::hex(u64::from(w0), &mut h),
-                " serial[0..8]=0x",
+                " serial[0..8]=",
                 strutil::hex(sn, &mut hs),
                 if identity {
                     " (512 bytes, identity lane)"

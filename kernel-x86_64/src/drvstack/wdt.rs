@@ -204,7 +204,7 @@ fn itco_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
         line(
             out,
             &[
-                "[WDT ] iTCO: PMBASE 0x",
+                "[WDT ] iTCO: PMBASE ",
                 strutil::hex(u64::from(pmbase), &mut [0u8; 18]),
                 " out of port bounds (reg ",
                 strutil::dec(u64::from(pmbase + TCO_OFFSET), &mut b),
@@ -241,11 +241,11 @@ fn itco_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
     line(
         out,
         &[
-            "[WDT ] iTCO live: PMBASE 0x",
+            "[WDT ] iTCO live: PMBASE ",
             strutil::hex(u64::from(pmbase), &mut b1),
-            " TCO@0x",
+            " TCO@",
             strutil::hex(u64::from(pmbase + TCO_OFFSET), &mut b2),
-            " — cnt1=0x",
+            " — cnt1=",
             strutil::hex(u64::from(cnt1), &mut b3),
             " tmr=",
             strutil::dec(u64::from(tmr), &mut b4),
@@ -357,9 +357,9 @@ fn esb_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
     line(
         out,
         &[
-            "[WDT ] i6300esb driven: unlock×3, timer1/2=0x",
+            "[WDT ] i6300esb driven: unlock×3, timer1/2=",
             strutil::hex(u64::from(ESB_MAX_PRELOAD), &mut b1),
-            " (max preload ≈ a quarter hour), pinged, reboot-on-timeout MASKED (cfg 0x",
+            " (max preload ≈ a quarter hour), pinged, reboot-on-timeout MASKED (cfg ",
             strutil::hex(
                 u64::from(crate::pci::read_cfg32(&dev, ESB_CONFIG_REG) & 0xFFFF),
                 &mut b2,

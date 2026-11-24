@@ -21,8 +21,10 @@
 //! **Context:** `feed` is pure (host-tested); `irq_bottom_half` is
 //! the target half — it runs INSIDE the broker's deliver() (after
 //! the EOI, the tty.rs doctrine: single CPU, IF=0, the ring is
-//! IRQ-safe by construction). `push` to the ring never blocks and
-//! never faults; a full ring drops with the honest counter.
+//! IRQ-safe by construction). `push_ps2` to the ring never blocks
+//! and never faults; a full ring drops with the honest counter. The
+//! keyboard tag is what lets the PS/2 capture take ONLY its own
+//! bytes (tty.rs) — the serial session shares the ring.
 
 // Host-test builds compile this module without the port half.
 #![cfg_attr(test, allow(unused_imports, dead_code))]
@@ -163,8 +165,10 @@ pub fn feed(sc: u8) -> Option<u8> {
 
 /// The target half: drain the 8042's output buffer (bounded — the
 /// controller's 16-byte queue plus slack), decode, and push every
-/// decoded byte into the TTY ring. Runs inside `irq::deliver` after
-/// the EOI. Returns the bytes pushed.
+/// decoded byte into the TTY ring KEYBOARD-TAGGED (the PS/2 capture's
+/// own path — a serial byte is never mistaken for a key, and a key is
+/// never mistaken for the session's input). Runs inside
+/// `irq::deliver` after the EOI. Returns the bytes pushed.
 #[cfg(not(test))]
 pub(crate) fn irq_bottom_half() -> usize {
     let mut pushed = 0usize;
@@ -172,7 +176,7 @@ pub(crate) fn irq_bottom_half() -> usize {
     while crate::hw::inb(0x64) & 1 != 0 && spins < 64 {
         let sc = crate::hw::inb(0x60);
         if let Some(b) = feed(sc) {
-            if crate::tty::push(b) {
+            if crate::tty::push_ps2(b) {
                 pushed += 1;
             }
         }

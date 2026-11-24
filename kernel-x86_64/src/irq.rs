@@ -257,6 +257,15 @@ pub fn last_delivered() -> u8 {
     LAST_DELIVERED.load(Ordering::SeqCst)
 }
 
+/// Clear the last-delivered witness: a proof window's own reset. The
+/// mwait helper clears internally, but a window that SPINS on the
+/// witness (drvstack::irq — the wake-safe shape; under TCG, MWAIT
+/// sleeps until an interrupt and a keyless lane with the tick paused
+/// has none) needs the same reset without opening a sleep.
+pub fn clear_last_delivered() {
+    LAST_DELIVERED.store(0, Ordering::SeqCst);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Target-only: the bounded delivery window (the proof path).
 // ─────────────────────────────────────────────────────────────────────────

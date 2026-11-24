@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased] — the K18 round: the PS/2 proof made honest (source tags, a dedicated lane) + the shell lane's real root cause fixed
+
+- **The shell lane's `? cho` root cause, found and fixed**: the PS/2
+  capture step drained the console-in ring's untagged HEAD byte — on
+  the shell lane that is the scripted session's first byte (the 'e'
+  of `echo`) — and printed a false "[KBD2] scancode decoded — QMP
+  send-key round trip" marker with it. The tty ring now carries a
+  per-byte SOURCE tag (`push_ps2` / `take_head_ps2` / `ps2_pushed`):
+  the capture can only take keyboard bytes; serial bytes are never
+  the proof and never the casualty.
+- **The DELIVERED marker was a false positive on keyless lanes**: the
+  i8042 self-test byte's IRQ1 edge latched in the LAPIC's IRR at
+  IF=0 and delivered at the window's very first STI — keyless lanes
+  were green on exactly that. The window now DRAINS the stale edge
+  first, accepts only the KEYBOARD'S own vector, is 1.5 s TSC-bound,
+  and a release window absorbs the key's break-code edge so nothing
+  latches into the kmain→user boundary.
+- **A dedicated `--verify-ps2` lane** (lean q35, no USB keyboard):
+  send-key has exactly one target, so the IRQ1 chain's DELIVERED pin
+  means the key's own edge. The pin moved off the q35 lane, where the
+  key routes to the USB keyboard. Six pins: ioapic live, armed,
+  DELIVERED, self-test, decoded (keyboard-tagged), negotiated.
+- **The IR lane's cross-device fault probe is producible**: the e1000
+  joined the IR machine (+netdev), with e1k pins (alive / TX / teardown).
+- **The doubled `0x0x…` marker prefix removed at 108 sites**
+  (107 by the persisted script + the K17 one): `strutil::hex` already
+  prints `0x…`; a literal ending in `0x` before a hex() call printed
+  `0x0x…`. All boot.sh pins re-checked (prefix pins unaffected).
+- Infra (outside the repo): the sandbox recycle lost the QEMU runtime
+  libs + BIOS files — restored durably into `tools/qemu-root` with
+  `LD_LIBRARY_PATH` in `tools/env.sh`; `lane.sh`'s cap is 660 s.
+
 ## [Unreleased] — the K17 round: checklist item 12 complete (xHCI enumeration + the HID keyboard)
 
 - **USB enumeration, fully live on the q35 lane**: the whole root-hub

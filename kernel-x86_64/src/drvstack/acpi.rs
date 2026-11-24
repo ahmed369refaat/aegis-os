@@ -388,7 +388,7 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
                 strutil::dec(u64::from(m.lapic_entries), &mut a),
                 " IOAPIC entries=",
                 strutil::dec(m.ioapic_count as u64, &mut b),
-                " @0x",
+                " @",
                 strutil::hex(m.ioapics[0].0, &mut c),
                 " (gsi base ",
                 strutil::dec(u64::from(m.ioapics[0].1), &mut d),
@@ -406,7 +406,7 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
                     strutil::dec(u64::from(*src), &mut s1),
                     " → gsi ",
                     strutil::dec(u64::from(*gsi), &mut s2),
-                    " flags=0x",
+                    " flags=",
                     strutil::hex(u64::from(*flags), &mut s3),
                 ],
             );
@@ -429,7 +429,7 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
                 line(
                     out,
                     &[
-                        "[MCFG] ECAM base 0x",
+                        "[MCFG] ECAM base ",
                         strutil::hex(base, &mut c),
                         " seg=",
                         strutil::dec(u64::from(seg), &mut a),
@@ -517,7 +517,7 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
                                 strutil::dec(u64::from(v.phys_addr_bits), &mut b1),
                                 " ivhd=",
                                 strutil::dec(v.ivhd_count as u64, &mut b2),
-                                " base=0x",
+                                " base=",
                                 strutil::hex(i.map(|x| x.base_address).unwrap_or(0), &mut b3),
                                 " (parse slice; the engine follows)",
                             ],
@@ -603,7 +603,7 @@ pub(crate) fn acpi_hpet_step(out: &mut dyn FnMut(&str), dir_pa: u64) -> Option<M
             line(
                 out,
                 &[
-                    "[HPET] block @0x",
+                    "[HPET] block @",
                     strutil::hex(block, &mut c),
                     " freq=",
                     strutil::dec(freq, &mut f),

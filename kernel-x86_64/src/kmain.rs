@@ -2047,9 +2047,9 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 line(
                     &mut out,
                     &[
-                        "[SEC] ADR-0031 measure: DF rogue user_flags=0x",
+                        "[SEC] ADR-0031 measure: DF rogue user_flags=",
                         strutil::hex(uf, &mut h1),
-                        " delivered=0x",
+                        " delivered=",
                         strutil::hex(dfl, &mut h2),
                         " exit=clean",
                     ],
@@ -2074,9 +2074,9 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 line(
                     &mut out,
                     &[
-                        "[SEC] ADR-0031 measure: TF rogue user_flags=0x",
+                        "[SEC] ADR-0031 measure: TF rogue user_flags=",
                         strutil::hex(uf, &mut h1),
-                        " delivered=0x",
+                        " delivered=",
                         strutil::hex(dfl, &mut h2),
                         verdict,
                     ],
@@ -2093,9 +2093,9 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 line(
                     &mut out,
                     &[
-                        "[SEC] ADR-0031 measure: AC rogue user_flags=0x",
+                        "[SEC] ADR-0031 measure: AC rogue user_flags=",
                         strutil::hex(uf, &mut h1),
-                        " delivered=0x",
+                        " delivered=",
                         strutil::hex(dfl, &mut h2),
                         " exit=clean",
                     ],

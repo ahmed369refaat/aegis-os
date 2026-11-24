@@ -186,7 +186,11 @@ case "${1:-}" in
       "[MCFG] ECAM base"  # parsed
       "[IRQ ] ioapic live @"  # ADR-0019: the IOAPIC probed from the MADT
       "[IRQ ] armed: isa irq 1 → gsi"  # ADR-0019: GSI 1 → a broker vector, RTE read-back ok
-      "[IRQ ] DELIVERED: vector"  # ADR-0019: the end-to-end line-interrupt chain (EOI + mailbox)
+      # (the IRQ DELIVERED pin moved to the dedicated --verify-ps2
+      # lane: on THIS machine send-key routes to the USB keyboard, so
+      # the key's PS/2 edge never comes — the old grep passed on the
+      # self-test's stale IRQ1 edge, a false positive, now drained
+      # before the window opens.)
       "[MSIX] armed: entries="  # ADR-0019: the NIC's MSI-X table pointed at a broker vector
       # Round I: the message DELIVERY grep moved off both lanes — the
       # machinery is proven (table programmed, read back unmasked,
@@ -204,6 +208,28 @@ case "${1:-}" in
       "[RTC] 2026-"  # the MC146818 read the host clock
       "[VNET] teardown dom"  # ADR-0018
       "cross-device DMA FAULTED (FSTS.PPF set)"  # ADR-0018: the negative probe — the lane FAILS if cross-device DMA does not fault
+    )
+    ;;
+  --verify-ps2)
+    # ADR-0019's dedicated PS/2 lane (K18): a lean q35 with NO USB
+    # keyboard — QEMU's send-key has exactly one keyboard to route to
+    # (the i8042), so the IRQ1 chain's DELIVERED pin means the KEY'S
+    # own edge: the self-test's stale edge is drained before the
+    # window, the window accepts only the keyboard's vector, and the
+    # captured byte must be KEYBOARD-TAGGED in the console-in ring
+    # (a serial byte is never the proof). The machine keeps the IOMMU
+    # so the full MADT → IOAPIC → broker chain runs; nothing else.
+    MODE=verify
+    MACHINE_ARGS=(-machine q35 -cpu max -m 128M
+                  -device intel-iommu,intremap=off
+                  -qmp unix:/tmp/qmp.sock,server,nowait)
+    EXTRA_GREPS=(
+      "[IRQ ] ioapic live @"  # the interrupt view probed from the MADT
+      "[IRQ ] armed: isa irq 1"  # the keyboard's GSI routed to a broker vector, RTE read back
+      "[IRQ ] DELIVERED: vector"  # THE end-to-end line-interrupt chain — the key's own IRQ1 edge (EOI + mailbox)
+      "[KBD] i8042 self-test passed (0x55)"
+      "[KBD2] scancode decoded: byte 0x"  # the decoded key, keyboard-tagged, in the console-in ring
+      "[KBD2] negotiated scancode set 2, ack=0x"  # the real 0xF0/0x02 protocol exchange
     )
     ;;
   --verify-q35-noiommu)
@@ -232,14 +258,18 @@ case "${1:-}" in
     # ADR-0019's IR lane: the SAME machine with interrupt remapping
     # ON — every device MSI must arrive in the remapped format through
     # its IRTE or the IOMMU faults it. A focused lane (the two virtio
-    # devices; the keyboard's IOAPIC compat-RTE proof stays on the
-    # base q35 lane, where it was proven).
+    # devices + the e1000, which joined in K18 so the ADR-0018
+    # cross-device fault probe is producible HERE too; the keyboard's
+    # IOAPIC compat-RTE proof lives on the dedicated --verify-ps2
+    # lane now, where the key really routes to the i8042).
     MODE=verify
     MACHINE_ARGS=(-machine q35 -cpu max -m 128M
                   -device intel-iommu,intremap=on
                   -device virtio-blk-pci,disable-legacy=on,iommu_platform=on,drive=vd0
                   -netdev user,id=n0
                   -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on
+                  -netdev user,id=n1
+                  -device e1000,netdev=n1
                   -drive id=vd0,if=none,format=raw,file=target/vdisk0.img)
     EXTRA_GREPS=(
       "[IOMMU] dmar: pa="
@@ -249,6 +279,10 @@ case "${1:-}" in
       "[VNET] alive: MAC="
       "[VNET] TX: DHCP DISCOVER sent"
       "[VNET] RX: "  # the full round trip with IR live
+      "[E1K] alive:"  # K18: the e1000 joined this machine — registers live through the IOMMU with IR on
+      "[E1K] TX: DHCP DISCOVER sent"  # the NIC egress under IR
+      "[E1K] RX: "  # the FULL TX→slirp→RX DHCP round trip under IR (proven this round, then pinned)
+      "[E1K] teardown dom"  # the scoped, counted teardown
       "[MSIX] format: remapped"  # the message went through the IRTE, not compat
       "[MSIX] armed: entries="
       # (the DELIVERED grep: see the base-lane comment — the message
@@ -411,6 +445,14 @@ if [ "$MODE" = "verify" ]; then
     rm -f /tmp/qmp.sock /tmp/screen.ppm
     touch "$LOG"
     (python3 "$(dirname "$0")/scripts/qmp_drive.py" "$LOG" >/tmp/qmp-drive.log 2>&1 &)
+  fi
+  # The PS/2 lane's own driver run: lean QMP mode — one key at the
+  # kernel's armed marker, no GFX to capture, no USB window.
+  if [ "${1:-}" = "--verify-ps2" ]; then
+    QEMU_TIMEOUT=180
+    rm -f /tmp/qmp.sock
+    touch "$LOG"
+    (python3 "$(dirname "$0")/scripts/qmp_drive.py" "$LOG" ps2 >/tmp/qmp-drive.log 2>&1 &)
   fi
   # The IR lane waits out the same keyboard poll budget (no QMP key is
   # injected there — the IOAPIC proof belongs to the base lane).

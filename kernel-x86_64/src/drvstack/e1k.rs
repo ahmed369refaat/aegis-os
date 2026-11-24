@@ -117,7 +117,7 @@ pub(crate) fn e1k_step<const N: usize>(
         line(
             out,
             &[
-                "[E1K] BAR0 window too small for the register set (len=0x",
+                "[E1K] BAR0 window too small for the register set (len=",
                 strutil::hex(bus.window().len(), &mut lb),
                 " < 0x5408) — refusing",
             ],
@@ -142,7 +142,7 @@ pub(crate) fn e1k_step<const N: usize>(
         line(
             out,
             &[
-                "[E1K] PCI command readback=0x",
+                "[E1K] PCI command readback=",
                 strutil::hex(u64::from(cmd_back), &mut cb),
                 " — the enable did not stick",
             ],
@@ -359,17 +359,17 @@ pub(crate) fn e1k_step<const N: usize>(
         line(
             out,
             &[
-                "[E1K] dbg rx: RDH=0x",
+                "[E1K] dbg rx: RDH=",
                 strutil::hex(u64::from(rdh), &mut rb),
-                " RDT=0x",
+                " RDT=",
                 strutil::hex(u64::from(rdt), &mut rc),
-                " RCTL=0x",
+                " RCTL=",
                 strutil::hex(u64::from(rctl), &mut re),
-                " desc[0]=0x",
+                " desc[0]=",
                 strutil::hex(crate::memops::read_u64(rx_ring), &mut rf),
-                "0x",
+                "",
                 strutil::hex(crate::memops::read_u64(rx_ring + 8), &mut rg),
-                " buf[0..8]=0x",
+                " buf[0..8]=",
                 strutil::hex(crate::memops::read_u64(rx_buf), &mut rh),
             ],
         );
@@ -650,7 +650,7 @@ pub(crate) fn e1k_cross_device_probe_step<const N: usize>(
             line(
                 out,
                 &[
-                    "[IOMMU] cross-device probe: FAILED — the cross-device DMA did NOT fault (fsts=0x",
+                    "[IOMMU] cross-device probe: FAILED — the cross-device DMA did NOT fault (fsts=",
                     strutil::hex(u64::from(fsts), &mut hf),
                     ") — isolation NOT proven",
                 ],

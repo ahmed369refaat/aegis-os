@@ -170,3 +170,20 @@ GPT/MBR fixtures. Lane markers (CI): `[IRQ ] ioapic live @`,
 `[MSIX] format: remapped` (IR lane), `[TSC ] calibrated`,
 `[PWR ] FADT`, `[IDLE] mwait woke`, `[RNG ] rdrand/virtio-rng/pool`,
 `[GPT ] partition 1 'aegis-root'`.
+
+
+## K18 addendum — the DELIVERED marker's semantics, corrected
+
+The keyboard's `[IRQ ] DELIVERED: vector` marker had TWO false
+positives, both found live in K18: (a) the i8042 self-test byte's
+IRQ1 edge latches in the LAPIC's IRR while the self-test poll runs
+at IF=0 and delivers at the window's very first STI — keyless lanes
+were green on exactly that stale edge, never a key; (b) the window
+accepted ANY owner's delivery (the serial's IRQ4 on a session lane
+qualifies too). The proof now: the stale edge is drained BEFORE the
+window, the window accepts only the keyboard's own vector and is
+1.5 s TSC-bounded, and the captured byte must be KEYBOARD-TAGGED in
+the console-in ring (the tty ring's per-byte source tag — the old
+untagged capture could eat a serial byte and claim a round trip with
+it). The pin lives on the dedicated `--verify-ps2` lane, whose
+machine has no USB keyboard, so send-key has exactly one target.

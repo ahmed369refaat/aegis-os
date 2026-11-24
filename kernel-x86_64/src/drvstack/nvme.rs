@@ -135,7 +135,7 @@ pub(crate) fn nvme_step<const N: usize>(
         line(
             out,
             &[
-                "[NVME] BAR0 window too small for the register set (len=0x",
+                "[NVME] BAR0 window too small for the register set (len=",
                 strutil::hex(bus.window().len(), &mut lb),
                 ") — refusing",
             ],
@@ -160,7 +160,7 @@ pub(crate) fn nvme_step<const N: usize>(
         line(
             out,
             &[
-                "[NVME] BAR0 window too small for the doorbell bank (len=0x",
+                "[NVME] BAR0 window too small for the doorbell bank (len=",
                 strutil::hex(bus.window().len(), &mut lb),
                 ") — refusing",
             ],
@@ -326,17 +326,17 @@ pub(crate) fn nvme_step<const N: usize>(
         line(
             out,
             &[
-                "[NVME] dbg entry: asq=0x",
+                "[NVME] dbg entry: asq=",
                 strutil::hex(asq, &mut e0),
-                " entry[0](cdw0|prp1)=0x",
+                " entry[0](cdw0|prp1)=",
                 strutil::hex(
                     (u64::from(crate::memops::read_u32(asq)) << 32)
                         | crate::memops::read_u64(asq + 16),
                     &mut e2,
                 ),
-                " asq_reg=0x",
+                " asq_reg=",
                 strutil::hex(asq_reg, &mut qa),
-                " aqa_reg=0x",
+                " aqa_reg=",
                 strutil::hex(u64::from(aqa_reg), &mut rb),
             ],
         );
@@ -362,19 +362,19 @@ pub(crate) fn nvme_step<const N: usize>(
             line(
                 out,
                 &[
-                    "[NVME] dbg: asq_reg=0x",
+                    "[NVME] dbg: asq_reg=",
                     strutil::hex(asq_reg, &mut [0u8; 18]),
-                    " (mine 0x",
+                    " (mine ",
                     strutil::hex(asq, &mut [0u8; 18]),
-                    ") acq_reg=0x",
+                    ") acq_reg=",
                     strutil::hex(acq_reg, &mut [0u8; 18]),
-                    " (mine 0x",
+                    " (mine ",
                     strutil::hex(acq, &mut [0u8; 18]),
-                    ") data1[0..8]=0x",
+                    ") data1[0..8]=",
                     strutil::hex(crate::memops::read_u64(data1), &mut [0u8; 18]),
-                    " cqe0=0x",
+                    " cqe0=",
                     strutil::hex(u64::from(crate::memops::read_u32(acq)), &mut [0u8; 18]),
-                    " cqe3=0x",
+                    " cqe3=",
                     strutil::hex(u64::from(crate::memops::read_u32(acq + 12)), &mut [0u8; 18]),
                     (if crate::memops::read_u64(data1) != 0 {
                         " — data ARRIVED; completion timing open"
@@ -406,7 +406,7 @@ pub(crate) fn nvme_step<const N: usize>(
         line(
             out,
             &[
-                "[NVME] Identify status != 0 (0x",
+                "[NVME] Identify status != 0 (",
                 strutil::hex(u64::from(st), &mut hs),
                 ") — refusing",
             ],
@@ -427,11 +427,11 @@ pub(crate) fn nvme_step<const N: usize>(
     line(
         out,
         &[
-            "[NVME] dbg identify: data1_pa=0x",
+            "[NVME] dbg identify: data1_pa=",
             strutil::hex(data1, &mut dp),
-            " data1[0..8]=0x",
+            " data1[0..8]=",
             strutil::hex(crate::memops::read_u64(data1), &mut d0),
-            " PA0[0..8]=0x",
+            " PA0[0..8]=",
             strutil::hex(crate::memops::read_u64(0x0), &mut z0),
         ],
     );
@@ -515,7 +515,7 @@ pub(crate) fn nvme_step<const N: usize>(
         line(
             out,
             &[
-                "[NVME] CreateIoCq status 0x",
+                "[NVME] CreateIoCq status ",
                 strutil::hex(u64::from(st), &mut hs),
                 " — refusing",
             ],
@@ -566,7 +566,7 @@ pub(crate) fn nvme_step<const N: usize>(
         line(
             out,
             &[
-                "[NVME] CreateIoSq status 0x",
+                "[NVME] CreateIoSq status ",
                 strutil::hex(u64::from(st), &mut hs),
                 " — refusing",
             ],
@@ -611,7 +611,7 @@ pub(crate) fn nvme_step<const N: usize>(
         line(
             out,
             &[
-                "[NVME] read LBA0 status 0x",
+                "[NVME] read LBA0 status ",
                 strutil::hex(u64::from(st), &mut hs),
                 " — refusing",
             ],
@@ -624,7 +624,7 @@ pub(crate) fn nvme_step<const N: usize>(
     line(
         out,
         &[
-            "[NVME] read LBA0: 0x",
+            "[NVME] read LBA0: ",
             strutil::hex(d0, &mut hd),
             " (512 bytes through the IOMMU)",
         ],

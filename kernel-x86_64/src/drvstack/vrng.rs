@@ -297,9 +297,9 @@ pub(crate) fn rng_step<const N: usize>(
     line(
         out,
         &[
-            "[RNG ] virtio-rng: 16 bytes harvested (0x",
+            "[RNG ] virtio-rng: 16 bytes harvested (",
             strutil::hex(w0, &mut h0),
-            " 0x",
+            " ",
             strutil::hex(w1, &mut h1),
             ") → pool",
         ],
@@ -331,9 +331,9 @@ fn rng_summary(out: &mut dyn FnMut(&str)) {
             strutil::dec(mixes, &mut m),
             " draws=",
             strutil::dec(draws, &mut dr),
-            " sample=0x",
+            " sample=",
             strutil::hex(d0, &mut s0),
-            " 0x",
+            " ",
             strutil::hex(d1, &mut s1),
             " (mixer: splitmix64 — CSPRNG is the next slice)",
         ],

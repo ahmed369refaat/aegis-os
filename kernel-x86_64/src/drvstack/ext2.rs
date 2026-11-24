@@ -186,18 +186,18 @@ pub(crate) fn ext2_over_ahci(
             line(
                 out,
                 &[
-                    "[EXT2] dbg read LBA2: TFD=0x",
+                    "[EXT2] dbg read LBA2: TFD=",
                     strutil::hex(u64::from(tfd.unwrap_or(0)), &mut h),
                     if tfd.is_none() {
                         " (read refused by the register window)"
                     } else {
                         ""
                     },
-                    " data[0]=0x",
+                    " data[0]=",
                     strutil::hex(d0, &mut hd),
-                    " d2h_fis[0]=0x",
+                    " d2h_fis[0]=",
                     strutil::hex(f0, &mut hd2),
-                    " — magic 0x",
+                    " — magic ",
                     strutil::hex(u64::from(magic), &mut hd3),
                     " != 0xef53 — refusing",
                 ],
@@ -214,19 +214,19 @@ pub(crate) fn ext2_over_ahci(
             line(
                 out,
                 &[
-                    "[EXT2] dbg cmdtbl: hdr0=0x",
+                    "[EXT2] dbg cmdtbl: hdr0=",
                     strutil::hex(u64::from(crate::memops::read_u32(clb)), &mut hc),
-                    " hdr_ctba=0x",
+                    " hdr_ctba=",
                     strutil::hex(u64::from(crate::memops::read_u32(clb + 8)), &mut ht),
-                    " fis_d0=0x",
+                    " fis_d0=",
                     strutil::hex(u64::from(crate::memops::read_u32(ctba)), &mut t0),
-                    " fis_d1=0x",
+                    " fis_d1=",
                     strutil::hex(u64::from(crate::memops::read_u32(ctba + 4)), &mut t1),
-                    " fis_d2=0x",
+                    " fis_d2=",
                     strutil::hex(u64::from(crate::memops::read_u32(ctba + 8)), &mut t2),
-                    " prdt_dba=0x",
+                    " prdt_dba=",
                     strutil::hex(crate::memops::read_u64(ctba + 0x80), &mut pd),
-                    " prdt_dbc=0x",
+                    " prdt_dbc=",
                     strutil::hex(u64::from(crate::memops::read_u32(ctba + 0x88)), &mut pc),
                 ],
             );
@@ -290,7 +290,7 @@ pub(crate) fn ext2_over_ahci(
         line(
             out,
             &[
-                "[EXT2] root inode mode 0x",
+                "[EXT2] root inode mode ",
                 strutil::hex(u64::from(root.mode), &mut hm),
                 " not a directory — refusing",
             ],

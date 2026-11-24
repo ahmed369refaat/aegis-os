@@ -71,7 +71,7 @@ pub(crate) fn xhci_step<const N: usize>(
         line(
             out,
             &[
-                "[XHCI] BAR0 window too small for the caps block (len=0x",
+                "[XHCI] BAR0 window too small for the caps block (len=",
                 strutil::hex(bus.window().len(), &mut lb),
                 ") — refusing",
             ],
@@ -98,7 +98,7 @@ pub(crate) fn xhci_step<const N: usize>(
         line(
             out,
             &[
-                "[XHCI] BAR0 window too small for the port bank (len=0x",
+                "[XHCI] BAR0 window too small for the port bank (len=",
                 strutil::hex(bus.window().len(), &mut lb),
                 ") — refusing",
             ],
@@ -312,7 +312,7 @@ pub(crate) fn xhci_cmdring_step<const N: usize>(
         line(
             out,
             &[
-                "[XTRB] BAR0 window too small for the op/runtime/doorbell registers (len=0x",
+                "[XTRB] BAR0 window too small for the op/runtime/doorbell registers (len=",
                 strutil::hex(bus.window().len(), &mut lb),
                 ") — refusing",
             ],
@@ -563,7 +563,7 @@ pub(crate) fn xhci_enum_step<const N: usize>(
         line(
             out,
             &[
-                "[USBH] BAR0 window cannot hold the caps/op/port/runtime/doorbell registers (len=0x",
+                "[USBH] BAR0 window cannot hold the caps/op/port/runtime/doorbell registers (len=",
                 strutil::hex(bus.window().len(), &mut [0u8; 18]),
                 ") — refusing",
             ],
@@ -926,7 +926,7 @@ pub(crate) fn xhci_enum_step<const N: usize>(
                 &[
                     "[USBH] port ",
                     strutil::dec(u64::from(port), &mut [0u8; 20]),
-                    ": vid=0x",
+                    ": vid=",
                     strutil::hex(u64::from(dd.vid), &mut [0u8; 18]),
                     " pid=",
                     strutil::hex(u64::from(dd.pid), &mut [0u8; 18]),
@@ -1035,7 +1035,7 @@ pub(crate) fn xhci_enum_step<const N: usize>(
         line(
             out,
             &[
-                "[USBH] device enumerated: vid=0x",
+                "[USBH] device enumerated: vid=",
                 strutil::hex(u64::from(dd.vid), &mut [0u8; 18]),
                 " pid=",
                 strutil::hex(u64::from(dd.pid), &mut [0u8; 18]),

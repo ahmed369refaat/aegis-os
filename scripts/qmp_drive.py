@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Marker-driven QMP driver for the q35 boot lane: waits for the
-kernel's "armed" marker, injects a keypress (the PS/2 round trip),
-then captures the screen (the GFX proof)."""
+"""Marker-driven QMP driver for the boot lanes: waits for the kernel's
+"armed" marker, injects a keypress (the PS/2 round trip), then captures
+the screen (the GFX proof). Mode "ps2" (K18): the lean PS/2 lane — one
+key at the kernel's armed marker, no GFX, no USB window."""
 import json
 import socket
 import sys
 import time
 
 LOG = sys.argv[1]
+MODE = sys.argv[2] if len(sys.argv) > 2 else "q35"
 SOCK = "/tmp/qmp.sock"
 
 
@@ -22,6 +24,39 @@ def wait_marker(pat, timeout=180):
             pass
         time.sleep(0.5)
     return False
+
+
+if MODE == "ps2":
+    # The PS/2 lane (K18): a lean machine — no VGA to capture, no USB
+    # keyboard, no text console. ONE key at the kernel's own armed
+    # marker: the IRQ1 chain's proof (the kernel drains the self-test's
+    # stale edge first and accepts only the keyboard's vector). The
+    # handshake is inline — the rx/cmd helpers below belong to the
+    # q35 flow, which this branch never reaches.
+    if not wait_marker("[KBD] armed"):
+        sys.exit("kernel never armed the keyboard")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(60)
+    s.connect(SOCK)
+    f = s.makefile("rwb")
+    f.readline()  # greeting
+    f.write(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
+    f.write(
+        json.dumps(
+            {
+                "execute": "send-key",
+                "arguments": {
+                    "keys": [{"type": "qcode", "data": "a"}],
+                    "hold-time": 300,
+                },
+            }
+        ).encode()
+        + b"\n"
+    )
+    f.flush()
+    print("qmp-drive: ps2 key sent", flush=True)
+    s.close()
+    sys.exit(0)
 
 
 # The pattern is drawn BEFORE the keyboard arms; capture the screen

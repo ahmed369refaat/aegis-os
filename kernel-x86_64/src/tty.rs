@@ -12,6 +12,16 @@
 //! bare `pc` box) the TTY still works — polling at SERVICE time,
 //! documented as such, never silently.
 //!
+//! Every byte carries its SOURCE: serial (the UART's RX) or keyboard
+//! (the 8042 bottom half, the PS/2 proof's own path). The tag rides a
+//! parallel bit-ring (`TAGS`, one bit per byte, set on `push_ps2`,
+//! cleared on `push`), so the PS/2 capture waits for and takes ONLY
+//! keyboard bytes and never consumes a serial byte — the shell
+//! session's scripted stdin shares this ring, and the old capture
+//! drained whatever sat at the head, ate the session's first byte,
+//! and printed a false round-trip marker with it (found live, the
+//! K17 shell lane's `? cho`).
+//!
 //! The ring itself is single-producer/single-consumer and — because
 //! there is exactly one CPU and syscalls run at IF=0 — the two
 //! sides can never actually interleave: the IRQ either happens
@@ -49,10 +59,27 @@ static TAIL: AtomicUsize = AtomicUsize::new(0);
 /// Bytes dropped because the ring was full (the overrun honesty
 /// counter — the marker prints it).
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
+/// The per-byte source tags, one bit per ring byte (1 = keyboard, 0 =
+/// serial): bit `(i % 8)` of `TAGS[(i / 8) % SLOTS]` names the
+/// producer of ring byte `i`. Every push writes its byte's bit, so
+/// the bit at HEAD is always the CURRENT head byte's tag — no stale
+/// tag can survive a lap of the ring.
+static TAGS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 
-/// Push one byte. False = the ring is full (the byte is dropped and
-/// counted, never a silent loss).
+/// Push one byte from the SERIAL source. False = the ring is full
+/// (the byte is dropped and counted, never a silent loss).
 pub fn push(b: u8) -> bool {
+    push_tagged(b, false)
+}
+
+/// Push one byte from the KEYBOARD source (the 8042 bottom half's
+/// decoded byte — the PS/2 round trip's own path). Same contract.
+pub fn push_ps2(b: u8) -> bool {
+    push_tagged(b, true)
+}
+
+/// The shared write half: one byte plus its source tag.
+fn push_tagged(b: u8, from_keyboard: bool) -> bool {
     let head = HEAD.load(Ordering::Acquire);
     let tail = TAIL.load(Ordering::Relaxed);
     if tail.wrapping_sub(head) >= CAP {
@@ -67,6 +94,12 @@ pub fn push(b: u8) -> bool {
     let mut q = RING[slot].load(Ordering::Relaxed);
     q = (q & !(0xFFu64 << shift)) | (u64::from(b) << shift);
     RING[slot].store(q, Ordering::Release);
+    // The same slot's tag byte: set or clear THIS byte's bit — the
+    // load-patch-store argument is the ring's, verbatim.
+    let bit = 1u64 << ((tail % 8) as u32);
+    let mut t = TAGS[slot].load(Ordering::Relaxed);
+    t = (t & !bit) | if from_keyboard { bit } else { 0 };
+    TAGS[slot].store(t, Ordering::Release);
     TAIL.store(tail.wrapping_add(1), Ordering::Release);
     true
 }
@@ -92,6 +125,42 @@ pub fn drain(out: &mut [u8]) -> usize {
 pub fn buffered() -> usize {
     TAIL.load(Ordering::Acquire)
         .wrapping_sub(HEAD.load(Ordering::Acquire))
+}
+
+/// Keyboard-sourced bytes currently buffered (the PS/2 capture's wait
+/// condition — serial bytes never count).
+pub fn ps2_pushed() -> usize {
+    let head = HEAD.load(Ordering::Acquire);
+    let tail = TAIL.load(Ordering::Acquire);
+    let mut n = 0usize;
+    for i in 0..tail.wrapping_sub(head) {
+        let idx = head.wrapping_add(i);
+        let t = TAGS[(idx / 8) % SLOTS].load(Ordering::Acquire);
+        if t & (1u64 << ((idx % 8) as u32)) != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Take the head byte ONLY if it is keyboard-sourced: the PS/2
+/// capture consumes exactly its own byte and leaves every serial byte
+/// where it sits. None = the head is serial, or the ring is empty.
+pub fn take_head_ps2() -> Option<u8> {
+    let head = HEAD.load(Ordering::Acquire);
+    let tail = TAIL.load(Ordering::Acquire);
+    if tail.wrapping_sub(head) == 0 {
+        return None;
+    }
+    let t = TAGS[(head / 8) % SLOTS].load(Ordering::Acquire);
+    if t & (1u64 << ((head % 8) as u32)) == 0 {
+        return None;
+    }
+    let q = RING[(head / 8) % SLOTS].load(Ordering::Acquire);
+    let shift = ((head % 8) * 8) as u32;
+    let b = ((q >> shift) & 0xFF) as u8;
+    HEAD.store(head.wrapping_add(1), Ordering::Release);
+    Some(b)
 }
 
 /// Bytes dropped to a full ring since boot.
@@ -206,5 +275,31 @@ mod tests {
         let mut two = [0u8; 2];
         assert_eq!(drain(&mut two), 2);
         assert_eq!(&two, &[0xAA, 0xBB]);
+        // The source tags: a keyboard byte is takeable exactly once,
+        // a serial byte is never consumed by the keyboard path — the
+        // shell-session contract (found live: the old capture drained
+        // the head and ate the session's first byte).
+        assert_eq!(ps2_pushed(), 0);
+        assert!(push(b'e')); // serial
+        assert_eq!(ps2_pushed(), 0);
+        assert_eq!(take_head_ps2(), None, "a serial head is not the keyboard's");
+        assert_eq!(buffered(), 1, "the serial byte stays put");
+        assert!(push_ps2(b'a')); // keyboard, behind the serial byte
+        assert_eq!(ps2_pushed(), 1);
+        assert_eq!(take_head_ps2(), None, "only a keyboard HEAD is takeable");
+        // The console read drains FIFO, tags aside — the shell gets
+        // every byte in order, whatever its source.
+        let mut one = [0u8; 1];
+        assert_eq!(drain(&mut one), 1);
+        assert_eq!(one[0], b'e');
+        // Now the head is the keyboard's: take it — exactly it.
+        assert_eq!(take_head_ps2(), Some(b'a'));
+        assert_eq!(take_head_ps2(), None);
+        assert_eq!(ps2_pushed(), 0);
+        assert!(push_ps2(b'h'));
+        assert!(push_ps2(b'i'));
+        assert_eq!(take_head_ps2(), Some(b'h'));
+        assert_eq!(take_head_ps2(), Some(b'i'));
+        assert_eq!(take_head_ps2(), None);
     }
 }

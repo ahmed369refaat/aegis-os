@@ -42,7 +42,7 @@ pub(crate) fn pci_step(
             line(
                 out,
                 &[
-                    "[PCI ] config access: ECAM @0x",
+                    "[PCI ] config access: ECAM @",
                     strutil::hex(base, &mut c),
                     " bus ",
                     strutil::dec(u64::from(sb), &mut b1),
@@ -613,17 +613,17 @@ pub(crate) fn pci_step(
             line(
                 out,
                 &[
-                    "[CTX ] dump: 0x10 hi=0x",
+                    "[CTX ] dump: 0x10 hi=",
                     strutil::hex(v0, &mut b0),
-                    " 0x18 hi=0x",
+                    " 0x18 hi=",
                     strutil::hex(v1, &mut b1),
-                    " 0x20 hi=0x",
+                    " 0x20 hi=",
                     strutil::hex(v2, &mut b2),
-                    " 0x28 hi=0x",
+                    " 0x28 hi=",
                     strutil::hex(v3, &mut b3),
-                    " 0x30 hi=0x",
+                    " 0x30 hi=",
                     strutil::hex(v4, &mut b4),
-                    " 0xF8 hi=0x",
+                    " 0xF8 hi=",
                     strutil::hex(v5, &mut b5),
                 ],
             );

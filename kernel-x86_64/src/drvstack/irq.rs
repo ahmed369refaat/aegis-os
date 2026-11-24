@@ -51,7 +51,7 @@ pub(crate) fn irq_step(out: &mut dyn FnMut(&str), madt: Option<&crate::drvstack:
         line(
             out,
             &[
-                "[IRQ ] ioapic: probe refused @0x",
+                "[IRQ ] ioapic: probe refused @",
                 strutil::hex(base, &mut h),
                 " (window or dead registers) — refusing closed",
             ],
@@ -64,9 +64,9 @@ pub(crate) fn irq_step(out: &mut dyn FnMut(&str), madt: Option<&crate::drvstack:
     line(
         out,
         &[
-            "[IRQ ] ioapic live @0x",
+            "[IRQ ] ioapic live @",
             strutil::hex(base, &mut h),
-            ": ver=0x",
+            ": ver=",
             strutil::hex(u64::from(ioapic.version()), &mut v),
             " max_gsi=",
             strutil::dec(u64::from(ioapic.max_gsi()), &mut n),
@@ -104,9 +104,9 @@ pub(crate) fn irq_step(out: &mut dyn FnMut(&str), madt: Option<&crate::drvstack:
         line(
             out,
             &[
-                "[IRQ ] RTE read-back mismatch: wrote 0x",
+                "[IRQ ] RTE read-back mismatch: wrote ",
                 strutil::hex(rte, &mut b1),
-                " read 0x",
+                " read ",
                 strutil::hex(back, &mut b2),
                 " — refusing",
             ],
@@ -122,7 +122,7 @@ pub(crate) fn irq_step(out: &mut dyn FnMut(&str), madt: Option<&crate::drvstack:
         &[
             "[IRQ ] armed: isa irq 1 → gsi ",
             strutil::dec(u64::from(gsi), &mut gg),
-            " → vector 0x",
+            " → vector ",
             strutil::hex(u64::from(vector), &mut vv),
             " (edge, active-high, dest 0, RTE read-back ok)",
         ],
@@ -167,7 +167,7 @@ pub(crate) fn irq_step(out: &mut dyn FnMut(&str), madt: Option<&crate::drvstack:
         &[
             "[TTY] armed: isa irq 4 → gsi ",
             strutil::dec(u64::from(tgsi), &mut tg),
-            " → vector 0x",
+            " → vector ",
             strutil::hex(u64::from(tvec), &mut tv),
             " — RX by interrupt, ring 256B, buffered=",
             strutil::dec(crate::tty::buffered() as u64, &mut tb),
@@ -216,7 +216,7 @@ pub(crate) fn ir_setup_step<const N: usize>(
             line(
                 out,
                 &[
-                    "[IR  ] enabled: 256 IRTEs @0x",
+                    "[IR  ] enabled: 256 IRTEs @",
                     strutil::hex(frame, &mut f),
                     " eim=off (sirtp spins=",
                     strutil::dec(sirtp, &mut s1),
@@ -242,9 +242,65 @@ pub(crate) fn ir_setup_step<const N: usize>(
 /// delivers through the broker chain (vector → EOI → mailbox). MWAIT
 /// sleeps until the delivery's store wakes the armed line (CPUID-
 /// gated; a spin otherwise). The scancode itself waits in the 8042's
-/// output buffer and is read right after. Absence prints LOUD (the
-/// lane greps the success marker, so a regression fails CI, not
-/// silently). Returns whether the delivery landed.
+/// output buffer and is read right after.
+///
+/// Three honesty fixes this round, each found live:
+/// (1) **The stale-edge drain runs FIRST.** The i8042 self-test
+///     byte's IRQ1 edge latches in the LAPIC's IRR while the
+///     self-test poll runs at IF=0 — it then delivers at the window's
+///     very first STI and satisfies DELIVERED with no key ever sent
+///     (keyless lanes were green on exactly that false positive). A
+///     short window opens IF, lets the latched edge land, and
+///     DISCARDS it.
+/// (2) **The window accepts only the KEYBOARD'S OWN vector.** A
+///     delivery on any other owner's vector (the serial's IRQ4 on a
+///     session lane, for one) no longer satisfies the keyboard proof —
+///     the loop keeps waiting until the keyboard's edge or the
+///     budget.
+/// (3) After a REAL delivery, a bounded RELEASE window absorbs the
+///     key's break-code edge (~the send-key hold time later), so it
+///     does not latch and deliver at some later IF-open (the
+///     kmain→user boundary, where the tick guard would name it).
+///
+/// Absence prints the honest lane text — no key sent here; the pinned
+/// proof lives on the `--verify-ps2` lane, whose machine has no USB
+/// keyboard, so send-key has exactly one keyboard to route to.
+/// Returns whether the keyboard's own delivery landed.
+/// A STI'd, TSC-bounded SPIN on the broker's last-delivered witness —
+/// the delivery window's wake-safe shape. NOT the mwait sleep: under
+/// TCG, MWAIT sleeps until an interrupt, and with the preempt tick
+/// paused a keyless lane has NO wake source at all (found live, K18:
+/// the drain consumed the stale self-test edge that used to satisfy
+/// the window at the loop top, and the very next mwait slept forever
+/// — the lane hung mid-proof). The spin sees the delivery's store
+/// within microseconds of the IRQ; the TSC budget bounds the keyless
+/// case honestly. Returns TRUE only for the KEYBOARD'S vector; any
+/// other owner's edge is consumed (its bottom half already ran at
+/// delivery time) and the wait goes on — a serial delivery never
+/// satisfies a keyboard proof.
+#[cfg(not(test))]
+fn spin_window_for(vector: u8, budget_tsc: u64) -> bool {
+    use crate::irq;
+    crate::sched::preempt::pause_ticks();
+    irq::clear_last_delivered();
+    crate::hw::sti();
+    let deadline = crate::hw::read_tsc() + budget_tsc;
+    let mut delivered = false;
+    while crate::hw::read_tsc() < deadline {
+        let v = irq::last_delivered();
+        if v == vector {
+            delivered = true;
+            break;
+        }
+        if v != 0 {
+            irq::clear_last_delivered();
+        }
+    }
+    crate::hw::cli();
+    crate::sched::preempt::resume_ticks();
+    delivered
+}
+
 #[cfg(not(test))]
 pub(crate) fn keyboard_delivery_step(out: &mut dyn FnMut(&str)) -> bool {
     use crate::irq;
@@ -254,35 +310,44 @@ pub(crate) fn keyboard_delivery_step(out: &mut dyn FnMut(&str)) -> bool {
         line(out, &["[IRQ ] delivery window skipped: keyboard not armed"]);
         return false;
     };
-    match irq::wait_for_delivery(150_000_000) {
-        Some(v) => {
-            let (served, lost, _pending) = irq::counts(KBD_OWNER).unwrap_or((0, 0, 0));
-            let mut b1 = [0u8; 18];
-            let mut b2 = [0u8; 18];
-            let mut b3 = [0u8; 20];
-            let mut b4 = [0u8; 20];
-            line(
-                out,
-                &[
-                    "[IRQ ] DELIVERED: vector 0x",
-                    strutil::hex(u64::from(v), &mut b1),
-                    " (armed 0x",
-                    strutil::hex(u64::from(vector), &mut b2),
-                    ") — EOI'd, mailbox served=",
-                    strutil::dec(served, &mut b3),
-                    " lost=",
-                    strutil::dec(lost, &mut b4),
-                    " (the interrupt→domain chain, live)",
-                ],
-            );
-            true
-        }
-        None => {
-            line(
-                out,
-                &["[IRQ ] keyboard IRQ NOT delivered within the window — LOUD (proof failed)"],
-            );
-            false
-        }
+    // (1) the stale-edge drain: wait_for_delivery is SAFE here — the
+    // latched IRR delivers at the window's very first STI (its own
+    // loop-top log line), so it never reaches the mwait sleep; its
+    // [IDLE] line feeds the C0-window OR-proof.
+    let drain = crate::clock::ns_to_cycles(50_000_000).unwrap_or(1 << 27);
+    let _ = irq::wait_for_delivery(drain);
+    // (2) the real window: the wake-safe SPIN (the helper's doc is
+    // the why), 1.5 s TSC-bounded — the QMP driver polls its marker
+    // at 0.5 s granularity; a loaded TCG box needs the slack.
+    let window = crate::clock::ns_to_cycles(1_500_000_000).unwrap_or(1 << 31);
+    let delivered = spin_window_for(vector, window);
+    if !delivered {
+        line(
+            out,
+            &["[IRQ ] no IRQ1 delivery in this window (no key sent on this lane) — the chain stays armed; the pinned proof lives on the PS/2 lane"],
+        );
+        return false;
     }
+    let (served, lost, _pending) = irq::counts(KBD_OWNER).unwrap_or((0, 0, 0));
+    let mut b1 = [0u8; 18];
+    let mut b3 = [0u8; 20];
+    let mut b4 = [0u8; 20];
+    line(
+        out,
+        &[
+            "[IRQ ] DELIVERED: vector ",
+            strutil::hex(u64::from(vector), &mut b1),
+            " — the key's own IRQ1 edge, EOI'd, mailbox served=",
+            strutil::dec(served, &mut b3),
+            " lost=",
+            strutil::dec(lost, &mut b4),
+            " (the interrupt→domain chain, live)",
+        ],
+    );
+    // (3) the break-code release: the send-key hold time is 300 ms —
+    // a 600 ms spin absorbs the break's edge here, silently, so
+    // nothing latches past this step.
+    let release = crate::clock::ns_to_cycles(600_000_000).unwrap_or(1 << 31);
+    let _ = spin_window_for(vector, release);
+    true
 }
