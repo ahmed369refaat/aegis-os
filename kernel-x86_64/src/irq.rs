@@ -201,6 +201,15 @@ pub fn deliver(vector: u8) {
     if _dev_tag == crate::tty::TTY_OWNER {
         crate::tty::drain_uart();
     }
+    // Phase 4 (item 11's completion): the keyboard's own bottom half
+    // — the 8042's output buffer drains, decodes, and feeds the SAME
+    // TTY ring the serial RX uses, RIGHT HERE at delivery time. The
+    // vector stays armed for the whole session, so every keystroke
+    // after the boot probe lands in console-in without any polling
+    // loop: the shell is keyboard-driven from this line on.
+    if _dev_tag == crate::drvstack::irq::KBD_OWNER {
+        crate::drvstack::kbd::irq_bottom_half();
+    }
     let slot = &SLOTS[(vector - DEVICE_VECTOR_BASE) as usize];
     bump_mailbox(slot);
     LAST_DELIVERED.store(vector, Ordering::SeqCst);

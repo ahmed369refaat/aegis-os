@@ -63,5 +63,13 @@ print("qmp-drive: screen captured", flush=True)
 if not wait_marker("[KBD] armed"):
     sys.exit("kernel never armed the keyboard poll")
 cmd("send-key", {"keys": [{"type": "qcode", "data": "a"}], "hold-time": 300})
-s.close()
 print("qmp-drive: key sent", flush=True)
+# Phase 4 (the text console): the console arms at the END of the
+# driver phase — wait for its marker, let the banner settle, and
+# capture the text plane for the pixel check.
+if not wait_marker("[GFX2] text console"):
+    sys.exit("kernel never armed the text console")
+time.sleep(1.0)
+cmd("screendump", {"filename": "/tmp/screen2.ppm"})
+print("qmp-drive: text screen captured", flush=True)
+s.close()

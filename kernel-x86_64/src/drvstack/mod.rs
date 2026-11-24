@@ -21,10 +21,12 @@ pub(crate) mod testharness;
 mod acpi;
 mod ahci;
 mod broker;
+pub(crate) mod console;
 mod e1k;
 mod ext2;
 mod fat32;
-mod irq;
+pub(crate) mod irq;
+pub(crate) mod kbd;
 mod legacy;
 mod netutil;
 mod nvme;
@@ -143,6 +145,34 @@ pub fn driver_stack_step<const N: usize>(
                 legacy::gfx_step(out, &inv);
                 legacy::ps2_step(out);
                 legacy::rtc_step(out);
+                // The driver phase's LAST step: the text console arms
+                // (the splash stayed on screen through the whole phase
+                // so the QMP screendump could capture it; from here
+                // the plane is the user's screen).
+                if console::init_pending() {
+                    // The body's first line (write_str's live target on
+                    // the boot build): the armed marker itself, ON the
+                    // user's screen.
+                    console::write_str("console armed — ring-3 output mirrors here\n");
+                    let (cells, scrolls) = console::stats();
+                    let mut b1 = [0u8; 20];
+                    let mut b2 = [0u8; 20];
+                    line(
+                        out,
+                        &[
+                            "[GFX2] text console: 80x30 cells live, banner ",
+                            strutil::dec(cells, &mut b1),
+                            " cells, ",
+                            strutil::dec(scrolls, &mut b2),
+                            " scrolls — ring-3 stdout mirrors here",
+                        ],
+                    );
+                } else {
+                    line(
+                        out,
+                        &["[GFX2] text console: no framebuffer named — skipped"],
+                    );
+                }
             } else {
                 line(out, &["[IOMMU] dma-drivers=0 (fail-closed: no broker)"]);
             }

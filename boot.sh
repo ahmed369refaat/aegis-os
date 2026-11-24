@@ -654,6 +654,21 @@ grep -qF "(virtio-blk) → dom" "$LOG" || { echo "VERIFY FAIL: the virtio-blk cl
     if ! python3 "$(dirname "$0")/scripts/check_screen.py" /tmp/screen.ppm; then
       ok=0
     fi
+    # Phase 4 (the text console): the SECOND capture — the banner's
+    # glyphs, pixel-exact, on the 80x30 double-buffered text plane.
+    if [ ! -s /tmp/screen2.ppm ] || ! python3 "$(dirname "$0")/scripts/check_screen.py" /tmp/screen2.ppm --text; then
+      ok=0
+    fi
+    # The keyboard round trip's new shape: the decoded BYTE in the
+    # console-in ring (the IRQ bottom half fed it).
+    grep -qaE "scancode decoded: byte 0x[0-9a-fx]+ \('a'\) in the console-in ring" "$LOG" || {
+      echo "VERIFY FAIL: the keyboard's decoded byte never reached the ring"
+      ok=0
+    }
+    grep -qa "\[GFX2\] text console: 80x30 cells live" "$LOG" || {
+      echo "VERIFY FAIL: the text console marker missing"
+      ok=0
+    }
   fi
   if [ "$ok" = 1 ]; then
     echo "BOOT VERIFY: PASS"

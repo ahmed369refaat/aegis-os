@@ -2188,12 +2188,18 @@ mod exec {
         if crate::hw::smap_active() {
             crate::hw::stac();
         }
-        let written = crate::mm::user_range::copy_user_bytes(
-            buf,
-            len,
-            &memops::read_u8_va,
-            serial::write_byte,
-        );
+        // Phase 4 (the text console): the USER's console output
+        // mirrors to the framebuffer text plane (the user's screen)
+        // alongside the serial — a no-op before console::init named
+        // the plane. The kernel's own log stays serial-only (the
+        // console is the user's screen, not a second copy of the
+        // boot log — and mirroring the log would add hundreds of
+        // scrolls to every boot).
+        let sink = |b: u8| {
+            serial::write_byte(b);
+            crate::drvstack::console::write_byte(b);
+        };
+        let written = crate::mm::user_range::copy_user_bytes(buf, len, &memops::read_u8_va, sink);
         if crate::hw::smap_active() {
             crate::hw::clac();
         }

@@ -128,6 +128,13 @@ pub(crate) fn gfx_step(out: &mut dyn FnMut(&str), inv: &crate::pci::Inventory) {
             "; bands+checker+AEGIS drawn",
         ],
     );
+    // Phase 4, item 13's second slice: the TEXT CONSOLE arms at the
+    // END of the driver phase (console::init_pending, called by the
+    // stack's sequencing) — the pattern above must stay on screen
+    // through the storage/network steps so the QMP screendump at THIS
+    // marker captures it; a console armed here would blank the splash
+    // before the camera fires.
+    crate::drvstack::console::set_pending_fb(fb);
 }
 
 /// Phase 2: the keyboard. Bring the i8042 up (flush, self-test,
@@ -167,36 +174,55 @@ pub(crate) fn ps2_step(out: &mut dyn FnMut(&str)) {
     // ADR-0019: the wait IS the delivery window — the QMP driver fires
     // the key at the marker above, the press arrives MID-WINDOW, and
     // its IRQ1 delivers through the IOAPIC → broker chain (MWAIT
-    // sleeps until the delivery's store wakes the armed line). The
-    // scancode itself waits in the 8042's output buffer, read after.
+    // sleeps until the delivery's store wakes the armed line).
     crate::drvstack::irq::keyboard_delivery_step(out);
-    // Then the scancode: a short bounded poll — the byte is buffered
-    // in the controller's output buffer the moment the IRQ fired.
+    // THE RING IS THE PROOF NOW (item 11's completion): the delivery's
+    // bottom half (irq::deliver → kbd::irq_bottom_half) drains the
+    // 8042, DECODES the set-1 pair, and pushes the byte into the same
+    // TTY ring the serial RX feeds — the whole path, host key to
+    // console-in. Wait for the decoded byte to appear in the ring
+    // (bounded); the fallback below covers a machine whose vector
+    // chain differs (the byte still sits in the output buffer).
     let budget = 150_000_000u64; // bounded: no infinite spin
     let mut spins = 0u64;
-    let mut got: Option<u8> = None;
-    while spins < budget {
+    while crate::tty::buffered() == 0 && spins < budget {
         if crate::hw::inb(0x64) & 1 != 0 {
-            got = Some(crate::hw::inb(0x60));
-            break;
+            // The fallback: decode the buffered byte here (the same
+            // pure function the bottom half runs).
+            let sc = crate::hw::inb(0x60);
+            if let Some(b) = crate::drvstack::kbd::feed(sc) {
+                let _ = crate::tty::push(b);
+                break;
+            }
         }
         spins += 1;
     }
-    match got {
-        Some(sc) => {
-            let mut h = [0u8; 18];
-            line(
-                out,
-                &[
-                    "[KBD2] scancode ",
-                    strutil::hex(u64::from(sc), &mut h),
-                    " received (the QMP send-key round trip)",
-                ],
-            );
-        }
-        None => {
-            line(out, &["[KBD] no key arrived within the poll budget"]);
-        }
+    let mut got: [u8; 1] = [0];
+    let decoded = if crate::tty::drain(&mut got) == 1 {
+        got[0]
+    } else {
+        0
+    };
+    if decoded != 0 {
+        let mut h = [0u8; 18];
+        let chb = [decoded];
+        let ch: &str = if (0x20..0x7F).contains(&decoded) {
+            core::str::from_utf8(&chb).unwrap_or("?")
+        } else {
+            "ctrl"
+        };
+        line(
+            out,
+            &[
+                "[KBD2] scancode decoded: byte 0x",
+                strutil::hex(u64::from(decoded), &mut h),
+                " ('",
+                ch,
+                "') in the console-in ring — the QMP send-key round trip",
+            ],
+        );
+    } else {
+        line(out, &["[KBD] no key arrived within the poll budget"]);
     }
     // THEN the real scancode-set negotiation (0xF0/0x02 → ACK 0xFA)
     // — after the capture, so the delivery path stays exactly the
