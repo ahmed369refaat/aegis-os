@@ -692,7 +692,7 @@ mod tests {
         FB.store(0x1000, Ordering::Relaxed);
         // A newline per body row, then one more: 29 newlines total,
         // one scroll (the 29th fires at the bottom row).
-        for r in 0..(ROWS - BODY_FIRST) {
+        for _r in 0..(ROWS - BODY_FIRST) {
             write_byte(b'\n');
         }
         assert_eq!(SCROLLS.load(Ordering::Relaxed), 1);

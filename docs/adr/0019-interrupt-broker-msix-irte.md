@@ -187,3 +187,23 @@ the console-in ring (the tty ring's per-byte source tag — the old
 untagged capture could eat a serial byte and claim a round trip with
 it). The pin lives on the dedicated `--verify-ps2` lane, whose
 machine has no USB keyboard, so send-key has exactly one target.
+
+
+## K19 addendum — the message DELIVERS; the round-one silence was ours
+
+The message-signaled interrupt is live end-to-end, both formats:
+`[MSIX] DELIVERED` is pinned on the q35 lane (compat) and the IR
+lane (remapped through the device's IRTE). The round-one silence —
+"the machinery is proven but the message never lands" — was a driver
+bug, not a QEMU limitation: the queues' MSI-X vectors were never
+BOUND. QEMU's modern virtio-pci sends a message for a completion
+only if the driver wrote the queue's `queue_msix_vector` (and the
+config's `config_vector`); unwritten, they stay VIRTIO_MSI_NO_VECTOR
+and no completion ever fires, however the table is programmed. The
+step now binds config→entry 0, RX→entry 1, TX→entry 2 BEFORE
+DRIVER_OK (the queue's notifier setup runs then), reading each grant
+back (0xFFFF is a refusal — fail-closed), and the DHCP completions'
+messages deliver through the bounded spin window, EOI'd and counted
+in the broker's mailbox. The teardown reverses it in order: the
+capability off (no message can land on a vector about to be
+unowned), the mailbox drained, the vector released.

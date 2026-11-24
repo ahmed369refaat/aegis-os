@@ -34,6 +34,7 @@ mod pci;
 mod persist;
 mod vballoon;
 mod vblk;
+mod vblkdom;
 mod vcon;
 mod vnet;
 mod vrng;
@@ -130,6 +131,13 @@ pub fn driver_stack_step<const N: usize>(
                 vcon::console_step(k, pool, out, &mut broker, &inv);
                 vballoon::balloon_step(k, pool, out, &mut broker, &inv);
                 vblk::virtio_step(k, pool, out, &mut broker, &inv);
+                // ADR-0017's first migration: the same device driven
+                // again as a RING-3 driver domain — the ring-0 half
+                // (the claim + the four registered core windows + the
+                // ring page's broker mapping) stays here, the driver
+                // logic runs at CPL=3 through SYS_DEVREG, and the read
+                // is verified against the ring-0 path's own bytes.
+                vblkdom::vblkdom_step(k, pool, out, &mut broker, &inv);
                 vnet::net_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_cross_device_probe_step(k, pool, out, &mut broker, &inv);

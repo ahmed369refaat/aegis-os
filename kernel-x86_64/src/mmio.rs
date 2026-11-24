@@ -82,6 +82,7 @@ pub(crate) trait MmioBus {
     fn volatile_read64(&self, pa: u64) -> u64;
     fn volatile_write64(&self, pa: u64, v: u64);
     fn volatile_read16(&self, pa: u64) -> u16;
+    fn volatile_write16(&self, pa: u64, v: u16);
 
     /// Read a 32-bit register at `off`; `None` = out-of-window refusal.
     fn read32(&self, off: u64) -> Option<u32> {
@@ -123,6 +124,21 @@ pub(crate) trait MmioBus {
             return None;
         }
         Some(self.volatile_read16(self.window().base() + off))
+    }
+
+    /// Write a 16-bit register at `off` — the virtio common config is
+    /// full of them (QUEUE_SEL/SIZE/ENABLE, the MSI-X vector grants),
+    /// and the notify doorbell is `iowrite16` by definition (ADR-0016:
+    /// a 4-byte kick is split into two dispatches); `false` = refused.
+    #[allow(dead_code)] // the release path reaches the volatile
+                        // primitives through the device core's serve;
+                        // this wrapper is the IpcMmio/host-test surface
+    fn write16(&self, off: u64, v: u16) -> bool {
+        if !self.window().contains(off, 2) {
+            return false;
+        }
+        self.volatile_write16(self.window().base() + off, v);
+        true
     }
 
     /// Read a single register byte (xHCI's CAPLENGTH lives at byte 0
@@ -180,6 +196,9 @@ macro_rules! impl_bus {
             }
             fn volatile_read16(&self, pa: u64) -> u16 {
                 memops::read_u16(pa)
+            }
+            fn volatile_write16(&self, pa: u64, v: u16) {
+                memops::write_u16(pa, v)
             }
         }
     };
@@ -263,6 +282,9 @@ mod tests {
         fn volatile_read16(&self, _pa: u64) -> u16 {
             self.reads.set(self.reads.get() + 1);
             0
+        }
+        fn volatile_write16(&self, _pa: u64, _v: u16) {
+            self.writes.set(self.writes.get() + 1);
         }
     }
 

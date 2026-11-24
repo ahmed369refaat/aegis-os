@@ -1,5 +1,43 @@
 # Changelog
 
+## [Unreleased] — the K19 round: MSI-X delivery proven, virtio-blk migrated to a ring-3 driver domain, and two audit finds fixed
+
+- **MSI/MSI-X messages DELIVER (ADR-0019 round two)** — both formats,
+  pinned on live lanes. The round-one silence was the driver's own:
+  the queues' vectors were never BOUND (`queue_msix_vector` /
+  `config_vector` unwritten), so no completion ever fired a message.
+  The step now binds config→entry 0, RX→entry 1, TX→entry 2 before
+  DRIVER_OK with each grant read back; the DHCP completions' messages
+  land through the broker (`[MSIX] DELIVERED` on q35 compat + the IR
+  lane's remapped format); teardown is disable → drain → release.
+- **ADR-0017's first migration: virtio-blk runs as a RING-3 driver
+  domain.** SYS_DEVREG (syscall 33) routes each register access to
+  the calling domain's registered core — the routing is the
+  capability; the core window-checks, counts, and after four
+  refusals CLOSES the channel (the quarantine). The blob
+  (examples/ring3-vblk) does the whole handshake + queue setup +
+  read at CPL=3 (23 ops, 0 refused); its data page doubles as the
+  broker-mapped ring page; the read is verified byte-identical to
+  the ring-0 path's own read of the same sector; the rogue domain's
+  containment is pinned (`[VBLKD] rogue driver domain contained`).
+- **xHCI EP-type constants were spec-wrong (found by a host test
+  that had been failing UNNOTICED)**: EP_CONTROL=7/EP_INTERRUPT_IN=6
+  → 4/7, pinned against QEMU's own EPType enum (ref/hcd-xhci.c) and
+  the spec; QEMU's loose direction dispatch (`in_xfer = type>>2`)
+  had silently tolerated the swap, while EP0 ran the interrupt path
+  and the HID pipe the bulk path. The lane re-proven green.
+- **A gate gap, closed**: `cargo test`'s default members never
+  included the kernel crate — its 316 host tests never ran in any
+  gate (the failing xHCI test was the tell). The gate is now
+  `cargo test --workspace` (385 + 318).
+- virtio-net TX (item 2): egress was already proven on both lanes;
+  the first-kick stall is now characterized from measured evidence
+  (drivers.md) with the bounded single re-kick documented; the stale
+  e1k "no egress" checklist row is corrected to the measured truth.
+- Infra: the sandbox's QEMU runtime restored durably
+  (tools/qemu-root + LD_LIBRARY_PATH) after the recycle lost the
+  system libs; 6 GB of stale lane logs + a 5.9 GB diag trace cleaned.
+
 ## [Unreleased] — the K18 round: the PS/2 proof made honest (source tags, a dedicated lane) + the shell lane's real root cause fixed
 
 - **The shell lane's `? cho` root cause, found and fixed**: the PS/2

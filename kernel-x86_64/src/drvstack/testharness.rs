@@ -130,6 +130,13 @@ impl MmioBus for FakeBus {
     fn volatile_read16(&self, pa: u64) -> u16 {
         self.volatile_read32(pa) as u16
     }
+    fn volatile_write16(&self, pa: u64, v: u16) {
+        // a 16-bit write merges into the logged dword: read-modify
+        // the script bus's own record so a subsequent read sees it.
+        let off = pa - self.win.base();
+        let cur = self.write_log.borrow().get(&off).copied().unwrap_or(0);
+        self.volatile_write32(pa, (cur & !0xFFFF) | u32::from(v));
+    }
 }
 
 /// The minimal honest DmaProt: a set of live runs with a region

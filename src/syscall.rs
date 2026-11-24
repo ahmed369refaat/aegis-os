@@ -166,6 +166,20 @@ pub const SYS_PIPE_WRITE: u8 = 31;
 /// names + count, not dirent64 structs.
 pub const SYS_LISTDIR: u8 = 32;
 
+/// devreg(op, off, len, val, region) — ADR-0017's ring-3 driver
+/// channel: ONE device-register access as a message, routed to the
+/// CALLING domain's registered core (the routing is the capability —
+/// no domain can name another's device). `op`: 0=read, 1=write;
+/// `region` 0..3 selects one of the domain's registered windows
+/// (common/notify/isr/device-config for virtio); the core
+/// window-checks the offset and width itself, counts what it serves
+/// and refuses, and after enough refusals stops serving the channel
+/// (the quarantine). The read returns the register value; a served
+/// write returns 0; every refusal is `u64::MAX` (no plausible
+/// register value on this bus family). Internal nr only — not a
+/// Linux ABI number.
+pub const SYS_DEVREG: u8 = 33;
+
 pub const SYS_EXIT: u8 = 63;
 
 /// Number of syscall slots (mask width).

@@ -12,8 +12,8 @@
 
 use crate::capability::Rights;
 use crate::syscall::{
-    SyscallMask, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK,
-    SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY,
+    SyscallMask, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_DEVREG, SYS_DUP, SYS_EXEC, SYS_EXIT,
+    SYS_FORK, SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY,
     SYS_IPC_SEND, SYS_KILL, SYS_LISTDIR, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP,
     SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_READ,
     SYS_SCHED_YIELD, SYS_SIGACTION, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
@@ -215,31 +215,22 @@ pub const fn parser_profile() -> DomainProfile {
     }
 }
 
-/// Device driver domain: controlled by a vendor, still untrusted to the kernel.
+/// Device driver domain (ADR-0017's shape, v2): the whole surface is
+/// the device-register channel — `SYS_DEVREG`, routed to the domain's
+/// OWN registered core, window-checked — plus the exit. No file I/O,
+/// no IPC, no ioctl: the MMIO window and the broker-mapped frames of
+/// its own domain are literally everything the driver can reach.
+/// The degraded tier drops the channel and keeps the exit: a
+/// tightened driver can always stop cleanly.
 pub const fn driver_profile() -> DomainProfile {
     DomainProfile {
         name: "driver",
-        syscalls: SyscallMask::from_bits(
-            (1u64 << SYS_READ)
-                | (1u64 << SYS_WRITE)
-                | (1u64 << SYS_IOCTL)
-                | (1u64 << SYS_IPC_SEND)
-                | (1u64 << SYS_IPC_RECV)
-                | (1u64 << SYS_IPC_CALL)
-                | (1u64 << SYS_IPC_RECV_WAIT)
-                | (1u64 << SYS_IPC_REPLY)
-                | (1u64 << SYS_IPC_GRANT)
-                | (1u64 << SYS_EXIT),
-        ),
-        // Degraded driver: IOCTL is the whole point — it stays; the
-        // side channels (IPC) drop.
-        degraded_syscalls: SyscallMask::from_bits(
-            (1u64 << SYS_READ) | (1u64 << SYS_WRITE) | (1u64 << SYS_IOCTL) | (1u64 << SYS_EXIT),
-        ),
-        quota_pages: 128,
-        base_rights: Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
+        syscalls: SyscallMask::from_bits((1u64 << SYS_DEVREG) | (1u64 << SYS_EXIT)),
+        degraded_syscalls: SyscallMask::from_bits(1u64 << SYS_EXIT),
+        quota_pages: 16,
+        base_rights: Rights::NONE,
         sensitivity: 50,
-        max_children: 2,
+        max_children: 0,
     }
 }
 
@@ -360,8 +351,8 @@ pub const fn app_profile() -> DomainProfile {
 mod degraded_tests {
     use super::*;
     use crate::syscall::{
-        SYS_CLOSE, SYS_DUP, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_IPC_SEND, SYS_MMAP,
-        SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_WRITE,
+        SYS_CLOSE, SYS_DUP, SYS_EXIT, SYS_IOCTL, SYS_IPC_RECV, SYS_MMAP, SYS_NET_RECV,
+        SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_WRITE,
     };
 
     /// F8: every profile's degraded surface is a STRICT subset of its
@@ -413,12 +404,23 @@ mod degraded_tests {
             .degraded_syscalls
             .is_allowed(SYS_DUP)
             .unwrap());
+        // The v2 driver is the DELIBERATE exception: its whole purpose
+        // (the DEVREG channel) is exactly what Tighten removes — a
+        // tightened driver is a STOPPED driver, the same containment
+        // the core's refusal ladder enforces from the device side. The
+        // old profile kept an ioctl stub that was never implemented;
+        // the v2 surface is DEVREG+EXIT, and the degraded tier keeps
+        // only the exit (the loop above already pinned that).
         assert!(
-            driver_profile()
+            !driver_profile()
                 .degraded_syscalls
-                .is_allowed(SYS_IOCTL)
+                .is_allowed(SYS_DEVREG)
                 .unwrap(),
-            "driver: its whole purpose"
+            "driver: Tighten stops the channel by design"
+        );
+        assert!(
+            !driver_profile().syscalls.is_allowed(SYS_IOCTL).unwrap(),
+            "driver v2: the ioctl stub is gone"
         );
         assert!(
             netd_profile()
@@ -505,7 +507,7 @@ mod degraded_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syscall::{SYS_NET_RECV, SYS_NET_SEND, SYS_SPAWN};
+    use crate::syscall::{SYS_IOCTL, SYS_NET_RECV, SYS_NET_SEND, SYS_SPAWN};
 
     const ALL_PROFILES: [DomainProfile; 4] = [
         service_profile(),
@@ -561,11 +563,24 @@ mod tests {
     }
 
     #[test]
-    fn driver_has_ioctl_but_no_spawn_or_net() {
+    fn driver_is_devreg_and_exit_only() {
         let p = driver_profile();
-        assert!(p.syscalls.is_allowed(SYS_IOCTL).unwrap());
-        assert!(!p.syscalls.is_allowed(SYS_SPAWN).unwrap());
-        assert!(!p.syscalls.is_allowed(SYS_NET_SEND).unwrap());
+        assert!(p.syscalls.is_allowed(SYS_DEVREG).unwrap());
+        assert!(p.syscalls.is_allowed(SYS_EXIT).unwrap());
+        // The old round-5 surface (read/write/ioctl/ipc) is gone: the
+        // MMIO window + the broker's own-domain frames are the whole
+        // surface a driver domain can reach.
+        for denied in [
+            SYS_IOCTL,
+            SYS_READ,
+            SYS_WRITE,
+            SYS_IPC_SEND,
+            SYS_SPAWN,
+            SYS_NET_SEND,
+            SYS_MMAP,
+        ] {
+            assert!(!p.syscalls.is_allowed(denied).unwrap());
+        }
     }
 
     #[test]

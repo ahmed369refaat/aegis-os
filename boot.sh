@@ -36,7 +36,7 @@ STUB_OBJ=target/stub.o
 IMAGE=target/aegis-boot.elf
 
 echo "==> [0/4] building the ring-3 example blobs (rustc --emit=obj + objcopy)"
-for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init; do
+for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init ring3-vblk ring3-rogue-drv; do
     rustc --edition 2021 --crate-type=lib --emit=obj \
           --target x86_64-unknown-none -O "examples/$b/src/lib.rs" \
           -o "target/$b.o"
@@ -192,14 +192,23 @@ case "${1:-}" in
       # self-test's stale IRQ1 edge, a false positive, now drained
       # before the window opens.)
       "[MSIX] armed: entries="  # ADR-0019: the NIC's MSI-X table pointed at a broker vector
-      # Round I: the message DELIVERY grep moved off both lanes — the
-      # machinery is proven (table programmed, read back unmasked,
-      # torn down clean, the kick queues real work, the window bounded
-      # and honest), but the message itself never lands (compat format
-      # on this lane, remapped on the IR lane): one open investigation,
-      # honestly recorded in the checklist instead of an aspirational
-      # grep. The line-interrupt chain above IS delivered and proven.
-      "[MSIX] disabled + vector released"  # the teardown discipline
+      # Round two: the DELIVERY grep is BACK — the round-one silence
+      # was never QEMU's: the queues' vectors were never BOUND
+      # (queue_msix_vector / config_vector unwritten), so no
+      # completion ever fired a message. The step now binds
+      # config→entry 0, RX→entry 1, TX→entry 2 BEFORE DRIVER_OK
+      # (grant read back), the DHCP completions fire real messages,
+      # and one delivers through the bounded window.
+      "[MSIX] DELIVERED: vector"  # the message-signaled interrupt, compat format on this lane
+      "[MSIX] disabled + vector released"  # the teardown discipline (disable → drain → release)
+      # ADR-0017's first migration (K19): the SAME virtio-blk driven
+      # again as a ring-3 driver domain — the register accesses are
+      # SYS_DEVREG messages through the windowed device core, the read
+      # is verified byte-identical to the ring-0 path's, and a rogue
+      # domain's channel is closed by the core's refusal ladder.
+      "[VBLKD] driver-domains=1"  # the migrated driver ran its whole proof at CPL=3
+      "[VBLKD] read sector 0 at CPL=3"  # byte-identical to the ring-0 path's read
+      "[VBLKD] rogue driver domain contained"  # the quarantine: a bad driver loses its device, the boot continues
       "[KBD2] negotiated scancode set 2, ack="  # the real 0xF0/0x02 exchange
       "[EXT2] hello.txt (inode 12, 17 bytes): \"HELLO-AEGIS-EXT2.\" ← read-only ext2 over AHCI"  # the mount LIVE (ADR-0014: the stale FIS was three driver bugs)
       "[FAT32] HELLO.ESP (cluster 3, 1200 bytes, 3 clusters): \"HEAD:AEGIS-FAT32:\"…\":TAIL-OK\" ← read-only FAT32 over AHCI"  # the ESP mount LIVE on the same port (GPT partition 2, the chain walk proven)
@@ -285,8 +294,10 @@ case "${1:-}" in
       "[E1K] teardown dom"  # the scoped, counted teardown
       "[MSIX] format: remapped"  # the message went through the IRTE, not compat
       "[MSIX] armed: entries="
-      # (the DELIVERED grep: see the base-lane comment — the message
-      # delivery is the open investigation, both formats, one item)
+      # Round two: the DELIVERY grep is live here too — the REMAPPED
+      # message lands through this device's IRTE (the vectors are
+      # bound before DRIVER_OK; see the q35 lane's comment).
+      "[MSIX] DELIVERED: vector"  # the message-signaled interrupt, remapped format
       "[MSIX] disabled + vector released"
       "cross-device DMA FAULTED (FSTS.PPF set)"  # the ADR-0018 negative probe still faults with IR on
     )

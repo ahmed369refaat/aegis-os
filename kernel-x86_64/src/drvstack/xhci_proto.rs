@@ -89,9 +89,17 @@ pub(crate) const ER_HOST_CONTROLLER: u32 = 37;
 pub(crate) const CC_SUCCESS: u32 = 1;
 pub(crate) const CC_SHORT_PACKET: u32 = 13;
 
-/// Endpoint context types (§6.2.3).
-const EP_CONTROL: u32 = 7;
-pub(crate) const EP_INTERRUPT_IN: u32 = 6;
+/// Endpoint context types (§6.2.3, the EP type field, bits [5:3] of
+/// the EP context's second dword). The values are pinned against
+/// QEMU's own EPType enum (ref: hcd-xhci.c — ET_CONTROL=4,
+/// ET_INTR_IN=7): the previous constants were misread as 7/6, which
+/// QEMU's loose direction dispatch (`in_xfer = type >> 2`) silently
+/// tolerated on the K17 lane, while the semantics were wrong (EP0
+/// ran the interrupt-in path, the HID pipe the bulk-in path). Found
+/// by the host test this round — and it had been failing unnoticed
+/// because `cargo test`'s default members never included this crate.
+const EP_CONTROL: u32 = 4;
+pub(crate) const EP_INTERRUPT_IN: u32 = 7;
 /// Context size, and context 1's offset (the slot); context n sits at
 /// `CTX_SLOT + CTX_SIZE * n`.
 const CTX_SIZE: u64 = 0x20;
@@ -932,7 +940,8 @@ mod tests {
         // xhci_init_epctx on the EP0 words.
         let d0 = read_u32(pa + 0x40);
         let d1 = read_u32(pa + 0x44);
-        assert_eq!((d1 >> 3) & 7, 7, "EP type control");
+        assert_eq!((d1 >> 3) & 7, 4, "EP type control (spec + QEMU ET_CONTROL)");
+        assert_eq!((d1 >> 3) & 7, EP_CONTROL, "…and the constant agrees");
         assert_eq!((d1 >> 1) & 3, 3, "CErr 3");
         assert_eq!(d1 >> 16, 64);
         assert_eq!(d1 & 0xFFFF, (3 << 1) | (4 << 3));

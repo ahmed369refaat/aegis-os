@@ -49,10 +49,10 @@ use aegis_os::syscall::gate;
 use aegis_os::syscall::Abi;
 #[cfg(not(test))]
 use aegis_os::syscall::{
-    SYSCALL_COUNT, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_IPC_CALL,
-    SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL,
-    SYS_LISTDIR, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_PIPE_READ, SYS_PIPE_WRITE,
-    SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
+    SYSCALL_COUNT, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_DEVREG, SYS_EXEC, SYS_EXIT, SYS_FORK,
+    SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND,
+    SYS_KILL, SYS_LISTDIR, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_PIPE_READ,
+    SYS_PIPE_WRITE, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
 };
 #[cfg(test)]
 use aegis_os::syscall::{
@@ -344,6 +344,10 @@ mod exec {
             Decision::Allowed if nr8 == SYS_IPC_CALL => sys_ipc_call(run, a1, a2),
             Decision::Allowed if nr8 == SYS_IPC_RECV_WAIT => sys_ipc_recv_wait(run, a1),
             Decision::Allowed if nr8 == SYS_IPC_REPLY => sys_ipc_reply(run, a1, a2),
+            // ADR-0017 round two: the ring-3 driver's register channel.
+            // One message, one window-checked access, routed to the
+            // CALLING domain's core — the routing is the capability.
+            Decision::Allowed if nr8 == SYS_DEVREG => sys_devreg(run, a1, a2, a3, _a4, _a5),
             Decision::Allowed if nr8 == SYS_IPC_GRANT => sys_grant_frames(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_PIPE_READ => sys_pipe_read(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_PIPE_WRITE => sys_pipe_write(run, a1, a2, a3),
@@ -1705,6 +1709,29 @@ mod exec {
     /// ring 3. The gate and the organic monitor accounting land in
     /// `dispatch`; the queue's bounded EAGAIN and the cap denial's
     /// -EPERM surface through the sysabi table.
+    /// devreg(op, off, len, val, region) — ADR-0017 round two: the
+    /// driver domain's register channel, routed to the CALLING
+    /// domain's registered core by `run.domain` (the routing IS the
+    /// capability — no domain can name another's device). All
+    /// device-side validation — width, window, the refusal ladder —
+    /// lives in the core (ipc_mmio), where every refusal is counted
+    /// for the monitor. The arm's own guard exists so a wide `len`
+    /// cannot launder through the u8 cast. Returns the read value, 0
+    /// for a served write, u64::MAX for every refusal.
+    fn sys_devreg(
+        run: &mut crate::sched::context::UserRun,
+        op: u64,
+        off: u64,
+        len: u64,
+        val: u64,
+        region: u64,
+    ) -> u64 {
+        if op > 1 || len > 8 || region > 3 {
+            return u64::MAX;
+        }
+        crate::ipc_mmio::devreg_serve(run.domain, region as u8, op as u8, off, len as u8, val)
+    }
+
     fn sys_ipc_send(run: &mut crate::sched::context::UserRun, channel: u64, len: u64) -> u64 {
         if channel > u32::MAX as u64 || len > u32::MAX as u64 {
             return (-EINVAL) as u64;

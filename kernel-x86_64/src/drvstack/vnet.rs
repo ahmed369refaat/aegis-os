@@ -234,6 +234,15 @@ pub(crate) fn net_step<const N: usize>(
     // F9e: rings mapped — now the device may DMA.
     crate::pci::enable_bus_master(dev);
 
+    // ── ADR-0019's ARM half, BEFORE DRIVER_OK: program the MSI-X
+    // table, enable the capability, and BIND the config + queue
+    // vectors — the binding must precede the queues going live, or
+    // the completions below fire nothing at all (the round-one
+    // silence's root cause; the marker story is in msix_arm_step).
+    // A refused arm degrades to the polling path: the DHCP round
+    // trip does not depend on the messages.
+    let msix = msix_arm_step(out, dev, &mmio, &mut session);
+
     // ── queue setup (selection precedes each setup — common-config
     // registers address the SELECTED queue) ──
     mmio.select_queue(0);
@@ -406,8 +415,15 @@ pub(crate) fn net_step<const N: usize>(
         }
         spins += 1;
     }
-    // Re-kick once (QEMU's TX bottom-half re-enables notifications
-    // when it finds the queue; a second kick re-triggers it).
+    // Re-kick ONCE, bounded: the first kick's dispatch can leave the
+    // posted chain unconsumed (measured with the trace on: the
+    // queue_notify lands, the avail ring is ready, zero translate and
+    // fault events, ISR clear — used.idx does not move; the guest side
+    // is proven by the common-config readback above, so the gap sits
+    // inside QEMU's TX scheduling and is not provable from the guest).
+    // A second kick reliably completes it — never a loop: a second
+    // failure prints the stall line below and degrades honestly to
+    // teardown (drivers.md, "The first TX kick").
     if crate::virtio::used_idx(tx_used) != want_tx {
         if !mmio.notify(1, n1) {
             line(
@@ -450,10 +466,11 @@ pub(crate) fn net_step<const N: usize>(
                 ")",
             ],
         );
-        // The guest side is proven (readback above); QEMU's TX
-        // bottom-half does not consume the posted chain — open item,
-        // evidence in the boot log. Fall through to teardown so the
-        // revoke path still runs with a live device attached.
+        // Both kicks exhausted: the guest side is proven (readback
+        // above; the trace evidence is in drivers.md's "first TX kick"
+        // note) and the chain sits unconsumed inside QEMU. Fall through
+        // to teardown so the revoke path still runs with a live device
+        // attached — honestly loud, never a hang.
         line(
             out,
             &["[VNET] TX: DISCOVER published+kicked (290 bytes, xid=0xa6515151) — QEMU did not consume it (open: TX bh)"],
@@ -537,53 +554,51 @@ pub(crate) fn net_step<const N: usize>(
         );
     }
 
-    // ── ADR-0019's message half: this NIC stops polling. QEMU's
-    // modern virtio-pci assigns table entry 0 to config changes and
-    // entry i+1 to queue i; every entry gets the broker vector, the
-    // kick that follows must arrive as a MESSAGE, and the teardown
-    // reverses the whole thing. With interrupt remapping live the
-    // message is the REMAPPED format through this device's IRTE.
-    msix_irq_step(
-        out,
-        dev,
-        &mmio,
-        n1,
-        &mut session,
-        tx_desc,
-        tx_buf,
-        tx_avail,
-        qs1,
-    );
+    // ── ADR-0019's message half: the completions above fired their
+    // MSI-X messages while the polls ran at IF=0 — they sit latched
+    // in the LAPIC's IRR. One bounded, interrupt-open window proves
+    // one landed as a MESSAGE (compat format here; remapped through
+    // this device's IRTE on the IR lane), then the teardown reverses
+    // the arm in order: disable → drain → release.
+    if let Some((vector, info)) = msix {
+        msix_message_step(out, dev, vector, &info);
+    }
 
     // ── teardown: revoke + scrub (the broker discipline) ──
     session.close(out);
 }
 
-/// The MSI-X slice (ADR-0019): point the NIC's MSI-X table at a
-/// broker-owned vector, enable the capability, kick the TX queue, and
-/// prove the delivery through the bounded window — the first
-/// message-signaled interrupt in the tree. Refuses closed (markers,
-/// no crash) at every step: no cap, malformed layout, broker refusal.
-/// Round I: the kick needs WORK — a notify on an idle queue never
-/// fires (the device interrupts on the used-ring update, and there is
-/// none), so the step queues one fresh TX first; the ring geometry
-/// rides in (the frames belong to the caller's session).
+/// The MSI-X ARM half (ADR-0019, round two): point the NIC's MSI-X
+/// table at a broker-owned vector, enable the capability, and BIND
+/// the interrupt vectors — the config-change interrupt to entry 0 and
+/// each queue to its own entry, through the common config's
+/// config_vector / queue_msix_vector registers, with the device's
+/// grant read back (a 0xFFFF grant is a refusal: fail-closed).
+///
+/// **The round-one silence's root cause, found live:** the step used
+/// to arm the table and never bind the queues — and QEMU's modern
+/// virtio-pci sends a message for a completion only if the queue's
+/// vector was WRITTEN (it stays VIRTIO_MSI_NO_VECTOR otherwise,
+/// whatever the table holds). Entries armed, cap enabled, work queued
+/// and even CONSUMED — the delivery window timed out every run. The
+/// binding must happen before the queues go live (their notifier
+/// setup runs at DRIVER_OK); the grant read-back means a silent
+/// refusal cannot hide.
+///
+/// Must run after the frames are broker-mapped and before
+/// setup_queue + DRIVER_OK. Returns the armed pair for the later
+/// message step; every failure refuses closed (loud markers, vector
+/// released) and the net driver keeps its polling path — the DHCP
+/// round trip does not depend on the messages.
 #[cfg(not(test))]
-#[allow(clippy::too_many_arguments)] // ring geometry rides in; a struct refactor is the ADR-0019 follow-up
-fn msix_irq_step<const N: usize>(
+fn msix_arm_step<const N: usize>(
     out: &mut dyn FnMut(&str),
     dev: &crate::pci::PciDev,
     mmio: &crate::virtio::MmioVirtio,
-    tx_notify_off: u16,
     session: &mut crate::session::DriverSession<'_, N, crate::arch::vtd::Vtd>,
-    tx_desc: u64,
-    tx_buf: u64,
-    tx_avail: u64,
-    tx_qsize: u16,
-) {
+) -> Option<(u8, crate::msi::MsixInfo)> {
     use crate::irq;
     use crate::msi;
-    use crate::virtio as v;
 
     // The broker vector this device's messages land on (domain: the
     // ADR-0018 domain the claim assigned — dev.dom).
@@ -592,7 +607,7 @@ fn msix_irq_step<const N: usize>(
             out,
             &["[MSIX] broker refused the NIC (table full or duplicate)"],
         );
-        return;
+        return None;
     };
     let Some(info) = msi::read_msix(dev) else {
         line(
@@ -600,8 +615,18 @@ fn msix_irq_step<const N: usize>(
             &["[MSIX] virtio-net carries no usable MSI-X cap — refusing closed"],
         );
         irq::release(VNET_OWNER);
-        return;
+        return None;
     };
+    // QEMU's modern layout: entry 0 = config changes, entry i+1 =
+    // queue i. A table without room for both queues refuses closed.
+    if info.table_size < 3 {
+        line(
+            out,
+            &["[MSIX] table too small to bind both queues — refusing closed"],
+        );
+        irq::release(VNET_OWNER);
+        return None;
+    }
     // The message pair: remapped through this device's IRTE when
     // interrupt remapping is live (the handle mirrors the broker slot
     // — one IRTE per vector, ADR-0019), classic compat format
@@ -613,7 +638,7 @@ fn msix_irq_step<const N: usize>(
         if !wrote {
             line(out, &["[MSIX] IRTE write refused — refusing closed"]);
             irq::release(VNET_OWNER);
-            return;
+            return None;
         }
         let mut h = [0u8; 20];
         line(
@@ -635,8 +660,9 @@ fn msix_irq_step<const N: usize>(
         );
         (msi::msi_addr(0), msi::msi_data(vector))
     };
-    // Program every entry (config + both queues — bounded by the
-    // table size, which read_msix already proved fits the BAR).
+    // Program every entry (config + both queues + the ctrl queue —
+    // bounded by the table size, which read_msix already proved fits
+    // the BAR).
     for i in 0..info.table_size {
         if !msi::program_entry(dev, &info, i, addr, data) {
             line(
@@ -645,13 +671,12 @@ fn msix_irq_step<const N: usize>(
             );
             msi::set_enable(dev, &info, false);
             irq::release(VNET_OWNER);
-            return;
+            return None;
         }
     }
     msi::set_enable(dev, &info, true);
-    // Read the control back: enabled, un-function-masked, the size we
-    // decoded (a silent cap write is the classic "why is nothing
-    // firing" bug — pinned here instead).
+    // Read the control back: enabled, un-function-masked (a silent cap
+    // write is the classic "why is nothing firing" bug — pinned).
     let mc = msi::message_control(dev, &info);
     if mc & msi::MSIX_ENABLE == 0 || mc & msi::MSIX_FUNC_MASK != 0 {
         line(
@@ -659,7 +684,32 @@ fn msix_irq_step<const N: usize>(
             &["[MSIX] enable write did not stick — refusing closed"],
         );
         irq::release(VNET_OWNER);
-        return;
+        return None;
+    }
+    // ── the round-two half: BIND the vectors (this was the silence) ──
+    // The config-change interrupt → entry 0; the grant must echo.
+    if mmio.set_config_vector(0) != 0 {
+        line(
+            out,
+            &["[MSIX] config vector binding refused (no grant) — refusing closed"],
+        );
+        msi::set_enable(dev, &info, false);
+        irq::release(VNET_OWNER);
+        return None;
+    }
+    // Queue 0 (RX) → entry 1, queue 1 (TX) → entry 2: selection
+    // addresses the queue's own register; each grant must echo.
+    for (queue, entry) in [(0u16, 1u16), (1u16, 2u16)] {
+        mmio.select_queue(queue);
+        if mmio.set_queue_vector(entry) != entry {
+            line(
+                out,
+                &["[MSIX] queue vector binding refused (no grant) — refusing closed"],
+            );
+            msi::set_enable(dev, &info, false);
+            irq::release(VNET_OWNER);
+            return None;
+        }
     }
     let (a, d, masked) = msi::read_entry(dev, &info, 0).unwrap_or((0, 0, true));
     let mut b1 = [0u8; 18];
@@ -680,27 +730,34 @@ fn msix_irq_step<const N: usize>(
             if masked { " MASKED?!" } else { " unmasked" },
         ],
     );
+    Some((vector, info))
+}
 
-    // Queue one fresh TX so the kick has WORK: the used-ring update
-    // (not the network) is the event that fires entry 2 (vq 1's
-    // vector) — round I: the bare notify on the drained queue never
-    // fired, and the window honestly timed out every run.
-    v::write_net_header(tx_buf);
-    v::write_desc(tx_desc, tx_buf, v::NET_HDR_LEN + 60, 0, 0);
-    let idx = v::read_u16_pa(tx_avail + 2);
-    v::write_u16_pa(v::avail_slot_addr(tx_avail, idx % tx_qsize), 0);
-    v::write_u16_pa(tx_avail + 2, idx.wrapping_add(1));
-    mmio.notify(1, tx_notify_off);
-    // The budget is TSC cycles; QEMU TCG's TSC advances with the
-    // emulated instruction stream, so 400M cycles was ten-plus
-    // wall-clock minutes and the LANE timed out before the window's
-    // own honesty could print. 40M is ~13ms on real iron at 3 GHz
-    // (generous for a device that answers in microseconds) and under
-    // a minute under TCG. The SPIN variant, deliberately: a silent
-    // device is a live outcome here and the mwait window would sleep
-    // through its own deadline (see wait_for_delivery_spin).
+/// The MSI-X MESSAGE half (ADR-0019, round two): one bounded,
+/// interrupt-open window that proves a message from THIS device
+/// landed as a broker delivery — the first message-signaled interrupt
+/// in the tree — then the teardown reverses the arm IN ORDER: the
+/// capability OFF first (no message can then land on a vector about
+/// to be unowned), the mailbox DRAINED (anything latched from the
+/// completions), the broker slot RELEASED last.
+#[cfg(not(test))]
+fn msix_message_step(
+    out: &mut dyn FnMut(&str),
+    dev: &crate::pci::PciDev,
+    vector: u8,
+    info: &crate::msi::MsixInfo,
+) {
+    use crate::irq;
+    use crate::msi;
+
+    // The completions of the DHCP round trip fired their messages
+    // while the polls ran at IF=0 — they sit latched in the LAPIC's
+    // IRR and deliver at this window's first STI. A silent device is
+    // still a live outcome: the SPIN window (a sleeping mwait never
+    // returns to check its own deadline — see wait_for_delivery_spin)
+    // and the TSC budget bound it honestly.
     match irq::wait_for_delivery_spin(40_000_000) {
-        Some(v) => {
+        Some(v) if v == vector => {
             let (served, lost, _pending) = irq::counts(VNET_OWNER).unwrap_or((0, 0, 0));
             let mut c1 = [0u8; 18];
             let mut c2 = [0u8; 18];
@@ -720,6 +777,19 @@ fn msix_irq_step<const N: usize>(
                 ],
             );
         }
+        Some(v) => {
+            // Another owner's vector delivered inside the window —
+            // not this device's proof. Loud, no DELIVERED claim.
+            let mut c1 = [0u8; 18];
+            line(
+                out,
+                &[
+                    "[MSIX] message NOT delivered within the window — another owner's vector ",
+                    strutil::hex(u64::from(v), &mut c1),
+                    " delivered instead — LOUD (proof failed)",
+                ],
+            );
+        }
         None => {
             line(
                 out,
@@ -728,11 +798,19 @@ fn msix_irq_step<const N: usize>(
         }
     }
 
-    // Teardown: the capability off, the vector released — the same
-    // close discipline as every other driver step.
-    msi::set_enable(dev, &info, false);
+    // Teardown: disable → drain → release, in that order.
+    msi::set_enable(dev, info, false);
+    let latched = irq::drain(VNET_OWNER).unwrap_or(0);
     irq::release(VNET_OWNER);
-    line(out, &["[MSIX] disabled + vector released (teardown)"]);
+    let mut b = [0u8; 20];
+    line(
+        out,
+        &[
+            "[MSIX] disabled + vector released (teardown; drained ",
+            strutil::dec(latched, &mut b),
+            " latched)",
+        ],
+    );
 }
 
 // ── the classic PC devices: screen (VBE on QEMU's std VGA), keyboard

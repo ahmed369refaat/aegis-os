@@ -83,9 +83,9 @@ comments and tests:
 
 | Driver | Status | Proof |
 | --- | --- | --- |
-| virtio-blk | **complete, enforced** | sector read status=OK; write+read-back round trip; **enforcement probe PPF=yes, SLPTE absent after unmap (ADR-0014)**; teardown revoke+scrub |
+| virtio-blk | **complete, enforced, MIGRATED to a ring-3 driver domain (ADR-0017, K19)** | sector read status=OK; write+read-back round trip; **enforcement probe PPF=yes, SLPTE absent after unmap (ADR-0014)**; teardown revoke+scrub — AND the whole bring-up + read runs at CPL=3 through the SYS_DEVREG channel (the windowed device core; 23 ops served, 0 refused on the lane), the read byte-identical to the ring-0 path's, with the rogue domain's channel closed by the core's refusal ladder |
 | AHCI/SATA (ich9, q35) | **LIVE incl. ext2 mount** | ABAR/GHC/PI read, port-0 SIG=0x101, IDENTIFY with the REAL serial (QM000001), **the ext2 mount runs: superblock → root dir → hello.txt read through the IOMMU (ADR-0014)** |
-| virtio-net | **complete** | handshake, MAC/link, both queues, 8 broker frames, **full DHCP DISCOVER→slirp→OFFER round trip through the IOMMU (ADR-0014)**, teardown |
+| virtio-net | **complete, MSI-X delivery live** | handshake, MAC/link, both queues, 8 broker frames, **full DHCP DISCOVER→slirp→OFFER round trip through the IOMMU (ADR-0014)** — real egress; **the first message-signaled interrupt in the tree (ADR-0019 round two): the completions' MSI-X messages DELIVER once the queues' vectors are BOUND before DRIVER_OK** — compat format on q35, remapped through the IRTE on the IR lane; teardown (disable → drain → release) |
 | e1000 | **complete** | rings programmed, **full DHCP round trip through the IOMMU** AND in identity mode on the control lane, teardown |
 | IOMMU isolation | **per-device (ADR-0018), proven live** | the e1000's cross-device DMA to a vnet-only page faults on the lane — on the q35 lane AND the IR lane (K18: the e1000 joined the IR machine, so the negative probe is producible there too) |
 | NVMe | **fully live (F11): identify + I/O qpair + LBA read through the IOMMU** | CAP/version/RDY, identify data lands, CreateIoCq/SQ pass, read LBA0 completes |
@@ -95,7 +95,6 @@ comments and tests:
 | RTC | **live** | MC146818, BCD, host time |
 | HPET | **live** (item 15 first slice) | table→block @0xFED00000, 100 MHz period, main counter enabled, delta>0 — the calibration source |
 | ACPI MADT/MCFG (item 14) | **parsed** | 1 LAPIC + 1 IOAPIC @0xFEC00000; ECAM base 0xB0000000 bus 0..255 |
-| USB enumeration / HID | **not started** | next xHCI slice: TRB rings, address device, interrupt-IN |
 | virtio-gpu / e1000-data / NVMe-data | **blocked on the device-DMA cluster** (below) | |
 | Block layer + ext2 (item 8) | **mounted, file read live** | the image builder (scripts/mkext2.py) + the full kernel parser run on the LIVE AHCI port: superblock ok (magic 0xef53, inode_size=128) → root inode → hello.txt read ("HELLO-AEGIS-EXT2.") — on BOTH the IOMMU lane and the no-IOMMU control lane (the historical "second-command no-op" was three driver bugs; see ADR-0014 below) |
 
@@ -135,6 +134,17 @@ Two follow-on bugs the now-working DMA exposed:
   (hw/net/virtio-net.c:646), mergeable-RX or not. Measured from the
   packet capture: the device skipped 12, the wire frame came out
   shifted by two (dst read ffffffff5254, len 288 = 300−12).
+- **The first TX kick can leave the posted chain unconsumed**
+  (measured with the trace on: the `queue_notify` dispatch lands, the
+  avail ring is ready, zero translate/fault events, ISR clear — and
+  `used.idx` does not move; the guest side is proven by the common-
+  config readback, so the gap is inside QEMU's TX scheduling and not
+  provable from the guest). Exactly ONE bounded re-kick completes it
+  every run (never a loop — vnet.rs; a second failure prints the
+  stall line and degrades honestly to teardown). The e1000 has no
+  such behavior: its descriptor-fetch TX has no kick semantics at
+  all, which is why the control lane's pcap is the cleaner egress
+  proof.
 
 **Result**: both NICs now complete the full DHCP
 DISCOVER→slirp→OFFER round trip **through the IOMMU** on the main

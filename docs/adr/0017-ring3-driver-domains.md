@@ -117,3 +117,45 @@ architecture is for.
   registers have side effects (RW1C status bits, doorbells); an
   unsynchronized writable mapping reintroduces exactly the
   device-steers-the-kernel class ADR-0016 closed.
+
+
+## K19 addendum — the first migration, PROVEN on the lane
+
+The ring-3 slice landed: **virtio-blk is the first migrated
+driver**. The transport is `SYS_DEVREG` (syscall 33): one register
+access = one message (op/off/len/val/region), routed to the CALLING
+domain's registered core by `run.domain` — the routing IS the
+capability (no domain can name another's device; a domain with no
+core gets the refusal sentinel, not a wildcard). The core
+(ipc_mmio's registry) checks offset AND width against the same
+validated windows `BarMmio` gives a ring-0 driver, counts what it
+serves and refuses, and after four refusals STOPS SERVING that
+domain — the "device core stops serving its channel" quarantine,
+implemented where the domain can neither forge nor suppress it.
+
+The domain image (`examples/ring3-vblk`) is a flat blob like every
+ring-3 example, spawned with the driver profile (DEVREG + EXIT,
+nothing else). Its data page doubles as the RING page: qsize 8 keeps
+the header, three descriptors, both rings, the 512-byte buffer and
+the status byte inside one 4 KiB page — the same page the spawn maps
+user-side and the broker maps device-side, so the confused-deputy
+surface is exactly one page. The blob does the whole modern
+handshake (features negotiated against VERSION_1|ACCESS_PLATFORM,
+grants read back), the queue setup, the 3-descriptor read chain, the
+iowrite16 kick, and the bounded used-ring poll — 23 register ops
+through the channel, zero refusals, on the green lane.
+
+**The proof shape:** the domain reports its read of sector 0; the
+kernel verifies it against the ring-0 path's own read of the same
+sector — two independent paths through the same device must agree
+byte-for-byte. `[VBLKD] driver-domains=1`, `[VBLKD] read sector 0 at
+CPL=3 … byte-identical`, and `[VBLKD] rogue driver domain contained`
+(5 out-of-window messages refused and counted, the ladder closed the
+channel, a legal read refuses too) are pinned on the q35 lane. The
+ring-0 legacy path is retained this slice as the reference; removing
+it (and migrating the next driver) is the follow-on.
+
+What this slice did NOT do (honest scope): the domain is
+run-to-completion, not resident; no interrupt routing to ring 3
+(the driver polls); one domain per device, sequentially with the
+ring-0 path in the same boot; no dynamic driver loading.

@@ -106,11 +106,11 @@ impl DeviceCore {
             MmioMsg::Write { off, len, val, .. } => {
                 let pa = self.win.pa(off).expect("contains() checked");
                 match len {
+                    2 => self.device.volatile_write16(pa, val as u16),
                     4 => self.device.volatile_write32(pa, val as u32),
                     8 => self.device.volatile_write64(pa, val),
-                    // the first slice's driver surface is 32/64-bit
-                    // registers; narrower writes stay refused rather
-                    // than half-implemented.
+                    // 1-byte writes stay refused rather than
+                    // half-implemented (no device in the tree needs one).
                     _ => {
                         self.refused += 1;
                         return MmioReply::Refused;
@@ -174,6 +174,9 @@ impl<C: MmioChannel> MmioBus for IpcMmio<'_, C> {
     fn volatile_read16(&self, _pa: u64) -> u16 {
         unreachable!("IpcMmio accessors are messages; the defaults never run")
     }
+    fn volatile_write16(&self, _pa: u64, _v: u16) {
+        unreachable!("IpcMmio accessors are messages; the defaults never run")
+    }
 
     fn read32(&self, off: u64) -> Option<u32> {
         match self.ask(MmioMsg::Read { off, len: 4 }) {
@@ -213,6 +216,19 @@ impl<C: MmioChannel> MmioBus for IpcMmio<'_, C> {
             _ => None,
         }
     }
+    /// A 2-byte write is a message like every other access — virtio's
+    /// common config is 16-bit registers end to end, and the notify
+    /// doorbell is `iowrite16` by definition (ADR-0016).
+    fn write16(&self, off: u64, v: u16) -> bool {
+        matches!(
+            self.ask(MmioMsg::Write {
+                off,
+                len: 2,
+                val: u64::from(v)
+            }),
+            MmioReply::Wrote
+        )
+    }
     /// A byte read is served by the core as a containing-dword read
     /// with the byte selected — the same construction `MmioBus`'s
     /// default uses, done at the core so the channel never widens a
@@ -221,6 +237,225 @@ impl<C: MmioChannel> MmioBus for IpcMmio<'_, C> {
         let aligned = off & !3;
         let dword = self.read32(aligned)?;
         Some((dword >> (8 * (off & 3))) as u8)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The ring-3 transport (ADR-0017 round two): the syscall core registry.
+//
+// The in-process `MmioChannel` above is the host-test transport. A
+// ring-3 driver domain reaches the same discipline through
+// `SYS_DEVREG` (syscall 33): one register access = one message
+// (op/region/offset/len/val), routed to the domain's OWN registered
+// core by `run.domain` — the routing IS the capability (no domain
+// can name another's device; a domain with no core gets a refusal,
+// not a wildcard). The core answers with the window-checked volatile
+// access; `u64::MAX` is the refusal sentinel (no plausible register
+// value on this bus family).
+//
+// The counters are the organic feed: the core counts what it serves
+// and what it refuses, and after REFUSAL_LADDER refusals it STOPS
+// SERVING that domain — ADR-0017's "the device core stops serving its
+// channel" quarantine, implemented in the core where the domain can
+// neither forge nor suppress it. The boot lane prints the counters at
+// teardown; the BehaviorMonitor consumes them through the same
+// denied-signal path every other domain misbehavior uses.
+// ─────────────────────────────────────────────────────────────────────────
+
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+
+/// After this many refusals on one region, the core stops serving the
+/// domain entirely on that region: a confused or hostile driver loses
+/// its channel instead of probing the window forever.
+const REFUSAL_LADDER: u64 = 4;
+
+/// One registered core: (domain, region) → a validated window + the
+/// organic counters. The window parameters are written ONCE at
+/// registration (before the domain can run) and read with Acquire on
+/// every serve; the counters are relaxed (monotonic tally).
+struct RegSlot {
+    domain: AtomicU32,
+    region: AtomicU8,
+    base: AtomicU64,
+    len: AtomicU64,
+    served: AtomicU64,
+    refused: AtomicU64,
+}
+
+/// Eight slots — one virtio device wants four (common/notify/isr/
+/// device-config); exhaustion is a loud `false` from registration,
+/// never a silent drop.
+static REGISTRY: [RegSlot; 8] = [const {
+    RegSlot {
+        domain: AtomicU32::new(0),
+        region: AtomicU8::new(0),
+        base: AtomicU64::new(0),
+        len: AtomicU64::new(0),
+        served: AtomicU64::new(0),
+        refused: AtomicU64::new(0),
+    }
+}; 8];
+
+/// Register `(domain, region)`'s core window. Fails (false) when the
+/// window is malformed, the region id is out of range, the slot is
+/// taken, or the table is full. Ownership: re-registering an existing
+/// `(domain, region)` pair is a driver-phase bug — refused.
+pub(crate) fn register_core(domain: u32, region: u8, base: u64, len: u64) -> bool {
+    if region > 3 || domain == 0 || MmioWindow::new(base, len).is_none() {
+        return false;
+    }
+    for s in REGISTRY.iter() {
+        let d = s.domain.load(Ordering::Acquire);
+        if d == 0 {
+            // free slot: claim it, then fill — single CPU, the syscall
+            // path cannot interleave with the driver phase.
+            s.domain.store(domain, Ordering::Release);
+            s.region.store(region, Ordering::Relaxed);
+            s.base.store(base, Ordering::Relaxed);
+            s.len.store(len, Ordering::Relaxed);
+            s.served.store(0, Ordering::Relaxed);
+            s.refused.store(0, Ordering::Relaxed);
+            return true;
+        }
+        if d == domain && s.region.load(Ordering::Relaxed) == region {
+            return false; // duplicate: refuse, never overwrite
+        }
+    }
+    false
+}
+
+/// Tear the domain's cores out of the table (the teardown half of the
+/// step: the channel dies before the frames are revoked). Returns the
+/// (served, refused) totals across the domain's regions — the monitor
+/// feed, printed by the caller.
+pub(crate) fn unregister_domain(domain: u32) -> (u64, u64) {
+    let mut served = 0u64;
+    let mut refused = 0u64;
+    for s in REGISTRY.iter() {
+        if s.domain.load(Ordering::Acquire) == domain {
+            served += s.served.load(Ordering::Relaxed);
+            refused += s.refused.load(Ordering::Relaxed);
+            s.domain.store(0, Ordering::Release);
+        }
+    }
+    (served, refused)
+}
+
+/// The `SYS_DEVREG` serve path: route `(domain, region)` to its core
+/// and perform one window-checked access. `op`: 0 = read, 1 = write.
+/// Returns the read value, or 0 for a served write; [`u64::MAX`] for
+/// every refusal (unknown domain/region, bad width, out-of-window, or
+/// the refusal ladder having closed the channel).
+pub(crate) fn devreg_serve(domain: u32, region: u8, op: u8, off: u64, len: u8, val: u64) -> u64 {
+    const REFUSED: u64 = u64::MAX;
+    if region > 3 {
+        return REFUSED;
+    }
+    let mut slot: Option<&RegSlot> = None;
+    for s in REGISTRY.iter() {
+        if s.domain.load(Ordering::Acquire) == domain && s.region.load(Ordering::Relaxed) == region
+        {
+            slot = Some(s);
+            break;
+        }
+    }
+    let Some(s) = slot else {
+        return REFUSED; // no core: the domain holds no such grant
+    };
+    let refused = s.refused.load(Ordering::Relaxed);
+    if refused >= REFUSAL_LADDER {
+        // The ladder: the core has stopped serving this channel. The
+        // refusal still counts (loudly, monotonically).
+        s.refused.store(refused + 1, Ordering::Relaxed);
+        return REFUSED;
+    }
+    if !matches!(op, 0 | 1) || !matches!(len, 1 | 2 | 4 | 8) {
+        s.refused.fetch_add(1, Ordering::Relaxed);
+        return REFUSED;
+    }
+    let win = match MmioWindow::new(
+        s.base.load(Ordering::Acquire),
+        s.len.load(Ordering::Acquire),
+    ) {
+        Some(w) => w,
+        None => return REFUSED, // cannot happen (registered validated)
+    };
+    if !win.contains(off, u64::from(len)) {
+        s.refused.fetch_add(1, Ordering::Relaxed);
+        return REFUSED;
+    }
+    let device = crate::mmio::BarMmio::new(win.base(), win.len())
+        .expect("register_core validated this pair");
+    let pa = win.pa(off).expect("contains checked");
+    match (op, len) {
+        (0, 1) => {
+            // the byte read: the containing dword, one byte selected —
+            // MmioBus::read8's construction, done at the core.
+            let aligned = off & !3;
+            let d = device.volatile_read32(
+                win.pa(aligned)
+                    .expect("contains checked the containing dword"),
+            );
+            s.served.fetch_add(1, Ordering::Relaxed);
+            u64::from((d >> (8 * (off & 3))) as u8)
+        }
+        (0, 2) => {
+            s.served.fetch_add(1, Ordering::Relaxed);
+            u64::from(device.volatile_read16(pa))
+        }
+        (0, 4) => {
+            s.served.fetch_add(1, Ordering::Relaxed);
+            u64::from(device.volatile_read32(pa))
+        }
+        (0, 8) => {
+            s.served.fetch_add(1, Ordering::Relaxed);
+            device.volatile_read64(pa)
+        }
+        (1, 2) => {
+            device.volatile_write16(pa, val as u16);
+            s.served.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        (1, 4) => {
+            device.volatile_write32(pa, val as u32);
+            s.served.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        (1, 8) => {
+            device.volatile_write64(pa, val);
+            s.served.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        // 1-byte writes and unknown ops: refused above by the width
+        // gate (len 1 with op 1 falls through here dead).
+        _ => {
+            s.refused.fetch_add(1, Ordering::Relaxed);
+            REFUSED
+        }
+    }
+}
+
+/// The domain's aggregate core counters — the monitor feed.
+pub(crate) fn core_counters(domain: u32) -> (u64, u64) {
+    let mut served = 0u64;
+    let mut refused = 0u64;
+    for s in REGISTRY.iter() {
+        if s.domain.load(Ordering::Acquire) == domain {
+            served += s.served.load(Ordering::Relaxed);
+            refused += s.refused.load(Ordering::Relaxed);
+        }
+    }
+    (served, refused)
+}
+
+/// Reset the registry (the host tests' seam; production unregisters by
+/// domain at teardown).
+#[cfg(test)]
+pub(crate) fn reset_registry_for_tests() {
+    for s in REGISTRY.iter() {
+        s.domain.store(0, Ordering::Release);
+        s.served.store(0, Ordering::Relaxed);
+        s.refused.store(0, Ordering::Relaxed);
     }
 }
 
@@ -437,6 +672,82 @@ mod tests {
         assert!(broker
             .map_region(2, pa_b + 4096, 4096, DmaDir::Bidirectional)
             .is_ok());
+        drop(phys);
+    }
+
+    /// virtio's register surface is 16-bit end to end (QUEUE_SEL/
+    /// SIZE/ENABLE, the vector grants) and the notify doorbell is
+    /// `iowrite16` — the core must serve 2-byte writes with the same
+    /// window discipline, and a straddling write is a refusal.
+    #[test]
+    fn sixteen_bit_writes_are_served_by_the_core() {
+        let (phys, win, _bus0) = setup();
+        let mut chan = CoreChannel {
+            core: DeviceCore::new(
+                win,
+                crate::mmio::BarMmio::new(win.base(), win.len()).unwrap(),
+            ),
+        };
+        let ipc = IpcMmio::new(win, &mut chan);
+        assert!(ipc.write16(0x30, 0xBEEF));
+        assert_eq!(ipc.read16(0x30), Some(0xBEEF));
+        assert!(!ipc.write16(0xFF, 1), "a 2-byte write straddling the end");
+        assert_eq!(chan.core.counters(), (2, 1));
+        drop(phys);
+    }
+
+    /// The SYS_DEVREG transport (the registry): routing by (domain,
+    /// region), the same window discipline, the refusal LADDER that
+    /// closes a hammering domain's channel — and a healthy domain's
+    /// channel surviving it (the quarantine is scoped).
+    #[test]
+    fn registry_routes_serves_and_closes_the_rogue_channel() {
+        reset_registry_for_tests();
+        let phys = FakePhys::new(2);
+        let base_a = phys.pa(0);
+        let base_b = phys.pa(4096);
+        assert!(register_core(7, 0, base_a, 0x100));
+        assert!(!register_core(7, 0, base_a, 0x100), "duplicate: refused");
+        assert!(register_core(8, 0, base_b, 0x100));
+        // routing: a domain with no core gets the sentinel, not a
+        // wildcard; an unregistered region likewise.
+        assert_eq!(devreg_serve(9, 0, 0, 0, 4, 0), u64::MAX);
+        assert_eq!(devreg_serve(7, 1, 0, 0, 4, 0), u64::MAX);
+        // a legal 16-bit write + read-back through the channel
+        assert_eq!(devreg_serve(7, 0, 1, 0x30, 2, 0xBEEF), 0);
+        assert_eq!(devreg_serve(7, 0, 0, 0x30, 2, 0), 0xBEEF);
+        // the byte read: containing dword, byte selected (0xBEEF is
+        // little-endian at 0x30 — byte 0x31 holds 0xBE)
+        assert_eq!(devreg_serve(7, 0, 0, 0x31, 1, 0), 0xBE);
+        // out-of-window + bad width + bad op + a 1-byte write: refusals,
+        // all counted
+        assert_eq!(devreg_serve(7, 0, 0, 0x100, 4, 0), u64::MAX);
+        assert_eq!(devreg_serve(7, 0, 0, 0, 3, 0), u64::MAX);
+        assert_eq!(devreg_serve(7, 0, 2, 0, 4, 0), u64::MAX);
+        assert_eq!(devreg_serve(7, 0, 1, 0, 1, 0xFF), u64::MAX);
+        // the ladder: 4 refusals accumulated above → the channel is
+        // closed for domain 7, even for a LEGAL access now (and the
+        // closure itself is counted: 5 refusals total)
+        assert_eq!(devreg_serve(7, 0, 0, 0x30, 2, 0), u64::MAX);
+        assert_eq!(
+            core_counters(7),
+            (3, 5),
+            "3 served, 5 refused (the ladder counted)"
+        );
+        // the quarantine is scoped: domain 8's channel never wavered
+        assert_eq!(devreg_serve(8, 0, 1, 0x40, 4, 0x1122_3344), 0);
+        assert_eq!(devreg_serve(8, 0, 0, 0x40, 4, 0), 0x1122_3344);
+        // teardown: the totals come back, the domain loses its cores
+        assert_eq!(unregister_domain(7), (3, 5));
+        assert_eq!(devreg_serve(7, 0, 0, 0x30, 2, 0), u64::MAX);
+        // the rogue's writes never landed: the guard word is intact
+        crate::memops::write_u64(base_a + 0x100, 0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(
+            crate::memops::read_u64(base_a + 0x100),
+            0xAAAA_BBBB_CCCC_DDDD
+        );
+        assert_eq!(unregister_domain(8), (2, 0));
+        reset_registry_for_tests();
         drop(phys);
     }
 }

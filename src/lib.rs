@@ -2486,8 +2486,15 @@ mod tests {
         assert_eq!(k.domain_mut(1).unwrap().stats.faults, faults_before + 1);
         // Stubs answer NotImplemented with their number, never Unit.
         let mut k2 = Kernel::new();
-        k2.create_domain_with(2, crate::profile::driver_profile(), 1002, 100, 0)
-            .unwrap(); // driver has IOCTL
+        // v2: the driver profile's channel is SYS_DEVREG (the ioctl
+        // placeholder is gone); this pins the STUB executor's shape, so
+        // the domain is built with an ioctl-bearing surface inline.
+        let mut ioctl_driver = crate::profile::driver_profile();
+        ioctl_driver.syscalls = crate::syscall::SyscallMask::from_bits(
+            (1 << crate::syscall::SYS_IOCTL) | (1 << crate::syscall::SYS_EXIT),
+        );
+        k2.create_domain_with(2, ioctl_driver, 1002, 100, 0)
+            .unwrap();
         assert!(matches!(
             k2.syscall(2, SysRequest::Ioctl { cmd: 0 }),
             Err(SysError::NotImplemented(nr)) if nr == crate::syscall::SYS_IOCTL

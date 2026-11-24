@@ -9,6 +9,29 @@
 use crate::frames::FramePool;
 use crate::strutil;
 use crate::strutil::line;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// The ring-0 read of sector 0's first 8 bytes — the TRUTH the
+/// ring-3 driver-domain step (vblkdom) verifies its own read against:
+/// two independent paths through the same device must agree
+/// byte-for-byte, so neither side's claim stands alone. One word + a
+/// present flag, written once by `virtio_step`, read once by
+/// `vblkdom_step` — the single-CPU driver phase cannot interleave the
+/// two. (The module's "no statics" rule is about ring/queue state;
+/// this is the hand-off witness between two steps, documented.)
+static SECTOR0_TRUTH: AtomicU64 = AtomicU64::new(0);
+static SECTOR0_PRESENT: AtomicBool = AtomicBool::new(false);
+
+/// The ring-0 path's read of sector 0 (None if the step never
+/// completed its read — the domain step skips loudly in that case).
+#[cfg(not(test))]
+pub(crate) fn sector0_truth() -> Option<u64> {
+    if SECTOR0_PRESENT.load(Ordering::Acquire) {
+        Some(SECTOR0_TRUTH.load(Ordering::Acquire))
+    } else {
+        None
+    }
+}
 
 /// The pool owner tag for virtio-blk frames (rings, control page,
 /// data page) — distinct from the VT-d table budget so the M1
@@ -331,6 +354,10 @@ pub(crate) fn virtio_step<const N: usize>(
     }
     let st = v::read_u8_pa(ctrl_pa + 512);
     let data0 = crate::memops::read_u64(data_pa);
+    // ADR-0017's cross-check witness: hand the ring-0 read to the
+    // domain step (vblkdom verifies its ring-3 read against THIS).
+    SECTOR0_TRUTH.store(data0, Ordering::Release);
+    SECTOR0_PRESENT.store(true, Ordering::Release);
     let mut h = [0u8; 18];
     line(
         out,
@@ -403,6 +430,11 @@ pub(crate) fn virtio_step<const N: usize>(
             out,
             &["[VBLK] write+read-back: pattern survived the round trip (device read+write through the IOMMU)"],
         );
+        // ADR-0017's witness, REFRESHED: sector 0's first 8 bytes are
+        // now this known pattern (the domain step runs after this and
+        // must read exactly these bytes through its own path — the
+        // original random image bytes it read earlier are gone).
+        SECTOR0_TRUTH.store(0x0BAD_C0DE_0BAD_C0DE, Ordering::Release);
     } else {
         let mut h2 = [0u8; 18];
         line(

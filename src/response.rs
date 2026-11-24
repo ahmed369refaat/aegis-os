@@ -92,7 +92,7 @@ mod tests {
     use crate::domain::DomainState;
     use crate::monitor::Verdict as V;
     use crate::profile::{parser_profile, service_profile};
-    use crate::syscall::{SYS_IOCTL, SYS_IPC_SEND, SYS_NET_SEND, SYS_OPEN, SYS_READ};
+    use crate::syscall::{SYS_DEVREG, SYS_EXIT, SYS_NET_SEND, SYS_OPEN, SYS_READ};
 
     fn ring() -> RingBuffer<SecurityEvent, TELEMETRY_CAPACITY> {
         RingBuffer::new().unwrap()
@@ -114,11 +114,15 @@ mod tests {
         );
         match out {
             Outcome::Tightened(m) => {
-                assert!(m.is_allowed(SYS_IOCTL).unwrap(), "driver keeps its purpose");
+                // v2: a tightened driver LOSES its channel by design —
+                // a stopped driver, the same containment the device
+                // core's refusal ladder enforces from its side — and
+                // keeps the exit path (the profile's contract).
                 assert!(
-                    !m.is_allowed(SYS_IPC_SEND).unwrap(),
-                    "IPC drops while degraded"
+                    !m.is_allowed(SYS_DEVREG).unwrap(),
+                    "driver: Tighten stops the channel"
                 );
+                assert!(m.is_allowed(SYS_EXIT).unwrap(), "exit stays reachable");
             }
             other => panic!("expected Tightened, got {:?}", other),
         }

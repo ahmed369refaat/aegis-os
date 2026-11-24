@@ -65,6 +65,15 @@ pub const CC_QUEUE_NOTIFY_OFF: u64 = 0x1E;
 pub const CC_QUEUE_DESC: u64 = 0x20;
 pub const CC_QUEUE_AVAIL: u64 = 0x28;
 pub const CC_QUEUE_USED: u64 = 0x30;
+/// config_msix_vector: the config-change interrupt's MSI-X table
+/// entry (write = request, read = the device's granted vector).
+pub const CC_CONFIG_MSIX: u64 = 0x10;
+/// queue_msix_vector: the SELECTED queue's interrupt entry (same
+/// write-then-read grant semantics).
+pub const CC_QUEUE_MSIX: u64 = 0x1A;
+/// The virtio "no vector" value: a refused binding (or an unbound
+/// queue) reads back as this — the device sends NO message for it.
+pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF;
 
 /// Descriptor flags: NEXT chains, WRITE means device-writable.
 pub const DESC_F_NEXT: u16 = 1;
@@ -624,6 +633,29 @@ impl MmioVirtio {
         self.w16(CC_QUEUE_ENABLE, 1);
     }
 
+    /// Bind the config-change interrupt to MSI-X table entry `entry`
+    /// (config_msix_vector). The grant is read back: a modern device
+    /// echoes the request or answers [`VIRTIO_MSI_NO_VECTOR`] when it
+    /// refuses — the caller fail-closes on anything but the echo.
+    pub fn set_config_vector(&self, entry: u16) -> u16 {
+        self.w16(CC_CONFIG_MSIX, entry);
+        self.r16(CC_CONFIG_MSIX)
+    }
+
+    /// Bind the SELECTED queue's completions to MSI-X table entry
+    /// `entry` (queue_msix_vector). Same grant semantics as
+    /// [`Self::set_config_vector`]. This write is what tells the
+    /// device WHICH entry a completion fires — without it the queue's
+    /// vector stays [`VIRTIO_MSI_NO_VECTOR`] and no completion ever
+    /// sends a message, however the table itself is programmed (found
+    /// live, round two of ADR-0019: entries armed, cap enabled, work
+    /// queued and consumed — the delivery window still timed out every
+    /// run until the binding).
+    pub fn set_queue_vector(&self, entry: u16) -> u16 {
+        self.w16(CC_QUEUE_MSIX, entry);
+        self.r16(CC_QUEUE_MSIX)
+    }
+
     /// Kick a queue. Per virtio 1.x §4.1.5.2 the VALUE written is the
     /// queue index (QEMU's modern notify dispatches on the value —
     /// measured: a value of 0 always kicks queue 0, which hid the
@@ -741,6 +773,25 @@ mod tests {
         assert_eq!(used_entry_id(used, 0), 7);
         assert_eq!(used_entry_len(used, 0), 0x2A);
     }
+
+    /// The MSI-X vector-binding registers sit at the SPEC offsets
+    /// (§4.1.4.3): config_msix_vector at +0x10, queue_msix_vector at
+    /// +0x1A — between num_queues (0x12) and queue_enable (0x1C). An
+    /// offset drift here breaks message delivery SILENTLY, which is
+    /// exactly how round one failed. Pinned at COMPILE time (an
+    /// `assert!` in a `const` block — stronger than a test run); the
+    /// write-then-read grant itself is target-only (MmioVirtio is
+    /// `cfg(not(test))`) and is proven by the lane's [MSIX] DELIVERED
+    /// marker.
+    const _: () = {
+        assert!(CC_CONFIG_MSIX == 0x10, "config_msix_vector offset");
+        assert!(CC_QUEUE_MSIX == 0x1A, "queue_msix_vector offset");
+        assert!(
+            CC_NUM_QUEUES == 0x12 && CC_QUEUE_SEL == 0x16 && CC_QUEUE_ENABLE == 0x1C,
+            "the layout neighbors pin the field map"
+        );
+        assert!(VIRTIO_MSI_NO_VECTOR == 0xFFFF, "the no-vector value");
+    };
 
     /// Byte-granular writes land byte-exactly (the RMW lane).
     #[test]
