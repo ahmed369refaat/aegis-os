@@ -49,6 +49,86 @@ pub struct DomainProfile {
     pub max_children: u16,
 }
 
+/// ADR-0032 section A: the typed reason a profile request is not an
+/// attenuation of its parent. One variant per authority axis — the
+/// audit trail names what was attacked, not just "escalation".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileViolation {
+    /// The requested syscall surface is not a subset of the parent's
+    /// LIVE mask (the possibly-tightened one, not the class profile).
+    MaskWiderThanParentLive,
+    /// The requested memory quota exceeds the parent's live quota.
+    QuotaAboveParent,
+    /// Monitor sensitivity would DROP relative to the parent — the
+    /// child would be watched less closely.
+    SensitivityBelowParent,
+    /// The Tighten-tier surface is not strictly narrower than the full
+    /// surface (`degraded == syscalls` makes Tighten a no-op).
+    DegradedNotNarrower,
+    /// The Tighten tier drops the exit call — a tightened domain could
+    /// never leave.
+    DegradedDropsExit,
+    /// The child's fan-out limit is not strictly below the parent's.
+    FanOutNotStricter,
+    /// The requested base rights exceed the parent's base rights.
+    RightsBroaderThanParent,
+}
+
+impl DomainProfile {
+    /// ADR-0032 section A: is this REQUEST an attenuation of the
+    /// parent? Pure, host-tested, and used at every point a requested
+    /// profile becomes a live domain. The parent's LIVE state is passed
+    /// in (mask and quota may be tighter than its class profile — the
+    /// child must fit under what the parent has NOW).
+    ///
+    /// The destructure below is EXHAUSTIVE on purpose — no `..`: adding
+    /// a field to `DomainProfile` breaks this function until someone
+    /// classifies the new field as authority, limit, or monitor
+    /// parameter and extends the relation. `name` is classified as
+    /// pure metadata (a label, no authority).
+    pub fn is_attenuation_of(
+        &self,
+        parent: &DomainProfile,
+        parent_live_mask: &SyscallMask,
+        parent_live_quota: usize,
+    ) -> Result<(), ProfileViolation> {
+        let DomainProfile {
+            name: _child_name,
+            syscalls: child_syscalls,
+            quota_pages: child_quota,
+            base_rights: child_rights,
+            sensitivity: child_sensitivity,
+            degraded_syscalls: child_degraded,
+            max_children: child_max_children,
+        } = self;
+        if !child_syscalls.is_subset_of(parent_live_mask) {
+            return Err(ProfileViolation::MaskWiderThanParentLive);
+        }
+        if *child_quota > parent_live_quota {
+            return Err(ProfileViolation::QuotaAboveParent);
+        }
+        if *child_sensitivity < parent.sensitivity {
+            return Err(ProfileViolation::SensitivityBelowParent);
+        }
+        // The Tighten tier must be a PROPER subset of the surface (an
+        // equal tier makes Tighten a no-op) and must always keep the
+        // exit call (a tightened domain can always leave).
+        if !child_degraded.is_subset_of(child_syscalls) || child_degraded == child_syscalls {
+            return Err(ProfileViolation::DegradedNotNarrower);
+        }
+        if !child_degraded.is_allowed(SYS_EXIT).unwrap_or(false) {
+            return Err(ProfileViolation::DegradedDropsExit);
+        }
+        if *child_max_children >= parent.max_children {
+            return Err(ProfileViolation::FanOutNotStricter);
+        }
+        if !child_rights.is_subset_of(parent.base_rights) {
+            return Err(ProfileViolation::RightsBroaderThanParent);
+        }
+        Ok(())
+    }
+}
+
 /// Long-running local service (vfsd-style): full file I/O + IPC + the
 /// Linux-like process-management syscalls, still no direct network.
 pub const fn service_profile() -> DomainProfile {
@@ -583,5 +663,171 @@ mod tests {
         assert!(service_profile()
             .base_rights
             .is_subset_of(Rights::READ | Rights::WRITE));
+    }
+}
+
+#[cfg(test)]
+mod adr0032_tests {
+    use super::*;
+
+    /// A fully-specified legal parent (sensitivity 40, fan-out 4,
+    /// rights READ|WRITE, quota 100).
+    fn parent() -> DomainProfile {
+        DomainProfile {
+            name: "axis-parent",
+            syscalls: SyscallMask::from_bits(
+                1u64 << SYS_READ | 1u64 << SYS_WRITE | 1u64 << SYS_EXIT,
+            ),
+            quota_pages: 100,
+            base_rights: Rights::READ.union(Rights::WRITE),
+            sensitivity: 40,
+            degraded_syscalls: SyscallMask::from_bits(1u64 << SYS_EXIT),
+            max_children: 4,
+        }
+    }
+
+    /// An attenuated request: legal on every axis.
+    fn legal_child() -> DomainProfile {
+        DomainProfile {
+            name: "child",
+            syscalls: SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_EXIT),
+            quota_pages: 50,
+            base_rights: Rights::READ,
+            sensitivity: 60,
+            degraded_syscalls: SyscallMask::from_bits(1u64 << SYS_EXIT),
+            max_children: 3,
+        }
+    }
+
+    #[test]
+    fn a_legal_request_passes() {
+        let p = parent();
+        assert_eq!(
+            legal_child().is_attenuation_of(&p, &p.syscalls, p.quota_pages),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn each_axis_has_a_typed_reason() {
+        let p = parent();
+        // Mask wider than the parent's LIVE mask (the class profile is
+        // wider here — the live one is not).
+        let mut r = legal_child();
+        r.syscalls =
+            SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_WRITE | 1u64 << SYS_EXIT);
+        assert_eq!(
+            r.is_attenuation_of(&p, &SyscallMask::from_bits(1u64 << SYS_EXIT), 100),
+            Err(ProfileViolation::MaskWiderThanParentLive)
+        );
+        // Quota above the live quota.
+        let mut r = legal_child();
+        r.quota_pages = 101;
+        assert_eq!(
+            r.is_attenuation_of(&p, &p.syscalls, 100),
+            Err(ProfileViolation::QuotaAboveParent)
+        );
+        // Sensitivity below the parent's.
+        let mut r = legal_child();
+        r.sensitivity = 39;
+        assert_eq!(
+            r.is_attenuation_of(&p, &p.syscalls, 100),
+            Err(ProfileViolation::SensitivityBelowParent)
+        );
+        // Degraded tier equal to the surface (Tighten becomes a no-op).
+        let mut r = legal_child();
+        r.degraded_syscalls = r.syscalls;
+        assert_eq!(
+            r.is_attenuation_of(&p, &p.syscalls, 100),
+            Err(ProfileViolation::DegradedNotNarrower)
+        );
+        // Degraded tier outside the surface is equally refused.
+        let mut r = legal_child();
+        r.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_WRITE | 1u64 << SYS_EXIT);
+        assert_eq!(
+            r.is_attenuation_of(&p, &p.syscalls, 100),
+            Err(ProfileViolation::DegradedNotNarrower)
+        );
+        // Degraded tier dropping the exit call.
+        let mut r = legal_child();
+        r.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_READ);
+        assert_eq!(
+            r.is_attenuation_of(&p, &p.syscalls, 100),
+            Err(ProfileViolation::DegradedDropsExit)
+        );
+        // Fan-out equal to the parent's (strict decay is required).
+        let mut r = legal_child();
+        r.max_children = 4;
+        assert_eq!(
+            r.is_attenuation_of(&p, &p.syscalls, 100),
+            Err(ProfileViolation::FanOutNotStricter)
+        );
+        // Base rights broader than the parent's.
+        let mut r = legal_child();
+        r.base_rights = Rights::READ.union(Rights::WRITE).union(Rights::GRANT);
+        assert_eq!(
+            r.is_attenuation_of(&p, &p.syscalls, 100),
+            Err(ProfileViolation::RightsBroaderThanParent)
+        );
+    }
+
+    #[test]
+    fn the_live_mask_can_be_tighter_than_the_class_profile() {
+        // The parent's class surface includes WRITE, but its LIVE mask
+        // has been tightened to READ|EXIT: a request keeping WRITE —
+        // legal against the class profile — must be refused against
+        // the live one.
+        let p = parent();
+        let mut r = legal_child();
+        r.syscalls =
+            SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_WRITE | 1u64 << SYS_EXIT);
+        let live = SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_EXIT);
+        assert_eq!(
+            r.is_attenuation_of(&p, &live, 100),
+            Err(ProfileViolation::MaskWiderThanParentLive)
+        );
+    }
+
+    /// ADR-0032 section A, the property form: 10k seeded random pairs —
+    /// a request that PASSES is never weaker on ANY axis.
+    #[test]
+    fn property_passing_requests_never_weaken_any_axis() {
+        let p = parent();
+        let mut s: u64 = 0x00AD_0032_5EED_0001;
+        for _ in 0..10_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let mut r = legal_child();
+            if s & 1 != 0 {
+                r.syscalls = SyscallMask::from_bits(s);
+            }
+            if (s >> 8) & 1 != 0 {
+                r.quota_pages = (s >> 16) as usize % 300;
+            }
+            if (s >> 9) & 1 != 0 {
+                r.sensitivity = ((s >> 20) % 101) as u8;
+            }
+            if (s >> 10) & 1 != 0 {
+                r.degraded_syscalls = SyscallMask::from_bits(s >> 24);
+            }
+            if (s >> 11) & 1 != 0 {
+                r.max_children = ((s >> 28) % 8) as u16;
+            }
+            if (s >> 12) & 1 != 0 {
+                r.base_rights = Rights::from_bits((s >> 32) as u8);
+            }
+            if r.is_attenuation_of(&p, &p.syscalls, 100).is_ok() {
+                // The never-weaker guarantee, axis by axis.
+                assert!(r.syscalls.is_subset_of(&p.syscalls));
+                assert!(r.quota_pages <= 100);
+                assert!(r.sensitivity >= p.sensitivity);
+                assert!(r.degraded_syscalls.is_subset_of(&r.syscalls));
+                assert!(r.degraded_syscalls != r.syscalls);
+                assert!(r.degraded_syscalls.is_allowed(SYS_EXIT).unwrap_or(false));
+                assert!(r.max_children < p.max_children);
+                assert!(r.base_rights.is_subset_of(p.base_rights));
+            }
+        }
     }
 }

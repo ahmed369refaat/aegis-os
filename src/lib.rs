@@ -347,10 +347,14 @@ impl<const N: usize> Kernel<N> {
     /// thing the child receives (no ambient fds, no ambient caps: the
     /// child starts with just its self-signal capability plus
     /// attenuated copies of the parent's caps at
-    /// `parent_cap ∩ request.base_rights`). The request's syscall
-    /// surface must be a subset of the parent's CURRENT (live) mask
-    /// and its quota no larger — anything wider is refused, fail
-    /// closed, and counted as an escalation attempt.
+    /// `parent_cap ∩ request.base_rights`). Since ADR-0032 section A
+    /// the request must ATTENUATE the parent on every axis — the
+    /// syscall surface a subset of the parent's CURRENT (live) mask,
+    /// the quota no larger, monitor sensitivity no lower, the Tighten
+    /// tier strictly narrower and always keeping the exit call,
+    /// fan-out strictly below, base rights never broader — anything
+    /// else is refused, fail closed, and counted as an escalation
+    /// attempt.
     pub fn spawn_process(
         &mut self,
         parent_id: u32,
@@ -382,8 +386,15 @@ impl<const N: usize> Kernel<N> {
         if self.procs.children_count(parent_id) >= usize::from(limit) {
             return Err(PE::TooManyChildren { limit });
         }
-        if !profile_request.syscalls.is_subset_of(&live_mask)
-            || profile_request.quota_pages > parent_quota
+        // ADR-0032 section A: the request must attenuate the parent on
+        // EVERY axis — mask (vs the LIVE mask), quota (vs the LIVE
+        // quota), monitor sensitivity, the Tighten tier (strictly
+        // narrower, keeping the exit call), fan-out (strictly below),
+        // and base rights — not just the two axes this used to check.
+        // The pure relation's typed reason names the attacked axis;
+        // every violation is an escalation attempt on the parent.
+        if let Err(_violation) =
+            profile_request.is_attenuation_of(&parent.profile, &live_mask, parent_quota)
         {
             if let Ok(pd) = self.domain_mut(parent_id) {
                 pd.record_escalation_attempt();

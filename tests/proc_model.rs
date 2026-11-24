@@ -101,6 +101,16 @@ fn kernel_with_parent() -> Kernel {
     k
 }
 
+/// ADR-0032: a legal CHILD request of a service parent — the app class
+/// with a strictly smaller fan-out (the profile relation now requires
+/// every spawn to attenuate on every axis; same-class max_children
+/// would be refused).
+fn child_app() -> aegis_os::profile::DomainProfile {
+    let mut p = app_profile();
+    p.max_children = 7;
+    p
+}
+
 fn read_fd(k: &Kernel, pid: u32, fd: u8) -> Option<FdEntry> {
     k.domain(pid).and_then(|d| d.fds.get(fd))
 }
@@ -108,9 +118,9 @@ fn read_fd(k: &Kernel, pid: u32, fd: u8) -> Option<FdEntry> {
 #[test]
 fn spawn_allocates_monotonic_pids_from_100() {
     let mut k = kernel_with_parent();
-    let c1 = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
-    let c2 = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
-    let c3 = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
+    let c1 = k.spawn_process(PARENT, child_app(), &[]).unwrap();
+    let c2 = k.spawn_process(PARENT, child_app(), &[]).unwrap();
+    let c3 = k.spawn_process(PARENT, child_app(), &[]).unwrap();
     assert!(c1 >= 100, "spawn pids start at 100, got {c1}");
     assert_ne!(c1, c2);
     assert_ne!(c2, c3);
@@ -125,7 +135,7 @@ fn spawn_inherits_exactly_the_fd_map_and_nothing_else() {
     let mut k = kernel_with_parent();
     // Parent fds: 3 = file (pos 4), 4 = pipe read, 5 = pipe write.
     let child = k
-        .spawn_process(PARENT, app_profile(), &[(3, 0), (4, 7)])
+        .spawn_process(PARENT, child_app(), &[(3, 0), (4, 7)])
         .unwrap();
     let ce = read_fd(&k, child, 0).expect("child fd 0 = the file");
     match ce.target {
@@ -152,9 +162,7 @@ fn spawn_inherits_exactly_the_fd_map_and_nothing_else() {
 fn spawn_refuses_a_fd_map_referencing_a_closed_fd() {
     let mut k = kernel_with_parent();
     let before_domains = k.live_domain_count();
-    let err = k
-        .spawn_process(PARENT, app_profile(), &[(9, 0)])
-        .unwrap_err();
+    let err = k.spawn_process(PARENT, child_app(), &[(9, 0)]).unwrap_err();
     assert_eq!(err, ProcError::FdNotOpen(9));
     assert_eq!(k.live_domain_count(), before_domains, "no child leaked");
 }
@@ -163,11 +171,11 @@ fn spawn_refuses_a_fd_map_referencing_a_closed_fd() {
 fn spawn_refuses_out_of_range_and_duplicate_child_fds() {
     let mut k = kernel_with_parent();
     let e1 = k
-        .spawn_process(PARENT, app_profile(), &[(3, 16)])
+        .spawn_process(PARENT, child_app(), &[(3, 16)])
         .unwrap_err();
     assert_eq!(e1, ProcError::FdMapInvalid { fd: 16 });
     let e2 = k
-        .spawn_process(PARENT, app_profile(), &[(3, 0), (4, 0)])
+        .spawn_process(PARENT, child_app(), &[(3, 0), (4, 0)])
         .unwrap_err();
     assert_eq!(e2, ProcError::FdMapInvalid { fd: 0 });
 }
@@ -203,7 +211,7 @@ fn spawned_children_get_no_ambient_capabilities_only_attenuated_copies() {
     // Jail the parent: its root capability attenuates to /pub.
     k.syscall(PARENT, SysRequest::Chroot { path: "/pub" })
         .unwrap();
-    let child = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
+    let child = k.spawn_process(PARENT, child_app(), &[]).unwrap();
     let parent_caps = k.domain(PARENT).map(|d| d.caps.clone()).unwrap();
     let child_caps = k.domain(child).map(|d| d.caps.clone()).unwrap();
     assert!(!child_caps.is_empty());
@@ -307,7 +315,7 @@ fn fork_of_a_narrowed_parent_is_born_narrowed() {
 #[test]
 fn exec_intersects_never_widens_and_keeps_exit() {
     let mut k = kernel_with_parent();
-    let child = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
+    let child = k.spawn_process(PARENT, child_app(), &[]).unwrap();
     let live = k.domain(child).unwrap().mask();
     // A declared surface WIDER than live: intersection stays live.
     let wide = SyscallMask::from_bits(u64::MAX);
@@ -375,7 +383,7 @@ fn exec_resets_regions_but_keeps_the_quota() {
 #[test]
 fn exit_records_the_status_and_makes_a_zombie() {
     let mut k = kernel_with_parent();
-    let child = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
+    let child = k.spawn_process(PARENT, child_app(), &[]).unwrap();
     let status = ExitStatus::killed(9);
     k.exit_process(child, status).unwrap();
     // The domain is gone: further syscalls fail closed.
@@ -390,9 +398,9 @@ fn exit_records_the_status_and_makes_a_zombie() {
 fn wait_reaps_specific_any_and_nohang_children() {
     let mut k = kernel_with_parent();
     let c = [
-        k.spawn_process(PARENT, app_profile(), &[]).unwrap(),
-        k.spawn_process(PARENT, app_profile(), &[]).unwrap(),
-        k.spawn_process(PARENT, app_profile(), &[]).unwrap(),
+        k.spawn_process(PARENT, child_app(), &[]).unwrap(),
+        k.spawn_process(PARENT, child_app(), &[]).unwrap(),
+        k.spawn_process(PARENT, child_app(), &[]).unwrap(),
     ];
     // Nothing has exited: nohang refuses, a blocking wait would too.
     assert_eq!(
@@ -428,8 +436,8 @@ fn wait_on_a_non_child_is_refused() {
     let mut k = kernel_with_parent();
     // PARENT must hold a child of its own so the refusal is about
     // WHOSE child the stranger is, not about having none.
-    let _own = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
-    let stranger = k.spawn_process(INIT, app_profile(), &[]).unwrap();
+    let _own = k.spawn_process(PARENT, child_app(), &[]).unwrap();
+    let stranger = k.spawn_process(INIT, child_app(), &[]).unwrap();
     assert_eq!(
         k.wait_process(PARENT, stranger as i64, true).unwrap_err(),
         ProcError::NotAChild(stranger)
@@ -444,7 +452,7 @@ fn wait_on_a_non_child_is_refused() {
 #[test]
 fn orphans_reparent_to_init_and_init_drains_their_zombies() {
     let mut k = kernel_with_parent();
-    let grandparent_spawns = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
+    let grandparent_spawns = k.spawn_process(PARENT, child_app(), &[]).unwrap();
     let orphan_baby = k.fork_process(grandparent_spawns).unwrap();
     // The middle generation dies: the baby and its zombie siblings go to init.
     k.exit_process(grandparent_spawns, ExitStatus::normal(1))
@@ -477,7 +485,7 @@ fn orphans_reparent_to_init_and_init_drains_their_zombies() {
 fn orphans_without_a_living_init_are_auto_reaped() {
     let mut k = kernel_with_parent();
     k.exit_process(INIT, ExitStatus::normal(0)).unwrap();
-    let parent = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
+    let parent = k.spawn_process(PARENT, child_app(), &[]).unwrap();
     let baby = k.fork_process(parent).unwrap();
     k.exit_process(parent, ExitStatus::normal(1)).unwrap();
     // No init to adopt: the orphan keeps running under a dead parent.
@@ -492,7 +500,7 @@ fn orphans_without_a_living_init_are_auto_reaped() {
 #[test]
 fn a_dying_parents_zombies_reparent_to_init() {
     let mut k = kernel_with_parent();
-    let child = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
+    let child = k.spawn_process(PARENT, child_app(), &[]).unwrap();
     k.exit_process(child, ExitStatus::normal(5)).unwrap();
     k.exit_process(PARENT, ExitStatus::normal(0)).unwrap();
     // init reaps both, zombie first or any order — both must be reachable.
@@ -512,7 +520,8 @@ fn children_limit_binds_spawn_and_fork() {
     fertile.syscalls =
         SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_WRITE | 1u64 << SYS_EXIT);
     fertile.max_children = 2;
-    fertile.degraded_syscalls = fertile.syscalls;
+    // ADR-0032: the Tighten tier must be a proper subset keeping exit.
+    fertile.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_EXIT);
     let parent = k.spawn_process(PARENT, fertile, &[]).unwrap();
     let a = k.fork_process(parent).unwrap();
     let _b = k.fork_process(parent).unwrap();
@@ -520,8 +529,13 @@ fn children_limit_binds_spawn_and_fork() {
         k.fork_process(parent).unwrap_err(),
         ProcError::TooManyChildren { limit: 2 }
     );
+    // ADR-0032: the over-limit request must ALSO be a legal attenuation
+    // (fan-out strictly below the parent's 2), or the profile check
+    // would refuse it before the children-count check runs.
+    let mut grandchild = fertile;
+    grandchild.max_children = 1;
     assert_eq!(
-        k.spawn_process(parent, fertile, &[]).unwrap_err(),
+        k.spawn_process(parent, grandchild, &[]).unwrap_err(),
         ProcError::TooManyChildren { limit: 2 }
     );
     // Exiting alone does NOT free the budget: the zombie still holds
@@ -536,22 +550,28 @@ fn children_limit_binds_spawn_and_fork() {
 #[test]
 fn meta_table_full_refuses_children_until_reaped() {
     let mut k = Kernel::new();
-    k.create_domain_with(SUPERVISOR, service_profile(), 0, 0, 0)
-        .unwrap();
+    // ADR-0032: bootstrap a BIG supervisor (create_domain_with makes no
+    // attenuation check — it is the root), then request a legal chain:
+    // supervisor(64) -> parent(40) -> kids(39).
+    let mut big = service_profile();
+    big.max_children = 64;
+    k.create_domain_with(SUPERVISOR, big, 0, 0, 0).unwrap();
     let mut many = service_profile();
-    many.max_children = 64;
+    many.max_children = 40;
     many.syscalls = SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_WRITE | 1u64 << SYS_EXIT);
-    many.degraded_syscalls = many.syscalls;
+    many.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_EXIT);
     let parent = k.spawn_process(SUPERVISOR, many, &[]).unwrap();
+    let mut kid = many;
+    kid.max_children = 39;
     // Fill every remaining meta slot with children (supervisor +
     // parent + 30 = MAX_DOMAINS 32).
     let mut kids = Vec::new();
-    while let Ok(pid) = k.spawn_process(parent, many, &[]) {
+    while let Ok(pid) = k.spawn_process(parent, kid, &[]) {
         kids.push(pid);
     }
     assert_eq!(kids.len(), 30, "MAX_DOMAINS = 32: supervisor + parent + 30");
     assert_eq!(
-        k.spawn_process(parent, many, &[]).unwrap_err(),
+        k.spawn_process(parent, kid, &[]).unwrap_err(),
         ProcError::TooManyProcesses
     );
     // Kill them all: zombies still hold their meta slots.
@@ -559,7 +579,7 @@ fn meta_table_full_refuses_children_until_reaped() {
         k.exit_process(*pid, ExitStatus::normal(0)).unwrap();
     }
     assert_eq!(
-        k.spawn_process(parent, many, &[]).unwrap_err(),
+        k.spawn_process(parent, kid, &[]).unwrap_err(),
         ProcError::TooManyProcesses,
         "zombies still hold meta slots"
     );
@@ -568,7 +588,7 @@ fn meta_table_full_refuses_children_until_reaped() {
         let (pid, _) = k.wait_process(parent, -1, true).unwrap();
         assert!(kids.contains(&pid));
     }
-    assert!(k.spawn_process(parent, many, &[]).is_ok());
+    assert!(k.spawn_process(parent, kid, &[]).is_ok());
 }
 
 #[test]
@@ -611,7 +631,7 @@ fn exec_policy_table_declare_lookup_default() {
 #[test]
 fn exec_sets_the_monitor_mode_from_the_policy() {
     let mut k = kernel_with_parent();
-    let child = k.spawn_process(PARENT, app_profile(), &[]).unwrap();
+    let child = k.spawn_process(PARENT, child_app(), &[]).unwrap();
     assert_eq!(k.domain(child).unwrap().monitor_enforce, None);
     k.exec_replace(child, &app_profile().syscalls, Some(false))
         .unwrap();
@@ -629,13 +649,16 @@ fn a_tightened_parent_spawns_tightened_children() {
     let narrow = SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_EXIT);
     k.exec_replace(PARENT, &narrow, None).unwrap();
     assert_eq!(
-        k.spawn_process(PARENT, app_profile(), &[]).unwrap_err(),
+        k.spawn_process(PARENT, child_app(), &[]).unwrap_err(),
         ProcError::ProfileEscalation
     );
     // A request INSIDE the narrowed surface is fine and is born narrowed.
     let mut tiny = app_profile();
     tiny.syscalls = narrow;
-    tiny.degraded_syscalls = narrow;
+    // ADR-0032: strictly narrower than the surface, keeping exit, and
+    // fan-out strictly below the (service) parent's 8.
+    tiny.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_EXIT);
+    tiny.max_children = 7;
     let child = k.spawn_process(PARENT, tiny, &[]).unwrap();
     assert_eq!(
         k.domain(child).unwrap().mask().bits(),
@@ -704,7 +727,11 @@ fn random_trees_never_escalate_authority() {
                 // drop a random subset of bits, keep EXIT.
                 bits &= !(rng.next() & bits & !(1u64 << SYS_EXIT));
                 req.syscalls = SyscallMask::from_bits(bits);
-                req.degraded_syscalls = SyscallMask::from_bits(bits);
+                // ADR-0032: the Tighten tier is a proper subset keeping
+                // exit; fan-out decays strictly down the tree.
+                req.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_EXIT);
+                let parent_fanout = k.domain(actor).unwrap().profile.max_children;
+                req.max_children = parent_fanout.saturating_sub(1).max(1);
                 req.quota_pages = rng.below(cur_quota as u64 + 1) as usize;
                 if let Ok(pid) = k.spawn_process(actor, req, &[]) {
                     assert_child_subset(&k, pid, actor);
@@ -838,4 +865,160 @@ fn random_lifecycles_conserve_everything_after_teardown() {
         k.sched.entity(PARENT).is_none(),
         "scheduler empty for PARENT"
     );
+}
+
+// ── ADR-0032 section A: attenuation is checked on EVERY axis ────────
+// Red first: against the current spawn (which validates only mask and
+// quota), each single-axis weakening below must be REFUSED, and the
+// round-A reproduction (sensitivity=0 + degraded=syscalls +
+// max_children=1000 under a max_children=2 parent) must be refused
+// with an escalation attempt recorded on the parent.
+
+/// The controlled parent for the axis tests: a legal child of PARENT
+/// with a narrow, fully-specified profile.
+fn axis_parent_profile() -> aegis_os::profile::DomainProfile {
+    let mut p = service_profile();
+    p.syscalls = SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_WRITE | 1u64 << SYS_EXIT);
+    p.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_EXIT);
+    p.quota_pages = 100;
+    p.max_children = 4;
+    p.sensitivity = 40;
+    p.base_rights = aegis_os::capability::Rights::READ.union(aegis_os::capability::Rights::WRITE);
+    p
+}
+
+#[test]
+fn spawn_refuses_the_reproduced_weakening_request() {
+    let mut k = kernel_with_parent();
+    let mut req = axis_parent_profile();
+    req.max_children = 2;
+    let parent = k.spawn_process(PARENT, req, &[]).unwrap();
+    // The round-A reproduction verbatim: sensitivity=0 (a nearly blind
+    // monitor), degraded=syscalls (Tighten becomes a no-op), and
+    // max_children=1000 (a 500x fan-out) under a max_children=2 parent.
+    let mut bad = axis_parent_profile();
+    bad.syscalls = SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_EXIT);
+    bad.degraded_syscalls = bad.syscalls;
+    bad.sensitivity = 0;
+    bad.max_children = 1000;
+    assert_eq!(
+        k.spawn_process(parent, bad, &[]).unwrap_err(),
+        ProcError::ProfileEscalation
+    );
+    // The refused request is an escalation attempt on the PARENT.
+    let before = k.domain(parent).unwrap().stats.escalation_attempts;
+    assert!(
+        before >= 1,
+        "the refused request must be recorded on the parent"
+    );
+}
+
+#[test]
+fn spawn_refuses_a_wider_mask_than_the_parents_live_one() {
+    let mut k = kernel_with_parent();
+    let parent = k.spawn_process(PARENT, axis_parent_profile(), &[]).unwrap();
+    let mut bad = axis_parent_profile();
+    // OPEN is not in the parent's live surface.
+    bad.syscalls = SyscallMask::from_bits(
+        1u64 << SYS_READ | 1u64 << SYS_WRITE | 1u64 << SYS_EXIT | 1u64 << SYS_OPEN,
+    );
+    bad.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_EXIT);
+    assert_eq!(
+        k.spawn_process(parent, bad, &[]).unwrap_err(),
+        ProcError::ProfileEscalation
+    );
+}
+
+#[test]
+fn spawn_refuses_a_quota_above_the_parents_live_one() {
+    let mut k = kernel_with_parent();
+    let parent = k.spawn_process(PARENT, axis_parent_profile(), &[]).unwrap();
+    let mut bad = axis_parent_profile();
+    bad.quota_pages = 101; // the parent's live quota is 100
+    assert_eq!(
+        k.spawn_process(parent, bad, &[]).unwrap_err(),
+        ProcError::ProfileEscalation
+    );
+}
+
+#[test]
+fn spawn_refuses_a_sensitivity_below_the_parents() {
+    let mut k = kernel_with_parent();
+    let parent = k.spawn_process(PARENT, axis_parent_profile(), &[]).unwrap();
+    let mut bad = axis_parent_profile();
+    bad.sensitivity = 39; // the parent's is 40: the child would be watched less closely
+    assert_eq!(
+        k.spawn_process(parent, bad, &[]).unwrap_err(),
+        ProcError::ProfileEscalation
+    );
+}
+
+#[test]
+fn spawn_refuses_a_degraded_tier_equal_to_the_surface() {
+    let mut k = kernel_with_parent();
+    let parent = k.spawn_process(PARENT, axis_parent_profile(), &[]).unwrap();
+    let mut bad = axis_parent_profile();
+    bad.degraded_syscalls = bad.syscalls; // Tighten becomes a no-op
+    assert_eq!(
+        k.spawn_process(parent, bad, &[]).unwrap_err(),
+        ProcError::ProfileEscalation
+    );
+}
+
+#[test]
+fn spawn_refuses_a_degraded_tier_that_drops_exit() {
+    let mut k = kernel_with_parent();
+    let parent = k.spawn_process(PARENT, axis_parent_profile(), &[]).unwrap();
+    let mut bad = axis_parent_profile();
+    // A proper subset of the surface — but without the exit call, a
+    // tightened domain could never leave.
+    bad.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_READ);
+    assert_eq!(
+        k.spawn_process(parent, bad, &[]).unwrap_err(),
+        ProcError::ProfileEscalation
+    );
+}
+
+#[test]
+fn spawn_refuses_a_fan_out_equal_to_the_parents() {
+    let mut k = kernel_with_parent();
+    let parent = k.spawn_process(PARENT, axis_parent_profile(), &[]).unwrap();
+    let mut bad = axis_parent_profile();
+    bad.max_children = 4; // == the parent's: fan-out must strictly decay
+    assert_eq!(
+        k.spawn_process(parent, bad, &[]).unwrap_err(),
+        ProcError::ProfileEscalation
+    );
+}
+
+#[test]
+fn spawn_refuses_broader_base_rights() {
+    let mut k = kernel_with_parent();
+    let parent = k.spawn_process(PARENT, axis_parent_profile(), &[]).unwrap();
+    let mut bad = axis_parent_profile();
+    bad.base_rights = aegis_os::capability::Rights::READ
+        .union(aegis_os::capability::Rights::WRITE)
+        .union(aegis_os::capability::Rights::GRANT); // GRANT is not the parent's
+    assert_eq!(
+        k.spawn_process(parent, bad, &[]).unwrap_err(),
+        ProcError::ProfileEscalation
+    );
+}
+
+#[test]
+fn spawn_accepts_a_strictly_attenuated_request() {
+    let mut k = kernel_with_parent();
+    let parent = k.spawn_process(PARENT, axis_parent_profile(), &[]).unwrap();
+    // Everything strictly inside: mask subset, quota below, sensitivity
+    // at or above, degraded a proper subset keeping exit, fan-out
+    // strictly below, rights a subset.
+    let mut good = axis_parent_profile();
+    good.syscalls = SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_EXIT);
+    good.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_EXIT);
+    good.quota_pages = 50;
+    good.sensitivity = 60;
+    good.max_children = 3;
+    good.base_rights = aegis_os::capability::Rights::READ;
+    let child = k.spawn_process(parent, good, &[]).unwrap();
+    assert!(k.domain(child).unwrap().mask().bits() == (1u64 << SYS_READ) | (1u64 << SYS_EXIT));
 }
