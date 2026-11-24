@@ -41,7 +41,9 @@ is `pkill -9 -f qemu-system-x86`. Lanes: --verify, q35,
 q35-noiommu, shell green; persist hits the documented ADR-0030
 flake-family timeout.
 
-Gates: 757 tests (464 core + 293 kernel), clippy -D warnings 0,
+- **The three fuzz harnesses (round A6/ITEM 8)**: seeded, deterministic, default-scale-in-CI — `tests/fuzz_syscall_storm.rs` (240k hostile ops over `Kernel::syscall`: wraparound lens, traversal paths, W+X mmap attempts, invalid fds/signals; the live invariant sweep proves zero panics and zero mask-widening), `tests/fuzz_lifecycle.rs` (240k spawn/fork/exec/kill/exit/reap ops; 17.8k GUARANTEED-widening spawn attacks, every one refused and the ProfileEscalation ones counted; the exec monitor ratchet and the birth-mask invariant held; found and fixed a generator subtlety: a widening OR the parent already satisfies is a legal request, not an attack — and documented the kernel's capacity-refusal-first order, ADR-0004, which correctly does not count as an escalation), and `tests/fuzz_elf_loader.rs` (300k mutations + cross-splices of the two real registry images; 108k accepted plans each re-checked against the loader's own promises — e_entry in an EXEC segment, e_phoff==64, filesz<=memsz, in-image segments, no W+X, page-granular map_bytes — and 192k typed refusals). Overridable with AEGIS_FUZZ_OPS / AEGIS_FUZZ_MUTATIONS.
+
+Gates: 760 tests (467 core + 293 kernel), clippy -D warnings 0,
 fmt, doc 0 warnings, unsafe 126/126, asm-patterns (3 rules),
 no-binaries PASS.
 
