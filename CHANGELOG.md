@@ -1,5 +1,50 @@
 # Changelog
 
+## [Unreleased] — the attenuation/security hardening round: ADR-0031 §A+§B, ADR-0032, ADR-0033, the exec image quota
+
+Six reviewer-found holes, each reproduced red before the fix (details
+and the red runs in the ADRs):
+
+- **ADR-0031 §A (sigreturn flag forgery)**: the resume path
+  whitelists the saved frame's flag bits; the restored context is
+  always preemptible; entries never inherit AC (the gated `clac`).
+  Blob modes 16/17 prove it (flag-forge + slow-writer starvation).
+- **ADR-0031 §B (entry flag state)**: `cld`, the RFLAGS sanitize
+  (TF|IF|DF|NT|AC through the pushed slot — asm-guard rule 3), the
+  IST7 #DB handler with the pure three-way `classify_debug`
+  (EntryWindow clear-and-resume; User = the domain's own death;
+  else fails closed), and the per-flag TCG measurement. Blob mode 18:
+  the DF/TF/AC rogues — byte-exact payloads, kernel never halts.
+- **ADR-0032 §A**: `DomainProfile::is_attenuation_of` — every
+  authority axis checked at spawn (typed violations, escalation
+  attempts recorded). The round-A reproduction (sensitivity=0 +
+  degraded=syscalls + max_children=1000 under a max_children=2
+  parent) is refused.
+- **ADR-0032 §B**: the exec monitor ratchet (once Enforce never
+  AuditOnly; None = inherit) + policy keyed by image content
+  identity + `canonicalize_path` before the registry lookup; stats
+  ride across the boundary.
+- **ADR-0032 §C**: per-frame reference counts — the 64-share
+  system-wide cap is gone (2000-page fork proven), typed overflow,
+  rollback by exact tree rewalk; the ADR-0027 grant bound is its own
+  constant.
+- **ADR-0033 + the quota (N2)**: ELF `e_entry` must lie in an
+  EXECUTABLE segment and `e_phoff == 64` (the 118-image mutation
+  finding); every program's quota is the caller's LIVE quota with a
+  pure pre-check before the point of no return (blob mode 19: a
+  five-page domain exec'ing the six-page shell is refused with the
+  old image intact).
+
+Ops notes: the QEMU disk-lock cascade's mechanism found (pkill
+without -f never matched the 15-char truncated comm) — lane hygiene
+is `pkill -9 -f qemu-system-x86`. Lanes: --verify, q35,
+q35-noiommu, shell green; persist hits the documented ADR-0030
+flake-family timeout.
+
+Gates: 757 tests (464 core + 293 kernel), clippy -D warnings 0,
+fmt, doc 0 warnings, unsafe 126/126, asm-patterns (3 rules),
+no-binaries PASS.
+
 ## [Unreleased] — Phase 7 slice 1: PID 1 — the init pattern, proven at CPL=3
 
 `examples/ring3-init`: the smallest honest init. PID 1 speaks Linux
