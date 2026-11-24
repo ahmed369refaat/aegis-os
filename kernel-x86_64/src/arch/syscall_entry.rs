@@ -18,9 +18,14 @@
 //!   TCG, `-cpu max`) SYSCALL demonstrably does NOT apply FMASK.IF —
 //!   the dispatch was measured running with IF=1 — so the no-nesting
 //!   invariant is self-enforced, not trusted to the MSR. Since
-//!   ADR-0031 the same self-enforcement covers AC: a gated `clac`
-//!   (on `hw::ENTRY_CLAC_GATE`, i.e. iff SMAP exists) runs before the
-//!   stub's first memory-touching instruction.
+//!   ADR-0031 section B the same self-enforcement covers the whole
+//!   family: `cld` right after `cli`, a gated `clac` (on
+//!   `hw::ENTRY_CLAC_GATE`, i.e. iff SMAP exists) once the stack is
+//!   the kernel's, and an explicit RFLAGS sanitize (TF|IF|DF|NT|AC
+//!   cleared through the pushed slot) before the frame is built. A
+//!   user-set TF that survives the transition traps #DB inside this
+//!   stub — IST7's handler clears it in the saved frame and resumes
+//!   (see `fault_class::classify_debug`).
 //! - **SYSCALL does not switch stacks.** The stub loads RSP from the
 //!   per-CPU `kstack_top` via `%gs:` right after `swapgs`; the TSS
 //!   RSP0 (same stack) only serves the *interrupt/exception* path.
@@ -66,9 +71,58 @@ const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 /// environments where the FMASK is not applied).
 const FMASK_IF_TF_DF_AC: u64 = 1 << 9 | 1 << 8 | 1 << 10 | 1 << 18;
 
+/// ADR-0031 section B: RFLAGS bits the entry SANITIZE clears through
+/// the pushed slot — TF (8), IF (9), DF (10), NT (14), AC (18). The
+/// kernel never runs on flag state it did not choose; IF is already
+/// self-enforced by `cli`, the sanitize re-clears it harmlessly. The
+/// value is sign-extendable from imm32, so the assembler encodes the
+/// `andq` directly.
+const ENTRY_SANITIZE_MASK: u64 = !((1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18));
+
 /// Last measured SYSCALL→SYSRET round-trip (TSC cycles). Written by the
 /// stub (plain store — single CPU), read by kmain after the run.
 static ROUNDTRIP: AtomicU64 = AtomicU64::new(0);
+
+/// ADR-0031 section B: the USER's raw RFLAGS as SYSCALL received them
+/// (SYSCALL copies RFLAGS→R11 BEFORE the FMASK applies; the stub parks
+/// R11's value here at its second instruction) — the measurement's
+/// "user intent" side.
+static USER_FLAGS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// ADR-0031 section B: the kernel's DELIVERED RFLAGS, captured after
+/// `cli`+`cld` and before the sanitize (a pushfq/popq pair on the
+/// kernel stack) — the "what survived the transition" side. The delta
+/// against `USER_FLAGS_SEEN` per bit is what the kernel had to clear
+/// itself.
+static DELIVERED_FLAGS: AtomicU64 = AtomicU64::new(0);
+
+/// ADR-0031 section B: the instruction after the entry sanitize — the
+/// END of the #DB entry window ([LSTAR, this]). Captured at runtime by
+/// the stub's `lea`, so stub layout changes need no hand-pinned
+/// constant. 0 until the first syscall runs (the classifier fails
+/// closed before that).
+static ENTRY_SANITIZE_END: AtomicU64 = AtomicU64::new(0);
+
+/// The last syscall's flag measurement: (user raw RFLAGS from R11,
+/// delivered RFLAGS at the capture point). Plain loads — single CPU,
+/// the stub's stores are the only writers. The bootstrap prints this
+/// around the ADR-0031 rogue domains.
+pub fn observed_flags() -> (u64, u64) {
+    (
+        USER_FLAGS_SEEN.load(Ordering::Relaxed),
+        DELIVERED_FLAGS.load(Ordering::Relaxed),
+    )
+}
+
+/// The #DB entry window (ADR-0031 section B): [LSTAR, the instruction
+/// after the sanitize]. LSTAR is read from the MSR — the source of
+/// truth for where the stub begins.
+pub fn entry_window() -> (u64, u64) {
+    (
+        hw::rdmsr(MSR_LSTAR),
+        ENTRY_SANITIZE_END.load(Ordering::Relaxed),
+    )
+}
 
 /// The syscall-entry stack top (RIP-relative read; the GS path arrives
 /// with Stage 4's SMP work — see docs/arch/syscall-entry.md).
@@ -182,6 +236,19 @@ pub fn init() {
     let entry: extern "C" fn() = syscall_entry;
     hw::wrmsr(MSR_LSTAR, entry as usize as u64);
     hw::wrmsr(MSR_FMASK, FMASK_IF_TF_DF_AC);
+    // ADR-0031 section B: MEASURE — read FMASK back after the write and
+    // print both values. A mismatch would mean a broken MSR-write helper;
+    // a match says only that the REGISTER holds the value, not that the
+    // CPU applies it across SYSCALL (the ADR-0012 IF lesson). The stub's
+    // cld/sanitize/clac self-enforcement makes the kernel's correctness
+    // independent of the answer.
+    let mut b1 = [0u8; 18];
+    let mut b2 = [0u8; 18];
+    crate::serial::write_str("[ARCH] FMASK readback: wrote 0x");
+    crate::serial::write_str(crate::strutil::hex(FMASK_IF_TF_DF_AC, &mut b1));
+    crate::serial::write_str(" read 0x");
+    crate::serial::write_str(crate::strutil::hex(hw::rdmsr(MSR_FMASK), &mut b2));
+    crate::serial::write_str(" (self-enforced regardless)\n");
     // EFER.SCE (bit 0): the instructions exist at all.
     let efer = hw::rdmsr(MSR_EFER);
     hw::wrmsr(MSR_EFER, efer | 1);
@@ -206,6 +273,12 @@ pub fn init() {
 pub extern "C" fn syscall_entry() {
     naked_asm!(
         "swapgs",                      // GS ← percpu (KERNEL_GS_BASE ↔ user)
+        "movq %r11, {ufseen}(%rip)",   // ADR-0031 §B: park the USER's raw
+                                       // RFLAGS (SYSCALL copies RFLAGS→R11
+                                       // BEFORE the FMASK applies) — the
+                                       // measurement's user-intent side.
+                                       // r11 stays live for the frame push
+                                       // below; this only reads it.
         "cli",                         // self-enforcing: interrupts OFF for
                                        // the whole kernel side of the syscall
                                        // (ADR-0012: SYSCALL's FMASK path does
@@ -214,14 +287,10 @@ pub extern "C" fn syscall_entry() {
                                        // so the stub enforces the no-nesting
                                        // invariant itself; SYSRET restores the
                                        // user's IF from R11)
-        "cmpb $0, {clacg}(%rip)",      // ADR-0031: never inherit a user-set
-        "je   1f",                     // AC — clear it before the stub's
-        "clac",                        // first memory access, but only when
-        "1:",                          // SMAP exists (else CLAC is #UD). The
-                                       // gate byte is set at boot with
-                                       // SMAP_ACTIVE; swapgs/cli above touch
-                                       // no memory, so nothing has run with
-                                       // the inherited AC.
+        "cld",                         // ADR-0031 §B: DF self-enforcement,
+                                       // same doctrine — never trust the
+                                       // FMASK: no kernel string op may run
+                                       // on the user's direction bit.
         "movq %rbp, {ubp}(%rip)",       // ADR-0024: park the user's
         "movq %r12, {ur12}(%rip)",      // callee-saved five BEFORE
         "movq %r13, {ur13}(%rip)",      // anything can clobber them
@@ -231,6 +300,36 @@ pub extern "C" fn syscall_entry() {
                                        // SYSRET will not restore it, and
                                        // the switch below destroys it
         "movq {srsp}(%rip), %rsp",     // SYSCALL switches no stack; we do
+        "pushfq",                      // ADR-0031 §B: MEASURE the delivered
+        "popq %rbp",                   // RFLAGS (rbp parked above — a free
+                                       // scratch; only swapgs/mov/cli/cld
+                                       // ran, so IF and DF are already
+                                       // self-cleared, TF/AC/NT show what
+                                       // survived the transition)
+        "movq %rbp, {dflags}(%rip)",   // the delivered-flags slot
+        "movq {ubp}(%rip), %rbp",      // restore rbp: the syscall path
+                                       // returns it bit-for-bit (SYSRET
+                                       // restores nothing else)
+        "cmpb $0, {clacg}(%rip)",      // ADR-0031: never inherit a user-set
+        "je   1f",                     // AC — clear it before anything can
+        "clac",                        // touch USER memory. The capture above
+        "1:",                          // and the stack it used are supervisor
+                                       // pages (kernel stack / .bss — SMAP
+                                       // does not apply), so an inherited AC
+                                       // through this gap is harmless by
+                                       // construction.
+        "pushfq",                      // ADR-0031 §B: SANITIZE — the kernel
+        "andq ${sane}, (%rsp)",        // never runs on flag state it did not
+        "popfq",                       // choose: TF|IF|DF|NT|AC cleared
+                                       // through the pushed slot (no
+                                       // register round-trip; the asm-pattern
+                                       // guard pins the shape)
+        "lea 2f(%rip), %rbp",          // capture the window END (the
+        "movq %rbp, {wend}(%rip)",     // instruction after the sanitize)
+        "2:",                          // for the #DB classifier —
+                                       // runtime-captured, no hand-pinned
+                                       // constant
+        "movq {ubp}(%rip), %rbp",      // rbp back, same contract as above
         // ── park the user registers (SyscallFrame order) ──
         "pushq $0",                    // pad (alignment)
         "pushq %rax",                  // nr → result slot
@@ -306,6 +405,10 @@ pub extern "C" fn syscall_entry() {
         off_r11 = const OFF_R11,
         off_rbx = const OFF_RBX,
         clacg = sym crate::hw::ENTRY_CLAC_GATE,
+        ufseen = sym USER_FLAGS_SEEN,
+        dflags = sym DELIVERED_FLAGS,
+        wend = sym ENTRY_SANITIZE_END,
+        sane = const ENTRY_SANITIZE_MASK,
         options(att_syntax),
     );
 }

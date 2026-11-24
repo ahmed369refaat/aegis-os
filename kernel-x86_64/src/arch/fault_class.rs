@@ -89,3 +89,105 @@ mod n1_tests {
         );
     }
 }
+
+/// ADR-0031 section B: classification of a #DB (vector 1) trap.
+///
+/// The trap is reported with the frame of the instruction that was
+/// ABOUT to execute when the trap fired (a trap, not a fault: the
+/// trapped instruction already completed). Three sources are possible:
+/// a user-set TF that survived the SYSCALL transition (kernel context,
+/// inside the entry window), a ring-3 single-step (the domain's own
+/// death — never a kernel halt), or a genuine kernel debug event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugTrap {
+    /// CPL0, rip inside [lstar, sanitize_end]: a user-set TF that
+    /// survived the transition and trapped inside the entry stub.
+    /// The handler clears TF in the saved frame and resumes.
+    EntryWindow,
+    /// CPL3 frame: the domain single-stepped itself — the ordinary
+    /// user-fault route (the domain dies, the kernel lives).
+    User,
+    /// CPL0 outside the window, or the window not yet captured
+    /// (fails closed): the existing forensics dump.
+    KernelBug,
+}
+
+/// Classify a #DB by its frame. `lstar` is the SYSCALL entry RIP (the
+/// window's start — the trap-on-SYSCALL case reports rip == lstar in
+/// kernel context); `sanitize_end` is the stub's runtime-captured
+/// address of the instruction after the RFLAGS sanitize (the window's
+/// end — once past it the stub has cleared TF itself, so any later
+/// kernel-context trap is not ours). A zero `sanitize_end` means the
+/// window was never captured (no syscall ran yet): fail CLOSED —
+/// never resume an unknown debug event.
+pub fn classify_debug(cs: u64, rip: u64, lstar: u64, sanitize_end: u64) -> DebugTrap {
+    // The RPL bits name the privilege the trap fired under.
+    if cs & 0x3 == 3 {
+        return DebugTrap::User;
+    }
+    if lstar != 0 && sanitize_end != 0 && rip >= lstar && rip <= sanitize_end {
+        return DebugTrap::EntryWindow;
+    }
+    DebugTrap::KernelBug
+}
+
+#[cfg(test)]
+mod adr0031_db_tests {
+    use super::*;
+
+    const LSTAR: u64 = 0xFFFF_FFFF_8000_1000;
+    const WEND: u64 = LSTAR + 0x40;
+
+    #[test]
+    fn ring3_single_step_is_the_users_own_death() {
+        assert_eq!(classify_debug(0x2b, 0x400000, LSTAR, WEND), DebugTrap::User);
+        // Even INSIDE the window's address range, a ring-3 frame is a
+        // ring-3 trap — the privilege bits decide, the rip cannot.
+        assert_eq!(classify_debug(0x2b, LSTAR, LSTAR, WEND), DebugTrap::User);
+        assert_eq!(
+            classify_debug(0x33, LSTAR + 8, LSTAR, WEND),
+            DebugTrap::User
+        );
+    }
+
+    #[test]
+    fn kernel_context_inside_the_window_is_the_entry_resume() {
+        // The trap-on-SYSCALL case: rip == lstar exactly.
+        assert_eq!(
+            classify_debug(0x30, LSTAR, LSTAR, WEND),
+            DebugTrap::EntryWindow
+        );
+        // After the stub's first instruction.
+        assert_eq!(
+            classify_debug(0x30, LSTAR + 2, LSTAR, WEND),
+            DebugTrap::EntryWindow
+        );
+        // The last in-window rip (the instruction after the sanitize).
+        assert_eq!(
+            classify_debug(0x30, WEND, LSTAR, WEND),
+            DebugTrap::EntryWindow
+        );
+    }
+
+    #[test]
+    fn kernel_context_outside_the_window_is_a_kernel_bug() {
+        assert_eq!(
+            classify_debug(0x30, LSTAR + 0x41, LSTAR, WEND),
+            DebugTrap::KernelBug
+        );
+        // Before the stub (impossible — LSTAR is the entry — but the
+        // classifier must not accept it).
+        assert_eq!(
+            classify_debug(0x30, LSTAR - 8, LSTAR, WEND),
+            DebugTrap::KernelBug
+        );
+    }
+
+    #[test]
+    fn an_uncaptured_window_fails_closed() {
+        // sanitize_end == 0 (no syscall ever ran): never resume.
+        assert_eq!(classify_debug(0x30, LSTAR, LSTAR, 0), DebugTrap::KernelBug);
+        // lstar == 0 (MSR not armed): never resume.
+        assert_eq!(classify_debug(0x30, 0x1000, 0, WEND), DebugTrap::KernelBug);
+    }
+}

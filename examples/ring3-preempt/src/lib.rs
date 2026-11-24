@@ -44,6 +44,14 @@
 //!     round (40M) — a co-runner still alive inside the flag forger's
 //!     post-sigreturn spin, so the "finished first" check is a real
 //!     starvation proof, not a vacuous one.
+//!   mode 18 — **flag rogues** (ADR-0031 §B): role byte at 0x403001 —
+//!     0 = DF via `std`, 1 = TF set so the SYSCALL is the instruction
+//!     right after `popfq`, 2 = AC via `pushfq`/`popfq`. Each rogue
+//!     makes a copy-heavy write + yield excursion with the flag set in
+//!     its own image: the kernel must survive, the payload must arrive
+//!     byte-exact, and the TF rogue dies by its own trap in either
+//!     reading (entry-window resume or a ring-3 trap) — never a
+//!     kernel halt.
 //!
 //! Register discipline (ADR-0012): live loop state lives in R12/R13 —
 //! the interrupt-frame switch preserves every GPR, but a *handover*
@@ -94,6 +102,8 @@ _ring3_start:
     je 27f                            /* mode 16: the parameterized killer */
     cmp al, 17
     je 28f                            /* mode 17: the slow writer */
+    cmp al, 18
+    je 29f                            /* mode 18: the flag rogues */
 
     /* ── mode 1: the writer ─────────────────────────────────────── */
     xor r12d, r12d                    /* round counter (R12: survives
@@ -1804,6 +1814,73 @@ slow_wr_spin:
     jb slow_wr_loop
     mov eax, 63                       /* SYS_EXIT */
     xor edi, edi
+    syscall
+
+29: /* ── mode 18: the flag rogues (ADR-0031 §B) ────────────────── */
+    /* Role byte at 0x403001: 0=DF (std), 1=TF, 2=AC. Each rogue sets
+       its flag from ring 3 and makes a copy-heavy syscall excursion;
+       the kernel must survive all three and the payloads must arrive
+       byte-exact. */
+    movzx eax, byte ptr [0x00403001]
+    test al, al
+    jz 34f                            /* role 0: DF the hard way */
+    cmp al, 1
+    je 35f                            /* role 1: TF into a syscall */
+    jmp 36f                           /* role 2: AC via pushfq/popfq */
+34: std
+    jmp 37f
+35: /* TF role: the PAYLOAD FIRST — the byte-exact proof must not
+       depend on surviving the trap dance (found live: in the
+       entry-window reading the resumed run dies on its very next
+       ring-3 instruction, before any write). Then the dance: load the
+       nr, set TF so the SYSCALL itself is the instruction right after
+       popfq — the first #DB lands either on the SYSCALL completion
+       (kernel context: the entry window — the classifier clears TF
+       and resumes us; our own image keeps TF and the next ring-3
+       instruction is our own death) or at the syscall instruction
+       (ring 3: our own death immediately). Either reading: the KERNEL
+       lives. The exit below is reached only if the transition itself
+       cleared TF (FMASK applied). */
+    mov eax, 1
+    mov edi, 1
+    mov rsi, 0x00403010
+    mov edx, 64
+    syscall
+    mov eax, 24                       /* sched_yield */
+    pushfq
+    or qword ptr [rsp], 0x100         /* TF on */
+    popfq
+    syscall
+    test rax, rax
+    jnz 258f
+    mov eax, 63                       /* SYS_EXIT */
+    xor edi, edi
+    syscall
+    jmp 38f                           /* unreachable belt: never fall
+                                          into role 2's code */
+36: /* AC: ring 3's own right (POP F at CPL3 may set it); the entry's
+       gated clac keeps the KERNEL's view clear (ADR-0031 §A). */
+    pushfq
+    or qword ptr [rsp], 0x40000       /* AC on */
+    popfq
+37: /* the common excursion (roles 0 and 2): write(fd 1, 64 bytes
+       @0x403010) with the flag still set in OUR image, then yield,
+       then exit 0 */
+    mov eax, 1
+    mov edi, 1
+    mov rsi, 0x00403010
+    mov edx, 64
+    syscall
+    mov eax, 24                       /* sched_yield: the full excursion */
+    syscall
+    test rax, rax
+    jnz 258f
+    mov eax, 63                       /* SYS_EXIT */
+    xor edi, edi
+    syscall
+38:
+258: mov eax, 63
+    mov edi, 258                      /* the rogue's excursion failed */
     syscall
 
 140: mov eax, 63

@@ -1957,6 +1957,157 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             );
             hw::halt_forever();
         }
+
+        // ── 16d. ADR-0031 section B: the flag rogues — DF, TF, AC set
+        //      from ring 3 around a copy-heavy syscall excursion. Each
+        //      rogue writes a 64-byte payload (the byte-exactness is
+        //      the copy proof: an inherited DF would corrupt it if the
+        //      kernel's copy were direction-sensitive), yields, and
+        //      exits. The DF and AC rogues must exit clean; the TF
+        //      rogue dies by its own trap in EITHER reading
+        //      (entry-window resume, or a ring-3 single-step) and the
+        //      kernel must live through all three — the measurement
+        //      slots print with each exit. ──
+        {
+            const fn rogue_payload(role: u8) -> [u8; 0x60] {
+                let mut d = [0u8; 0x60];
+                d[0] = 18; // mode 18: the flag rogue
+                d[1] = role;
+                let msg: &[u8; 64] = match role {
+                    0 => b"ROGUE-DF: the kernel copy must run forwards, byte-exact !!!!!!!\n",
+                    1 => b"ROGUE-TF: the trap must never reach the kernel death path !!!!!\n",
+                    _ => b"ROGUE-AC: the SMAP window must hold with AC in user image !!!!!\n",
+                };
+                let mut i = 0;
+                while i < 64 {
+                    d[0x10 + i] = msg[i];
+                    i += 1;
+                }
+                d
+            }
+            static ROGUE_DF_DATA: [u8; 0x60] = rogue_payload(0);
+            static ROGUE_TF_DATA: [u8; 0x60] = rogue_payload(1);
+            static ROGUE_AC_DATA: [u8; 0x60] = rogue_payload(2);
+
+            /// One rogue at a time: launch, take, measure, destroy.
+            /// Returns (user_flags, delivered_flags, clean_exit,
+            /// tf_fault). The rogues never park (the yield is solo), so
+            /// the strict take() is the right reaper here.
+            fn run_rogue<const N: usize>(
+                k: &mut aegis_os::Kernel<N>,
+                pool: &mut crate::frames::FramePool<N>,
+                out: &mut dyn FnMut(&str),
+                id: u32,
+                name: &str,
+                data: &[u8; 0x60],
+            ) -> (u64, u64, bool, bool) {
+                let rogue = match mm::user::spawn_user_blob(
+                    k,
+                    pool,
+                    id,
+                    aegis_os::profile::service_profile(),
+                    RING3_PREEMPT,
+                    data,
+                ) {
+                    Ok(sp) => sp,
+                    Err(_) => {
+                        line(
+                            out,
+                            &[
+                                "[SEC] ADR-0031 measure: ERROR: ",
+                                name,
+                                " spawn failed; halting",
+                            ],
+                        );
+                        hw::halt_forever();
+                    }
+                };
+                let kernel_cr3 = hw::read_cr3();
+                rogue.run.tables.activate();
+                crate::sched::context::begin(rogue.run);
+                crate::sched::context::launch(&rogue.ctx);
+                let run = crate::sched::context::take();
+                hw::write_cr3(kernel_cr3);
+                let (uf, dfl) = crate::arch::syscall_entry::observed_flags();
+                let (clean, tf_fault) = match run.exit {
+                    crate::sched::context::ExitKind::Exited(0) => (true, false),
+                    crate::sched::context::ExitKind::Fault { vector: 1, .. } => (false, true),
+                    _ => (false, false),
+                };
+                mm::user::destroy_user(k, pool, id);
+                let _ = crate::sched::preempt::on_exit(&mut k.sched, id);
+                (uf, dfl, clean, tf_fault)
+            }
+
+            let (uf, dfl, clean, _) =
+                run_rogue(&mut k, &mut pool, &mut out, 34, "DF rogue", &ROGUE_DF_DATA);
+            let mut h1 = [0u8; 18];
+            let mut h2 = [0u8; 18];
+            if clean {
+                line(
+                    &mut out,
+                    &[
+                        "[SEC] ADR-0031 measure: DF rogue user_flags=0x",
+                        strutil::hex(uf, &mut h1),
+                        " delivered=0x",
+                        strutil::hex(dfl, &mut h2),
+                        " exit=clean",
+                    ],
+                );
+            } else {
+                line(
+                    &mut out,
+                    &["[SEC] ADR-0031 measure: DF rogue ERROR: not a clean exit; halting"],
+                );
+                hw::halt_forever();
+            }
+            let (uf, dfl, clean, tf_fault) =
+                run_rogue(&mut k, &mut pool, &mut out, 35, "TF rogue", &ROGUE_TF_DATA);
+            let mut h1 = [0u8; 18];
+            let mut h2 = [0u8; 18];
+            if clean || tf_fault {
+                let verdict = if tf_fault {
+                    " exit=own-trap (kernel lived)"
+                } else {
+                    " exit=clean (the transition cleared TF)"
+                };
+                line(
+                    &mut out,
+                    &[
+                        "[SEC] ADR-0031 measure: TF rogue user_flags=0x",
+                        strutil::hex(uf, &mut h1),
+                        " delivered=0x",
+                        strutil::hex(dfl, &mut h2),
+                        verdict,
+                    ],
+                );
+            } else {
+                line(&mut out, &["[SEC] ADR-0031 measure: TF rogue ERROR: neither clean nor its own trap; halting"]);
+                hw::halt_forever();
+            }
+            let (uf, dfl, clean, _) =
+                run_rogue(&mut k, &mut pool, &mut out, 36, "AC rogue", &ROGUE_AC_DATA);
+            let mut h1 = [0u8; 18];
+            let mut h2 = [0u8; 18];
+            if clean {
+                line(
+                    &mut out,
+                    &[
+                        "[SEC] ADR-0031 measure: AC rogue user_flags=0x",
+                        strutil::hex(uf, &mut h1),
+                        " delivered=0x",
+                        strutil::hex(dfl, &mut h2),
+                        " exit=clean",
+                    ],
+                );
+            } else {
+                line(
+                    &mut out,
+                    &["[SEC] ADR-0031 measure: AC rogue ERROR: not a clean exit; halting"],
+                );
+                hw::halt_forever();
+            }
+        }
     }
 
     // ── 19. ADR-0025: the IPC proof — capability-mediated endpoints,

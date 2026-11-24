@@ -501,6 +501,17 @@ if [ "$MODE" = "verify" ]; then
   # must not weaken the SMAP self-test (the re-probe still faults).
   grep -qF "[SEC ] ADR-0031 forge: IF=0+AC=1 frame sanitized" "$LOG" || { echo "VERIFY FAIL: ADR-0031 flag-forge marker missing"; ok=0; }
   grep -qF "[SEC ] ADR-0031 AC-setter: entry clac held — the SMAP re-probe still faulted" "$LOG" || { echo "VERIFY FAIL: ADR-0031 AC-setter/SMAP re-probe marker missing"; ok=0; }
+  # ADR-0031 section B: the flag rogues — the kernel survives a DF/TF/AC
+  # rogue (the TF one dies by its own trap in either reading, never a
+  # kernel halt), the 64-byte payloads arrive byte-exact, the
+  # measurement slots print, and the FMASK readback is on record.
+  grep -qF "[ARCH] FMASK readback: " "$LOG" || { echo "VERIFY FAIL: ADR-0031 FMASK readback marker missing"; ok=0; }
+  grep -qF "[SEC] ADR-0031 measure: DF rogue" "$LOG" || { echo "VERIFY FAIL: ADR-0031 DF-rogue measure marker missing"; ok=0; }
+  grep -qF "[SEC] ADR-0031 measure: TF rogue" "$LOG" || { echo "VERIFY FAIL: ADR-0031 TF-rogue measure marker missing"; ok=0; }
+  grep -qF "[SEC] ADR-0031 measure: AC rogue" "$LOG" || { echo "VERIFY FAIL: ADR-0031 AC-rogue measure marker missing"; ok=0; }
+  grep -qF "ROGUE-DF: the kernel copy must run forwards, byte-exact !!!!!!!" "$LOG" || { echo "VERIFY FAIL: ADR-0031 DF payload not byte-exact"; ok=0; }
+  grep -qF "ROGUE-TF: the trap must never reach the kernel death path !!!!!" "$LOG" || { echo "VERIFY FAIL: ADR-0031 TF payload not byte-exact"; ok=0; }
+  grep -qF "ROGUE-AC: the SMAP window must hold with AC in user image !!!!!" "$LOG" || { echo "VERIFY FAIL: ADR-0031 AC payload not byte-exact"; ok=0; }
   # ADR-0023: the sleep/idle proof (self-park + guarded idle + the
   # calibrated clock read from ring 3).
   grep -qF "[M3] sleep: idle engaged" "$LOG" || { echo "VERIFY FAIL: M3 sleep/idle marker missing"; ok=0; }

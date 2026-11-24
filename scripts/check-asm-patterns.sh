@@ -97,6 +97,44 @@ check_cpuid_reg() {
     ' "$1"
 }
 
+# Rule 3 (ADR-0031 section B): an asm! block that touches RFLAGS via
+# pushfq must route the modification through the PUSHED SLOT
+# (e.g. `andq $mask, (%rsp)`), never through an out(reg)/inout(reg)
+# template operand (allocation luck can pick a live register — the same
+# class rule 1 banned) and never through a bare register target. The
+# syscall entry's RFLAGS sanitize and its delivered-flags capture are
+# the live instances. Block-scoped by paren depth (rule 2's shape), so
+# single-line and multi-line blocks are caught alike.
+check_pushfq_window() {
+    awk '
+        # Strip // comments so their parens never skew the depth.
+        { line = $0; sub(/\/\/.*/, "", line) }
+        state == 0 && /asm!\(/ {
+            state = 1
+            depth = gsub(/\(/, "(", line) - gsub(/\)/, ")", line)
+            has_pushfq = (line ~ /pushfq/)
+            has_reg = (line ~ /(out|inout)\(reg\)/)
+            has_value_and = (line ~ /(andq?|orq?) +(\$|\{)[^ ]+ *, *%r/)
+            next
+        }
+        state == 1 {
+            if (line ~ /pushfq/) has_pushfq = 1
+            if (line ~ /(out|inout)\(reg\)/) has_reg = 1
+            if (line ~ /(andq?|orq?) +(\$|\{)[^ ]+ *, *%r/) has_value_and = 1
+            depth += gsub(/\(/, "(", line) - gsub(/\)/, ")", line)
+            if (depth <= 0) {
+                if (has_pushfq && (has_reg || has_value_and)) {
+                    print FILENAME ":" FNR ": an asm block touching RFLAGS (pushfq) routes its modification through a register (out/inout operand or a bare register target) — apply the mask to the pushed slot, e.g. andq $mask, (%rsp) (rule 3, ADR-0031)"
+                    bad = 1
+                }
+                state = 0
+            }
+            next
+        }
+        END { exit bad ? 1 : 0 }
+    ' "$1"
+}
+
 if [ "${1:-}" = "--self-test" ]; then
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
@@ -221,10 +259,47 @@ fn bad_load() {
     }
 }
 EOS
+    # GOOD (rule 3): the ADR-0031 entry sanitize — the mask applied
+    # through the pushed slot, no register round-trip.
+    cat > "$tmp/good-pushfq.rs" <<'EOS'
+fn sanitize() {
+    unsafe {
+        core::arch::asm!("pushfq", "andq $-264704, (%rsp)", "popfq", options(att_syntax));
+    }
+}
+EOS
+    # GOOD (rule 3): the delivered-flags capture — popq into a FIXED
+    # register (no template operand) inside the window.
+    cat > "$tmp/good-pushfq-capture.rs" <<'EOS'
+fn capture() {
+    unsafe {
+        core::arch::asm!("pushfq", "popq %rbp", options(att_syntax));
+    }
+}
+EOS
+    # BAD (rule 3): the register round-trip — out(reg) inside the
+    # pushfq→popfq window is allocation luck on a live register.
+    cat > "$tmp/bad-pushfq-reg.rs" <<'EOS'
+fn bad_pushfq() {
+    unsafe {
+        core::arch::asm!("pushfq", "pop {f}", "andq {m}, {f}", "push {f}", "popfq", f = out(reg) f, m = const M);
+    }
+}
+EOS
+    # BAD (rule 3): the bare-register target — andq hits %rax, not the
+    # pushed slot; the popfq then loads an unmodified image.
+    cat > "$tmp/bad-pushfq-slot.rs" <<'EOS'
+fn bad_slot() {
+    unsafe {
+        core::arch::asm!("pushfq", "andq $-264704, %rax", "popfq", options(att_syntax));
+    }
+}
+EOS
     run_case() { # name, file, expect_ok(0/1)
         local rc=0
         check_pushpop "$2" >/dev/null 2>&1 || rc=1
         check_cpuid_reg "$2" >/dev/null 2>&1 || rc=1
+        check_pushfq_window "$2" >/dev/null 2>&1 || rc=1
         if [ "$3" -eq 0 ] && [ "$rc" -ne 0 ]; then
             echo "SELF-TEST FAIL: the good sample $1 was rejected"; exit 1
         fi
@@ -237,12 +312,16 @@ EOS
     run_case good-fixed.rs      "$tmp/good-fixed.rs"      0
     run_case good-ebx-fixed.rs  "$tmp/good-ebx-fixed.rs"  0
     run_case good-rdrand.rs     "$tmp/good-rdrand.rs"     0
+    run_case good-pushfq.rs     "$tmp/good-pushfq.rs"     0
+    run_case good-pushfq-capture.rs "$tmp/good-pushfq-capture.rs" 0
+    run_case bad-pushfq-reg.rs  "$tmp/bad-pushfq-reg.rs"  1
+    run_case bad-pushfq-slot.rs "$tmp/bad-pushfq-slot.rs" 1
     run_case bad.rs             "$tmp/bad.rs"             1
     run_case bad-ecx-exact.rs   "$tmp/bad-ecx-exact.rs"   1
     run_case bad-ecx-slot.rs    "$tmp/bad-ecx-slot.rs"    1
     run_case bad-cpuid-reg.rs   "$tmp/bad-cpuid-reg.rs"   1
     run_case bad-load.rs        "$tmp/bad-load.rs"        1
-    echo "ASM PATTERN GUARD: self-test PASS (rule 1: push/pop %rbx must store through the slot; rule 2: no out(reg) near CPUID; both catch the historical shapes)"
+    echo "ASM PATTERN GUARD: self-test PASS (rule 1: push/pop %rbx must store through the slot; rule 2: no out(reg) near CPUID; rule 3: pushfq→popfq windows modify through the pushed slot; all catch the historical shapes)"
     exit 0
 fi
 
@@ -259,7 +338,13 @@ while IFS= read -r f; do
     fi
 done < <(grep -rl '"cpuid"' kernel-x86_64/src --include='*.rs' 2>/dev/null || true)
 
+while IFS= read -r f; do
+    if ! check_pushfq_window "$f"; then
+        fail=1
+    fi
+done < <(grep -rl 'pushfq' kernel-x86_64/src --include='*.rs' 2>/dev/null || true)
+
 if [ "$fail" -eq 0 ]; then
-    echo "ASM PATTERN GUARD: PASS (every push/pop %rbx window stores through the pushed slot; every CPUID block uses fixed registers only)"
+    echo "ASM PATTERN GUARD: PASS (every push/pop %rbx window stores through the pushed slot; every CPUID block uses fixed registers only; every pushfq→popfq window modifies through the pushed slot)"
 fi
 exit "$fail"

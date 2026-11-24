@@ -126,13 +126,98 @@ missing is the CI-visible failure.
   kernel's own DF is handled by the entry sanitize in section B, not by
   policing user frames); VIF/VIP stay stripped (no virtual-8086 stories).
 
-## Section B (ITEM 7, next in this round) — measurement first
+## Section B (ITEM 7, this round) — measure first, then self-enforce regardless
 
-Before any further flag work: read back `FMASK` after the write, capture
-RFLAGS at the first kernel instruction after SYSCALL for blobs that set
-DF, TF and AC, and record per-environment (TCG, KVM if present) whether
-the MSR mask or the flags survive. Then, regardless of the measurement:
-`cld` after `swapgs`, an explicit RFLAGS sanitize (clear TF/AC/DF/NT) in
-the entry, and a safe IST #DB handler that classifies trap-vs-kernel-bug.
-Recorded here because the two sections share the ADR's invariant: the
-kernel never runs on flag state it did not choose.
+**The question.** ADR-0012 already measured that this environment (QEMU
+10.0.13 TCG, `-cpu max`) does not apply `FMASK.IF` across SYSCALL (the
+stub self-enforces IF with `cli`). Section A added AC to the mask and
+self-enforced it with a gated `clac`. Section B asks the same question
+for the whole flag family and then, regardless of the answer, removes
+the kernel's dependence on the MSR entirely.
+
+**The measurement (recorded, TCG only — KVM not present in this
+sandbox, "not run").**
+- `init()` reads `FMASK` back after the write and prints both values
+  (`[ARCH] FMASK readback: wrote … read …`). A readback mismatch would
+  mean a broken MSR-write helper; a match says only that the REGISTER
+  holds the value, not that the CPU applies it (the ADR-0012 lesson).
+- The stub parks the user's raw RFLAGS (SYSCALL copies RFLAGS→R11
+  before the mask applies) into `USER_FLAGS_SEEN`, and captures the
+  kernel's actual running RFLAGS — after `cli` and `cld`, before the
+  sanitize — into `DELIVERED_FLAGS` (a `pushfq`/`popq %rbp` pair; RBP
+  is parked first, so the scratch is free; the capture runs on the
+  kernel stack). The delta per bit is what the transition actually
+  cleared versus what the kernel had to clear itself. The capture
+  point is AFTER `cli`/`cld` by construction — the fix must be in
+  place for the measurement to run safely, so the lane proves the END
+  STATE (the kernel never runs with user DF/TF/AC), not the MSR's
+  behavior in isolation.
+- Ring-3 rogues set DF (`std`), TF (`pushfq`/`popfq`) and AC before a
+  syscall excursion; the bootstrap prints per-rogue measurement lines
+  (`[SEC] ADR-0031 measure: … user_flags=… delivered=… exit=…`) and
+  greps the 64-byte write payload byte-exact — a kernel that inherited
+  DF and used a direction-sensitive copy would corrupt the payload.
+
+**The trap-flag subtlety (both readings survivable).** With TF set by
+`popfq` directly before `syscall`, the first #DB lands either (a) on
+the SYSCALL completion — kernel context, rip at/near LSTAR (the SDM
+popfq-grace reading), or (b) at the syscall instruction itself —
+ring-3 context (cs RPL 3). The lane accepts both: reading (a)
+exercises the entry-window resume below (and the rogue then dies on
+its next ring-3 instruction — its own TF, its own death); reading (b)
+kills the domain as an ordinary user fault. In NEITHER reading may the
+kernel halt — that is the security claim.
+
+**The fix (unconditional — never trust the MSR).**
+- `cld` right after `swapgs` (before any kernel code could run a
+  direction-sensitive instruction), and
+- an explicit RFLAGS sanitize before the dispatch call:
+  `pushfq; andq $ENTRY_SANITIZE_MASK, (%rsp); popfq`, clearing
+  TF|IF|DF|NT|AC through the pushed slot (no register round-trip; the
+  asm-pattern guard gains a rule that every pushfq→popfq window routes
+  its modification through the stack slot and uses no `out(reg)`).
+  IF was already self-enforced by `cli`; the sanitize re-clears it
+  harmlessly.
+- The flag-capture ordering note: the capture and the RSP switch touch
+  only the kernel stack and kernel .bss (supervisor pages — SMAP does
+  not apply), so the gated `clac` may run after them; nothing between
+  SYSCALL and `clac` accesses user memory. Section A's invariant
+  ("nothing runs with the inherited AC on a user access") is preserved.
+- **#DB gets a safe IST handler.** Vector 1 moves to IST7 (its own
+  stack — a trap mid-stub, after the RSP switch but before the frame
+  is complete, must not clobber a live kernel stack). The pure
+  classifier `fault_class::classify_debug(cs, rip, lstar,
+  sanitize_end)` returns:
+  - `EntryWindow` — CPL0 and rip in [LSTAR, sanitize_end]: a user-set
+    TF that survived the transition. The handler clears TF in the
+    SAVED frame (stopping the trap train; the saved rip already points
+    past the trapped instruction) and returns through the ordinary
+    unwind — the stub resumes transparently with its partial state
+    intact (the exception frame preserved it).
+  - `User` — CPL3 frame: the domain single-stepped itself; the
+    ordinary user-fault path (the domain's death, never a kernel
+    halt). DEVIATION FROM THE TASK TEXT, recorded for maintainer
+    review: the round brief said "any other source … a kernel bug",
+    but a ring-3 TF trap is user-owned state; halting on it would give
+    ring 3 a trivial halt-the-machine primitive and violates the
+    round's own invariant ("never fault the kernel from user input").
+  - `KernelBug` — CPL0 outside the window, or the window not yet
+    captured (`sanitize_end == 0` — fails closed): the existing
+    forensics dump.
+  The window end is captured at runtime (`lea` of the instruction
+  after the sanitize) so the stub's layout can change without a
+  hand-pinned constant; the window start is LSTAR itself (read from
+  the MSR — the source of truth), and the window includes rip ==
+  LSTAR for the trap-on-SYSCALL case.
+- Boot markers added (no existing marker byte changed): the readback
+  line, the three measure lines, the three byte-exact rogue payloads,
+  and the entry-window #DB line (grepped as information, not as a pass
+  requirement — the trap's reading is an environment property).
+
+**Proven / not proven.** Proven in TCG: the lane runs red on the
+pre-fix kernel (the TF rogue halts the machine at the entry — the
+exact "unexpected vector halts" hazard the round named) and green
+after (clear/resume, byte-exact payloads, kernel survives all three).
+NOT PROVEN: KVM behavior (absent), real hardware, and whether FMASK
+applies at the transition on any platform — by design the kernel's
+correctness no longer depends on the answer.

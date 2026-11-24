@@ -24,6 +24,15 @@ const fn ist_for(vector: u8) -> u8 {
         18 => 3, // #MC: most severe, its own stack
         12 => 4, // #SS: a stack fault cannot trust that stack
         14 => 5, // #PF: own stack since PR-1.4 (was: none)
+        // ADR-0031 section B: #DB gets its own stack (IST7). A user-set
+        // TF that survives the SYSCALL transition traps inside the
+        // entry stub — possibly after the stub switched RSP to the
+        // kernel stack but before its frame is complete, where a
+        // same-stack push would clobber the half-built frame. The
+        // handler clears TF in the saved frame and resumes (see
+        // exceptions::dispatch's #DB branch); every other source is
+        // the ordinary CPL3-fault or forensics route.
+        1 => 7,
         // ADR-0030's third shape, SOLVED: an interrupt delivered at
         // CPL0 keeps the CURRENT stack — and in the syscall-entry
         // window (after SYSCALL switched CPL but before the stub

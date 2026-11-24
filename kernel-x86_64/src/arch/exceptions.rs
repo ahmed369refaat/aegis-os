@@ -54,10 +54,18 @@ static mut IST_PF: IstStack = IstStack([0; 0x4000]);
 /// the original flake's mechanism (see stubs::ist_for).
 static mut IST_IRQ: IstStack = IstStack([0; 0x4000]);
 
-/// Top-of-stack addresses for TSS.IST1..IST6, in the order `gdt::load`
+/// ADR-0031 section B: #DB's own stack (IST7). A user-set TF that
+/// survives SYSCALL traps inside the entry stub — possibly after the
+/// stub switched RSP to the kernel stack but before its frame is
+/// complete, a context where a same-stack push would clobber the
+/// half-built frame. Its own IST makes the handler safe at every
+/// point of the window.
+static mut IST_DB: IstStack = IstStack([0; 0x4000]);
+
+/// Top-of-stack addresses for TSS.IST1..IST7, in the order `gdt::load`
 /// writes them (IST1=#DF, IST2=#NMI, IST3=#MC, IST4=#SS, IST5=#PF,
-/// IST6=the interrupt family).
-pub fn ist_tops() -> [u64; 6] {
+/// IST6=the interrupt family, IST7=#DB).
+pub fn ist_tops() -> [u64; 7] {
     // F16: raw pointers into the `static mut` stacks — no references to
     // mutable statics; the tops are pure address arithmetic.
     let top = |s: *const IstStack| (s as usize + core::mem::size_of::<IstStack>()) as u64;
@@ -68,6 +76,7 @@ pub fn ist_tops() -> [u64; 6] {
         top(core::ptr::addr_of!(IST_SS)),
         top(core::ptr::addr_of!(IST_PF)),
         top(core::ptr::addr_of!(IST_IRQ)),
+        top(core::ptr::addr_of!(IST_DB)),
     ]
 }
 
@@ -253,6 +262,30 @@ fn dispatch(f: &mut ExceptionFrame) {
     {
         crate::irq::deliver(f.vector as u8);
         return;
+    }
+
+    // ── #DB (ADR-0031 section B): a user-set TF that survived the
+    // SYSCALL transition traps inside the entry stub (kernel context,
+    // rip inside [LSTAR, sanitize_end]). Clear TF in the SAVED frame —
+    // the saved rip already points past the trapped instruction, and
+    // the clear stops the trap train — and return through the unwind:
+    // the stub resumes transparently with its partial state intact
+    // (the exception frame preserved it). A ring-3 #DB (the domain
+    // single-stepped itself) and any other kernel-context #DB fall
+    // through to the ordinary routing below: the CPL3-fault path owns
+    // the first, the forensics dump owns the second (classify_debug
+    // fails closed while the window is uncaptured).
+    if f.vector as u8 == 1 {
+        let (lstar, wend) = crate::arch::syscall_entry::entry_window();
+        if let super::fault_class::DebugTrap::EntryWindow =
+            super::fault_class::classify_debug(f.cs, f.rip, lstar, wend)
+        {
+            f.rflags &= !(1 << 8); // TF off in the saved frame
+            serial::write_str(
+                "[SEC ] #DB: user-set TF trapped in the syscall-entry window — cleared, resumed\n",
+            );
+            return;
+        }
     }
 
     let mut bv = [0u8; 20];

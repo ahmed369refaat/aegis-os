@@ -265,6 +265,8 @@ mod load {
             (*t).ist[3] = tops[3]; // #SS
             (*t).ist[4] = tops[4]; // #PF (PR-1.4)
             (*t).ist[5] = tops[5]; // the interrupt family (ADR-0030)
+            (*t).ist[6] = tops[6]; // #DB (ADR-0031 section B: the
+                                   // syscall-entry-window trap stack)
 
             (*gdtr).limit = (8 * 10 - 1) as u16;
             (*gdtr).base = g as u64;
