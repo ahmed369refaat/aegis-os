@@ -197,7 +197,6 @@ case "${1:-}" in
       # grep. The line-interrupt chain above IS delivered and proven.
       "[MSIX] disabled + vector released"  # the teardown discipline
       "[KBD2] negotiated scancode set 2, ack="  # the real 0xF0/0x02 exchange
-      "[KBD2] scancode"  # the QMP round trip
       "[EXT2] hello.txt (inode 12, 17 bytes): \"HELLO-AEGIS-EXT2.\" ← read-only ext2 over AHCI"  # the mount LIVE (ADR-0014: the stale FIS was three driver bugs)
       "[FAT32] HELLO.ESP (cluster 3, 1200 bytes, 3 clusters): \"HEAD:AEGIS-FAT32:\"…\":TAIL-OK\" ← read-only FAT32 over AHCI"  # the ESP mount LIVE on the same port (GPT partition 2, the chain walk proven)
       "[E1K] teardown dom"  # ADR-0018
@@ -434,12 +433,30 @@ if [ "$MODE" = "verify" ]; then
   # ADR-0014: the q35 lane runs with the VT-d trace on, so the lane
   # can PROVE no device takes the pass-through fast path. The trace
   # (log backend) lands on stderr; the serial log stays on stdout.
+  # set -euo pipefail (line 30) would kill this script on the
+  # pipeline's rc — including the 124 of a BUDGET KILL: the shell
+  # lane's kernel can end in M3's ERROR-halting path (init halts on a
+  # failed session command), QEMU then sits in the halted state until
+  # the timeout TERMs it, and the wall-clock echo + the verify greps
+  # never ran — the lane printed no verdict at all (found live, rc=124
+  # at exactly QEMU_TIMEOUT+8s). A budget-kill is not a verify
+  # failure: the session markers are already in the log. Capture the
+  # rc, restore -e, keep going.
+  QEMU_RC=0
   if [ "${1:-}" = "--verify-q35" ]; then
     TRACE_LOG=$(mktemp)
+    set +e
     timeout "$QEMU_TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" \
       -trace enable=vtd_* 2>"$TRACE_LOG" < "$STDIN_FILE" | tee "$LOG"
+    QEMU_RC=$?
   else
+    set +e
     timeout "$QEMU_TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" < "$STDIN_FILE" | tee "$LOG"
+    QEMU_RC=$?
+  fi
+  set -e
+  if [ "$QEMU_RC" = 124 ]; then
+    echo "QEMU hit its ${QEMU_TIMEOUT}s budget (the kernel halted without exiting) — the verify greps still run"
   fi
   END=$(date +%s.%N)
   echo
@@ -667,14 +684,23 @@ grep -qF "(virtio-blk) → dom" "$LOG" || { echo "VERIFY FAIL: the virtio-blk cl
     # the xHCI TRB layer died with it ("DMA memory access failed",
     # HCE-sticky); the No-Op's completion is a PINNED grep now (it
     # silently broke once already). The enumeration slice's current
-    # honest state: Enable Slot completes; Address Device is the open
-    # item (its completion code prints — the diagnostic discipline).
+    # Full proof: the enumeration's three markers — device enumerated,
+    # the HID boot keyboard's interrupt-IN endpoint parsed, and the 'a'
+    # report delivered through the xHCI interrupt-IN pipe (QMP key).
     grep -qa "No-Op command: event-ring slot0 type=33 = COMMAND COMPLETION" "$LOG" || {
       echo "VERIFY FAIL: the xHCI TRB machinery (the No-Op) is dead"
       ok=0
     }
-    grep -qa "Address Device: completion code" "$LOG" || {
-      echo "VERIFY FAIL: the USB enumeration never reached Address Device"
+    grep -qa "device enumerated: vid=" "$LOG" || {
+      echo "VERIFY FAIL: the USB enumeration never completed (Address Device + Get Descriptor)"
+      ok=0
+    }
+    grep -qa "HID keyboard: interrupt-IN EP" "$LOG" || {
+      echo "VERIFY FAIL: no HID boot keyboard endpoint was parsed"
+      ok=0
+    }
+    grep -qaE "HID report: key 0x0000000000000004 decoded \\('a'\\)" "$LOG" || {
+      echo "VERIFY FAIL: the USB keyboard round trip never landed"
       ok=0
     }
     grep -qa "\[GFX2\] text console: 80x30 cells live" "$LOG" || {

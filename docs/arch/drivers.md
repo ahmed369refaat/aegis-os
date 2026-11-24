@@ -89,7 +89,7 @@ comments and tests:
 | e1000 | **complete** | rings programmed, **full DHCP round trip through the IOMMU** AND in identity mode on the control lane, teardown |
 | IOMMU isolation | **per-device (ADR-0018), proven live** | the e1000's cross-device DMA to a vnet-only page faults on the lane |
 | NVMe | **fully live (F11): identify + I/O qpair + LBA read through the IOMMU** | CAP/version/RDY, identify data lands, CreateIoCq/SQ pass, read LBA0 completes |
-| USB xHCI | **bring-up FULLY LIVE** (item 12 first slice) | caps (v0 read as 0? HCSPARAMS MaxSlots=64 MaxPorts=8), halt→reset→DCBAAP+MaxSlotsEn+CRCR→RUN (HCH cleared), **port 0 device attached speed=4 (the usb-storage)** — register-only path, no device DMA needed |
+| USB xHCI | **enumeration + HID keyboard FULLY LIVE** (item 12 complete) | bring-up (halt→reset→DCBAA+CRCR→RUN, HCH cleared), the No-Op TRB round trip (ring DMA → execution → event post; the completion code prints — QEMU answers 5), then the full root-hub pass on the lane's usb-kbd: bus reset → Enable Slot → Address Device → GET_DESCRIPTOR (device + config) → Configure Endpoint (the interrupt-IN pipe) → SET_CONFIGURATION/SET_IDLE/SET_PROTOCOL → **the armed report decoded ('a', the QMP key) through the xHCI interrupt-IN pipe and pushed to the tty** — three pinned q35 greps. One-shot driver-phase proof: no resident IRQ-driven HID driver, no MSI/MSI-X (the next slice) |
 | screen/GPU (VBE) | **pixel-proven** | 7/7 sampled pixels in the QMP screendump |
 | PS/2 keyboard | **round-trip + negotiated** | QMP send-key → scancode 0x1e; THEN the real 0xF0/0x02 scancode-set-2 exchange, ACK 0xfa (translation restored for delivery — measured on this build) |
 | RTC | **live** | MC146818, BCD, host time |
@@ -310,6 +310,7 @@ enforced by `boot.sh --verify-q35`.
 
 Every virtio device shares one audited transport; USB (xHCI) is a
 whole second transport (event rings, TRBs, descriptors, hubs) and is
-sized as its own phase (checklist item 12, hub/tree support
-explicitly out of scope in its ADR). The broker discipline and the
+sized as its own phase (checklist item 12 — now complete: the
+enumeration and the HID keyboard's report round trip; hub/tree
+support explicitly out of scope in its ADR). The broker discipline and the
 MMIO lessons above apply to it unchanged.

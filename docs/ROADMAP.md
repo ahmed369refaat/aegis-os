@@ -111,8 +111,9 @@ scrub-on-free already enforces in DRAM, extended to the medium);
 (4) **an async block interface** (submission/completion rings in
 the driver-domain style of ADR-0004 — the io_uring-class model,
 adapted to the capability-gated IPC the kernel already runs);
-(5) **xHCI enumeration** (Enable Slot → Address Device → the
-device descriptor, on the TRB machinery that is already proven).
+(5) **xHCI enumeration** — landed (the K17 round): the full pass
+through Configure Endpoint and the HID keyboard's interrupt-IN
+report, on the TRB machinery that was already proven.
 Each slice lands only with its host tests, its lane marker, and its
 honest-absence line on machines without the device.
 

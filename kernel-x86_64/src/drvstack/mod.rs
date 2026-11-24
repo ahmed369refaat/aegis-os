@@ -40,6 +40,7 @@ mod vrng;
 mod vtd;
 mod wdt;
 mod xhci;
+pub(crate) mod xhci_proto;
 
 // The pool owner tags stay reachable at `crate::drvstack::*` (their
 // documented home in the frames ledger); the modules define them.
@@ -139,16 +140,17 @@ pub fn driver_stack_step<const N: usize>(
                 persist::persist_step(k, pool, out, &mut broker, &mut inv, &mut domains, &dmar);
                 xhci::xhci_step(k, pool, out, &mut broker, &inv);
                 xhci::xhci_cmdring_step(k, pool, out, &mut broker, &inv);
-                // Item 12's completion: enumeration + the HID keyboard
-                // (Enable Slot → Address Device → Get Descriptor →
-                // Configure → SET_CONFIGURATION → the interrupt-IN
-                // report, with the QMP key window).
-                xhci::xhci_enum_step(k, pool, out, &mut broker, &inv);
                 let madt_view = acpi::acpi_hpet_step(out, dir_pa);
                 irq::irq_step(out, madt_view.as_ref());
                 wdt::wdt_step(out, &inv);
                 legacy::gfx_step(out, &inv);
                 legacy::ps2_step(out);
+                // Item 12's completion: enumeration + the HID keyboard
+                // (Enable Slot → Address Device → Get Descriptor →
+                // Configure → SET_CONFIGURATION → the interrupt-IN
+                // report). After the PS/2 step: the QMP driver sends the
+                // USB key once "[USBH] HID armed" is in the log.
+                xhci::xhci_enum_step(k, pool, out, &mut broker, &inv);
                 legacy::rtc_step(out);
                 // The driver phase's LAST step: the text console arms
                 // (the splash stayed on screen through the whole phase

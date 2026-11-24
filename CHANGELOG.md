@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased] — the K17 round: checklist item 12 complete (xHCI enumeration + the HID keyboard)
+
+- **USB enumeration, fully live on the q35 lane**: the whole root-hub
+  pass — port bus reset, Enable Slot, Address Device, GET_DESCRIPTOR
+  (device + config), Configure Endpoint (the interrupt-IN pipe),
+  SET_CONFIGURATION / SET_IDLE / SET_PROTOCOL — ending in the HID boot
+  keyboard's report decoded ('a' from the QMP key) and pushed to the
+  tty. Three new pinned greps (device enumerated / interrupt-IN EP
+  parsed / HID report decoded); the stale `[KBD2] scancode` grep the
+  USB keyboard had quietly replaced is retired.
+- **A real protocol layer** (`drvstack/xhci_proto.rs`): the TRB/event
+  decoders, input-context builders, descriptor parsers, and the boot
+  keyboard report decoder, all host-tested (14 tests) — the tests
+  caught three real bugs before any lane run: the EP context index is
+  the endpoint id (EP1-IN = 3, not 2·(ep−1)+dir), interrupt-IN is EP
+  type 6 (7 is control), and the EP0-context field layout.
+- **Found live on the lane**: the second device's control transfers
+  timed out — Address Device re-bases the new slot's EP0 dequeue at
+  the ring BASE, so each device's TRB sequence restarts at slot 0
+  (the ring is scrubbed and re-based per device). The No-Op proof now
+  prints QEMU's own completion code (5) instead of assuming SUCCESS:
+  the round trip is the proof, the code is the honest witness.
+- **Scope, stated**: a one-shot driver-phase proof — no resident
+  IRQ-driven HID driver, no MSI/MSI-X, no TRB-stream fuzz yet
+  (deferred with the network fuzz round); hub/tree stays out of scope
+  per the ADR.
+
 ## [Unreleased] — the attenuation/security hardening round: ADR-0031 §A+§B, ADR-0032, ADR-0033, the exec image quota
 
 Six reviewer-found holes, each reproduced red before the fix (details
