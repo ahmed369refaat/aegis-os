@@ -1309,6 +1309,27 @@ mod exec {
         let Ok(plan) = aegis_os::elf::build_exec_plan(image) else {
             return (-ENOEXEC) as u64;
         };
+        // 1b. (round N2) The QUOTA pre-check — pure, BEFORE the point
+        // of no return: the image's mapped pages + stack + trampoline
+        // must fit the caller's LIVE quota. A refusal is a plain
+        // syscall answer: the old image keeps running, its mask
+        // untouched, no frame spent. (Before this, an over-quota image
+        // was caught only AFTER exec_replace had already narrowed the
+        // caller — the failure path documented itself as "narrowed".)
+        let live_quota = k
+            .domain(run.domain)
+            .map(|d| d.space.quota_pages())
+            .unwrap_or(0);
+        if crate::exec_registry::exec_quota_check(
+            plan.map_bytes,
+            crate::mm::user_layout::STACK_PAGES,
+            crate::mm::user_layout::TRAMPOLINE_PAGES,
+            live_quota,
+        )
+        .is_err()
+        {
+            return (-sysabi::ENOMEM) as u64;
+        }
         // 2. The point of no return: the declared profile, keyed by
         // the IMAGE IDENTITY (the content hash of the registry bytes —
         // never the path). An unlisted image inherits the caller's
@@ -1339,6 +1360,7 @@ mod exec {
                 crate::exec_registry::EXEC_SCRATCH_OWNER,
                 &plan,
                 image,
+                live_quota,
             )
         };
         let (tables, space) = match build {
@@ -1878,7 +1900,7 @@ mod exec {
         // The source walk: every page in the granter's range must be
         // present (a grant of unmapped memory is -EFAULT, mapped
         // nothing, touched nothing).
-        let mut pas = [0u64; aegis_os::frame_share::MAX_SHARED];
+        let mut pas = [0u64; aegis_os::frame_share::MAX_GRANT_PAGES];
         let pages = (len / 4096) as usize;
         for (i, slot) in pas.iter_mut().enumerate().take(pages) {
             match run.tables.translate(va + (i as u64) * 4096) {
@@ -1928,7 +1950,7 @@ mod exec {
                 context::stash_parked(brun, bctx);
                 return match e {
                     MapError::Policy(_) => (-EINVAL) as u64,
-                    MapError::SharesFull => (-sysabi::EAGAIN) as u64,
+                    MapError::ShareLimit => (-sysabi::EAGAIN) as u64,
                     _ => (-ENOMEM) as u64,
                 };
             }

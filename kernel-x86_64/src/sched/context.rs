@@ -590,11 +590,16 @@ mod entry {
     /// CPU, one pool), born empty, never reset. Holds a refcount per
     /// frame mapped by more than one address space; private frames
     /// never enter it.
-    static mut SHARES: aegis_os::frame_share::FrameShares =
-        aegis_os::frame_share::FrameShares::new();
+    static mut SHARES: aegis_os::frame_share::FrameShares<{ crate::frames::KERNEL_POOL_FRAMES }> =
+        aegis_os::frame_share::FrameShares::new(
+            crate::frames::POOL_BASE,
+            crate::frames::FRAME_SIZE,
+        );
 
     /// The live share table (fork, munmap, teardown, the CoW fault).
-    pub fn shares_mut() -> &'static mut aegis_os::frame_share::FrameShares {
+    pub fn shares_mut(
+    ) -> &'static mut aegis_os::frame_share::FrameShares<{ crate::frames::KERNEL_POOL_FRAMES }>
+    {
         // SAFETY: single CPU; every caller runs at IF=0 on the one
         // kernel stack (syscall/fault paths) or from kmain between
         // runs — no concurrent access exists to exclude.

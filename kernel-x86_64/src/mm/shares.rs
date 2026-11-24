@@ -101,7 +101,7 @@ pub fn release_borrowed_frames<const N: usize>(
     // domain may map far more pages than MAX_SHARED, but its borrowed
     // shares cannot exceed the table (each needs an entry) — so the
     // buffer cannot truncate a real share.
-    let mut pas = [0u64; aegis_os::frame_share::MAX_SHARED];
+    let mut pas = [0u64; aegis_os::frame_share::MAX_GRANT_PAGES];
     let mut n = 0usize;
     tables.walk_user_frames(&mut |_va, pa| {
         let shares = context::shares_mut();

@@ -9,7 +9,7 @@ use aegis_os::memory::AddressSpace;
 
 #[test]
 fn refcounts_acquire_release_and_report_sharing() {
-    let mut s = FrameShares::new();
+    let mut s = FrameShares::<64>::new(0x1000, 0x1000);
     assert_eq!(s.refs(0x5000), None, "absent frames carry no count");
     // One acquire = the private holder + this new sharer (insertion
     // counts the original mapping — the fork shape).
@@ -38,7 +38,7 @@ fn refcounts_acquire_release_and_report_sharing() {
 
 #[test]
 fn releasing_an_absent_frame_is_a_typed_error_never_a_wraparound() {
-    let mut s = FrameShares::new();
+    let mut s = FrameShares::<64>::new(0x1000, 0x1000);
     assert_eq!(s.release(0x7000), Err(ShareError::NotHeld(0x7000)));
     // acquire + releases down to the last: the insertion counts the
     // original holder, so ONE acquire holds TWO references.
@@ -49,14 +49,42 @@ fn releasing_an_absent_frame_is_a_typed_error_never_a_wraparound() {
 }
 
 #[test]
-fn the_table_is_bounded_and_refuses_loudly() {
-    let mut s = FrameShares::new();
-    for i in 0..aegis_os::frame_share::MAX_SHARED {
-        s.acquire((0x9000 + i * 0x1000) as u64, 7).unwrap();
+fn the_dense_table_has_no_capacity_to_refuse() {
+    // ADR-0032 section C: the round-A finding, killed at the
+    // integration level — filling EVERY frame the pool indexes (the
+    // old test filled MAX_SHARED=64 and expected TableFull; the dense
+    // table has no capacity, so the SAME fill must simply work).
+    let mut s = FrameShares::<64>::new(0x1000, 0x1000);
+    for i in 0..64u64 {
+        s.acquire(0x1000 + i * 0x1000, 7).unwrap();
     }
-    assert_eq!(s.acquire(0xF000_0000, 7), Err(ShareError::TableFull));
-    // Existing entries still work after the refusal.
+    assert_eq!(s.shared_frames(), 64);
+    // Every entry is live and queryable, O(1).
     assert_eq!(s.refs(0x9000), Some(2));
+    // Out-of-pool geometry is still a typed refusal — the bound is
+    // the POOL, not a slot count.
+    assert_eq!(
+        s.acquire(0xF000_0000, 7),
+        Err(ShareError::NotHeld(0xF000_0000))
+    );
+    // The refcount bound is typed, never a wrap (the u16 ceiling):
+    // wind a single frame's count all the way up — the next acquire
+    // must refuse with Overflow, and the count must not wrap.
+    let mut t = FrameShares::<4>::new(0x1000, 0x1000);
+    let mut acquires = 0u64;
+    loop {
+        match t.acquire(0x2000, 7) {
+            Ok(()) => acquires += 1,
+            Err(ShareError::Overflow(0x2000)) => break,
+            Err(other) => panic!("unexpected refusal before the ceiling: {other:?}"),
+        }
+        assert!(acquires < 70_000, "the ceiling must arrive, not loop");
+    }
+    assert_eq!(
+        t.refs(0x2000),
+        Some(u32::from(aegis_os::frame_share::RefCount::MAX)),
+        "the count sits exactly at the ceiling, unwrapped"
+    );
 }
 
 // ── the CoW decision ────────────────────────────────────────────────

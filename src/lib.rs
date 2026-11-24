@@ -1759,7 +1759,7 @@ pub mod prelude {
     pub use crate::dmar::{Dmar, DmarError, Drhd, MAX_TABLE_BYTES};
     pub use crate::domain::{Decision, Domain, DomainState};
     pub use crate::fd::{FdEntry, FdError, FdTable, FdTarget, MAX_FDS};
-    pub use crate::frame_share::{CowDecision, FrameShares, ShareError, MAX_SHARED};
+    pub use crate::frame_share::{CowDecision, FrameShares, RefCount, ShareError};
     pub use crate::net::{
         NetError, Socket, SocketState, SocketTable, TokenBucket, RATE_WINDOW_TICKS,
     };
@@ -4269,7 +4269,8 @@ mod adr0027_grants {
     }
 
     /// The bound: page-granular, nonzero, and never above the shares
-    /// table's own capacity (MAX_SHARED pages).
+    /// page-grant constant (MAX_GRANT_PAGES pages — its OWN bound since
+    /// ADR-0032 section C, no longer coupled to the refcount table).
     #[test]
     fn grant_len_is_bounded_and_page_granular() {
         let mut k = frame();
@@ -4278,7 +4279,7 @@ mod adr0027_grants {
             0u32,
             1,
             4097,
-            (crate::frame_share::MAX_SHARED as u32 + 1) * 4096,
+            (crate::frame_share::MAX_GRANT_PAGES as u32 + 1) * 4096,
         ] {
             assert!(
                 matches!(
@@ -4302,7 +4303,7 @@ mod adr0027_grants {
                 SysRequest::IpcGrantFrames {
                     dst: 1,
                     va: 0x1000,
-                    len: (crate::frame_share::MAX_SHARED as u32) * 4096
+                    len: (crate::frame_share::MAX_GRANT_PAGES as u32) * 4096
                 }
             ),
             Ok(SysValue::Unit)

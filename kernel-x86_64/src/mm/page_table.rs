@@ -44,9 +44,13 @@ pub enum MapError {
     AlreadyMapped(u64),
     /// No PTE at this VA on unmap.
     NotMapped(u64),
-    /// ADR-0027: the frame-refcount table refused (MAX_SHARED entries
-    /// live) — the transient capacity truth, never a policy stance.
-    SharesFull,
+    /// ADR-0032 section C: the per-frame refcount refused — a count
+    /// cannot exceed its bound (typed, never a wrap), or the frame
+    /// lies outside the pool's geometry (an impossible shape, loudly
+    /// refused). Replaces both the old SharesFull (the 64-entry
+    /// capacity truth — the dense per-frame table has no capacity)
+    /// and the WRONG KernelHalf this path once reported.
+    ShareLimit,
     /// Policy and hardware disagree about a region (should be impossible;
     /// loud rather than silent).
     Desync {
@@ -111,7 +115,7 @@ pub struct SharesSource<'a, const N: usize> {
     pub pool: &'a mut FramePool<N>,
     pub buddy: &'a mut BuddyAllocator<N>,
     pub owner: u32,
-    pub shares: &'a mut aegis_os::frame_share::FrameShares,
+    pub shares: &'a mut aegis_os::frame_share::FrameShares<{ crate::frames::KERNEL_POOL_FRAMES }>,
 }
 
 impl<const N: usize> FrameSource for SharesSource<'_, N> {
@@ -147,7 +151,7 @@ pub struct PageTables {
 pub struct GrantFrames<'a> {
     pub pas: &'a [u64],
     pub owner: u32,
-    pub shares: &'a mut aegis_os::frame_share::FrameShares,
+    pub shares: &'a mut aegis_os::frame_share::FrameShares<{ crate::frames::KERNEL_POOL_FRAMES }>,
 }
 
 impl PageTables {
@@ -371,7 +375,7 @@ impl PageTables {
                 // The table is full: the transient refusal. Nothing of
                 // THIS page was taken; the earlier pages unwind.
                 self.rollback(space, base, va, src);
-                return Err(MapError::SharesFull);
+                return Err(MapError::ShareLimit);
             }
             match self.map_user_page(va, frame, pf, src) {
                 Ok(()) => {}
@@ -480,6 +484,42 @@ impl PageTables {
     /// Free every TABLE frame of a (possibly partial) user-half tree
     /// by walking it — rollback for `clone_for_fork`. Frees tables
     /// only; leaf data frames are the caller's business.
+    /// ADR-0032 section C: release every USER LEAF in a (partial)
+    /// child tree — exactly the refcounts `clone_for_fork`'s pass 1
+    /// acquired, one per user PTE. Table frames are NOT freed here
+    /// (`free_user_tree` owns those); kernel-half PML4 entries are not
+    /// walked (pass 2 has not run at rollback time).
+    fn release_user_leaves(
+        pml4_pa: u64,
+        shares: &mut aegis_os::frame_share::FrameShares<{ crate::frames::KERNEL_POOL_FRAMES }>,
+    ) {
+        for pml4i in 0..256usize {
+            let pml4e = Self::entry(pml4_pa, pml4i);
+            if pml4e & pte::PTE_P == 0 {
+                continue;
+            }
+            for pdpti in 0..512usize {
+                let pdpte = Self::entry(pml4e & ADDR_MASK, pdpti);
+                if pdpte & pte::PTE_P == 0 {
+                    continue;
+                }
+                for pdi in 0..512usize {
+                    let pde = Self::entry(pdpte & ADDR_MASK, pdi);
+                    if pde & pte::PTE_P == 0 {
+                        continue;
+                    }
+                    for pti in 0..512usize {
+                        let pte_v = Self::entry(pde & ADDR_MASK, pti);
+                        if pte_v & pte::PTE_P == 0 || pte_v & pte::PTE_U == 0 {
+                            continue;
+                        }
+                        let _ = shares.release(pte_v & ADDR_MASK);
+                    }
+                }
+            }
+        }
+    }
+
     fn free_user_tree(pml4_pa: u64, src: &mut dyn FrameSource) {
         for pml4i in 0..256usize {
             let pml4e = Self::entry(pml4_pa, pml4i);
@@ -527,7 +567,7 @@ impl PageTables {
     pub fn clone_for_fork(
         &self,
         src: &mut dyn FrameSource,
-        shares: &mut aegis_os::frame_share::FrameShares,
+        shares: &mut aegis_os::frame_share::FrameShares<{ crate::frames::KERNEL_POOL_FRAMES }>,
         owner: u32,
     ) -> Result<PageTables, MapError> {
         // ── pass 1: the child's tree ──────────────────────────────
@@ -537,12 +577,12 @@ impl PageTables {
         // kernel-owned pointers into the user half's subtrees)
         let mid_flags = pte::PTE_P | pte::PTE_W | pte::PTE_U;
 
-        // Rollback bookkeeping: every shared frame PA acquired so far
-        // (released on rollback). The child's TABLE frames are freed
-        // by walking the tree itself (no buffer bound).
-        let mut acquired: [u64; aegis_os::frame_share::MAX_SHARED] =
-            [0; aegis_os::frame_share::MAX_SHARED];
-        let mut acquired_n = 0usize;
+        // Rollback bookkeeping: NONE. The old `[u64; MAX_SHARED]`
+        // acquired-list silently dropped every frame past the 64th —
+        // a rollback LEAK on top of the capacity cap (ADR-0032 §C).
+        // The partial child tree's USER LEAVES are exactly the frames
+        // pass 1 acquired; the rollback below rewalks and releases
+        // them — capacity-free and exact.
 
         let mut result: Result<(), MapError> = Ok(());
         'outer: for pml4i in 0..256usize {
@@ -615,16 +655,16 @@ impl PageTables {
                             continue;
                         }
                         let writable = flags & pte::PTE_W != 0;
-                        if shares.acquire(pa, owner).is_err() {
-                            // TableFull / Overflow: the share table
-                            // refused — surface as the pool-shaped
-                            // ENOMEM the ABI maps.
-                            result = Err(MapError::KernelHalf(pa));
+                        if let Err(e) = shares.acquire(pa, owner) {
+                            // ADR-0032 §C: Overflow = the refcount bound
+                            // (typed ShareLimit, never a wrap); NotHeld =
+                            // a frame outside the pool geometry, an
+                            // impossible shape — surfaced loudly as the
+                            // same typed refusal. The old code reported
+                            // KernelHalf(pa) here: the WRONG variant.
+                            let _ = e;
+                            result = Err(MapError::ShareLimit);
                             break 'outer;
-                        }
-                        if acquired_n < acquired.len() {
-                            acquired[acquired_n] = pa;
-                            acquired_n += 1;
                         }
                         // The child's copy: RO when the parent is
                         // writable (the demote marker).
@@ -636,13 +676,11 @@ impl PageTables {
         }
 
         if let Err(e) = result {
-            // Rollback: release what pass 1 acquired, then free the
-            // child's whole table tree by WALKING it (every table
-            // frame the partial build allocated). Best-effort, like
-            // map_region's rollback. The parent was never touched.
-            for pa in acquired[..acquired_n].iter() {
-                let _ = shares.release(*pa);
-            }
+            // Rollback: rewalk the partial child tree — every USER
+            // leaf is exactly one acquire pass 1 made — release them
+            // all, then free the table frames themselves. Best-effort,
+            // like map_region's rollback. The parent was never touched.
+            Self::release_user_leaves(child_pml4, shares);
             Self::free_user_tree(child_pml4, src);
             let _ = src.free_frame(child_pml4);
             return Err(e);

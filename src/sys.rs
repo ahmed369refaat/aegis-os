@@ -1040,12 +1040,14 @@ impl<const N: usize> Kernel<N> {
             SysRequest::IpcGrantFrames { dst, va: _, len } => {
                 // Length sanity FIRST (the ADR-0004 rule: the
                 // cheapest check before any capability work) —
-                // page-granular, nonzero, bounded by the shares
-                // table itself (MAX_SHARED frames; a bigger ask is
-                // the transient refusal, not a policy stance).
+                // page-granular, nonzero, bounded by the ADR-0027
+                // page-grant constant (its OWN configurable bound
+                // since ADR-0032 §C, no longer coupled to the
+                // refcount table's shape; a bigger ask is the
+                // transient refusal, not a policy stance).
                 if len == 0
                     || len % 4096 != 0
-                    || (len as usize) > crate::frame_share::MAX_SHARED * 4096
+                    || (len as usize) > crate::frame_share::MAX_GRANT_PAGES * 4096
                 {
                     return Err(SysError::InvalidArgument(u64::from(len)));
                 }

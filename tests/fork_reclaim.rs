@@ -1,14 +1,18 @@
-//! ADR-0024 (Phase 3) host tests: the fork/reclaim stress MODEL —
-//! the core's `fork_process`/`exit_process` churn replayed against a
-//! frame-sharing model built on the REAL `FrameShares` table, ending
-//! with every frame accounted for. The kernel-side page-table fork is
-//! lane-proven; this model pins the REFCOUNT/RECLAIM half the lanes
-//! only sample.
+//! ADR-0024 (Phase 3) + ADR-0032 section C host tests: the
+//! fork/write/exit stress MODEL — the core's `fork_process`/
+//! `exit_process` churn replayed against a frame-sharing model built
+//! on the REAL `FrameShares` table, ending with every frame accounted
+//! for. The kernel-side page-table fork is lane-proven; this model
+//! pins the REFCOUNT/RECLAIM half the lanes only sample.
 
 use aegis_os::frame_share::FrameShares;
 use aegis_os::prelude::*;
 
 const SUPERVISOR: u32 = 0;
+/// The model's pool geometry: 64 frames at 1 MiB, 4 KiB each.
+type ModelTable = FrameShares<64>;
+const MODEL_POOL_BASE: u64 = 0x100_000;
+const MODEL_FRAME: u64 = 0x1000;
 
 struct Rng(u64);
 impl Rng {
@@ -43,7 +47,7 @@ impl Model {
         }
     }
 
-    fn fork(&mut self, parent: usize, child: usize, shares: &mut FrameShares) -> bool {
+    fn fork(&mut self, parent: usize, child: usize, shares: &mut ModelTable) -> bool {
         // The child maps everything the parent maps (the clone's
         // verbatim copy); every shared frame is acquired.
         let parent_frames: Vec<u64> = self.frames[parent].clone();
@@ -63,10 +67,17 @@ impl Model {
         true
     }
 
-    fn exit(&mut self, id: usize, shares: &mut FrameShares) {
+    fn exit(&mut self, id: usize, shares: &mut ModelTable) {
         let owned: Vec<u64> = self.frames[id].clone();
         for pa in owned {
             if shares.refs(pa).is_some() {
+                // The owner tag must be present and stable right up to
+                // the last release — the pool free rides on it.
+                let owner = shares.owner_of(pa);
+                assert!(
+                    owner.is_some(),
+                    "counted frame {pa:#x} without an owner tag"
+                );
                 if matches!(shares.release(pa), Ok(true)) {
                     self.freed += 1;
                 }
@@ -76,6 +87,34 @@ impl Model {
             }
         }
         self.frames[id].clear();
+    }
+
+    /// ADR-0032 section C: a WRITE through a shared mapping — the CoW
+    /// transition, modeled. refs > 1: Copy (release the shared frame,
+    /// map a fresh private one); refs == 1: Promote (nothing changes —
+    /// the demote marker just wears off); private: nothing.
+    fn write(&mut self, id: usize, which: u64, shares: &mut ModelTable) {
+        let len = self.frames[id].len();
+        if len == 0 {
+            return;
+        }
+        let i = (which as usize) % len;
+        let pa = self.frames[id][i];
+        match shares.refs(pa) {
+            Some(r) if r > 1 => {
+                // Copy: the writer leaves the shared frame...
+                assert_eq!(shares.release(pa), Ok(false));
+                self.frames[id].swap_remove(i);
+                // ...and maps a fresh PRIVATE one.
+                let new_pa = self.next_frame;
+                self.next_frame += MODEL_FRAME;
+                self.allocated += 1;
+                self.frames[id].push(new_pa);
+            }
+            _ => {
+                // Promote or private: in place, no state change.
+            }
+        }
     }
 }
 
@@ -87,10 +126,10 @@ fn random_fork_exit_churn_reclaims_every_frame() {
     // The live proc churn runs on the real core in lockstep: every
     // model fork is a real fork_process, every exit a real exit.
     let mut rng = Rng(0x5EED_C0DE);
-    let mut shares = FrameShares::new();
+    let mut shares = ModelTable::new(MODEL_POOL_BASE, MODEL_FRAME);
     let mut model = Model {
         frames: core::array::from_fn(|_| Vec::new()),
-        next_frame: 0x100_000,
+        next_frame: MODEL_POOL_BASE,
         freed: 0,
         allocated: 0,
     };
@@ -118,7 +157,7 @@ fn random_fork_exit_churn_reclaims_every_frame() {
         let idx = rng.below(n as u64) as usize;
         let id = live[idx];
         match pick {
-            0 | 1 => {
+            0 => {
                 // FORK: the core must agree, the model must follow.
                 if let Ok(child) = k.fork_process(id) {
                     let Some(&parent_slot) = slot_of.get(&id) else {
@@ -139,7 +178,14 @@ fn random_fork_exit_churn_reclaims_every_frame() {
                     }
                 }
             }
-            2 | 3 if n > 2 => {
+            1 | 2 => {
+                // WRITE: a random live domain writes a random frame it
+                // maps — the CoW Copy/Promote transition (ADR-0032 §C).
+                if let Some(&slot) = slot_of.get(&id) {
+                    model.write(slot, rng.next(), &mut shares);
+                }
+            }
+            3 if n > 2 => {
                 // EXIT (leave the supervisor and one domain alive).
                 k.exit_process(id, ExitStatus::normal(0)).unwrap();
                 if let Some(slot) = slot_of.remove(&id) {
@@ -205,7 +251,7 @@ fn random_fork_exit_churn_reclaims_every_frame() {
 
 #[test]
 fn a_single_fork_and_two_exits_frees_under_the_original_owner() {
-    let mut shares = FrameShares::new();
+    let mut shares = ModelTable::new(0x1000, MODEL_FRAME);
     // A parent-owned frame shared at fork: ONE acquire, and the
     // insertion itself accounts for both holders (parent + child).
     shares.acquire(0x2000, 5).unwrap();

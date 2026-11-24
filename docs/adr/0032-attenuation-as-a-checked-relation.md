@@ -139,12 +139,64 @@ linux-abi execve round-trip both cross the new boundary).
 
 ## Decision (section C — ITEM 4): per-frame reference counts
 
-(Section C lands with its item in this round: the linear 64-entry
-table replaced by per-frame reference counts indexed by pool frame
-number — O(1), overflow-checked; `cow_decision`/`CowDecision` keep
-their meaning; a new `MapError::ShareLimit` replaces the wrong
-`KernelHalf` variant; the ADR-0027 page-grant bound stays separate and
-configurable.)
+The linear `[Option<(pa, refs, owner)>; 64]` is replaced by a DENSE
+pair of arrays on `FrameShares<N>` — `[RefCount; N]` counts plus
+`[u32; N]` original-owner tags, indexed by POOL FRAME NUMBER (the
+kernel instantiates `FrameShares::<KERNEL_POOL_FRAMES>` with the
+pool's base and frame size; `pa -> index` is pure checked
+arithmetic):
+
+- **No capacity.** Every frame the pool owns has a count slot
+  whether it is shared or not; the round-A failure (a fork of any
+  process with more than ~64 distinct pages was refused
+  SYSTEM-WIDE) is structurally impossible. The old `TableFull`
+  error is deleted with its cause.
+- **`RefCount = u16`, CHECKED**: the ceiling is a typed
+  `ShareError::Overflow`, never a wrap. A single frame mapped by
+  65534 address spaces is beyond any quota this kernel grants.
+- **Tiers.** 0 = private (the overwhelmingly common case holds
+  nothing); 1 = shared-orphaned — the Promote tier: the demote
+  marker outlived its reason, a write fault Promotes in place, and
+  the owner tag stays live for the last holder's tagged free;
+  >1 = shared. A release to exactly 1 KEEPS the count (the old
+  design's refs==1 residue consumed a scarce slot; here it is one
+  u16 in a dense array, and the queryability is load-bearing —
+  dropping it would turn the second sibling's write into NotCow and
+  kill the domain).
+- **The semantics kept verbatim**: insertion starts at 2 (the
+  original private holder + the new sharer); the FIRST owner sticks
+  (the count is the frame's provenance); `release` answers
+  "was that the last one"; `owner_of` names the tag the last holder
+  frees under; `cow_decision`/`CowDecision` and the full truth-table
+  test are byte-identical.
+- **`MapError::ShareLimit`** replaces both the old `SharesFull` (a
+  capacity that no longer exists) and the WRONG `KernelHalf(pa)`
+  the fork path reported on refcount refusal. The kernel's ABI arm
+  maps it to the same transient-refusal errno as before.
+- **The rollback is a rewalk, not a list.** The old rollback
+  tracked acquired frames in `[u64; MAX_SHARED]` and SILENTLY
+  DROPPED every frame past the 64th — a rollback leak on top of the
+  capacity cap. The partial child tree's user leaves ARE the
+  acquired set; the rollback walks and releases them exactly
+  (`release_user_leaves`), capacity-free.
+- **The ADR-0027 page-grant bound is now its own configurable
+  constant** (`MAX_GRANT_PAGES`, still 64) — it rode on the old
+  table's capacity by accident; grants and refcounts are separate
+  concerns with separate bounds.
+
+### Tests (red by construction of the old table)
+
+`a_2000_page_domain_forks` (impossible on the 64-slot table),
+`fork_exit_cycles_conserve_everything`, `promote_leaves_no_residue`
+(the `shared_frames()` gauge reads zero),
+`the_dense_table_has_no_capacity_to_refuse` (the integration twin:
+filling every slot the pool indexes simply works, and the u16
+ceiling refuses with Overflow after a full wind-up — no test seam
+needed), the overflow/geometry/insertion/release-to-one unit tests,
+and the fork/write/exit MODEL property test (deterministic seed,
+now with the CoW Copy/Promote WRITE step: every frame freed exactly
+once, never while referenced, owner tags present and stable to the
+last release). The CoW boot markers re-verified on every lane.
 
 ## Consequences
 
