@@ -88,3 +88,39 @@ mod tests {
 /// the tag never collides with a domain id (the domain table is far
 /// smaller than 0x5AFE_0000).
 pub const EXEC_SCRATCH_OWNER: u32 = 0x5AFE_0E0E;
+
+#[cfg(test)]
+mod adr0032_tests {
+    use super::*;
+
+    /// ADR-0032 section B: alias paths canonicalize to one registry
+    /// entry, and the resolved image carries ONE identity — the
+    /// declared policy cannot be dodged by spelling.
+    #[test]
+    fn aliases_canonicalize_to_the_same_image_and_identity() {
+        let canon = |input: &str| -> String {
+            let mut out = [0u8; 64];
+            let n = aegis_os::proc::canonicalize_path(input, &mut out).expect("canonical");
+            core::str::from_utf8(&out[..n]).unwrap().to_string()
+        };
+        assert_eq!(canon("//bin/./sh"), "/bin/sh");
+        assert_eq!(canon("/bin/../bin/sh"), "/bin/sh");
+        assert_eq!(canon("/bin//exec-target/"), "/bin/exec-target");
+        // The canonical paths resolve to the same bytes, hence the
+        // same identity — one policy entry for every spelling.
+        assert_eq!(
+            aegis_os::proc::image_id(resolve(&canon("//bin/./sh")).unwrap()),
+            aegis_os::proc::image_id(EXEC_SH_ELF)
+        );
+        assert_eq!(
+            aegis_os::proc::image_id(resolve(&canon("/bin/../bin/exec-target")).unwrap()),
+            aegis_os::proc::image_id(EXEC_TARGET_ELF)
+        );
+        // Different bytes, different identity — a policy declared for
+        // one never applies to the other.
+        assert_ne!(
+            aegis_os::proc::image_id(EXEC_SH_ELF),
+            aegis_os::proc::image_id(EXEC_TARGET_ELF)
+        );
+    }
+}

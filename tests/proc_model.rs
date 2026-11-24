@@ -617,15 +617,20 @@ fn exec_policy_table_declare_lookup_default() {
             | 1u64 << SYS_WAIT
             | 1u64 << SYS_EXIT,
     );
-    k.exec_policy_declare("/bin/sh", &sh_mask, Some(true))
-        .unwrap();
-    let got = k.exec_policy_declared_for("/bin/sh");
+    // ADR-0032 §B: the table is keyed by IMAGE IDENTITY, never by a
+    // path string.
+    let sh_id = aegis_os::proc::image_id(b"the shell image bytes");
+    k.exec_policy_declare(sh_id, &sh_mask, Some(true)).unwrap();
+    let got = k.exec_policy_declared_for(sh_id).unwrap();
     assert_eq!(got.0.bits(), sh_mask.bits());
     assert_eq!(got.1, Some(true));
-    // Unlisted: the app default, AuditOnly.
-    let dfl = k.exec_policy_declared_for("/bin/definitely-not-listed");
-    assert_eq!(dfl.0.bits(), app_profile().syscalls.bits());
-    assert_eq!(dfl.1, Some(false));
+    // Unlisted: no entry — the caller arm inherits the caller's
+    // monitor mode and the app-default surface (the exec ratchet makes
+    // that inheritance never a downgrade).
+    assert_eq!(
+        k.exec_policy_declared_for(aegis_os::proc::image_id(b"other bytes")),
+        None
+    );
 }
 
 #[test]

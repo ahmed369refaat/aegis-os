@@ -568,7 +568,20 @@ impl<const N: usize> Kernel<N> {
             .domain_mut(pid)
             .map_err(|_| proc::ProcError::UnknownProcess(pid))?;
         d.exec_intersect(declared);
-        d.monitor_enforce = monitor_enforce;
+        // ADR-0032 section B: the MONITOR RATCHET — enforcement turns
+        // on, never off. Once Enforce, an exec cannot become AuditOnly
+        // (the old unconditional assignment let a domain under Enforce
+        // exec any unlisted image and downgrade to AuditOnly — the
+        // round-A finding). A None parameter is INHERIT — exactly what
+        // the unlisted-image arm passes: the caller's state rides
+        // across untouched. A Some(_) parameter is a real declared
+        // decision for THIS image — it lands, except that it can never
+        // lower an existing Enforce (the first arm).
+        d.monitor_enforce = match (d.monitor_enforce, monitor_enforce) {
+            (Some(true), _) => Some(true),
+            (old, None) => old,
+            (_, declared) => declared,
+        };
         // ADR-0023 D8: caught handlers reset to default across exec
         // (POSIX) — the new image installs its own.
         d.clear_caught_handlers();
@@ -759,18 +772,20 @@ impl<const N: usize> Kernel<N> {
     /// table (supervisor API — never a child-held syscall).
     pub fn exec_policy_declare(
         &mut self,
-        path: &str,
+        image_id: u64,
         mask: &SyscallMask,
         enforce: Option<bool>,
     ) -> Result<(), proc::ProcError> {
-        self.exec_policy.declare(path, *mask, enforce)
+        self.exec_policy.declare(image_id, *mask, enforce)
     }
 
-    /// ADR-0022 D5: the declared surface for a path (unlisted = the
-    /// app default, AuditOnly).
+    /// ADR-0032 section B: the declared surface for an IMAGE identity
+    /// (`proc::image_id` of the registry bytes). None = unlisted — the
+    /// caller arm inherits its own monitor mode (the exec ratchet) and
+    /// the app-default surface intersected with its live mask.
     #[must_use]
-    pub fn exec_policy_declared_for(&self, path: &str) -> (SyscallMask, Option<bool>) {
-        self.exec_policy.declared_for(path)
+    pub fn exec_policy_declared_for(&self, image_id: u64) -> Option<(SyscallMask, Option<bool>)> {
+        self.exec_policy.declared_for(image_id)
     }
 
     /// ADR-0022 D7: settle a dead process's children — living AND
@@ -2082,8 +2097,10 @@ mod tests {
             },
         )
         .unwrap();
-        // What sys_exec does for an unlisted path: the app default.
-        let (dfl, monitor) = k.exec_policy_declared_for("/bin/unlisted");
+        // What sys_exec does for an unlisted IMAGE (ADR-0032 §B): the
+        // app-default surface, and None — INHERIT the caller's monitor
+        // mode across the boundary (never a downgrade).
+        let (dfl, monitor) = (crate::profile::app_profile().syscalls, None);
         k.exec_replace(1, &dfl, monitor).unwrap();
         // The mask — not a capability — refuses the session's first
         // command. DeniedByMask is the -EPERM the lane saw live.
@@ -2120,11 +2137,15 @@ mod tests {
             },
         )
         .unwrap();
-        // The supervisor's declaration — kmain's /bin/sh line.
-        k.exec_policy_declare("/bin/sh", &service_profile().syscalls, None)
+        // The supervisor's declaration — kmain's /bin/sh line, keyed
+        // by the IMAGE IDENTITY (ADR-0032 §B), never by a path string.
+        let sh_id = crate::proc::image_id(b"the shell image bytes");
+        k.exec_policy_declare(sh_id, &service_profile().syscalls, None)
             .unwrap();
-        let (declared, monitor) = k.exec_policy_declared_for("/bin/sh");
+        let (declared, monitor) = k.exec_policy_declared_for(sh_id).unwrap();
         assert!(declared.is_allowed(SYS_LISTDIR).unwrap());
+        // The ratchet treats None as "no per-domain decision" — preserved.
+        assert_eq!(monitor, None);
         k.exec_replace(1, &declared, monitor).unwrap();
         // The session's commands, in order: mkdir, ls (dir open +
         // list), rm (unlink) — every one across the exec boundary.
@@ -4772,5 +4793,149 @@ mod adr0029_pipes_over_endpoints {
         k.destroy_domain(4).unwrap(); // the last writer goes
         assert!(k.sched.entity(3).unwrap().runnable, "EOF now");
         assert_eq!(k.pop_ipc_wake(), Some((3, 0)));
+    }
+}
+
+#[cfg(test)]
+mod adr0032_exec_tests {
+    use super::*;
+    use crate::profile::service_profile;
+    use crate::syscall::{SyscallMask, SYS_EXIT, SYS_READ};
+
+    /// ADR-0032 section B: once Enforce, an exec can never become
+    /// AuditOnly — the round-A finding was an Enforce domain exec'ing
+    /// an unlisted image (declared Some(false)) and silently
+    /// downgrading.
+    #[test]
+    fn exec_never_downgrades_the_monitor_mode() {
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        let narrow = SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_EXIT);
+        // Enforce.
+        k.exec_replace(1, &narrow, Some(true)).unwrap();
+        assert_eq!(k.domain(1).unwrap().monitor_enforce, Some(true));
+        // An AuditOnly declaration (or an unlisted image's Some(false))
+        // must not downgrade.
+        k.exec_replace(1, &narrow, Some(false)).unwrap();
+        assert_eq!(
+            k.domain(1).unwrap().monitor_enforce,
+            Some(true),
+            "once Enforce, always Enforce across exec"
+        );
+        // An AuditOnly domain MAY become Enforce (the ratchet only
+        // turns enforcement on).
+        k.create_domain_with(2, service_profile(), 0, 0, 0).unwrap();
+        k.exec_replace(2, &narrow, Some(false)).unwrap();
+        assert_eq!(k.domain(2).unwrap().monitor_enforce, Some(false));
+        k.exec_replace(2, &narrow, Some(true)).unwrap();
+        assert_eq!(k.domain(2).unwrap().monitor_enforce, Some(true));
+        // A DECLARED AuditOnly lands on a fresh domain (Some(_) is a
+        // real decision for this image — Some(false) must be
+        // reachable, or "AuditOnly" could never mean anything).
+        k.create_domain_with(3, service_profile(), 0, 0, 0).unwrap();
+        k.exec_replace(3, &narrow, Some(false)).unwrap();
+        assert_eq!(k.domain(3).unwrap().monitor_enforce, Some(false));
+        // ...and from there it may still ratchet up to Enforce.
+        k.exec_replace(3, &narrow, Some(true)).unwrap();
+        assert_eq!(k.domain(3).unwrap().monitor_enforce, Some(true));
+        // None is INHERIT (the unlisted-image arm): the caller's state
+        // rides across untouched, whatever it is.
+        k.create_domain_with(4, service_profile(), 0, 0, 0).unwrap();
+        k.exec_replace(4, &narrow, None).unwrap();
+        assert_eq!(k.domain(4).unwrap().monitor_enforce, None);
+        k.exec_replace(4, &narrow, Some(true)).unwrap();
+        k.exec_replace(4, &narrow, None).unwrap();
+        assert_eq!(
+            k.domain(4).unwrap().monitor_enforce,
+            Some(true),
+            "inherit must not lower an Enforce"
+        );
+    }
+
+    /// ADR-0032 section B: tightened state, violation counters and
+    /// monitor stats ride across the exec boundary — the new image
+    /// inherits the domain's history, not a fresh ledger.
+    #[test]
+    fn exec_stats_and_violations_survive_the_boundary() {
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        // Two refused spawn requests = two escalation attempts.
+        let mut bad = service_profile();
+        bad.max_children = 99;
+        let _ = k.spawn_process(1, bad, &[]);
+        let _ = k.spawn_process(1, bad, &[]);
+        let before = k.domain(1).unwrap().stats.escalation_attempts;
+        assert_eq!(before, 2);
+        let mask_bits = k.domain(1).unwrap().mask().bits();
+        let narrow = SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_EXIT);
+        k.exec_replace(1, &narrow, None).unwrap();
+        let d = k.domain(1).unwrap();
+        assert_eq!(
+            d.stats.escalation_attempts, 2,
+            "violation counters survive exec"
+        );
+        // The mask only ever intersects: the narrowed bits remain.
+        assert_eq!(d.mask().bits(), mask_bits & narrow.bits());
+    }
+
+    /// ADR-0032 section B: a policy declared for one image's identity
+    /// never applies to different bytes — the mismatch is an unlisted
+    /// exec (inherit), not the other image's surface.
+    #[test]
+    fn a_policy_declared_for_one_image_never_applies_to_another() {
+        let mut k = Kernel::new();
+        let a_id = crate::proc::image_id(b"image A bytes");
+        let b_id = crate::proc::image_id(b"image B bytes");
+        assert_ne!(a_id, b_id);
+        let wide = service_profile().syscalls;
+        k.exec_policy_declare(a_id, &wide, Some(true)).unwrap();
+        // A's own declaration applies...
+        let (m, e) = k.exec_policy_declared_for(a_id).unwrap();
+        assert_eq!((m, e), (wide, Some(true)));
+        // ...and B is unlisted: no surface, no mode — never A's.
+        assert_eq!(k.exec_policy_declared_for(b_id), None);
+        assert_eq!(
+            k.exec_policy_declared_for(crate::proc::image_id(b"no such image")),
+            None
+        );
+    }
+
+    /// ADR-0032 section B, the property form: random exec chains —
+    /// the monitor mode never turns off and the live mask never gains
+    /// a bit.
+    #[test]
+    fn random_exec_chains_never_loosen_mode_or_mask() {
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        let mut s: u64 = 0x00AD_0032_5EED_0002;
+        let mut rng = move || -> u64 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut mask_bits = k.domain(1).unwrap().mask().bits();
+        let mut enforcing = false;
+        for _ in 0..500 {
+            let r = rng();
+            // A random sub-mask of the live one, keeping EXIT.
+            let bits = mask_bits & !(r & mask_bits & !(1u64 << SYS_EXIT));
+            let declared = SyscallMask::from_bits(bits);
+            let mode = match (r >> 32) % 3 {
+                0 => None,
+                1 => Some(false),
+                _ => Some(true),
+            };
+            k.exec_replace(1, &declared, mode).unwrap();
+            let d = k.domain(1).unwrap();
+            // The mask never grows.
+            let now = d.mask().bits();
+            assert_eq!(now, mask_bits & bits, "exec widened the mask");
+            mask_bits = now;
+            // The mode never turns off.
+            let now_enforcing = matches!(d.monitor_enforce, Some(true));
+            assert!(!enforcing || now_enforcing, "exec turned enforcement off");
+            enforcing = now_enforcing;
+        }
     }
 }

@@ -1293,16 +1293,34 @@ mod exec {
         let Ok(path) = core::str::from_utf8(&pathbuf[..len]) else {
             return (-EINVAL) as u64;
         };
-        let Some(image) = crate::exec_registry::resolve(path) else {
+        // ADR-0032 section B: canonicalize BEFORE the registry lookup —
+        // `//bin/x`, `/bin/./x`, and `/bin/../bin/x` are ONE entry, so
+        // no path spelling can dodge a declared policy.
+        let mut canon = [0u8; sysabi::MAX_PATH];
+        let Some(clen) = aegis_os::proc::canonicalize_path(path, &mut canon) else {
+            return (-sysabi::ENOENT) as u64;
+        };
+        let Ok(cpath) = core::str::from_utf8(&canon[..clen]) else {
+            return (-sysabi::EINVAL) as u64;
+        };
+        let Some(image) = crate::exec_registry::resolve(cpath) else {
             return (-sysabi::ENOENT) as u64;
         };
         let Ok(plan) = aegis_os::elf::build_exec_plan(image) else {
             return (-ENOEXEC) as u64;
         };
-        // 2. The point of no return: the declared profile (the
-        // exec policy table, unlisted = app default) intersects the
-        // live mask; cloexec fds close; handlers and regions reset.
-        let (declared, monitor) = k.exec_policy_declared_for(path);
+        // 2. The point of no return: the declared profile, keyed by
+        // the IMAGE IDENTITY (the content hash of the registry bytes —
+        // never the path). An unlisted image inherits the caller's
+        // monitor mode (None) and the app-default surface (intersected
+        // with the live mask inside exec_replace); the monitor ratchet
+        // there keeps an enforcing domain enforcing. cloexec fds
+        // close; handlers and regions reset.
+        let (declared, monitor) = match k.exec_policy_declared_for(aegis_os::proc::image_id(image))
+        {
+            Some((m, e)) => (m, e),
+            None => (aegis_os::profile::app_profile().syscalls, None),
+        };
         if let Err(aegis_os::proc::ProcError::UnknownProcess(_)) =
             k.exec_replace(run.domain, &declared, monitor)
         {

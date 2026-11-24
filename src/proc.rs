@@ -18,9 +18,7 @@
 //! All of it is pure bookkeeping over `Copy` data in fixed arrays —
 //! host-testable, `#![forbid(unsafe_code)]` intact.
 
-use crate::profile::app_profile;
 use crate::syscall::SyscallMask;
-use crate::vfs::NAME_MAX;
 
 /// PID 1 by convention: the process orphans reparent to.
 pub const INIT_PID: u32 = 1;
@@ -216,21 +214,117 @@ impl ProcTable {
 
 /// ADR-0022 D5: an executable's declared surface — the init-owned
 /// policy table that decides what a binary may keep across execve.
-/// Unlisted paths get the app default: `app_profile()`'s mask and
-/// AuditOnly monitoring (Enforce is opt-in per binary).
+/// ADR-0032 section B: entries are keyed by IMAGE IDENTITY — a 64-bit
+/// content hash of the registry image (`image_id`) — never by a path
+/// string: aliases of the same bytes resolve to the same entry, and
+/// different bytes never inherit a policy they did not declare.
+/// Unlisted images get no entry here; the caller inherits its own
+/// monitor mode (the exec ratchet) and the app-default surface
+/// intersected with its live mask.
 #[derive(Clone, Copy)]
 pub struct ExecPolicyEntry {
-    pub path: [u8; NAME_MAX],
-    pub path_len: usize,
+    pub image_id: u64,
     pub mask: SyscallMask,
     pub enforce: Option<bool>,
 }
 
-impl ExecPolicyEntry {
-    #[must_use]
-    pub fn path(&self) -> &str {
-        core::str::from_utf8(&self.path[..self.path_len]).unwrap_or("")
+/// ADR-0032 section B: the IMAGE IDENTITY — a 64-bit FNV-1a content
+/// hash. Deterministic, no_std, cheap; collisions are a policy-confusion
+/// risk bounded by the registry's size (two images, embedded bytes),
+/// and the table never widens anything by construction (masks only
+/// intersect). NOT a cryptographic identity — recorded in the ADR as
+/// a deliberate, environment-honest choice.
+#[must_use]
+pub fn image_id(bytes: &[u8]) -> u64 {
+    // FNV-1a 64-bit offset basis and prime.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    h
+}
+
+/// ADR-0032 section B: lexical path canonicalization for the exec
+/// registry lookup — collapse `//`, resolve `.` and `..`, clamp at the
+/// root (POSIX), drop trailing slashes. Pure and bounded: the output
+/// is written into `out` and the LENGTH returned; `None` refuses
+/// (non-absolute input, or output longer than `out`). This is what
+/// makes `/bin/x`, `//bin/x`, `/bin/./x`, and `/bin/../bin/x` one
+/// registry entry — a path string can no longer dodge a declared
+/// policy by spelling the same file differently.
+#[must_use]
+pub fn canonicalize_path(input: &str, out: &mut [u8]) -> Option<usize> {
+    if !input.starts_with('/') {
+        return None;
+    }
+    let mut out_len: usize = 0;
+    let mut component_start = true;
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'/' {
+            // Collapse runs of slashes; drop trailing ones.
+            component_start = true;
+            i += 1;
+            continue;
+        }
+        if !component_start {
+            // A byte inside the current component: copy verbatim.
+            if out_len == out.len() {
+                return None;
+            }
+            out[out_len] = b;
+            out_len += 1;
+            i += 1;
+            continue;
+        }
+        // A component starts here.
+        component_start = false;
+        if b == b'.' && (i + 1 == bytes.len() || bytes[i + 1] == b'/') {
+            // `.` — contributes nothing.
+            i += 1;
+            continue;
+        }
+        if b == b'.'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'.'
+            && (i + 2 == bytes.len() || bytes[i + 2] == b'/')
+        {
+            // `..` — strip the last component (saturating: at the root
+            // it clamps, never escaping upward).
+            while out_len > 0 && out[out_len - 1] != b'/' {
+                out_len -= 1;
+            }
+            out_len = out_len.saturating_sub(1); // the separating '/'
+            i += 2;
+            continue;
+        }
+        // A real component: the separating '/' first (the root '/' for
+        // the first component), then the byte — checked, never
+        // truncated.
+        if out_len >= out.len() {
+            return None;
+        }
+        out[out_len] = b'/';
+        out_len += 1;
+        if out_len == out.len() {
+            return None;
+        }
+        out[out_len] = b;
+        out_len += 1;
+        i += 1;
+    }
+    // The empty result (the root itself) stays "/".
+    if out_len == 0 {
+        if out.is_empty() {
+            return None;
+        }
+        out[0] = b'/';
+        return Some(1);
+    }
+    Some(out_len)
 }
 
 impl Default for ExecPolicyTable {
@@ -251,56 +345,54 @@ impl ExecPolicyTable {
         }
     }
 
-    /// Declare (or overwrite, exact-path match) a binary's surface.
-    /// Bounded by NAME_MAX; refusing a too-long path is fail-closed,
-    /// not truncating.
+    /// Declare (or overwrite) an IMAGE's surface, keyed by its content
+    /// identity (`image_id` of the registry bytes). ADR-0032 section
+    /// B: never by a path string — aliases of the same bytes resolve
+    /// to the same entry by construction.
     pub fn declare(
         &mut self,
-        path: &str,
+        image_id: u64,
         mask: SyscallMask,
         enforce: Option<bool>,
     ) -> Result<(), ProcError> {
-        let bytes = path.as_bytes();
-        if bytes.len() > NAME_MAX {
-            return Err(ProcError::PolicyTableFull);
-        }
-        // Overwrite an existing entry for the same path if present.
+        // Overwrite an existing entry for the same image if present.
         for e in self.entries.iter_mut().flatten() {
-            if e.path() == path {
-                *e = Self::build(path, mask, enforce);
+            if e.image_id == image_id {
+                *e = ExecPolicyEntry {
+                    image_id,
+                    mask,
+                    enforce,
+                };
                 return Ok(());
             }
         }
         for slot in &mut self.entries {
             if slot.is_none() {
-                *slot = Some(Self::build(path, mask, enforce));
+                *slot = Some(ExecPolicyEntry {
+                    image_id,
+                    mask,
+                    enforce,
+                });
                 return Ok(());
             }
         }
         Err(ProcError::PolicyTableFull)
     }
 
-    fn build(path: &str, mask: SyscallMask, enforce: Option<bool>) -> ExecPolicyEntry {
-        let mut entry = ExecPolicyEntry {
-            path: [0; NAME_MAX],
-            path_len: path.len(),
-            mask,
-            enforce,
-        };
-        entry.path[..path.len()].copy_from_slice(path.as_bytes());
-        entry
-    }
-
-    /// The declared surface for a path, or the app default
-    /// (`app_profile`'s mask, AuditOnly) for anything unlisted.
+    /// The declared surface for an IMAGE identity, or None when the
+    /// image is unlisted — the caller then inherits its own monitor
+    /// mode (the exec ratchet in `exec_replace`) and the app-default
+    /// surface intersected with its live mask. The old path-keyed
+    /// lookup returned AuditOnly for unlisted paths, silently
+    /// downgrading an enforcing domain (the round-A finding).
     #[must_use]
-    pub fn declared_for(&self, path: &str) -> (SyscallMask, Option<bool>) {
+    pub fn declared_for(&self, image_id: u64) -> Option<(SyscallMask, Option<bool>)> {
         for e in self.entries.iter().flatten() {
-            if e.path() == path {
-                return (e.mask, e.enforce);
+            if e.image_id == image_id {
+                return Some((e.mask, e.enforce));
             }
         }
-        (app_profile().syscalls, Some(false))
+        None
     }
 }
 
@@ -385,32 +477,72 @@ mod tests {
     fn exec_policy_declare_lookup_overwrite_default() {
         let mut t = ExecPolicyTable::new();
         let m1 = SyscallMask::from_bits(1u64 << SYS_READ);
-        t.declare("/bin/a", m1, Some(true)).unwrap();
-        assert_eq!(t.declared_for("/bin/a"), (m1, Some(true)));
+        let a_id = image_id(b"image a bytes");
+        t.declare(a_id, m1, Some(true)).unwrap();
+        assert_eq!(t.declared_for(a_id), Some((m1, Some(true))));
         // Overwrite in place, no duplicate rows.
         let m2 = SyscallMask::from_bits(0);
-        t.declare("/bin/a", m2, None).unwrap();
-        assert_eq!(t.declared_for("/bin/a"), (m2, None));
-        // Unlisted: the app default, AuditOnly.
-        let (dfl_mask, dfl_mode) = t.declared_for("/not/there");
-        assert_eq!(dfl_mask, app_profile().syscalls);
-        assert_eq!(dfl_mode, Some(false));
+        t.declare(a_id, m2, None).unwrap();
+        assert_eq!(t.declared_for(a_id), Some((m2, None)));
+        // Unlisted (ADR-0032 §B): None — the caller arm inherits the
+        // caller's monitor mode (the exec ratchet) and the
+        // app-default surface; a policy for one image never applies to
+        // different bytes.
+        assert_eq!(t.declared_for(image_id(b"other bytes")), None);
         // The table fills and refuses with a typed error (one slot is
-        // already taken by /bin/a above).
+        // already taken by image a above).
         for i in 0..(MAX_EXEC_ENTRIES - 1) {
-            let path = [
-                b'/',
+            let id = image_id(&[
                 b'p',
                 b'0' + ((i % 10) as u8),
                 b'0' + (((i / 10) % 10) as u8),
-            ];
-            t.declare(core::str::from_utf8(&path).unwrap(), m1, None)
-                .unwrap();
+            ]);
+            t.declare(id, m1, None).unwrap();
         }
         assert_eq!(
-            t.declare("/overflow", m1, None),
+            t.declare(image_id(b"overflow"), m1, None),
             Err(ProcError::PolicyTableFull)
         );
+    }
+
+    /// ADR-0032 section B: aliases collapse to one registry entry —
+    /// `//`, `.`, `..`, and trailing slashes never dodge a declared
+    /// policy by spelling the same file differently.
+    #[test]
+    fn path_aliases_canonicalize_to_one_entry() {
+        let canon = |input: &str| -> String {
+            let mut out = [0u8; 64];
+            let n = canonicalize_path(input, &mut out).expect("canonical");
+            core::str::from_utf8(&out[..n]).unwrap().to_string()
+        };
+        assert_eq!(canon("/bin/x"), "/bin/x");
+        assert_eq!(canon("//bin/x"), "/bin/x");
+        assert_eq!(canon("/bin//x"), "/bin/x");
+        assert_eq!(canon("/bin/./x"), "/bin/x");
+        assert_eq!(canon("/bin/../bin/x"), "/bin/x");
+        assert_eq!(canon("/a/b/../c"), "/a/c");
+        assert_eq!(canon("/a/b/../../c"), "/c");
+        // .. above the root clamps (POSIX), never escapes upward.
+        assert_eq!(canon("/../../bin/x"), "/bin/x");
+        // Trailing slashes drop; the root itself stays "/".
+        assert_eq!(canon("/bin/"), "/bin");
+        assert_eq!(canon("///"), "/");
+        assert_eq!(canon("/"), "/");
+        assert_eq!(canon("/././."), "/");
+        // Relative input is refused (the registry is absolute-only).
+        assert!(canonicalize_path("bin/x", &mut [0u8; 64]).is_none());
+        // A too-small output buffer refuses, never truncates.
+        assert!(canonicalize_path("/bin/exec-target", &mut [0u8; 4]).is_none());
+    }
+
+    /// ADR-0032 section B: the image identity is a pure function of
+    /// the bytes — same bytes, same id; different bytes, different id.
+    #[test]
+    fn image_identity_is_content_addressed() {
+        assert_eq!(image_id(b"same bytes"), image_id(b"same bytes"));
+        assert_ne!(image_id(b"same bytes"), image_id(b"same bytes "));
+        // The empty image still has a well-defined identity.
+        assert_ne!(image_id(b""), 0);
     }
 
     #[test]

@@ -84,12 +84,58 @@ tests that legitimately set `degraded = syscalls` and large
 
 ## Decision (section B — ITEM 3): exec ratchets, policy by IMAGE identity
 
-(Section B lands with its item in this round: the monitor ratchet
-(once Enforce never AuditOnly; None = inherit for unlisted images), the
-policy table keyed by the image's content identity — never a path
-string — with paths canonicalized before the registry lookup, stats
-persisting across exec, and exec_replace's mask intersection and the
-atomic image replacement unchanged.)
+- **The monitor ratchet** (`exec_replace`): `(Some(true), _) =>
+  Some(true)` — once Enforce, always; `(old, None) => old` — a None
+  parameter is INHERIT (exactly what the unlisted-image arm passes:
+  the caller's state rides across untouched); `(_, declared) =>
+  declared` — a Some(_) parameter is a real declared decision for
+  THIS image and lands (it can never lower an Enforce — the first
+  arm). This kills the round-A downgrade (an Enforce domain exec'ing
+  an unlisted image became AuditOnly) while keeping a declared
+  AuditOnly reachable — Some(false) must be a meaningful state, or
+  "AuditOnly" could never mean anything.
+- **The policy table is keyed by IMAGE IDENTITY** — a 64-bit FNV-1a
+  content hash of the registry image bytes (`proc::image_id`), never
+  a path string. Aliases of the same bytes resolve to one entry by
+  construction; different bytes never inherit a policy they did not
+  declare. FNV-1a is NOT cryptographic — recorded as a deliberate,
+  environment-honest choice: the registry is two kernel-embedded
+  images, the table never widens anything (masks only intersect), and
+  a collision would confuse two KERNEL-CHOSEN images, not hand user
+  input a privilege.
+- **`canonicalize_path`** (pure, bounded): collapse `//`, resolve `.`
+  and `..` (saturating at the root, POSIX-style — never escaping
+  upward), drop trailing slashes, refuse non-absolute input and
+  output overflow. `sys_exec` canonicalizes BEFORE the registry
+  lookup — `/bin/x`, `//bin/x`, `/bin/./x`, `/bin/../bin/x` are one
+  entry, so no spelling can dodge a declared policy.
+- **Unlisted images**: no table entry — the caller arm passes the
+  app-default surface (intersected with the live mask inside
+  `exec_replace`, which never widens) and None (inherit the caller's
+  monitor mode). The old code returned Some(false) for unlisted
+  paths — the silent downgrade.
+- **Persistence**: violation counters, monitor stats, tightened state
+  and the quarantine flag ride across exec (nothing in the path
+  clears them; the test pins it). Caught signal handlers still reset
+  (POSIX; the new image installs its own) and the address space still
+  clears — both unchanged.
+- `exec_replace`'s mask intersection and the kernel-side atomic image
+  replacement are untouched.
+
+### Tests (red first)
+
+`exec_never_downgrades_the_monitor_mode` (red on the old
+unconditional assignment — `left: Some(false), right: Some(true)`,
+the exact round-A shape), `exec_stats_and_violations_survive_the_
+boundary`, `a_policy_declared_for_one_image_never_applies_to_another`
+(the mismatch case), `random_exec_chains_never_loosen_mode_or_mask`
+(500 seeded execs: the mode never turns off, the mask never gains a
+bit), `path_aliases_canonicalize_to_one_entry` and
+`image_identity_is_content_addressed` (pure), and the kernel-side
+`aliases_canonicalize_to_the_same_image_and_identity` (the embedded
+registry bytes). Boot: `--verify` and the shell lane PASS with the
+identity-keyed declaration live (PID 1's /bin/sh exec and the
+linux-abi execve round-trip both cross the new boundary).
 
 ## Decision (section C — ITEM 4): per-frame reference counts
 

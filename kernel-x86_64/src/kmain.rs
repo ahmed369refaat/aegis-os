@@ -2976,7 +2976,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     //    mode (None) — a surface declaration is not a monitoring
     //    decision.
     let _ = k.exec_policy_declare(
-        "/bin/sh",
+        aegis_os::proc::image_id(crate::exec_registry::EXEC_SH_ELF),
         &aegis_os::profile::service_profile().syscalls,
         None,
     );
