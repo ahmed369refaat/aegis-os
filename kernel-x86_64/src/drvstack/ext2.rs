@@ -382,6 +382,131 @@ pub(crate) fn ext2_over_ahci(
             "\" ← read-only ext2 over AHCI",
         ],
     );
+
+    // ── K20 (P0-3): the gcc userland image comes OFF THE DISK ──
+    // "hello" is the gcc-14.2 -ffreestanding -nostdlib ELF boot.sh
+    // put on this image (scripts/mkext2.py); the boot reads ALL its
+    // direct blocks (the multi-KiB read the hello.txt path never
+    // needed) and registers the bytes as the execve image
+    // /bin/hello — the kernel binary is no longer the only root.
+    if root.block0 >= sb.blocks_count || !load(base + u64::from(root.block0) * 2, &mut sec) {
+        line(
+            out,
+            &["[EXT2] /bin/hello: root-dir re-read failed — skipping"],
+        );
+        return;
+    }
+    let elf_ino = match aegis_os::ext2::find_dirent(&sec, root.size, b"hello") {
+        Ok(Some(ino)) if ino != hello_ino => ino,
+        Ok(Some(_)) => {
+            line(
+                out,
+                &["[EXT2] /bin/hello: dirent resolved to hello.txt's inode — refusing"],
+            );
+            return;
+        }
+        Ok(None) => {
+            line(
+                out,
+                &["[EXT2] /bin/hello: no 'hello' file on this image — skipping"],
+            );
+            return;
+        }
+        Err(_) => {
+            line(out, &["[EXT2] /bin/hello: dirent walk refused — skipping"]);
+            return;
+        }
+    };
+    let h_byte = match sb.inode_byte(itable, elf_ino) {
+        Ok(b) => b,
+        Err(_) => {
+            line(
+                out,
+                &["[EXT2] /bin/hello: inode geometry refused — skipping"],
+            );
+            return;
+        }
+    };
+    if !load(base + h_byte / 512, &mut sec) {
+        line(out, &["[EXT2] /bin/hello: inode read failed — skipping"]);
+        return;
+    }
+    let hnode = match aegis_os::ext2::Inode::parse(&sec, (h_byte % 512) as usize, sb.inode_size) {
+        Ok(i) => i,
+        Err(_) => {
+            line(out, &["[EXT2] /bin/hello: inode parse refused — skipping"]);
+            return;
+        }
+    };
+    let hsize = hnode.size as usize;
+    if hsize == 0 || hsize > crate::exec_registry::DISK_IMAGE_MAX {
+        line(
+            out,
+            &["[EXT2] /bin/hello: size outside the slot's bounds — refusing"],
+        );
+        return;
+    }
+    let blocks_needed = hsize.div_ceil(1024);
+    if blocks_needed > 12 {
+        line(
+            out,
+            &["[EXT2] /bin/hello: needs an indirect chain — refusing (direct only)"],
+        );
+        return;
+    }
+    let mut image = [0u8; crate::exec_registry::DISK_IMAGE_MAX];
+    let mut off = 0usize;
+    for b in hnode.direct.iter().take(blocks_needed) {
+        // One 1KiB ext2 block = two 512-byte sectors through the
+        // same AHCI read path every other file used.
+        let lba = base + u64::from(*b) * 2;
+        if *b >= sb.blocks_count || !load(lba, &mut sec) {
+            line(
+                out,
+                &["[EXT2] /bin/hello: data block read failed — refusing"],
+            );
+            return;
+        }
+        // The first half of the block (a full sector, or the file's
+        // tail when it ends here).
+        let take1 = 512.min(hsize - off);
+        image[off..off + take1].copy_from_slice(&sec[..take1]);
+        off += take1;
+        if off >= hsize {
+            continue;
+        }
+        if !load(lba + 1, &mut sec) {
+            line(
+                out,
+                &["[EXT2] /bin/hello: data block read failed — refusing"],
+            );
+            return;
+        }
+        let take2 = 512.min(hsize - off);
+        image[off..off + take2].copy_from_slice(&sec[..take2]);
+        off += take2;
+    }
+    if off != hsize {
+        line(out, &["[EXT2] /bin/hello: short read — refusing"]);
+        return;
+    }
+    if !crate::exec_registry::register_disk_image(&image[..hsize]) {
+        line(
+            out,
+            &["[EXT2] /bin/hello: registry refused the image (already registered?)"],
+        );
+        return;
+    }
+    line(
+        out,
+        &[
+            "[EXT2] /bin/hello: ",
+            strutil::dec(hsize as u64, &mut hn),
+            "-byte gcc ELF read off the disk (",
+            strutil::dec(blocks_needed as u64, &mut [0u8; 20]),
+            " direct blocks) → the exec registry's disk slot",
+        ],
+    );
 }
 
 // ── xHCI TRB machinery (item 12, second slice): event ring + the

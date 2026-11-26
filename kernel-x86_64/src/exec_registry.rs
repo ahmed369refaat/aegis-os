@@ -19,6 +19,11 @@
 //! bss-probing, entry-honoring, exit_group(11) image the linux-abi
 //! lane's fork + execve + wait4 round-trip runs.
 
+// SAFETY discipline (module-level): the ONE static-mut slot below
+// (the disk-sourced exec image) is written once at boot — driver
+// stack, IF=0, before any exec-capable domain exists — and read
+// only afterwards; every access is documented at the site.
+#![allow(unsafe_code)]
 /// The exec target: ELF64, text RX at 0x400000, data RW at 0x403000
 /// with the bss tail at 0x403800 (the zero-fill probe), entry
 /// `_start` = 0x400000. Built by boot.sh (rustc --emit=obj + ld -T
@@ -36,13 +41,87 @@ pub const REGISTRY: &[(&str, &[u8])] = &[
     ("/bin/sh", EXEC_SH_ELF),
 ];
 
+// ── K20 (P0-3): the disk-sourced extension slot ──
+//
+// The registry above is compile-time: the kernel binary carries the
+// bytes. P0-3's userland citizen arrives differently — the gcc-built
+// ELF rides the ext2 root DISK IMAGE, and the boot READS it off the
+// AHCI drive into this slot (once, at IF=0 in the driver stack,
+// before the first exec-capable domain exists). One slot, fixed
+// path, fixed capacity, write-once: the honest middle step
+// between "the kernel binary is the filesystem" and the Phase-6 VFS
+// — the bytes are real disk bytes at boot, immutable from ring 3
+// after registration, and the arm answers ENOENT for every path but
+// this one until the registration happened.
+
+/// The one disk-sourced image this slot holds (the gcc userland
+/// citizen). 16 KiB = the exec cage's whole extent — an image that
+/// cannot fit the cage cannot fit the slot either.
+pub const DISK_IMAGE_PATH: &str = "/bin/hello";
+pub const DISK_IMAGE_MAX: usize = 16 * 1024;
+
+static mut DISK_IMAGE: [u8; DISK_IMAGE_MAX] = [0; DISK_IMAGE_MAX];
+static DISK_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static DISK_INSTALLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Register the disk image for `DISK_IMAGE_PATH`. Fails (false) when
+/// the bytes are empty, over-long, or a registration already
+/// happened — never silently overwritten.
+pub fn register_disk_image(bytes: &[u8]) -> bool {
+    use core::sync::atomic::Ordering;
+    if bytes.is_empty() || bytes.len() > DISK_IMAGE_MAX {
+        return false;
+    }
+    if DISK_INSTALLED.swap(true, Ordering::AcqRel) {
+        return false; // one registration, ever
+    }
+    // SAFETY: the sole write happens here, once, at boot (driver
+    // stack, IF=0, before any domain that could exec exists); every
+    // later reader goes through `resolve`, which only reads. Single
+    // CPU — no concurrent access exists to exclude.
+    unsafe {
+        DISK_IMAGE[..bytes.len()].copy_from_slice(bytes);
+    }
+    DISK_LEN.store(bytes.len(), Ordering::Release);
+    true
+}
+
 /// Resolve `path` to its image bytes. `None` is `-ENOENT` at the arm.
+/// The compiled-in table first, then the disk slot — a path either
+/// names an image or it does not.
 #[must_use]
 pub fn resolve(path: &str) -> Option<&'static [u8]> {
-    REGISTRY
+    use core::sync::atomic::Ordering;
+    if let Some(image) = REGISTRY
         .iter()
         .find(|(p, _)| *p == path)
         .map(|(_, image)| *image)
+    {
+        return Some(image);
+    }
+    if path == DISK_IMAGE_PATH {
+        let len = DISK_LEN.load(Ordering::Acquire);
+        if !DISK_INSTALLED.load(Ordering::Acquire) || len == 0 {
+            return None;
+        }
+        // SAFETY: the buffer was written once at registration (before
+        // any exec-capable domain existed) and never written again;
+        // the length is published after the bytes (Release/Acquire).
+        // The slice borrows a static — read-only for the boot's life.
+        unsafe {
+            return Some(core::slice::from_raw_parts(
+                core::ptr::addr_of!(DISK_IMAGE) as *const u8,
+                len,
+            ));
+        }
+    }
+    None
+}
+
+/// K20 (P0-3): is the disk image for `DISK_IMAGE_PATH` installed?
+#[must_use]
+pub fn disk_image_installed() -> bool {
+    DISK_INSTALLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 #[cfg(test)]

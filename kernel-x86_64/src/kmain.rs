@@ -1455,6 +1455,169 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     //      later claim paths fail closed on it.
     crate::drvstack::driver_stack_step(&mut k, &mut pool, &mut out);
 
+    // ── K20 (P0-3): the gcc userland citizen — /bin/hello off the
+    //      DISK. The ext2 step (inside the driver stack) read the
+    //      8760-byte gcc-14.2 -ffreestanding -nostdlib ELF off the
+    //      AHCI drive into the exec registry's disk slot; this step
+    //      spawns a ring-3 caller that execve's it. The image runs
+    //      through the same loader, cage, quota and policy gates the
+    //      compiled-in registry images use — the only difference is
+    //      where the bytes came from: a REAL compiler, a REAL disk
+    //      image, instead of the kernel binary. The verification keys
+    //      on the image's OWN outputs: exit_group(42) and the pattern
+    //      it wrote into its data page (the run's tables are the NEW
+    //      image's — the exec arm swapped them before the teardown).
+    {
+        /// The caller domain's id (distinct: vnet frames 44, vblkdom
+        /// 61, its rogue 62, the netd 66).
+        const USERLAND_DOM: u32 = 68;
+        static CALLER_BLOB: &[u8] = include_bytes!("../blob/ring3-exec-caller.bin");
+        if !crate::exec_registry::disk_image_installed() {
+            line(
+                &mut out,
+                &["[USER] /bin/hello: the disk image never loaded — skipping"],
+            );
+        } else {
+            let boot: [u8; 64] = [0; 64];
+            let sp = match mm::user::spawn_user_blob(
+                &mut k,
+                &mut pool,
+                USERLAND_DOM,
+                aegis_os::profile::service_profile(),
+                CALLER_BLOB,
+                &boot,
+            ) {
+                Ok(sp) => sp,
+                Err(_) => {
+                    line(
+                        &mut out,
+                        &["[USER] /bin/hello: ERROR: caller spawn failed; halting"],
+                    );
+                    hw::halt_forever();
+                }
+            };
+            // The caller and the image both speak Linux numbers (the
+            // execve 59 and the image's exit_group 231) — the same
+            // v1 treatment init gets.
+            let _ = k.set_domain_abi(USERLAND_DOM, aegis_os::syscall::Abi::Linux);
+            let kernel_cr3 = hw::read_cr3();
+            sp.run.tables.activate();
+            crate::sched::context::begin(sp.run);
+            crate::sched::context::launch(&sp.ctx);
+            hw::write_cr3(kernel_cr3);
+            // The exec's synthetic park: launch returns when the
+            // execve parks the NEW image (the caller is gone); the
+            // image resumes on a scheduler tick and its exit arrives
+            // EITHER in the run slot (try_take — tables available for
+            // the pattern read) OR through the parked-completed
+            // mailbox (round U's lesson, the init flow's dual drain).
+            // A bounded hlt-wait lets the ticks land; a stall is a
+            // loud refusal, never a hang.
+            let mut image_exit: Option<crate::sched::context::ExitKind> = None;
+            let mut image_page: Option<u64> = None;
+            let mut spins = 0u64;
+            while image_exit.is_none() && spins < 20_000_000 {
+                if let Some(run) = crate::sched::context::try_take() {
+                    if run.domain == USERLAND_DOM {
+                        image_page = Some(
+                            run.tables
+                                .translate(crate::mm::user_layout::DATA_BASE)
+                                .unwrap_or(0),
+                        );
+                        image_exit = Some(run.exit);
+                    }
+                }
+                if image_exit.is_none() {
+                    if let Some((dom, exit)) = crate::sched::park::completed_drain() {
+                        if dom == USERLAND_DOM {
+                            image_exit = Some(exit);
+                        }
+                    }
+                }
+                if image_exit.is_none() {
+                    hw::hlt_once();
+                }
+                spins += 1;
+            }
+            let run_exit = match image_exit {
+                Some(e) => e,
+                None => {
+                    line(
+                        &mut out,
+                        &["[USER] /bin/hello: ERROR: the image never completed (park stalled) — LOUD"],
+                    );
+                    pool.free_all_owned(&mut k.frames, USERLAND_DOM);
+                    let _ = k.destroy_domain(USERLAND_DOM);
+                    hw::halt_forever();
+                }
+            };
+            // The image's data page, through the run's (new) tables
+            // when the exit rode the slot; 0 (pattern unverifiable)
+            // when it rode the parked mailbox. The EXIT CODE is the
+            // primary proof either way: the caller's refusal exits
+            // answer 100+|errno| and a fault answers Fault — ONLY the
+            // gcc image's own exit_group(42) can answer 42.
+            let page = image_page.unwrap_or(0);
+            let mut pattern_verified = false;
+            if page != 0 {
+                let m0 = crate::virtio::read_u8_pa(page);
+                let m1 = crate::virtio::read_u8_pa(page + 1);
+                let mut msg = [0u8; 18];
+                for (i, slot) in msg.iter_mut().enumerate() {
+                    *slot = crate::virtio::read_u8_pa(page + 64 + i as u64);
+                }
+                pattern_verified = m0 == 0xA7 && m1 == 0x5A && msg == b"GCC-USERLAND-AEGIS"[..];
+            }
+            match run_exit {
+                crate::sched::context::ExitKind::Exited(42) => {
+                    line(
+                        &mut out,
+                        &[
+                            "[USER] /bin/hello: gcc 14.2 -ffreestanding -nostdlib ELF, read off the ext2 disk, execve'd at CPL=3",
+                        ],
+                    );
+                    line(
+                        &mut out,
+                        &[
+                            "[USER] the image ran: exit_group(42)",
+                            if pattern_verified {
+                                " + pattern verified"
+                            } else {
+                                " (via the parked handover; pattern page reclaimed with the run)"
+                            },
+                            " — the first REAL-compiler userland citizen",
+                        ],
+                    );
+                }
+                crate::sched::context::ExitKind::Exited(code) => {
+                    let mut cn = [0u8; 20];
+                    line(
+                        &mut out,
+                        &[
+                            "[USER] /bin/hello: ERROR: exit=",
+                            strutil::dec(code, &mut cn),
+                            " pattern_ok=",
+                            if pattern_verified {
+                                "yes"
+                            } else {
+                                "unverified"
+                            },
+                            " — LOUD",
+                        ],
+                    );
+                }
+                _ => {
+                    line(
+                        &mut out,
+                        &["[USER] /bin/hello: ERROR: the caller faulted — LOUD"],
+                    );
+                }
+            }
+            pool.free_all_owned(&mut k.frames, USERLAND_DOM);
+            let _ = k.destroy_domain(USERLAND_DOM);
+        }
+    }
+
     // ── 15. ADR-0023: the sleep/idle proof — the first process that
     //      parks ITSELF and the first guarded idle the machine ever
     //      served. The sleeper (mode 2, its own data page) verifies

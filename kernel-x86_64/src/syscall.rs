@@ -2240,7 +2240,22 @@ mod exec {
         } else {
             0
         };
-        crate::drvstack::netdata::snapshot_target(pa, readback);
+        // K20 debug: the SAME byte through the USER VA, under the
+        // blessed SMAP window, at arm time.
+        IN_USER_COPY.store(true, Ordering::SeqCst);
+        if crate::hw::smap_active() {
+            crate::hw::stac();
+        }
+        let va_readback = if n > 42 {
+            memops::read_u8_va(buf + 42)
+        } else {
+            0
+        };
+        if crate::hw::smap_active() {
+            crate::hw::clac();
+        }
+        IN_USER_COPY.store(false, Ordering::SeqCst);
+        crate::drvstack::netdata::snapshot_target(pa, readback, va_readback);
         // K20 (P0-2): the arm-time truth — the frame as received.
         crate::drvstack::netdata::snapshot(&kbuf[..n]);
         n as u64

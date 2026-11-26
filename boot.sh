@@ -36,7 +36,7 @@ STUB_OBJ=target/stub.o
 IMAGE=target/aegis-boot.elf
 
 echo "==> [0/4] building the ring-3 example blobs (rustc --emit=obj + objcopy)"
-for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init ring3-netd ring3-vblk ring3-rogue-drv; do
+for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init ring3-netd ring3-vblk ring3-rogue-drv ring3-exec-caller; do
     rustc --edition 2021 --crate-type=lib --emit=obj \
           --target x86_64-unknown-none -O "examples/$b/src/lib.rs" \
           -o "target/$b.o"
@@ -58,6 +58,19 @@ rustc --edition 2021 --crate-type=lib --emit=obj \
       -o "target/ring3-exec-target.o"
 ld -T "examples/ring3-exec-target/exec.ld" \
    -o "kernel-x86_64/blob/ring3-exec-target.bin" "target/ring3-exec-target.o"
+# K20 (P0-3): the gcc userland citizen — a REAL compiler's ELF.
+# -ffreestanding -nostdlib: no libc, no startup files; the program is
+# the whole image. Linked at the exec cage's declared vaddrs; carried
+# on the ext2 root as the file "hello" (scripts/mkext2.py reads THIS
+# file), read back off the AHCI disk at boot, and execve'd by a
+# ring-3 caller — see exec_registry.rs's disk slot + kmain's [USER]
+# step.
+echo "==> [0c/4] building the gcc userland image (/bin/hello)"
+gcc -ffreestanding -nostdlib -nostartfiles -static -O2 \
+    -T "examples/userland-hello/hello.ld" \
+    -o "kernel-x86_64/blob/userland-hello.elf" \
+    "examples/userland-hello/hello.c" 2>&1 | grep -v "build-id" || true
+[ -s "kernel-x86_64/blob/userland-hello.elf" ] || { echo "FATAL: gcc userland image build failed"; exit 1; }
 
 echo "==> [0c/4] linking the shell (a REAL ELF64 — /bin/sh, opt-level=z + gc-sections)"
 rustc --edition 2021 --crate-type=bin -C panic=abort -C opt-level=z -C codegen-units=1 \
@@ -217,6 +230,9 @@ case "${1:-}" in
       "[VBLKD] rogue driver domain contained"  # the quarantine: a bad driver loses its device, the boot continues
       "[KBD2] negotiated scancode set 2, ack="  # the real 0xF0/0x02 exchange
       "[EXT2] hello.txt (inode 12, 17 bytes): \"HELLO-AEGIS-EXT2.\" ← read-only ext2 over AHCI"  # the mount LIVE (ADR-0014: the stale FIS was three driver bugs)
+      "[EXT2] /bin/hello: "  # K20 (P0-3): the gcc ELF read off the disk into the exec registry
+      "[USER] /bin/hello: gcc 14.2 -ffreestanding -nostdlib ELF, read off the ext2 disk, execve'd at CPL=3"  # K20 (P0-3): the userland bootstrap
+      "[USER] the image ran: exit_group(42)"  # K20 (P0-3): the loader, cage, quota and policy gates on a REAL compiler's output
       "[FAT32] HELLO.ESP (cluster 3, 1200 bytes, 3 clusters): \"HEAD:AEGIS-FAT32:\"…\":TAIL-OK\" ← read-only FAT32 over AHCI"  # the ESP mount LIVE on the same port (GPT partition 2, the chain walk proven)
       "[E1K] teardown dom"  # ADR-0018
       "[GFX] VBE 640x480x32 linear"  # the mode engaged
@@ -264,6 +280,8 @@ case "${1:-}" in
       "[AHCI] IDENTIFY completed:"  # command 1 must complete here too
       "[GPT ] partition 1 'aegis-root' LBA 34..=289"  # the partition layer: protective MBR + GPT CRCs verified, ext2 at the partition base
       "[EXT2] hello.txt (inode 12, 17 bytes): \"HELLO-AEGIS-EXT2.\" ← read-only ext2 over AHCI"  # ADR-0014: the mount works on BOTH lanes
+      "[EXT2] /bin/hello: "  # K20 (P0-3): the disk-sourced image loads on BOTH lanes
+      "[USER] the image ran: exit_group(42)"  # K20 (P0-3): the exec path on real-compiler output
       "[FAT32] GPT partition 2 'aegis-esp' LBA 296..=66959"  # the multi-partition GPT walk (the ESP is a GPT citizen)
       "[FAT32] BPB ok: 65600 clusters"  # the FAT32 type determination, honest (>= 65525 by the spec's rule)
       "[FAT32] HELLO.ESP (cluster 3, 1200 bytes, 3 clusters): \"HEAD:AEGIS-FAT32:\"…\":TAIL-OK\" ← read-only FAT32 over AHCI"  # the ESP mount works on BOTH lanes

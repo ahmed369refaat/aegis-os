@@ -778,6 +778,25 @@ fn ring3_net_step(out: &mut dyn FnMut(&str), mac: &[u8; 6]) {
                 "[VNET] ring-3 throttle: 1+20 sends OK, the next EAGAIN (bucket 1514 exhausted, no clock advance); 1515B refused -EMSGSIZE",
             ],
         );
+        // K20 debug: the page-anomaly brackets — t1 = the op byte the
+        // blob read right after the recv, t2 = after the throttle
+        // loop, dhcp_op = what the kernel reads NOW (post-exit).
+        line(
+            out,
+            &[
+                "[VNET] ring-3 dbg page: t0va=",
+                strutil::dec(
+                    u64::from(crate::drvstack::netdata::snap_va_readback()),
+                    &mut [0u8; 20],
+                ),
+                " t1=",
+                strutil::dec(crate::memops::read_u64(data_pa + 0xC30), &mut [0u8; 20]),
+                " t2=",
+                strutil::dec(crate::memops::read_u64(data_pa + 0xC38), &mut [0u8; 20]),
+                " verify=",
+                strutil::dec(dhcp_op, &mut [0u8; 20]),
+            ],
+        );
     } else {
         // Dump the whole report so the mismatch is diagnosable: the
         // raw returns, the refusal codes, the frame's identity.
@@ -810,6 +829,15 @@ fn ring3_net_step(out: &mut dyn FnMut(&str), mac: &[u8; 6]) {
                 strutil::dec(u64::from(snap_op), &mut [0u8; 20]),
                 " yiaddr=",
                 strutil::hex(sy, &mut [0u8; 18]),
+                " t0va=",
+                strutil::dec(
+                    u64::from(crate::drvstack::netdata::snap_va_readback()),
+                    &mut [0u8; 20],
+                ),
+                " t1=",
+                strutil::dec(crate::memops::read_u64(data_pa + 0xC30), &mut [0u8; 20]),
+                " t2=",
+                strutil::dec(crate::memops::read_u64(data_pa + 0xC38), &mut [0u8; 20]),
                 " copy_pa=",
                 strutil::hex(crate::drvstack::netdata::snap_pa(), &mut [0u8; 18]),
                 " readback=",

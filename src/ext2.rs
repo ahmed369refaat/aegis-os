@@ -113,14 +113,25 @@ pub struct Inode {
     pub size: u32,
     /// i_block\[0\] — the first direct block (all this demo reads).
     pub block0: u32,
+    /// K20 (P0-3): the DIRECT block list i_block\[0..12\] — a
+    /// multi-KiB file (the gcc userland image) spans several, and the
+    /// boot's loader walks them in order. Indirect blocks are refused
+    /// by the reader, not modeled here.
+    pub direct: [u32; 12],
 }
 
 impl Inode {
     /// Parse one inode at `off` in `buf` (a sector or larger slice);
-    /// the whole `inode_size` must fit from `off`.
+    /// the whole `inode_size` must fit from `off`. K20 (P0-3) fixed a
+    /// live bug here: the old `off < 44` guard refused every inode
+    /// that happens to START a sector (inodes 5, 9, 13, ... at
+    /// inode_size 128 — one in four), even though the actual bounds
+    /// check is `buf.len() < need` alone. The gcc userland image's
+    /// inode landed exactly there and the boot refused it; the guard
+    /// was a leftover, not a policy.
     pub fn parse(buf: &[u8], off: usize, inode_size: u16) -> Result<Inode, Ext2Error> {
         let need = off + inode_size as usize;
-        if buf.len() < need || off < 44 {
+        if buf.len() < need {
             return Err(Ext2Error::Truncated {
                 need,
                 have: buf.len(),
@@ -130,7 +141,17 @@ impl Inode {
         let size = u32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
         let block0 =
             u32::from_le_bytes([buf[off + 40], buf[off + 41], buf[off + 42], buf[off + 43]]);
-        Ok(Inode { mode, size, block0 })
+        let mut direct = [block0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        for (i, slot) in direct.iter_mut().enumerate().skip(1) {
+            let b = off + 40 + 4 * i;
+            *slot = u32::from_le_bytes([buf[b], buf[b + 1], buf[b + 2], buf[b + 3]]);
+        }
+        Ok(Inode {
+            mode,
+            size,
+            block0,
+            direct,
+        })
     }
 
     /// Directory bit of `mode` (0x4000).
@@ -636,6 +657,22 @@ mod tests {
 
     /// Phase 6 S4: create + multi-block write + parser read-back, with
     /// the free counters and the dirent honestly maintained.
+    /// K20 (P0-3), the live bug the gcc userland image found: an
+    /// inode that STARTS a sector (offset 0 — inodes 5, 9, 13, ...
+    /// at inode_size 128) is legal, and the old `off < 44` guard
+    /// refused exactly those. The parse must accept them.
+    #[test]
+    fn inode_starting_a_sector_parses() {
+        let mut img = build_image();
+        // Inode 5 sits at 5*1024 + 4*128 = 6656 → sector 13, offset 0.
+        let e = [0u8; 128];
+        img[6656..6656 + 128].copy_from_slice(&e);
+        let sec = &img[6656..6656 + 512];
+        let node = Inode::parse(sec, 0, 128).expect("offset 0 is legal");
+        assert_eq!(node.mode, 0);
+        assert_eq!(node.size, 0);
+    }
+
     #[test]
     fn rw_create_write_and_read_back() {
         let mut img = build_rw_image();

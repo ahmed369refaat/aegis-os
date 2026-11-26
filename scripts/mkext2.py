@@ -96,18 +96,34 @@ put(FS + 3*BS, bb)
 ib = bytearray(BS); ib[0] = 0xFF
 put(FS + 4*BS, ib)
 
-def inode(n, mode, size, block0):
+def inode(n, mode, size, blocks):
+    """One inode: `blocks` is the DIRECT block list (i_block[0..],
+    12 direct entries fit a <= 12 KiB file; larger files refuse)."""
+    assert len(blocks) <= 12, "direct blocks only"
     off = FS + 5*BS + (n-1)*128
     ent = bytearray(128)
     struct.pack_into('<H', ent, 0, mode)
     struct.pack_into('<I', ent, 4, size)
-    struct.pack_into('<I', ent, 40, block0)  # i_block[0]
+    for i, b in enumerate(blocks):
+        struct.pack_into('<I', ent, 40 + 4*i, b)  # i_block[i]
     put(off, ent)
 
-inode(2, 0x41ED, BS, 20)          # root dir
-inode(12, 0x81A4, 17, 21)         # hello.txt
+inode(2, 0x41ED, BS, [20])       # root dir
+inode(12, 0x81A4, 17, [21])      # hello.txt
 
-# Root dir block 20: ".", "..", "hello.txt".
+# K20 (P0-3): the gcc-built userland image, carried as a real file.
+# Built by boot.sh step [0c] BEFORE this script runs; 8..12 KiB of
+# ELF spans several direct blocks.
+hello_elf = open('kernel-x86_64/blob/userland-hello.elf', 'rb').read()
+hello_blocks = [22 + i for i in range((len(hello_elf) + BS - 1) // BS)]
+assert 22 + len(hello_blocks) <= 128, "the image must fit the filesystem"
+inode(13, 0o100755, len(hello_elf), hello_blocks)
+# Mark the new data blocks used in the block bitmap (honesty).
+for b in range(22, 22 + len(hello_blocks)):
+    bb[b >> 3] |= 1 << (b & 7)
+put(FS + 4*BS, bb)
+
+# Root dir block 20: ".", "..", "hello.txt", "hello".
 d = bytearray(BS)
 o = 0
 for name, ino, ftype in [(b'.', 2, 2), (b'..', 2, 2)]:
@@ -116,13 +132,22 @@ for name, ino, ftype in [(b'.', 2, 2), (b'..', 2, 2)]:
     d[o+8:o+8+len(name)] = name
     o += rec
 name, ino, ftype = b'hello.txt', 12, 1
+rec = (8 + len(name) + 3) & ~3
+struct.pack_into('<IHBB', d, o, ino, rec, len(name), ftype)
+d[o+8:o+8+len(name)] = name
+o += rec
+name, ino, ftype = b'hello', 13, 1
 struct.pack_into('<IHBB', d, o, ino, BS - o, len(name), ftype)
 d[o+8:o+8+len(name)] = name
 put(FS + 20*BS, d)
 
 # File data at block 21.
 put(FS + 21*BS, b'HELLO-AEGIS-EXT2\n')
+# The gcc ELF's blocks at 22...
+for i in range(0, len(hello_elf), BS):
+    put(FS + (22 + i//BS)*BS, hello_elf[i:i+BS])
 
 open('target/sdisk0.img', 'wb').write(img)
 print(f"GPT-wrapped ext2 image: {TOTAL} sectors, partition 'aegis-root' "
-      f"LBA {PART_FIRST}..={PART_LAST}, hello.txt = HELLO-AEGIS-EXT2")
+      f"LBA {PART_FIRST}..={PART_LAST}, hello.txt = HELLO-AEGIS-EXT2, "
+      f"hello = {len(hello_elf)}-byte gcc ELF in {len(hello_blocks)} blocks")
