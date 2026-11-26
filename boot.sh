@@ -36,7 +36,7 @@ STUB_OBJ=target/stub.o
 IMAGE=target/aegis-boot.elf
 
 echo "==> [0/4] building the ring-3 example blobs (rustc --emit=obj + objcopy)"
-for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init ring3-netd ring3-vblk ring3-rogue-drv ring3-exec-caller; do
+for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init ring3-netd ring3-vblk ring3-rogue-drv ring3-exec-caller ring3-vnetd; do
     rustc --edition 2021 --crate-type=lib --emit=obj \
           --target x86_64-unknown-none -O "examples/$b/src/lib.rs" \
           -o "target/$b.o"
@@ -233,6 +233,9 @@ case "${1:-}" in
       "[EXT2] /bin/hello: "  # K20 (P0-3): the gcc ELF read off the disk into the exec registry
       "[USER] /bin/hello: gcc 14.2 -ffreestanding -nostdlib ELF, read off the ext2 disk, execve'd at CPL=3"  # K20 (P0-3): the userland bootstrap
       "[USER] the image ran: exit_group(42)"  # K20 (P0-3): the loader, cage, quota and policy gates on a REAL compiler's output
+      "[VNETD] driver-domains=2: the ring-3 domain brought the NIC up on its OWN rings through the devreg channel ("  # K20 (P0-4): the second migrated driver
+      "[VNETD] DHCP at CPL=3 through the domain's OWN rings: 290-byte DISCOVER out, 590-byte OFFER back"  # K20 (P0-4): device ownership proven by the exchange itself
+      "[VNETD] rogue driver domain contained: "  # K20 (P0-4): the quarantine, NIC edition
       "[FAT32] HELLO.ESP (cluster 3, 1200 bytes, 3 clusters): \"HEAD:AEGIS-FAT32:\"…\":TAIL-OK\" ← read-only FAT32 over AHCI"  # the ESP mount LIVE on the same port (GPT partition 2, the chain walk proven)
       "[E1K] teardown dom"  # ADR-0018
       "[GFX] VBE 640x480x32 linear"  # the mode engaged

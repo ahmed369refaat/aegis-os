@@ -39,6 +39,7 @@ mod vblk;
 mod vblkdom;
 mod vcon;
 mod vnet;
+mod vnetdom;
 mod vrng;
 mod vtd;
 mod wdt;
@@ -141,6 +142,12 @@ pub fn driver_stack_step<const N: usize>(
                 // is verified against the ring-0 path's own bytes.
                 vblkdom::vblkdom_step(k, pool, out, &mut broker, &inv);
                 vnet::net_step(k, pool, out, &mut broker, &inv);
+                // K20 (P0-4): the SECOND migrated driver — the NIC.
+                // Runs AFTER net_step so the ring-0 proof's teardown
+                // and the netd's syscall session are long done: this
+                // domain RESETS the device and brings it up on its
+                // OWN rings at CPL=3.
+                vnetdom::vnetdom_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_cross_device_probe_step(k, pool, out, &mut broker, &inv);
                 nvme::nvme_step(k, pool, out, &mut broker, &inv);
