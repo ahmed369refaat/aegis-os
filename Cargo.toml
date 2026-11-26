@@ -22,7 +22,7 @@ dma-contract = []
 # external crates). default-members keeps plain `cargo build`/`cargo test`
 # at the root scoped to the policy library.
 [workspace]
-members = ["kernel-x86_64"]
+members = ["kernel-x86_64", "pkg"]
 exclude = ["examples/ring3-hello", "examples/ring3-rogue", "examples/ring3-edge"]
 default-members = ["."]
 

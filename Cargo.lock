@@ -12,3 +12,7 @@ dependencies = [
 [[package]]
 name = "aegis-os"
 version = "0.2.0"
+
+[[package]]
+name = "aegis-pkg"
+version = "0.1.0"

@@ -1,0 +1,23 @@
+[package]
+name = "aegis-pkg"
+version = "0.1.0"
+edition = "2021"
+description = "AegisOS package manager: no_std, no_alloc, zero-dependency, Ed25519-verified atomic package transactions. File-only packages (no install scripts by design), least-privilege Fs abstraction, WAL journal with power-loss recovery."
+license = "MIT"
+
+# Intentionally empty: core-only, no_std, zero supply-chain surface.
+[dependencies]
+
+[features]
+# Signing is NOT compiled into the deployed manager: the AegisOS build
+# verifies only (repo keys are provisioned out-of-band). Tests and the
+# host-side repo builder enable this feature.
+signer = []
+
+[lib]
+name = "aegis_pkg"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pkg"
+path = "src/main.rs"
