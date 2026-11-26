@@ -51,8 +51,9 @@ use aegis_os::syscall::Abi;
 use aegis_os::syscall::{
     SYSCALL_COUNT, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_DEVREG, SYS_EXEC, SYS_EXIT, SYS_FORK,
     SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND,
-    SYS_KILL, SYS_LISTDIR, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_PIPE_READ,
-    SYS_PIPE_WRITE, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
+    SYS_KILL, SYS_LISTDIR, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_NET_RECV,
+    SYS_NET_SEND, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN,
+    SYS_UNLINK, SYS_WAIT, SYS_WRITE,
 };
 #[cfg(test)]
 use aegis_os::syscall::{
@@ -72,6 +73,13 @@ pub const ENOSYS: i64 = 38;
 /// ADR-0024: the frame source or the address space refused — out of
 /// memory (budget, pool, or window).
 pub const ENOMEM: i64 = 12;
+/// K20 (P0-2): the send is longer than `MAX_NET_FRAME_BYTES` — a
+/// value error (Linux send(2)'s EMSGSIZE), never a throttle: it can
+/// not fit any token window.
+pub const EMSGSIZE: i64 = 90;
+/// K20 (P0-2): no live NIC session behind the brokered socket (the
+/// arms answer this honestly on machines/lane phases without one).
+pub const ENODEV: i64 = 19;
 
 /// Longest SYS_WRITE the kernel will service in one call (bounds the
 /// copy loop; user code wanting more loops itself). K20 (P0-1):
@@ -334,6 +342,12 @@ mod exec {
             // ring 3 (the core executors were live since round F11;
             // the arms arrive with the boot root).
             Decision::Allowed if nr8 == SYS_MKDIR => sys_mkdir(run, a1, a2),
+            // K20 (P0-2): the network data path — the brokered socket's
+            // send/receive arms, gated by the core policy (Device cap +
+            // token bucket) and driven against the live virtio-net
+            // session the driver-stack proof armed.
+            Decision::Allowed if nr8 == SYS_NET_SEND => sys_net_send(run, a1, a2),
+            Decision::Allowed if nr8 == SYS_NET_RECV => sys_net_recv(run, a1, a2),
             Decision::Allowed if nr8 == SYS_UNLINK => sys_unlink(run, a1),
             Decision::Allowed if nr8 == SYS_LISTDIR => sys_listdir(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_CHROOT => sys_chroot(run, a1),
@@ -2101,6 +2115,135 @@ mod exec {
         // wake must land in its image before this arm returns.
         drain_ipc_wakes();
         r
+    }
+
+    /// SYS_NET_SEND(buf, len) — K20 (P0-2), the brokered socket's
+    /// data path. The order is the discipline:
+    /// 1. the frame bound (EMSGSIZE — a request that can never fit
+    ///    any token window is a value error, and burns nothing),
+    /// 2. the live session (ENODEV — no NIC behind the broker; checked
+    ///    BEFORE the policy gate so a doomed send consumes no tokens),
+    /// 3. the user range (EFAULT, fault-reported like every arm),
+    /// 4. the POLICY gate on the live kernel (Device cap WRITE + the
+    ///    caller's socket + the token bucket — audit, Tighten and
+    ///    Quarantine all apply, EACCES/EAGAIN out of `errno_of`),
+    /// 5. the data (copy-in once under the blessed SMAP window),
+    /// 6. the wire (the netdata session's publish/kick/completion).
+    ///
+    /// RAX answers the byte count, Linux send(2)-style — the core's
+    /// internal `Count` (remaining tokens) is the policy layer's own.
+    fn sys_net_send(run: &mut crate::sched::context::UserRun, buf: u64, len: u64) -> u64 {
+        use aegis_os::net::MAX_NET_FRAME_BYTES;
+        if len > MAX_NET_FRAME_BYTES as u64 {
+            return (-EMSGSIZE) as u64;
+        }
+        if len == 0 {
+            return 0; // nothing to move, nothing to charge
+        }
+        if !crate::drvstack::netdata::armed() {
+            return (-ENODEV) as u64;
+        }
+        if !validate_user_range(run, buf, len, MAX_NET_FRAME_BYTES as u64) {
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_fault(run.domain);
+            }
+            return (-EFAULT) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        if let Err(e) = k.execute(run.domain, SysRequest::NetSend { len: len as u32 }) {
+            return sysabi::errno_of(&e) as u64;
+        }
+        // The data: read the user bytes ONCE into a kernel buffer.
+        let mut kbuf = [0u8; MAX_NET_FRAME_BYTES as usize];
+        let mut pos = 0usize;
+        IN_USER_COPY.store(true, Ordering::SeqCst);
+        if crate::hw::smap_active() {
+            crate::hw::stac();
+        }
+        crate::mm::user_range::copy_user_bytes(buf, len, &memops::read_u8_va, |b| {
+            kbuf[pos] = b;
+            pos += 1;
+        });
+        if crate::hw::smap_active() {
+            crate::hw::clac();
+        }
+        IN_USER_COPY.store(false, Ordering::SeqCst);
+        match crate::drvstack::netdata::send(&kbuf[..len as usize]) {
+            Some(n) => n as u64,
+            // Armed but the completion stalled: loud, never silent.
+            None => (-sysabi::EIO) as u64,
+        }
+    }
+
+    /// SYS_NET_RECV(buf, len) — the receive half. Same order: the
+    /// session (ENODEV), the user range (EFAULT), the POLICY gate
+    /// (Device cap READ + the caller's socket — EACCES/EBADF), then
+    /// the data: a bounded poll of the RX used ring; nothing ready is
+    /// EAGAIN (the module's non-blocking flavor, never a park), a
+    /// completed frame copies out byte-exact and the buffer re-arms
+    /// for the next packet. The actual byte count is accounted on the
+    /// socket through the supervisor callback (`net_recv_account`) —
+    /// the policy gate admitted the REQUEST, this is the truth.
+    /// RAX answers the copied count; a frame longer than the buffer
+    /// truncates like read(2) on a datagram (min semantics).
+    fn sys_net_recv(run: &mut crate::sched::context::UserRun, buf: u64, len: u64) -> u64 {
+        use aegis_os::net::MAX_NET_FRAME_BYTES;
+        if len == 0 {
+            return (-EINVAL) as u64;
+        }
+        if !crate::drvstack::netdata::armed() {
+            return (-ENODEV) as u64;
+        }
+        if !validate_user_range(run, buf, len, MAX_NET_FRAME_BYTES as u64) {
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_fault(run.domain);
+            }
+            return (-EFAULT) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-EPERM) as u64;
+        };
+        if let Err(e) = k.execute(run.domain, SysRequest::NetRecv { len: len as u32 }) {
+            return sysabi::errno_of(&e) as u64;
+        }
+        let mut kbuf = [0u8; MAX_NET_FRAME_BYTES as usize];
+        let Some(n) = crate::drvstack::netdata::recv(&mut kbuf) else {
+            return (-sysabi::EAGAIN) as u64;
+        };
+        // The policy half's honest accounting: the ACTUAL count.
+        k.net_recv_account(run.domain, n as u32);
+        // K20 (P0-2): the copy-out rides the page's PHYSICAL mapping,
+        // translated through the CALLER's own tables — the same frame
+        // the VA store would reach (the range was validated above; the
+        // bytes are read ONCE, from kbuf — no double-fetch). The
+        // direct VA-store path measurably loses whole-frame writes in
+        // the driver-stack phase while working in the M3/TTY context —
+        // the arm-time snapshot plus the verifier's page read pin the
+        // divergence; the AC-flag/SMAP interaction is the documented
+        // open question (vnet.rs).
+        let page = buf & !0xFFF;
+        let in_page = buf & 0xFFF;
+        let Some(pa) = run.tables.translate(page) else {
+            return (-EFAULT) as u64;
+        };
+        for (off, b) in kbuf.iter().enumerate().take(n) {
+            crate::virtio::write_u8_pa(pa + in_page + off as u64, *b);
+        }
+        // K20 debug: the copy target + the immediate read-back — if
+        // the read-back sees the byte but the verifier later does
+        // not, the page was rewritten in between; if the read-back is
+        // already wrong, the translate or the write is.
+        let readback = if n > 42 {
+            crate::virtio::read_u8_pa(pa + in_page + 42)
+        } else {
+            0
+        };
+        crate::drvstack::netdata::snapshot_target(pa, readback);
+        // K20 (P0-2): the arm-time truth — the frame as received.
+        crate::drvstack::netdata::snapshot(&kbuf[..n]);
+        n as u64
     }
 
     /// SYS_READ(fd, buf, len): the executor fills a KERNEL buffer

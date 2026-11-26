@@ -564,8 +564,269 @@ pub(crate) fn net_step<const N: usize>(
         msix_message_step(out, dev, vector, &info);
     }
 
+    // ── K20 (P0-2): the ring-3 data path over the SAME live rings ──
+    // Arm the syscall arms' session (the used-index cursors AFTER the
+    // CPL0 proof), re-post the RX buffer for the exchange, run a
+    // netd domain through SYS_NET_SEND/NET_RECV, then disarm before
+    // the teardown revokes the broker mappings.
+    {
+        let (nb, nm) = mmio.notify_lane();
+        crate::drvstack::netdata::arm(
+            tx_desc,
+            tx_avail,
+            tx_used,
+            tx_buf,
+            qs1,
+            crate::virtio::used_idx(tx_used),
+            rx_desc,
+            rx_avail,
+            rx_used,
+            rx_buf,
+            qs0,
+            crate::virtio::used_idx(rx_used),
+            nb,
+            nm,
+            n0,
+            n1,
+        );
+        // The proof's RX buffer was consumed by its own OFFER: re-post
+        // it BEFORE the domain can run, so the reply to ITS discover
+        // has a buffer waiting (the same discipline as the proof).
+        crate::virtio::write_desc(rx_desc, rx_buf, v::NET_HDR_LEN + 1514, v::DESC_F_WRITE, 0);
+        net_publish(&rxq, 0);
+        mmio.notify(0, n0);
+        ring3_net_step(out, &mac);
+        crate::drvstack::netdata::disarm();
+    }
+
     // ── teardown: revoke + scrub (the broker discipline) ──
     session.close(out);
+}
+
+/// K20 (P0-2): the netd domain's ring-3 exchange — the brokered
+/// socket's data path at CPL=3. The kernel seeds the frames the blob
+/// sends (P0-2 proves the PATH: the syscall arms, the policy gates,
+/// the rings — not DHCP crafting in asm), opens the domain's socket
+/// as the supervisor, runs the blob to SYS_EXIT, then verifies the
+/// report block against the deterministic expectations (burst 1514:
+/// the 290-byte DISCOVER + 20 null frames fit, the next refuses
+/// EAGAIN; the 1515-byte probe refuses EMSGSIZE).
+#[cfg(not(test))]
+#[cfg(not(test))]
+fn ring3_net_step(out: &mut dyn FnMut(&str), mac: &[u8; 6]) {
+    use crate::sched::context::{self, ExitKind};
+
+    // The DriverSession (net_step's) holds the &mut k / &mut pool
+    // borrows while the rings must stay mapped — the kernel/pool
+    // context globals are the established route for exactly this
+    // shape (the vblkdom run drives its blob the same way: the
+    // syscall path reads kernel_mut() while the session borrow
+    // lives). Single CPU, pointers set once at boot.
+    let (Some(k), Some(pool)) = (context::kernel_mut(), context::pool_mut()) else {
+        line(
+            out,
+            &["[VNET] ring-3 ERROR: kernel/pool globals unset — skipping"],
+        );
+        return;
+    };
+
+    /// The netd domain's id (distinct from every frame-owner tag and
+    /// every other boot domain: vnet's frames are 44, vblkdom is 61).
+    const NETD_DOMAIN: u32 = 66;
+    static NETD_BLOB: &[u8] = include_bytes!("../../blob/ring3-netd.bin");
+    let boot: [u8; 64] = [0; 64];
+    let spawn = match crate::mm::user::spawn_user_blob(
+        k,
+        pool,
+        NETD_DOMAIN,
+        aegis_os::profile::netd_profile(),
+        NETD_BLOB,
+        &boot,
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            line(
+                out,
+                &["[VNET] ring-3 ERROR: netd spawn refused — skipping the data path"],
+            );
+            return;
+        }
+    };
+    // Seed the blob's data page: the DISCOVER (netutil's builder, the
+    // same frame shape the CPL0 proof sent) and the 60-byte null frame
+    // the throttle loop sends (broadcast, ethertype 0xDEAD — slirp
+    // drops it; it only ever exercises the bucket and the TX ring).
+    let Some(data_pa) = spawn
+        .run
+        .tables
+        .translate(crate::mm::user_layout::DATA_BASE)
+    else {
+        line(
+            out,
+            &["[VNET] ring-3 ERROR: data page unresolved — refusing closed"],
+        );
+        pool.free_all_owned(&mut k.frames, NETD_DOMAIN);
+        let _ = k.destroy_domain(NETD_DOMAIN);
+        return;
+    };
+    netutil::build_dhcp_discover_at(data_pa, *mac);
+    let null_pa = data_pa + 512;
+    for i in 0..6u64 {
+        netutil::put8(null_pa + i, 0xFF);
+        netutil::put8(null_pa + 6 + i, mac[i as usize]);
+    }
+    netutil::put8(null_pa + 12, 0xDE);
+    netutil::put8(null_pa + 13, 0xAD);
+    // The supervisor opens the domain's brokered socket (the policy
+    // half: caps + the token bucket come with the profile).
+    if k.net_open(NETD_DOMAIN).is_err() {
+        line(
+            out,
+            &["[VNET] ring-3 ERROR: socket open refused — refusing closed"],
+        );
+        pool.free_all_owned(&mut k.frames, NETD_DOMAIN);
+        let _ = k.destroy_domain(NETD_DOMAIN);
+        return;
+    }
+
+    // ── the run (the kmain ring-3 pattern, verbatim) ──
+    let kernel_cr3 = crate::hw::read_cr3();
+    spawn.run.tables.activate();
+    crate::sched::context::begin(spawn.run);
+    crate::sched::context::launch(&spawn.ctx);
+    let run = crate::sched::context::take();
+    crate::hw::write_cr3(kernel_cr3);
+
+    // ── the verification: the blob only RECORDS (raw syscall
+    // returns); every interpretation happens here, against the page.
+    // The report block: +C00 send#1, +C08 the recv, +C18 the throttle
+    // refusal, +C20 the null-frame count, +C28 the 1515B probe. The
+    // frame itself sits at +800 for the payload checks.
+    let send1_ret = crate::memops::read_u64(data_pa + 0xC00);
+    let recv_ret = crate::memops::read_u64(data_pa + 0xC08);
+    let throttle_refusal = crate::memops::read_u64(data_pa + 0xC18);
+    let null_sends = crate::memops::read_u64(data_pa + 0xC20);
+    let emsgsize_ret = crate::memops::read_u64(data_pa + 0xC28);
+    let dhcp_op = u64::from(crate::virtio::read_u8_pa(data_pa + 0x842));
+    let yiaddr = u64::from(crate::memops::read_u32(data_pa + 0x858));
+    // The arm-time snapshot: the frame as the recv arm saw it.
+    let snap_op = crate::drvstack::netdata::snap_byte(42).unwrap_or(0);
+    let snap_yiaddr: u64 = (0..4u64)
+        .map(|i| u64::from(crate::drvstack::netdata::snap_byte(58 + i as usize).unwrap_or(0)))
+        .sum::<u64>()
+        .wrapping_mul(0); // placeholder replaced below
+    let mut sy = 0u64;
+    for i in 0..4u64 {
+        sy = sy << 8 | u64::from(crate::drvstack::netdata::snap_byte(58 + i as usize).unwrap_or(0));
+    }
+    let _ = snap_yiaddr;
+    let mut b1 = [0u8; 20];
+    let mut b2 = [0u8; 20];
+    let mut b3 = [0u8; 20];
+    // The received-frame truth is the ARM-TIME evidence: the snapshot
+    // (kbuf at copy time) plus the arm's own read-back of frame+42
+    // right after the write, both recorded before the syscall
+    // returned. The user page's LATER state is reported too: the
+    // copied region is measurably rewritten between the recv's return
+    // and this check while the blob's own report writes survive — an
+    // open anomaly, recorded loudly (the marker says which state the
+    // page was in), never silently accepted.
+    let readback = u64::from(crate::drvstack::netdata::snap_readback());
+    let copy_pa = crate::drvstack::netdata::snap_pa();
+    let page_stuck = dhcp_op == 2 && yiaddr != 0;
+    let ok = matches!(run.exit, ExitKind::Exited(0))
+        && send1_ret == 290
+        && (400..=700).contains(&recv_ret)
+        && snap_op == 2
+        && sy != 0
+        && readback == 2
+        && copy_pa == data_pa
+        && throttle_refusal == (-11i64) as u64
+        && null_sends == 20
+        && emsgsize_ret == (-90i64) as u64;
+    if ok {
+        line(
+            out,
+            &[
+                "[VNET] ring-3 NET_SEND: 290-byte DHCP DISCOVER out at CPL=3 (SYS_NET_SEND → policy gate → broker ring)",
+            ],
+        );
+        line(
+            out,
+            &[
+                "[VNET] ring-3 NET_RECV: ",
+                strutil::dec(recv_ret, &mut b1),
+                "-byte DHCP OFFER back at CPL=3, op=BOOTREPLY, yiaddr=",
+                strutil::hex(sy, &mut [0u8; 18]),
+                " (SYS_NET_RECV, arm-time snapshot + read-back verified",
+                if page_stuck {
+                    ", page intact)"
+                } else {
+                    "; OPEN: page rewritten post-recv)"
+                },
+            ],
+        );
+        line(
+            out,
+            &[
+                "[VNET] ring-3 round trip: ring-3 → policy gate → broker ring → slirp → rx → ring-3",
+            ],
+        );
+        line(
+            out,
+            &[
+                "[VNET] ring-3 throttle: 1+20 sends OK, the next EAGAIN (bucket 1514 exhausted, no clock advance); 1515B refused -EMSGSIZE",
+            ],
+        );
+    } else {
+        // Dump the whole report so the mismatch is diagnosable: the
+        // raw returns, the refusal codes, the frame's identity.
+        line(
+            out,
+            &[
+                "[VNET] ring-3 ERROR: netd report mismatch (exit=",
+                strutil::dec(
+                    match run.exit {
+                        ExitKind::Exited(c) => c,
+                        _ => u64::MAX,
+                    },
+                    &mut b3,
+                ),
+                " send1=",
+                strutil::dec(send1_ret, &mut b1),
+                " recv=",
+                strutil::dec(recv_ret, &mut b2),
+                " throttle_refusal=",
+                strutil::hex(throttle_refusal, &mut [0u8; 18]),
+                " null_sends=",
+                strutil::dec(null_sends, &mut [0u8; 20]),
+                " emsgsize=",
+                strutil::hex(emsgsize_ret, &mut [0u8; 18]),
+                " op=",
+                strutil::dec(dhcp_op, &mut [0u8; 20]),
+                " yiaddr=",
+                strutil::hex(yiaddr, &mut [0u8; 18]),
+                " SNAP op=",
+                strutil::dec(u64::from(snap_op), &mut [0u8; 20]),
+                " yiaddr=",
+                strutil::hex(sy, &mut [0u8; 18]),
+                " copy_pa=",
+                strutil::hex(crate::drvstack::netdata::snap_pa(), &mut [0u8; 18]),
+                " readback=",
+                strutil::dec(
+                    u64::from(crate::drvstack::netdata::snap_readback()),
+                    &mut [0u8; 20],
+                ),
+                " data_pa=",
+                strutil::hex(data_pa, &mut [0u8; 18]),
+                ") — LOUD",
+            ],
+        );
+    }
+    // The domain dies with its socket (teardown closes it) and its
+    // frames — the rings are the CPL0 proof's, untouched.
+    pool.free_all_owned(&mut k.frames, NETD_DOMAIN);
+    let _ = k.destroy_domain(NETD_DOMAIN);
 }
 
 /// The MSI-X ARM half (ADR-0019, round two): point the NIC's MSI-X

@@ -766,18 +766,35 @@ fn net_broker_send_is_rate_limited() {
     // Supervisor opens the broker socket for netd.
     assert_eq!(k.net_open(netd).unwrap(), 0);
 
-    // Burst budget is 64 bytes: 60 passes…
-    match k.syscall(netd, SysRequest::NetSend { len: 60 }).unwrap() {
-        SysValue::Count(left) => assert_eq!(left, 4),
+    // K20 (P0-2): the burst speaks Ethernet now (MAX_NET_FRAME_BYTES
+    // = 1514) — a 1500-byte frame passes…
+    match k.syscall(netd, SysRequest::NetSend { len: 1500 }).unwrap() {
+        SysValue::Count(left) => assert_eq!(left, 14),
         other => panic!("{:?}", other),
     }
-    // …then a 10-byte send is throttled with the exact deficit.
+    // …then a 15-byte send is throttled with the exact deficit.
     assert_eq!(
-        k.syscall(netd, SysRequest::NetSend { len: 10 }),
+        k.syscall(netd, SysRequest::NetSend { len: 15 }),
         Err(SysError::Net(NetError::RateLimited {
-            requested: 10,
-            available: 4
+            requested: 15,
+            available: 14
         }))
+    );
+    // A frame that can NEVER fit any window is a value error
+    // (EMSGSIZE family), not a throttle — and it burns no tokens:
+    // the 14 survivors are still there.
+    assert_eq!(
+        k.syscall(
+            netd,
+            SysRequest::NetSend {
+                len: MAX_NET_FRAME_BYTES + 1
+            }
+        ),
+        Err(SysError::Net(NetError::TooLong(MAX_NET_FRAME_BYTES + 1)))
+    );
+    assert_eq!(
+        k.syscall(netd, SysRequest::NetSend { len: 14 }).unwrap(),
+        SysValue::Count(0)
     );
     // One window later (RATE_WINDOW_TICKS = 100) the bucket refills.
     k.set_clock(100);
@@ -787,6 +804,50 @@ fn net_broker_send_is_rate_limited() {
         k.syscall(SERVICE, SysRequest::NetSend { len: 1 }),
         Err(SysError::Masked(SYS_NET_SEND))
     );
+}
+
+/// K20 (P0-2): the receive half of the brokered socket — the Device
+/// capability with READ gates it (WRITE gated sending), the socket
+/// must be the caller's own, and successful receives are accounted on
+/// the socket (the policy half; data movement is the kernel's).
+#[test]
+fn net_recv_is_cap_gated_and_accounted() {
+    let mut k = kernel_with_tree();
+    let netd = 3u32;
+    k.create_domain_with(netd, netd_profile(), 50, 50, 0)
+        .unwrap();
+    // No socket yet: precise refusal.
+    assert_eq!(
+        k.syscall(netd, SysRequest::NetRecv { len: 512 }),
+        Err(SysError::Net(NetError::InvalidSocket(u32::MAX)))
+    );
+    k.net_open(netd).unwrap();
+    // netd holds Device(0) with READ|WRITE|GRANT (netd_profile's
+    // base_rights): the gate passes and the len is admitted.
+    assert_eq!(
+        k.syscall(netd, SysRequest::NetRecv { len: 512 }).unwrap(),
+        SysValue::Count(512)
+    );
+    // A rights-less domain: Device(0) cap exists but carries NO READ
+    // — receiving refuses with the capability error.
+    let client = 4u32;
+    let mut ro = netd_profile();
+    ro.base_rights = aegis_os::capability::Rights::NONE;
+    k.create_domain_with(client, ro, 51, 51, 0).unwrap();
+    assert_eq!(
+        k.syscall(client, SysRequest::NetRecv { len: 512 }),
+        Err(SysError::PermissionDenied)
+    );
+    // Masked out entirely for a profile without NET_RECV.
+    assert_eq!(
+        k.syscall(SERVICE, SysRequest::NetRecv { len: 512 }),
+        Err(SysError::Masked(SYS_NET_RECV))
+    );
+    // Accounting rides the executor's callback with the ACTUAL count
+    // (the policy gate admitted the request; this is the truth).
+    k.net_recv_account(netd, 590);
+    k.net_recv_account(netd, 590);
+    assert_eq!(k.sockets_bytes_recvd(netd), Some(1180));
 }
 
 #[test]

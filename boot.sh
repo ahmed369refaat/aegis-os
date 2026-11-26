@@ -36,7 +36,7 @@ STUB_OBJ=target/stub.o
 IMAGE=target/aegis-boot.elf
 
 echo "==> [0/4] building the ring-3 example blobs (rustc --emit=obj + objcopy)"
-for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init ring3-vblk ring3-rogue-drv; do
+for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init ring3-netd ring3-vblk ring3-rogue-drv; do
     rustc --edition 2021 --crate-type=lib --emit=obj \
           --target x86_64-unknown-none -O "examples/$b/src/lib.rs" \
           -o "target/$b.o"
@@ -167,6 +167,12 @@ case "${1:-}" in
       "[VNET] alive: MAC="
       "[VNET] dbg q1 readback:"  # the device holds exactly the frames we mapped
       "[VNET] TX: DHCP DISCOVER sent"
+      # K20 (P0-2): the ring-3 data path — the brokered socket's
+      # send/receive syscall arms, driven by a real CPL=3 domain.
+      "[VNET] ring-3 NET_SEND:"  # the DISCOVER left ring-3 through SYS_NET_SEND
+      "[VNET] ring-3 NET_RECV:"  # the OFFER returned to ring-3 through SYS_NET_RECV
+      "[VNET] ring-3 round trip:"  # ring-3 → policy gate → broker ring → slirp → rx → ring-3
+      "[VNET] ring-3 throttle:"  # the bucket: 1+20 sends fit, the next EAGAIN; 1515B → EMSGSIZE
       "[E1K] alive:"  # registers live: MAC + link
       "[E1K] TX: DHCP DISCOVER sent"  # the NIC egress works
       "[E1K] RX: "  # the OFFER parsed: full round trip through the IOMMU

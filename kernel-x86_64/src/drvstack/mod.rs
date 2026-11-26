@@ -28,6 +28,8 @@ mod fat32;
 pub(crate) mod irq;
 pub(crate) mod kbd;
 mod legacy;
+// K20 (P0-2): the live virtio-net session the ring-3 NET_* arms drive.
+pub(crate) mod netdata;
 mod netutil;
 mod nvme;
 mod pci;

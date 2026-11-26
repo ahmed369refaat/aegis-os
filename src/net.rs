@@ -13,8 +13,17 @@
 //! function of (bucket state, current tick).
 
 pub const RATE_WINDOW_TICKS: u64 = 100;
-pub const DEFAULT_RATE_BYTES_PER_WINDOW: u32 = 64;
-pub const DEFAULT_BURST_BYTES: u32 = 64;
+/// K20 (P0-2): the largest frame `NetSend` will ever admit — one
+/// standard Ethernet frame (1500 MTU + 14 header). A longer request
+/// is refused `TooLong` before any token is touched: it can never fit
+/// any window and must not masquerade as a throttle.
+pub const MAX_NET_FRAME_BYTES: u32 = 1514;
+/// K20 (P0-2): the defaults now speak Ethernet: a full standard frame
+/// per window. The old 64-byte burst could never pass a real frame —
+/// the DHCP DISCOVER the boot itself sends is 290 bytes — so the rate
+/// limit was a paper gate.
+pub const DEFAULT_RATE_BYTES_PER_WINDOW: u32 = MAX_NET_FRAME_BYTES;
+pub const DEFAULT_BURST_BYTES: u32 = MAX_NET_FRAME_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetError {
@@ -26,6 +35,10 @@ pub enum NetError {
     NotOpen(u32),
     /// Bucket empty: throttled (non-blocking flavor).
     RateLimited { requested: u32, available: u32 },
+    /// K20 (P0-2): the send is longer than `MAX_NET_FRAME_BYTES` —
+    /// refused before any capability or token work (it can never fit
+    /// the bucket; EMSGSIZE, not EAGAIN).
+    TooLong(u32),
 }
 
 /// Integer token bucket. `last_window` is the last window index at which a
@@ -93,6 +106,9 @@ pub struct Socket {
     pub domain_id: u32,
     pub state: SocketState,
     pub bytes_sent: u64,
+    /// K20 (P0-2): bytes accounted RECEIVED on this socket (the
+    /// policy half — data movement is the kernel executor's business).
+    pub bytes_recvd: u64,
 }
 
 /// K20 (P0-1): 4 -> 16 — one listening socket per service domain in a
@@ -120,6 +136,7 @@ impl SocketTable {
                     domain_id,
                     state: SocketState::Open,
                     bytes_sent: 0,
+                    bytes_recvd: 0,
                 });
                 return Ok(i as u32);
             }
@@ -177,6 +194,29 @@ impl SocketTable {
             Some(Some(s)) => Some(s.bytes_sent),
             _ => None,
         }
+    }
+
+    /// K20 (P0-2): the received-byte total of an open socket.
+    #[must_use]
+    pub fn bytes_recvd(&self, id: u32) -> Option<u64> {
+        match self.sockets.get(id as usize) {
+            Some(Some(s)) => Some(s.bytes_recvd),
+            _ => None,
+        }
+    }
+
+    /// K20 (P0-2): account a successful receive of `len` bytes — the
+    /// policy half of `NetRecv` (the kernel executor moved the data
+    /// and already re-validated everything; this keeps the socket's
+    /// counters honest for telemetry). Refuses closed/unknown
+    /// sockets with the same identities as `send`.
+    pub fn recv(&mut self, id: u32, len: u32) -> Result<(), NetError> {
+        let s = self.get(id)?;
+        if s.state != SocketState::Open {
+            return Err(NetError::NotOpen(id));
+        }
+        s.bytes_recvd = s.bytes_recvd.saturating_add(len as u64);
+        Ok(())
     }
 
     #[must_use]

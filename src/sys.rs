@@ -853,6 +853,13 @@ impl<const N: usize> Kernel<N> {
                 }
             }
             SysRequest::NetSend { len } => {
+                // K20 (P0-2): the frame bound comes FIRST — a request
+                // that can never fit any window is a value error
+                // (EMSGSIZE), not a throttle, and must not burn
+                // capability checks or tokens on its way out.
+                if len > crate::net::MAX_NET_FRAME_BYTES {
+                    return Err(SysError::Net(NetError::TooLong(len)));
+                }
                 // F18 (ADR-0009): the brokered NIC needs the Device
                 // capability with WRITE, before any socket work.
                 self.require_device_cap(domain_id, Rights::WRITE)?;
@@ -1111,7 +1118,22 @@ impl<const N: usize> Kernel<N> {
                 Ok(SysValue::Count(n))
             }
             SysRequest::Ioctl { .. } => Err(SysError::NotImplemented(SYS_IOCTL)),
-            SysRequest::NetRecv { .. } => Err(SysError::NotImplemented(SYS_NET_RECV)),
+            SysRequest::NetRecv { len } => {
+                // K20 (P0-2): the receive half of the brokered socket.
+                // F18 symmetry: the Device capability with READ gates
+                // receiving (WRITE gated sending); the socket must be
+                // the caller's own, open. This is the POLICY half —
+                // data movement is the kernel executor's business; the
+                // executor reports the ACTUAL byte count back through
+                // `net_recv_account` (the admitted `len` below is the
+                // buffer size the caller offers, not a promise).
+                self.require_device_cap(domain_id, Rights::READ)?;
+                let _sock = self
+                    .sockets
+                    .open_socket_of(domain_id)
+                    .ok_or(SysError::Net(NetError::InvalidSocket(u32::MAX)))?;
+                Ok(SysValue::Count(len as usize))
+            }
         }
     }
 
@@ -1142,6 +1164,27 @@ impl<const N: usize> Kernel<N> {
             return Ok(id);
         }
         self.sockets.open(domain_id).map_err(NetOpenError::Net)
+    }
+
+    /// K20 (P0-2): the domain's received-byte total on its brokered
+    /// socket (None when it holds no open socket) — the accounting
+    /// the `NetRecv` policy half keeps honest for telemetry and tests.
+    #[must_use]
+    pub fn sockets_bytes_recvd(&self, domain_id: u32) -> Option<u64> {
+        self.sockets
+            .open_socket_of(domain_id)
+            .and_then(|id| self.sockets.bytes_recvd(id))
+    }
+
+    /// K20 (P0-2): the kernel executor's accounting callback — record
+    /// the ACTUAL received byte count on the domain's socket after the
+    /// data moved (the policy gate admitted the request; this is the
+    /// truth). Supervisor-side by construction: only the executor
+    /// knows the real count.
+    pub fn net_recv_account(&mut self, domain_id: u32, actual: u32) {
+        if let Some(id) = self.sockets.open_socket_of(domain_id) {
+            let _ = self.sockets.recv(id, actual);
+        }
     }
 
     /// Advance the kernel clock (drives rate-limit windows).

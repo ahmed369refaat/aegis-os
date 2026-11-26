@@ -1767,7 +1767,8 @@ pub mod prelude {
     pub use crate::fd::{FdEntry, FdError, FdTable, FdTarget, MAX_FDS};
     pub use crate::frame_share::{CowDecision, FrameShares, RefCount, ShareError};
     pub use crate::net::{
-        NetError, Socket, SocketState, SocketTable, TokenBucket, RATE_WINDOW_TICKS,
+        NetError, Socket, SocketState, SocketTable, TokenBucket, MAX_NET_FRAME_BYTES,
+        RATE_WINDOW_TICKS,
     };
     pub use crate::pipe::PipeError;
     pub use crate::preempt::{Preemptor, TickDecision};

@@ -187,6 +187,7 @@ pub fn errno_of(e: &SysError) -> i64 {
             aegis_os::net::NetError::InvalidSocket(_) => -EBADF,
             aegis_os::net::NetError::NotOpen(_) => -EBADF,
             aegis_os::net::NetError::RateLimited { .. } => -EAGAIN,
+            aegis_os::net::NetError::TooLong(_) => -crate::syscall::EMSGSIZE,
         },
         SysError::Ipc(i) => match i {
             aegis_os::ipc::IpcError::QueueFull => -EAGAIN,
