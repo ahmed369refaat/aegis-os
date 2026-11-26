@@ -1150,6 +1150,19 @@ mod tests {
         }
     }
 
+    /// The IOVA every address-striding test maps (identity: IOVA == PA).
+    /// A FIXED number — never derived from the arena's heap address. No
+    /// test dereferences a mapped page: the PA is only ever walked
+    /// through the page tables (which live in the arena) or compared
+    /// against a leaf entry. A heap-derived base made three tests
+    /// placement-dependent (~1 run in 400 each): a base at offset
+    /// 2046 MiB pushes the "+2 MiB fine-tuning" map into the next 1 GiB
+    /// region (PD + PT, not one PT); a base in the last 1 GiB of a
+    /// 512 GiB PML4 slot adds a PDPT to the next stride — or pushes it
+    /// past the 48-bit HAW. This base opens its 512 GiB slot, so the
+    /// longest stride sequence in the module (~97 GiB) never leaves it.
+    const IOVA_BASE: u64 = 1 << 40;
+
     /// A DMAR with one DRHD (seg 0, 0xFED90000, include_all, no
     /// scopes) — the QEMU shape with the HAW we boot with.
     fn dmar_48() -> Dmar {
@@ -1385,9 +1398,10 @@ mod tests {
         let mut vtd = plan_vtd(&arena).unwrap();
         vtd.assign_device(0, 0, 0, (0x03, 0)).unwrap();
         let slpt = vtd.dom_slpt[0].unwrap();
-        // 2 MiB-aligned so the four maps provably share one leaf
-        // table regardless of where the heap put the arena.
-        let pa = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        // 2 MiB-aligned, at the head of its 1 GiB region, so the four
+        // maps provably share one leaf table and the +1 GiB stride
+        // below provably opens exactly one fresh chain.
+        let pa = IOVA_BASE;
         vtd.map_run(0, pa, 4096, DmaDir::ToDevice).unwrap();
         assert_eq!(
             vtd.slpte_of(slpt, pa).unwrap(),
@@ -1433,7 +1447,7 @@ mod tests {
         let mut vtd = plan_vtd(&arena).unwrap();
         vtd.assign_device(0, 0, 0, (0x03, 0)).unwrap();
         let slpt = vtd.dom_slpt[0].unwrap();
-        let pa = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        let pa = IOVA_BASE;
         vtd.map_run(0, pa, 4096, DmaDir::Bidirectional).unwrap();
         // Walk exactly like the device does: levels 4..=2 must each
         // present a readable + writable entry, or a fresh write
@@ -1465,7 +1479,7 @@ mod tests {
         let mut vtd = plan_vtd(&arena).unwrap();
         vtd.assign_device(0, 0, 0, (0x03, 0)).unwrap();
         let slpt = vtd.dom_slpt[0].unwrap();
-        let base = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        let base = IOVA_BASE;
         // Burn all but two table frames: every fresh 1 GiB stride
         // costs exactly PD + PT (the low-address PML4/PDPT chain
         // exists after the first map).
@@ -1495,7 +1509,7 @@ mod tests {
         let pages_before = vtd.mapped_pages();
         // A run spanning TWO fresh 1 GiB regions needs 4 tables; only
         // 2 remain. The refusal must touch nothing.
-        let run_base = base + ((strides as u64 + 1) << 30);
+        let run_base = base + ((strides + 1) << 30);
         assert!(
             vtd.map_run(0, run_base, 2 << 30, DmaDir::Bidirectional)
                 .is_err(),
@@ -1524,7 +1538,7 @@ mod tests {
         // anything the failed attempt touched: with the pre-fix code
         // the rolled-back cursor handed the linked frames out AGAIN —
         // exactly what check_no_table_aliasing exists to catch.
-        let after = base + ((strides as u64 + 3) << 30);
+        let after = base + ((strides + 3) << 30);
         vtd.map_run(0, after, 4096, DmaDir::ToDevice).unwrap();
         assert!(vtd.slpte_of(slpt, after).is_some());
         assert!(
@@ -1541,7 +1555,7 @@ mod tests {
         let arena = Arena::new(TABLE_BUDGET);
         let mut vtd = plan_vtd(&arena).unwrap();
         vtd.assign_device(0, 0, 0, (0x03, 0)).unwrap();
-        let base = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        let base = IOVA_BASE;
         aegis_os::dma::contract::exercise(&mut vtd, 0, base, 4096);
         // Atomicity arm: exhaust the whole table budget, then a run
         // spanning fresh regions must refuse and leave nothing.
@@ -1577,7 +1591,7 @@ mod tests {
         let mut vtd = plan_vtd(&arena).unwrap();
         vtd.assign_device(0, 0, 0, (0x03, 0)).unwrap();
         let slpt = vtd.dom_slpt[0].unwrap();
-        let base = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        let base = IOVA_BASE;
         let mut state = 0x1234_5678_9ABC_DEF0u64;
         let mut next = move || {
             state ^= state << 13;
@@ -1665,7 +1679,7 @@ mod tests {
         // via address strides would depend on heap placement — the
         // exact flakiness the pinned-2 MiB test above avoids.)
         vtd.table_cursor = TABLE_BUDGET - 2;
-        let pa = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        let pa = IOVA_BASE;
         // assign_device needs exactly two frames (ctx table + SLPT
         // root): it succeeds and empties the budget...
         vtd.assign_device(0, 0, 0, (0x03, 0)).unwrap();
@@ -1705,7 +1719,7 @@ mod tests {
         // the FIXED claim shape: each device its own domain.
         vtd.assign_device(1, 0, 0, (0x03, 0)).unwrap();
         vtd.assign_device(2, 0, 0, (0x04, 0)).unwrap();
-        let pa = (arena.pa(30) + 0x1F_FFFF) & !0x1F_FFFF;
+        let pa = IOVA_BASE;
         // device A maps its page in A's domain
         vtd.map_run(1, pa, 4096, DmaDir::Bidirectional).unwrap();
         let a_slpt = vtd.dom_slpt(1).unwrap();
