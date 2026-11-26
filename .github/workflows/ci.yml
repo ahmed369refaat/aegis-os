@@ -7,6 +7,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # K20 (P0-1): the policy core's `Kernel<4096>` state grew to a
+  # measured ~455 KiB (docs/capacity.md). Every host test builds it on
+  # a test-thread stack, so the threads need headroom — the default
+  # 2 MiB still fits, but the deep-park tests' own recursion plus the
+  # struct measurably overflowed at 455 KiB. 16 MiB is the pin.
+  RUST_MIN_STACK: 16777216
 
 jobs:
   test:

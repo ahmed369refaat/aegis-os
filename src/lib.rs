@@ -87,11 +87,13 @@ use crate::syscall::SyscallMask;
 use crate::vfs::Vfs;
 
 /// Maximum simultaneously resident domains. ADR-0022 D1 raised this
-/// 4 -> 32 (the scale-reality row): a shell with a pipeline needs
-/// headroom and the fork-bomb guard needs something to guard. The
-/// process meta table and the scheduler grow with it; the capacity
-/// self-test pins the fill/refuse/drain/reuse behavior.
-pub const MAX_DOMAINS: usize = 32;
+/// 4 -> 32 (the scale-reality row); K20 (P0-1) raises 32 -> 64: an
+/// init, a shell, a driver domain per device class, a service pool and
+/// a fork bomb's guard all fit without the table being the story. The
+/// process meta table, the sleep/wait tables and the monitor grow with
+/// it; the capacity self-test pins the fill/refuse/drain/reuse behavior
+/// and docs/capacity.md records the measured `size_of::<Kernel>`.
+pub const MAX_DOMAINS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelError {
@@ -1435,8 +1437,12 @@ impl<const N: usize> Kernel<N> {
             Ok(h) => Ok((id, h)),
             Err(_) => {
                 // Roll back: never leave an endpoint nobody can reach.
+                // The refusal names the table that actually refused —
+                // the owner's capability table, not the endpoint table
+                // (K20/P0-1: with both at 32 slots the mislabeling
+                // became reachable and a fill-test caught it).
                 let _ = self.endpoints.destroy(id);
-                Err(KernelError::Ipc(crate::ipc::IpcError::TableFull))
+                Err(KernelError::Ipc(crate::ipc::IpcError::OwnerCapFull))
             }
         }
     }
@@ -3208,12 +3214,14 @@ mod tests {
             .is_err());
     }
 
-    /// ADR-0004 §1: messages are fixed-size (<= 64 bytes). The size
-    /// check is the cheapest test and runs before any capability work.
+    /// ADR-0004 §1: messages are fixed-size (<= IPC_MAX_MSG_BYTES). The
+    /// size check is the cheapest test and runs before any capability
+    /// work. K20 (P0-1): the bound is the constant, not a literal.
     #[test]
-    fn ipc_message_size_limit_is_64_bytes() {
+    fn ipc_message_size_limit_is_the_declared_bound() {
         use crate::ipc::IpcError;
         use crate::sys::{SysError, SysRequest};
+        const BOUND: u32 = crate::ipc::IPC_MAX_MSG_BYTES;
         let mut k = Kernel::new();
         k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
         k.create_domain(2, service_profile()).unwrap();
@@ -3223,20 +3231,18 @@ mod tests {
                 2,
                 SysRequest::IpcSend {
                     channel: ep,
-                    len: 64
+                    len: BOUND
                 }
             )
             .is_ok());
-        assert!(matches!(
-            k.syscall(
-                2,
-                SysRequest::IpcSend {
-                    channel: ep,
-                    len: 65
-                }
-            ),
-            Err(SysError::Ipc(IpcError::TooLong(65)))
-        ));
+        let over = k.syscall(
+            2,
+            SysRequest::IpcSend {
+                channel: ep,
+                len: BOUND + 1,
+            },
+        );
+        assert_eq!(over, Err(SysError::Ipc(IpcError::TooLong(BOUND + 1))));
     }
 
     /// Quarantine cuts IPC like every other syscall: only EXIT passes.
@@ -3297,19 +3303,63 @@ mod tests {
             Err(KernelError::UnknownDomain(7777))
         ));
         // Table exhaustion is surfaced (F14 discipline: never silent).
+        // K20 (P0-1): TWO bounded tables stack here — the endpoint
+        // table (MAX_ENDPOINTS slots) and each owner's capability
+        // table (MAX_CAPABILITIES, one conferable endpoint cap per
+        // endpoint, plus the domain's minted caps). With both raised
+        // the owner's table can refuse FIRST; the refusal must say
+        // which layer refused (OwnerCapFull, not a borrowed
+        // TableFull) and must not leak an endpoint slot.
         let mut made = 0;
+        let mut first_handle = None;
         loop {
             match k.ipc_endpoint_create(1, 2) {
-                Ok(_) => made += 1,
+                Ok((_id, h)) => {
+                    if made == 0 {
+                        first_handle = Some(h);
+                    }
+                    made += 1;
+                }
+                Err(KernelError::Ipc(IpcError::OwnerCapFull)) => break,
+                Err(e) => panic!("unexpected: {e:?}"),
+            }
+        }
+        // Domain 2 starts with its minted caps (Device + root-Fs); every
+        // endpoint costs one conferable cap, so the owner layer refuses
+        // exactly when the cap table is full — while the endpoint table
+        // still has free slots (the rollbacks gave nothing away).
+        let owner_caps = k.domain(2).unwrap().caps.len();
+        assert_eq!(owner_caps, crate::capability::MAX_CAPABILITIES);
+        assert!(
+            made < MAX_ENDPOINTS,
+            "the cap layer refused, not the endpoint layer"
+        );
+        // A second owner still gets endpoints: the ENDPOINT table's
+        // own exhaustion is reachable and honest.
+        k.create_domain(3, service_profile()).unwrap();
+        let mut made3 = 0;
+        loop {
+            match k.ipc_endpoint_create(1, 3) {
+                Ok(_) => made3 += 1,
+                Err(KernelError::Ipc(IpcError::OwnerCapFull)) => break,
                 Err(KernelError::Ipc(IpcError::TableFull)) => break,
                 Err(e) => panic!("unexpected: {e:?}"),
             }
         }
-        assert_eq!(made, MAX_ENDPOINTS);
-        // Destroy frees a slot (a later create succeeds), and the
-        // freed endpoint's id is never handed out again.
+        assert_eq!(
+            made + made3,
+            MAX_ENDPOINTS,
+            "the endpoint table is exactly full"
+        );
+        // Destroy frees the endpoint slot, and revoking the owner's
+        // stale conferable cap (the documented path — stale caps fail
+        // closed at use, but keep occupying their slot) frees the cap
+        // slot. With BOTH freed, a later create succeeds and the freed
+        // endpoint's id is never handed out again.
         let first_id = 1; // ids start at 1, monotonic
         k.ipc_endpoint_destroy(1, first_id).unwrap();
+        k.cap_revoke(2, first_handle.expect("the first create gave a handle"))
+            .unwrap();
         let (new_id, _h) = k.ipc_endpoint_create(1, 2).unwrap();
         assert_ne!(new_id, first_id, "endpoint ids are never reused");
     }
@@ -4565,7 +4615,10 @@ mod adr0029_pipes_over_endpoints {
                 2,
                 SysRequest::PipeWrite {
                     channel: ep,
-                    bytes: &[1u8; 300]
+                    // K20 (P0-1): the channel ring is 1 KiB now; a
+                    // bigger-than-capacity write must short-write to
+                    // exactly the free space, then EAGAIN.
+                    bytes: &[1u8; crate::ipc::CHANNEL_CAPACITY + 44]
                 }
             ),
             Ok(SysValue::Count(crate::ipc::CHANNEL_CAPACITY)),

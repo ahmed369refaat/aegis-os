@@ -74,8 +74,11 @@ pub const ENOSYS: i64 = 38;
 pub const ENOMEM: i64 = 12;
 
 /// Longest SYS_WRITE the kernel will service in one call (bounds the
-/// copy loop; user code wanting more loops itself).
-pub const MAX_WRITE: usize = 256;
+/// copy loop; user code wanting more loops itself). K20 (P0-1):
+/// 256 -> 4096, one page — the read-side mirror (sysabi::MAX_READ)
+/// carries the full sizing note (the copy buffer rides the guarded
+/// syscall stack).
+pub const MAX_WRITE: usize = 4096;
 
 /// ADR-0023: the Linux-ABI numbers of the time family map onto the
 /// core's internal ids (the numbers below 64 that coincide with Linux

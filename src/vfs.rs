@@ -13,17 +13,25 @@
 /// Phase 6 S1: the boot root's inode budget. The kernel is
 /// no_std — the table is a fixed BSS array, sized for the M3 boot
 /// tree (/pub, /tmp, /dev, /bin, /proc + their files) with slack for
-/// the file demos and the persistence round-trip.
-pub const MAX_INODES: usize = 64;
+/// the file demos and the persistence round-trip. K20 (P0-1):
+/// 64 -> 128 (the boot tree plus a shell session's creations plus a
+/// service's scratch files). Measured cost: the inode record is
+/// ~1.1 KiB, the table 68 -> ~140 KiB of the (budgeted, see
+/// docs/capacity.md) `Kernel` state.
+pub const MAX_INODES: usize = 128;
 /// Phase 6 S1: a tmpfs file's inline data window — one full ext2
 /// block (1 KiB, the persistence round's unit). No dynamic allocation
 /// exists anywhere in the core: each inode carries its window inline
-/// and `NoSpace` is the honest ENOSPC at the edge. Sizing note: the
-/// VFS is inline in `Kernel<P>` and every host test builds a `Kernel`
-/// on its stack — 64 x 1 KiB keeps the struct ~68 KiB (a 4 KiB window
-/// measurably overflowed the deep-park host tests' stacks).
+/// and `NoSpace` is the honest ENOSPC at the edge. K20 (P0-1) keeps
+/// the 1 KiB window DELIBERATELY: it rides inline in every inode, so
+/// it multiplies MAX_INODES; a 4 KiB window measurably overflowed the
+/// deep-park host tests' stacks at 64 inodes. Real file data goes
+/// through the ext2/FAT32 paths — this is the boot-time ramfs.
 pub const FILE_DATA_MAX: usize = 1024;
-pub const NAME_MAX: usize = 28;
+/// K20 (P0-1): 28 -> 64 bytes per path component — real file names
+/// ("aegis-session-2026-11-26.log") no longer bounce off NAME_MAX.
+/// Measured cost: +36 B per inode, +4.6 KiB over the table.
+pub const NAME_MAX: usize = 64;
 pub const ROOT_ID: u32 = 0;
 
 /// F10: an inode identity that survives slot reuse — a bare id aliases

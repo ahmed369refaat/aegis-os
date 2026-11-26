@@ -95,7 +95,10 @@ pub struct Socket {
     pub bytes_sent: u64,
 }
 
-pub const MAX_SOCKETS: usize = 4;
+/// K20 (P0-1): 4 -> 16 — one listening socket per service domain in a
+/// 64-domain system, still a fixed table with fail-loud `TableFull`.
+/// Measured cost: 24 B per slot; the whole table is bytes.
+pub const MAX_SOCKETS: usize = 16;
 
 #[derive(Default)]
 pub struct SocketTable {

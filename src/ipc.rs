@@ -27,9 +27,15 @@
 use crate::pipe::PipeError;
 
 /// Endpoint slots in the kernel (fail-loud exhaustion, F14 discipline).
-pub const MAX_ENDPOINTS: usize = 8;
-/// ADR-0004 §1: messages are fixed-size, at most 64 bytes.
-pub const IPC_MAX_MSG_BYTES: u32 = 64;
+/// K20 (P0-1): 8 -> 32 — one endpoint per service domain plus pipe
+/// pairs, in a 64-domain system. Measured cost: ~1.1 KiB per endpoint
+/// (the inline byte-channel ring dominates); the table 2.8 -> ~36 KiB.
+pub const MAX_ENDPOINTS: usize = 32;
+/// ADR-0004 §1: messages are fixed-size, at most this many bytes.
+/// K20 (P0-1): 64 -> 256 — a real request (a path, a small header
+/// block) fits without the size cap being the story; still fixed-size
+/// and bounded. `CHANNEL_CAPACITY` (the pipe ring) scales with it.
+pub const IPC_MAX_MSG_BYTES: u32 = 256;
 /// Per-endpoint queue depth (bounded, EAGAIN-style overflow).
 pub const IPC_QUEUE_DEPTH: usize = 4;
 /// ADR-0029: a byte-channel endpoint's ring — the queue-depth ×
@@ -52,6 +58,12 @@ pub enum IpcError {
     NotOwner(u32),
     /// The endpoint table is exhausted.
     TableFull,
+    /// K20 (P0-1): the OWNER's capability table is exhausted — the
+    /// endpoint itself was rolled back (no slot leaks), so this is
+    /// distinct from `TableFull`: the supervisor asked for a
+    /// well-formed endpoint, the owner just cannot hold another
+    /// conferable capability. Surface truth, not a borrowed variant.
+    OwnerCapFull,
     /// A supervisor-only API was called by a non-privileged domain.
     NotAuthorized(u32),
     /// Requested rights exceed the conferable set (READ|WRITE|GRANT):
@@ -431,7 +443,7 @@ mod tests {
         assert_eq!(t.push(ep, 1, IPC_MAX_MSG_BYTES), Ok(IPC_QUEUE_DEPTH - 1));
         assert_eq!(
             t.push(ep, 1, IPC_MAX_MSG_BYTES + 1),
-            Err(IpcError::TooLong(65))
+            Err(IpcError::TooLong(IPC_MAX_MSG_BYTES + 1))
         );
     }
 

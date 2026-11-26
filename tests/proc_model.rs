@@ -170,10 +170,17 @@ fn spawn_refuses_a_fd_map_referencing_a_closed_fd() {
 #[test]
 fn spawn_refuses_out_of_range_and_duplicate_child_fds() {
     let mut k = kernel_with_parent();
+    // K20 (P0-1): the out-of-range child fd is the constant, not a
+    // literal (MAX_FDS rose 16 -> 32 and fd 16 became legal).
     let e1 = k
-        .spawn_process(PARENT, child_app(), &[(3, 16)])
+        .spawn_process(PARENT, child_app(), &[(3, aegis_os::fd::MAX_FDS as u8)])
         .unwrap_err();
-    assert_eq!(e1, ProcError::FdMapInvalid { fd: 16 });
+    assert_eq!(
+        e1,
+        ProcError::FdMapInvalid {
+            fd: aegis_os::fd::MAX_FDS as u8
+        }
+    );
     let e2 = k
         .spawn_process(PARENT, child_app(), &[(3, 0), (4, 0)])
         .unwrap_err();
@@ -552,24 +559,35 @@ fn meta_table_full_refuses_children_until_reaped() {
     let mut k = Kernel::new();
     // ADR-0032: bootstrap a BIG supervisor (create_domain_with makes no
     // attenuation check — it is the root), then request a legal chain:
-    // supervisor(64) -> parent(40) -> kids(39).
+    // supervisor -> parent -> kids. K20 (P0-1): every bound below is
+    // derived from MAX_DOMAINS (64), not a literal — the profile
+    // ceilings are the story, the table is the edge.
+    const DOMS: u16 = aegis_os::MAX_DOMAINS as u16;
     let mut big = service_profile();
-    big.max_children = 64;
+    big.max_children = DOMS;
     k.create_domain_with(SUPERVISOR, big, 0, 0, 0).unwrap();
     let mut many = service_profile();
-    many.max_children = 40;
+    // max_children attenuates strictly down the chain (the
+    // ProfileEscalation gate): supervisor DOMS -> parent DOMS-1 ->
+    // kids DOMS-2, which exactly fills the table.
+    many.max_children = DOMS - 1;
     many.syscalls = SyscallMask::from_bits(1u64 << SYS_READ | 1u64 << SYS_WRITE | 1u64 << SYS_EXIT);
     many.degraded_syscalls = SyscallMask::from_bits(1u64 << SYS_EXIT);
     let parent = k.spawn_process(SUPERVISOR, many, &[]).unwrap();
     let mut kid = many;
-    kid.max_children = 39;
+    kid.max_children = DOMS - 2;
     // Fill every remaining meta slot with children (supervisor +
-    // parent + 30 = MAX_DOMAINS 32).
+    // parent + DOMS-2 kids = MAX_DOMAINS).
     let mut kids = Vec::new();
     while let Ok(pid) = k.spawn_process(parent, kid, &[]) {
         kids.push(pid);
     }
-    assert_eq!(kids.len(), 30, "MAX_DOMAINS = 32: supervisor + parent + 30");
+    assert_eq!(
+        kids.len(),
+        (aegis_os::MAX_DOMAINS - 2),
+        "MAX_DOMAINS = {}: supervisor + parent + kids",
+        aegis_os::MAX_DOMAINS
+    );
     assert_eq!(
         k.spawn_process(parent, kid, &[]).unwrap_err(),
         ProcError::TooManyProcesses
@@ -594,14 +612,18 @@ fn meta_table_full_refuses_children_until_reaped() {
 #[test]
 fn capacity_selftest_fill_refuse_drain_reuse() {
     let mut k = Kernel::new();
-    for id in 1..=32u32 {
+    // K20 (P0-1): the fill bound is the constant (MAX_DOMAINS), not a
+    // literal — this is the fill/refuse/drain/reuse proof the
+    // MAX_DOMAINS doc comment promises, at whatever the limit is.
+    let n = aegis_os::MAX_DOMAINS as u32;
+    for id in 1..=n {
         k.create_domain(id, parser_profile()).unwrap();
     }
     assert_eq!(
-        k.create_domain(33, parser_profile()).unwrap_err(),
+        k.create_domain(n + 1, parser_profile()).unwrap_err(),
         KernelError::TooManyDomains
     );
-    for id in 1..=32u32 {
+    for id in 1..=n {
         k.destroy_domain(id).unwrap();
     }
     k.create_domain(1, parser_profile()).unwrap();

@@ -8,7 +8,12 @@
 //!   fd numbers are a per-domain namespace, and stale-fd bugs are the
 //!   caller's race, exactly as in Unix).
 
-pub const MAX_FDS: usize = 16;
+/// K20 (P0-1): 16 -> 32. stdio (3) + a pipe pair + a few open files +
+/// dup'd handles left 16 slots feeling like a demo. Fd numbers stay
+/// `u8`-shaped (the kernel's pipe syscall packs a pair into two byte
+/// lanes of one RAX), so the hard ceiling is 256 — pinned by a const
+/// assert in the kernel's sysabi tests.
+pub const MAX_FDS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FdTarget {

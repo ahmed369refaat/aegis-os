@@ -8,7 +8,12 @@
 //! requested rights must be a subset of the parent's rights. There is no
 //! operation that adds rights — escalation attempts return `CapError::Escalation`.
 
-pub const MAX_CAPABILITIES: usize = 16;
+/// K20 (P0-1): 16 -> 32. A real domain holds caps for its device, its
+/// IPC endpoints, granted frame ranges and derived children; 16 was a
+/// demo ceiling. Measured cost: 24 B per slot, `CapabilityTable` 384 ->
+/// 768 B inside every `Domain` (the capacity-accounting test pins the
+/// whole-`Kernel` budget).
+pub const MAX_CAPABILITIES: usize = 32;
 
 /// Rights bitset over a resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

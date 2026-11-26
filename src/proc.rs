@@ -27,8 +27,10 @@ pub const INIT_PID: u32 = 1;
 pub const FIRST_DYNAMIC_PID: u32 = 100;
 /// Living + zombie processes: bounded by the domain table.
 pub const MAX_PROCS: usize = crate::MAX_DOMAINS;
-/// Entries in the exec policy table (ADR-0022 D5).
-pub const MAX_EXEC_ENTRIES: usize = 16;
+/// Entries in the exec policy table (ADR-0022 D5). K20 (P0-1):
+/// 16 -> 32 — one declared surface per registry image plus room for
+/// third-party binaries (P0-3 makes the registry path real).
+pub const MAX_EXEC_ENTRIES: usize = 32;
 
 /// How a process ended. `code` is the raw wait status word's payload
 /// (the exit code, or the signal number for kills).

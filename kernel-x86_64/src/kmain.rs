@@ -253,6 +253,156 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     crate::sched::context::set_kernel(&mut k as *mut Kernel<KERNEL_POOL_FRAMES>);
     let t_boot = hw::boot_tsc();
 
+    // ── 8b. capacity selftest (K20/P0-1) ───────────────────────────
+    // The production-limits round (docs/capacity.md): report the
+    // measured kernel state, then take the three boot-cheap tables to
+    // their edges and prove the refusals are loud, the drain clean,
+    // and the tables reusable. Pure policy work — no frames, no time,
+    // no user pages — so it can run before the ring-3 sequence.
+    {
+        let state_kib = core::mem::size_of_val(&k) / 1024;
+        let (mut b1, mut b2, mut b3, mut b4, mut b5, mut b6) = (
+            [0u8; 20], [0u8; 20], [0u8; 20], [0u8; 20], [0u8; 20], [0u8; 20],
+        );
+        line(
+            &mut out,
+            &[
+                "[CAP] limits: domains=",
+                strutil::dec(aegis_os::MAX_DOMAINS as u64, &mut b1),
+                " caps=",
+                strutil::dec(aegis_os::capability::MAX_CAPABILITIES as u64, &mut b2),
+                " endpoints=",
+                strutil::dec(aegis_os::ipc::MAX_ENDPOINTS as u64, &mut b3),
+                " sockets=",
+                strutil::dec(aegis_os::net::MAX_SOCKETS as u64, &mut b4),
+                " sched=",
+                strutil::dec(aegis_os::sched::MAX_SCHED_ENTITIES as u64, &mut b5),
+                " state=",
+                strutil::dec(state_kib as u64, &mut b6),
+                "KiB",
+            ],
+        );
+        let (mut c1, mut c2, mut c3) = ([0u8; 20], [0u8; 20], [0u8; 20]);
+        line(
+            &mut out,
+            &[
+                "[CAP] limits: inodes=",
+                strutil::dec(aegis_os::vfs::MAX_INODES as u64, &mut c1),
+                " fds=",
+                strutil::dec(aegis_os::fd::MAX_FDS as u64, &mut c2),
+                " exec-entries=",
+                strutil::dec(aegis_os::proc::MAX_EXEC_ENTRIES as u64, &mut c3),
+                " io-chunk=4096",
+            ],
+        );
+
+        // A uid-0 supervisor (endpoint create is supervisor-only), then
+        // the fill: 900 + 901..=963 = MAX_DOMAINS domains exactly.
+        k.create_domain_with(900, aegis_os::profile::service_profile(), 0, 0, 0)
+            .unwrap();
+        for id in 901..(900 + aegis_os::MAX_DOMAINS as u32) {
+            k.create_domain(id, aegis_os::profile::service_profile())
+                .unwrap();
+        }
+        let domains_refused = matches!(
+            k.create_domain(964, aegis_os::profile::service_profile()),
+            Err(aegis_os::KernelError::TooManyDomains)
+        );
+
+        // Sockets: net_open is idempotent per domain, so the table
+        // fills one socket per domain across 16 distinct domains.
+        let mut sockets = 0u32;
+        for id in 901..(901 + aegis_os::net::MAX_SOCKETS as u32) {
+            if k.net_open(id).is_ok() {
+                sockets += 1;
+            }
+        }
+        let sockets_refused = matches!(
+            k.net_open(901 + aegis_os::net::MAX_SOCKETS as u32),
+            Err(aegis_os::sys::NetOpenError::Net(
+                aegis_os::net::NetError::TableFull
+            ))
+        );
+
+        // Endpoints: spread across three owners so the ENDPOINT table
+        // is the layer that refuses — a single owner's capability
+        // table would refuse first (the two-layer honesty the
+        // ipc_supervisor host test pins).
+        let owners = [918u32, 919, 920];
+        let mut ep_ids = [0u32; aegis_os::ipc::MAX_ENDPOINTS];
+        let mut endpoints = 0usize;
+        for i in 0..aegis_os::ipc::MAX_ENDPOINTS {
+            match k.ipc_endpoint_create(900, owners[i % 3]) {
+                Ok((id, _h)) => {
+                    ep_ids[i] = id;
+                    endpoints += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        let endpoints_refused = endpoints == aegis_os::ipc::MAX_ENDPOINTS
+            && matches!(
+                k.ipc_endpoint_create(900, 919),
+                Err(aegis_os::KernelError::Ipc(
+                    aegis_os::ipc::IpcError::TableFull
+                ))
+            );
+        for &id in ep_ids.iter().take(endpoints) {
+            k.ipc_endpoint_destroy(900, id).unwrap();
+        }
+        // The drain freed real slots: a fresh create succeeds (and is
+        // itself undone — no orphan endpoint rides into the M3 boot).
+        let endpoints_reused = match k.ipc_endpoint_create(900, 920) {
+            Ok((id, _h)) => k.ipc_endpoint_destroy(900, id).is_ok(),
+            Err(_) => false,
+        };
+
+        // The drain: every domain destroyed — teardown closes the
+        // sockets, frees the monitor state, unregisters the scheduler
+        // entities — and the table takes a fresh domain again.
+        for id in 900..(900 + aegis_os::MAX_DOMAINS as u32) {
+            k.destroy_domain(id).unwrap();
+        }
+        let drained = k.live_domain_count() == 0;
+        let domains_reused = k
+            .create_domain(900, aegis_os::profile::service_profile())
+            .is_ok();
+        k.destroy_domain(900).unwrap();
+
+        let (mut d1, mut d2, mut d3) = ([0u8; 20], [0u8; 20], [0u8; 20]);
+        line(
+            &mut out,
+            &[
+                "[CAP] selftest: domains fill=",
+                strutil::dec(aegis_os::MAX_DOMAINS as u64, &mut d1),
+                " refuse=TooManyDomains; sockets fill=",
+                strutil::dec(sockets as u64, &mut d2),
+                " refuse=TableFull; endpoints fill=",
+                strutil::dec(endpoints as u64, &mut d3),
+                " refuse=TableFull",
+            ],
+        );
+        if domains_refused
+            && sockets_refused
+            && sockets == aegis_os::net::MAX_SOCKETS as u32
+            && endpoints_refused
+            && endpoints_reused
+            && drained
+            && domains_reused
+        {
+            line(
+                &mut out,
+                &["[CAP] selftest: fill/refuse/drain/reuse ok (all layers honest)"],
+            );
+        } else {
+            line(
+                &mut out,
+                &["[CAP] ERROR: capacity selftest failed; halting"],
+            );
+            hw::halt_forever();
+        }
+    }
+
     // ── 4. the M1 sequence (identical code to the host tests) ──────
     let hello = runtime::hello_domain(&mut k, &mut pool, &mut out);
     let mon = runtime::monitor_demo(&mut k, &mut out);

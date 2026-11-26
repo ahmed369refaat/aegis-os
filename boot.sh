@@ -635,6 +635,12 @@ if [ "$MODE" = "verify" ]; then
     grep -qF "[VERDICT] M2-W2 PREEMPTION: PASS" "$LOG" || { echo "VERIFY FAIL: M2-W2 preemption verdict failed"; ok=0; }
   fi
   grep -qF "[MM ] guarded stacks: alloc+map+cross-view ok, free+scrub ok" "$LOG" || { echo "VERIFY FAIL: guarded-stack marker missing"; ok=0; }
+  # K20 (P0-1): the capacity selftest — the limits line, the fill/refuse
+  # markers, and the all-layers-honest verdict (docs/capacity.md).
+  grep -qF "[CAP] limits: domains=" "$LOG" || { echo "VERIFY FAIL: capacity limits line missing"; ok=0; }
+  grep -qF "[CAP] limits: inodes=" "$LOG" || { echo "VERIFY FAIL: capacity limits line 2 missing"; ok=0; }
+  grep -qF "[CAP] selftest: domains fill=" "$LOG" || { echo "VERIFY FAIL: capacity fill/refuse marker missing"; ok=0; }
+  grep -qF "[CAP] selftest: fill/refuse/drain/reuse ok (all layers honest)" "$LOG" || { echo "VERIFY FAIL: capacity selftest verdict missing"; ok=0; }
   if ! grep -qF "[RING3] launch blocked: ring-3 entry faults in this QEMU build" "$LOG"; then
     grep -qF "[EXC] guard selftest: stack guard #PF ok" "$LOG" || { echo "VERIFY FAIL: guard-page #PF marker missing"; ok=0; }
   fi

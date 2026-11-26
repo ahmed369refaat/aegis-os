@@ -15,8 +15,10 @@ use crate::monitor::{Response, Verdict};
 use crate::ringbuf::RingBuffer;
 use crate::syscall::SyscallMask;
 
-/// Telemetry ring capacity (power of two, required by the ring buffer).
-pub const TELEMETRY_CAPACITY: usize = 16;
+/// Telemetry ring capacity (power of two, required by the ring
+/// buffer). K20 (P0-1): 16 -> 64 — a boot's worth of monitor events
+/// before the drop-counter (the honest full-ring refusal) engages.
+pub const TELEMETRY_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventAction {
@@ -224,8 +226,12 @@ mod tests {
     fn telemetry_overflow_never_panics_and_counts_drops() {
         let mut d = Domain::new(4, service_profile());
         let mut r = ring();
-        // Fill the 16-slot ring and keep applying: drops counted, no panic.
-        for i in 0..20u8 {
+        // Fill the ring and keep applying: drops counted, no panic.
+        // K20 (P0-1): the capacity is the constant (16 -> 64), the
+        // overshoot stays 4.
+        const EXTRA: u8 = 4;
+        let total = TELEMETRY_CAPACITY as u8 + EXTRA;
+        for i in 0..total {
             let v = V {
                 score: i,
                 response: Response::Log,
@@ -233,10 +239,10 @@ mod tests {
             let out = apply_response(&mut d, &v, &mut r);
             assert_eq!(out, Outcome::Logged);
         }
-        assert_eq!(r.dropped(), 4);
+        assert_eq!(r.dropped(), EXTRA as u64);
         assert!(r.is_full());
-        // The first 16 events are intact, in order.
-        for i in 0..16u8 {
+        // The first events are intact, in order.
+        for i in 0..TELEMETRY_CAPACITY as u8 {
             let ev = r.pop().unwrap();
             assert_eq!(ev.score, i);
         }

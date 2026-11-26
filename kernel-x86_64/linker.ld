@@ -67,12 +67,18 @@ SECTIONS
         __stack_guard = .;
         . += 4096;
         stack_bottom = .;
-        /* Round J: 256K -> 512K. The measured driver-stack call chain
+        /* Round J: 256K -> 512K (the measured driver-stack call chain
          * bottoms out barely 1.6 KiB above stack_bottom at 256K — a
-         * 4 KiB kmain local overflowed into the guard page (which
-         * caught it, as designed). The margin is now honest. Image +
-         * bss + stack stay well inside the single 2 MiB page. */
-        . += 512K;
+         * 4 KiB kmain local overflowed into the guard page, which
+         * caught it, as designed).
+         * K20 (P0-1): 512K -> 768K. The production-limits round grows
+         * the `Kernel<4096>` state (a kmain stack local) from a
+         * measured 216 KiB to ~460 KiB (64 domains x 3.4 KiB + 128
+         * inodes + 32 endpoints — docs/capacity.md). The chain margin
+         * keeps the Round-J discipline: deepest measured chain ~40 KiB,
+         * >= 250 KiB of slack. Image + bss + stack still fit the single
+         * 2 MiB page; the ASSERT below fails the link loudly if not. */
+        . += 1024K;
         stack_top = .;
         . = ALIGN(4096);
         __bss_end = .;

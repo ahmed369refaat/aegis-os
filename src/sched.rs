@@ -10,7 +10,11 @@
 //! - The charge is floored at 1 per tick so that even the heaviest domain
 //!   cannot stall the others (starvation freedom).
 
-pub const MAX_SCHED_ENTITIES: usize = 8;
+/// K20 (P0-1): 8 -> 64 = one schedulable entity per domain. The 8-slot
+/// table was the sharpest toy limit in the core: 32 (now 64) domains
+/// existed but only 8 could ever be runnable. Measured cost: a
+/// `SchedEntity` is 32 B, the whole table 264 B -> 2 KiB.
+pub const MAX_SCHED_ENTITIES: usize = 64;
 pub const NICE_MIN: i8 = -20;
 pub const NICE_MAX: i8 = 19;
 pub const NICE0_WEIGHT: u32 = 1024;
@@ -39,12 +43,19 @@ pub struct SchedEntity {
     pub slices: u64,
 }
 
-#[derive(Default)]
+/// K20 note: `Default` is hand-written because std only derives it for
+/// arrays up to 32 elements and MAX_SCHED_ENTITIES is 64 now.
 pub struct Scheduler {
     /// F12: the floor every new or woken entity is placed at — without
     /// it, a late joiner starts at vruntime 0 and monopolizes the CPU.
     min_vruntime: u64,
     entities: [Option<SchedEntity>; MAX_SCHED_ENTITIES],
+}
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        Scheduler::new()
+    }
 }
 
 impl Scheduler {

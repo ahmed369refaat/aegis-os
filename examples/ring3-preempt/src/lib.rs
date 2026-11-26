@@ -1149,23 +1149,30 @@ pipe_writer:
        local — zero cross-domain interleaving). Fill exactly 256
        (MAX_WRITE = the ring's capacity), then one more byte must
        refuse -EAGAIN: a channel is not an unbounded privilege. */
+    /* the PRIVATE bounded fill: the writer's OWN pipe() (fd path,
+       local — zero cross-domain interleaving). K20 (P0-1): the ring's
+       capacity is 1 KiB (CHANNEL_CAPACITY = 4 x 256) while a write may
+       carry a whole page (MAX_WRITE = 4096) — so the fill is one
+       page-sized write that must SHORT-WRITE to exactly the ring's
+       capacity, then one more byte must refuse -EAGAIN: a channel is
+       not an unbounded privilege. */
     mov eax, 12                        /* pipe() -> (w << 8) | r */
     syscall
     cmp rax, 0
     jle 183f
     mov r12, rax
-    mov eax, 1                         /* write(wfd, A, 256) */
+    mov eax, 1                         /* write(wfd, page, 4096) */
     mov edi, r12d
     shr edi, 8
-    mov rsi, 0x00403200
-    mov edx, 256
+    mov rsi, 0x00403000
+    mov edx, 4096
     syscall
-    cmp rax, 256
+    cmp rax, 1024
     jne 184f
-    mov eax, 1                         /* write(wfd, A, 1) on a FULL ring */
+    mov eax, 1                         /* write(wfd, page, 1) on a FULL ring */
     mov edi, r12d
     shr edi, 8
-    mov rsi, 0x00403200
+    mov rsi, 0x00403000
     mov edx, 1
     syscall
     cmp rax, -11

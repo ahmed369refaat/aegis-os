@@ -58,8 +58,12 @@ pub const KNOWN_OPEN_FLAGS: u64 = O_READ | O_WRITE | O_CREAT | O_TRUNC;
 pub const MAX_PATH: usize = 128;
 
 /// Longest SYS_READ the kernel services in one call (the read-side
-/// mirror of syscall::MAX_WRITE).
-pub const MAX_READ: usize = 256;
+/// mirror of syscall::MAX_WRITE). K20 (P0-1): 256 -> 4096, one page —
+/// the natural chunk unit. The executor's copy buffer is a kernel
+/// stack local on the 32 KiB guarded syscall stack (8 pages,
+/// kmain.rs), where 4 KiB leaves the dispatch chain ~28 KiB of room;
+/// the read/write bound tests in syscall.rs pin the refusal edge.
+pub const MAX_READ: usize = 4096;
 
 /// Decode the a2 flags word of SYS_OPEN. Unknown bits refuse (-EINVAL)
 /// rather than ignore — an ABI the caller cannot predict is not an ABI.
@@ -190,6 +194,10 @@ pub fn errno_of(e: &SysError) -> i64 {
             aegis_os::ipc::IpcError::TooLong(_) => -EINVAL,
             aegis_os::ipc::IpcError::NotOwner(_) => -EPERM,
             aegis_os::ipc::IpcError::TableFull => -ENOMEM,
+            // K20/P0-1: the owner's capability table refused (the
+            // endpoint was rolled back) — same ENOMEM family, distinct
+            // variant so policy tests can tell the layers apart.
+            aegis_os::ipc::IpcError::OwnerCapFull => -ENOMEM,
             aegis_os::ipc::IpcError::InvalidHandle => -EBADF,
             aegis_os::ipc::IpcError::NotAuthorized(_) => -EPERM,
             // A rights-derivation escalation attempt: permission, and
@@ -405,6 +413,9 @@ mod tests {
         assert_eq!(errno_of(&SysError::Ipc(IpcError::TooLong(9))), -EINVAL);
         assert_eq!(errno_of(&SysError::Ipc(IpcError::NotOwner(2))), -EPERM);
         assert_eq!(errno_of(&SysError::Ipc(IpcError::TableFull)), -ENOMEM);
+        // K20/P0-1: the owner's cap-table refusal — same errno family,
+        // distinct variant (policy tests tell the layers apart).
+        assert_eq!(errno_of(&SysError::Ipc(IpcError::OwnerCapFull)), -ENOMEM);
         assert_eq!(errno_of(&SysError::Ipc(IpcError::InvalidHandle)), -EBADF);
         assert_eq!(errno_of(&SysError::Ipc(IpcError::Escalation)), -EPERM);
         assert_eq!(errno_of(&SysError::Ipc(IpcError::UnknownDomain(9))), -ESRCH);
@@ -416,8 +427,11 @@ mod tests {
             -ENOMEM
         );
         assert_eq!(errno_of(&SysError::PermissionDenied), -EACCES);
-        // MAX_FDS bound sanity: the packing lanes cannot collide.
-        const { assert!(MAX_FDS <= 16) };
+        // MAX_FDS bound sanity: the pipe packing uses one byte lane per
+        // fd (u8 read fd, u8 write fd in RAX), so the true ABI ceiling
+        // is 256; the const pins the discipline, not the current value
+        // (K20/P0-1 raised the table 16 -> 32, well under the lanes).
+        const { assert!(MAX_FDS <= 256) };
         let mut t = FdTable::new();
         assert_eq!(t.alloc(FdTarget::Reserved).unwrap(), 0);
     }
