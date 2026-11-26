@@ -44,10 +44,17 @@ method:
   the image's own proof. What is NOT here: no hosted libc (musl),
   freestanding only; the registry's disk slot is one fixed path, not
   a VFS-backed exec.
-- **P0-4 (second ring-3 driver domain): NOT STARTED.** virtio-blk has
-  its driver domain (ADR-0017); the NIC does not — P0-2's netd sends
-  through syscalls, it does not own the device (no DEVREG channel, no
-  own rings).
+- **P0-4 (second ring-3 driver domain): DONE, lane-proven (q35).**
+  virtio-net, migrated the virtio-blk way: a CPL=3 domain (DEVREG+EXIT
+  profile) resets the NIC, negotiates, reads its MAC through the
+  device-config window, builds BOTH queues in its own one-page ring
+  layout, sets DRIVER_OK, posts the RX buffer, publishes + kicks the
+  TX at the queue's own notify slot, and completes both polls — 32
+  devreg ops, 0 refused; a DHCP round trip on the domain's OWN rings
+  (DISCOVER out, OFFER back, MAC agreeing with the kernel's read);
+  the rogue quarantine closes a bad driver's channel. What is NOT
+  here: the e1000/NVMe/AHCI paths remain ring-0 (the migration
+  pattern exists for the next driver, not yet applied).
 - **P0-5 (this ledger): DONE** — README's "Current status" carries the
   K20 bullet; the "Not yet" list is re-scoped (NET live at the entry;
   TCP/IP, musl, the NIC driver domain, SMP explicitly not).
