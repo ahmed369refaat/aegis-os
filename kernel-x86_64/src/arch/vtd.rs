@@ -1917,11 +1917,11 @@ mod tests {
             // presence matches the model.
             if step % 97 == 0 {
                 assert!(check_no_table_aliasing(&vtd).is_ok(), "step {step}: alias");
-                for d in 0..MAX_VTD_DOMAINS {
+                for (d, live_d) in live.iter().enumerate() {
                     let Some(slpt) = vtd.dom_slpt(d as u32) else {
                         continue;
                     };
-                    for &span in live[d].iter() {
+                    for &span in live_d.iter() {
                         let pa = 0x20_0000u64 * span + 0x1000;
                         assert!(
                             vtd.slpte_of(slpt, pa).is_some(),
@@ -2011,7 +2011,7 @@ mod ir_tests {
             assert_eq!(a & (1 << 4), 1 << 4, "remappable format");
         }
         // Handle bit 15 lands at address bit 2 (QEMU's index_h).
-        assert_eq!(msi_remap_addr(0x8000), 0xFEE0_0010 | (1 << 2) | (0 << 5));
+        assert_eq!(msi_remap_addr(0x8000), (0xFEE0_0010 | (1 << 2)));
         assert_eq!(msi_remap_addr(0x8001), 0xFEE0_0030 | (1 << 2));
         assert_eq!(MSI_REMAP_DATA, 0);
     }

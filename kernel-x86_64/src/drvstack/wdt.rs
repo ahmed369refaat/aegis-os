@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(GCS_NO_REBOOT, 1 << 5);
         // QEMU's GCS default (0x20) IS no-reboot-set — the fact that
         // makes the lane's write path safe.
-        assert!(0x20 & GCS_NO_REBOOT != 0);
+        const { assert!(0x20 & GCS_NO_REBOOT != 0) };
     }
 
     /// The i6300esb encodings, pinned against wdt_i6300esb.c.

@@ -492,10 +492,10 @@ mod tests {
         for (i, b) in src.iter().enumerate() {
             // byte-granular writes through aligned words: write_byte
             // does not exist (that is the point), so plant via masks.
-            let w = crate::memops::read_u32(pa + i as u64 & !3);
-            let shift = 8 * (pa + i as u64 & 3);
+            let w = crate::memops::read_u32((pa + i as u64) & !3);
+            let shift = 8 * ((pa + i as u64) & 3);
             let cleared = w & !(0xFF << shift);
-            crate::memops::write_u32(pa + i as u64 & !3, cleared | ((*b as u32) << shift));
+            crate::memops::write_u32((pa + i as u64) & !3, cleared | ((*b as u32) << shift));
         }
         let mut out = [0u8; 20];
         read_bytes(pa, &mut out);

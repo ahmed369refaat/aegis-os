@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn vectors_are_where_the_idt_expects_them() {
         assert_eq!(TIMER_VECTOR, 48, "above the 32..=47 legacy catch-alls");
-        assert!(TIMER_VECTOR < SPURIOUS_VECTOR);
+        const { assert!(TIMER_VECTOR < SPURIOUS_VECTOR) };
         assert_eq!(SPURIOUS_VECTOR, 0xFF);
     }
 
@@ -367,15 +367,17 @@ mod tests {
     #[test]
     fn window_pte_is_the_direct_map_discipline() {
         assert_eq!(WINDOW_PTE & 0x000F_FFFF_FFFF_F000, 0xC000_0000);
-        assert!(WINDOW_PTE & pte::PTE_P != 0);
-        assert!(WINDOW_PTE & pte::PTE_W != 0);
-        assert!(WINDOW_PTE & PTE_PS != 0, "page-size bit: 1 GiB page");
-        assert!(WINDOW_PTE & pte::PTE_NX != 0, "MMIO is never executable");
-        assert!(
-            WINDOW_PTE & pte::PTE_G != 0,
-            "global: survives CR3 switches"
-        );
-        assert!(WINDOW_PTE & pte::PTE_U == 0, "kernel-only");
+        const { assert!(WINDOW_PTE & pte::PTE_P != 0) };
+        const { assert!(WINDOW_PTE & pte::PTE_W != 0) };
+        const { assert!(WINDOW_PTE & PTE_PS != 0, "page-size bit: 1 GiB page") };
+        const { assert!(WINDOW_PTE & pte::PTE_NX != 0, "MMIO is never executable") };
+        const {
+            assert!(
+                WINDOW_PTE & pte::PTE_G != 0,
+                "global: survives CR3 switches"
+            )
+        };
+        const { assert!(WINDOW_PTE & pte::PTE_U == 0, "kernel-only") };
     }
 
     /// Register offsets are the SDM's (a wrong offset writes a
@@ -406,13 +408,13 @@ mod tests {
     fn the_window_pte_range_covers_the_default_lapic_base() {
         use crate::mm::direct_map::{DIRECT_MAP_BASE, DIRECT_MAP_SIZE};
         assert_eq!(DEFAULT_MMIO_BASE, 0xFEE0_0000);
-        assert!(DEFAULT_MMIO_BASE >= 0xC000_0000, "inside WINDOW_PTE's GiB");
-        assert!(DEFAULT_MMIO_BASE < 0x1_0000_0000, "inside WINDOW_PTE's GiB");
+        const { assert!(DEFAULT_MMIO_BASE >= 0xC000_0000, "inside WINDOW_PTE's GiB") };
+        const { assert!(DEFAULT_MMIO_BASE < 0x1_0000_0000, "inside WINDOW_PTE's GiB") };
         let va = reg(0);
         assert_eq!(va, DIRECT_MAP_BASE + DEFAULT_MMIO_BASE);
         // And the first-GiB direct map genuinely does NOT cover it —
         // the window mapping is load-bearing, not redundant.
-        assert!(DEFAULT_MMIO_BASE >= DIRECT_MAP_SIZE);
+        const { assert!(DEFAULT_MMIO_BASE >= DIRECT_MAP_SIZE) };
     }
 
     #[test]

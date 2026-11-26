@@ -213,8 +213,8 @@ mod tests {
 
     #[test]
     fn write_bounds_are_sane() {
-        assert!(MAX_WRITE >= 64, "a hello fits comfortably");
-        assert!(MAX_WRITE.is_power_of_two() || MAX_WRITE % 8 == 0);
+        const { assert!(MAX_WRITE >= 64, "a hello fits comfortably") };
+        assert!(MAX_WRITE.is_power_of_two() || MAX_WRITE.is_multiple_of(8));
     }
 }
 

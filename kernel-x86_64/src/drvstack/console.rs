@@ -727,7 +727,7 @@ mod tests {
         assert_eq!(CELLS[BODY_FIRST * COLS].load(Ordering::Relaxed), b'x');
         // A body line longer than the status text overflows DOWN, never
         // into row 0.
-        let long: String = core::iter::repeat('y').take(200).collect();
+        let long: String = std::iter::repeat_n('y', 200).collect();
         write_str(&long);
         assert_eq!(
             CELLS[0].load(Ordering::Relaxed),

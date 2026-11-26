@@ -417,7 +417,7 @@ mod tests {
         );
         assert_eq!(errno_of(&SysError::PermissionDenied), -EACCES);
         // MAX_FDS bound sanity: the packing lanes cannot collide.
-        assert!(MAX_FDS <= 16);
+        const { assert!(MAX_FDS <= 16) };
         let mut t = FdTable::new();
         assert_eq!(t.alloc(FdTarget::Reserved).unwrap(), 0);
     }

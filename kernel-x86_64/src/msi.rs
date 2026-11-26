@@ -248,10 +248,7 @@ mod tests {
         assert_eq!(msix_table_size(2), 3);
         assert_eq!(msix_table_size(0), 1, "N−1 encoding: zero is one entry");
         assert_eq!(msix_table_size(0x7FF), 2048, "the max field value");
-        assert_eq!(
-            msix_table_size(0xFFFF & !MSIX_ENABLE & !MSIX_FUNC_MASK),
-            2048
-        );
+        assert_eq!(msix_table_size(!MSIX_ENABLE & !MSIX_FUNC_MASK), 2048);
         // Enabled + masked + size 2 reads back consistently.
         let mc = MSIX_ENABLE | MSIX_FUNC_MASK | 2;
         assert_eq!(msix_table_size(mc), 3);

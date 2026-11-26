@@ -418,9 +418,9 @@ mod tests {
         assert_eq!(VEC_SLOTS, 64);
         // The range must not touch the exceptions, the legacy
         // catch-alls, the timer, or the spurious vector.
-        assert!(DEVICE_VECTOR_BASE > 48);
-        assert!(DEVICE_VECTOR_MAX < 255);
-        assert!(DEVICE_VECTOR_MAX < 0xF0, "leaves headroom below 255");
+        const { assert!(DEVICE_VECTOR_BASE > 48) };
+        const { assert!(DEVICE_VECTOR_MAX < 255) };
+        const { assert!(DEVICE_VECTOR_MAX < 0xF0, "leaves headroom below 255") };
     }
 
     #[test]
@@ -511,12 +511,12 @@ mod tests {
         // The namespaces are disjoint by construction: a GSI fits in
         // 16 bits on any bootable machine; MSI entries ride above
         // 0x8000_0000.
-        assert!(MSI_SOURCE_BASE > 0xFFFF);
-        assert_ne!(Some(MSI_SOURCE_BASE + 0), Some(0));
+        const { assert!(MSI_SOURCE_BASE > 0xFFFF) };
+        assert_ne!(Some(MSI_SOURCE_BASE), Some(0));
         // And the table keeps them distinguishable.
         reset();
         let _ = alloc(0xAAA, 1, 1);
-        let _ = alloc(0xBBB, 1, MSI_SOURCE_BASE + 0);
+        let _ = alloc(0xBBB, 1, MSI_SOURCE_BASE);
         assert_eq!(owner_of(DEVICE_VECTOR_BASE), Some((0xAAA, 1, 1)));
         assert_eq!(
             owner_of(DEVICE_VECTOR_BASE + 1),

@@ -822,7 +822,10 @@ mod tests {
         fn read(&self, off: u8) -> u32 {
             self.d[(off / 4) as usize]
         }
-        /// Plant one virtio cap; returns its offset.
+        /// Plant one virtio cap; returns its offset. The 7 parameters
+        /// are exactly the fields of the cap this plants — grouping
+        /// them would just move the noise to every call site.
+        #[allow(clippy::too_many_arguments)]
         fn cap(
             &mut self,
             off: u8,
@@ -836,10 +839,8 @@ mod tests {
             let i = (off / 4) as usize;
             // w0: vndr=9, next, len, cfg_type
             let cap_len: u32 = if multiplier.is_some() { 20 } else { 16 };
-            self.d[i] = 0x09
-                | (u32::from(next) << 8)
-                | (u32::from(cap_len) << 16)
-                | (u32::from(cfg_type) << 24);
+            self.d[i] =
+                0x09 | (u32::from(next) << 8) | (cap_len << 16) | (u32::from(cfg_type) << 24);
             // w1: bar (+padding)
             self.d[i + 1] = u32::from(bar);
             // offset, length
@@ -937,7 +938,7 @@ mod tests {
         // len < 16: the offset/length dwords would read past the cap.
         let mut c = FakeCfg::new();
         c.d[13] = 0x40;
-        c.d[(0x40 / 4) as usize] = 0x09 | (0x00 << 8) | (8 << 16) | (1 << 24); // len=8
+        c.d[(0x40 / 4) as usize] = 0x09 | (8 << 16) | (1 << 24); // len=8
         assert!(
             parse_virtio_caps(&mut |off| c.read(off)).is_none(),
             "len < 16 refused"
@@ -945,7 +946,7 @@ mod tests {
         // A notify cap without the multiplier dword (len 16..19).
         let mut c = FakeCfg::new();
         c.d[13] = 0x40;
-        c.d[(0x40 / 4) as usize] = 0x09 | (0x00 << 8) | (16 << 16) | (2 << 24); // notify, len=16
+        c.d[(0x40 / 4) as usize] = 0x09 | (16 << 16) | (2 << 24); // notify, len=16
         assert!(
             parse_virtio_caps(&mut |off| c.read(off)).is_none(),
             "notify needs len >= 20"
@@ -1249,7 +1250,7 @@ mod tests {
 
     #[test]
     fn u16_helpers_cover_both_word_lanes() {
-        let buf = vec![0u64; 8];
+        let buf = [0u64; 8];
         let pa = buf.as_ptr() as u64;
         // Lane 0 (offset 0) and lane 1 (offset 2).
         write_u16_pa(pa, 0xBEEF);
@@ -1270,7 +1271,7 @@ mod tests {
 
     #[test]
     fn descriptor_encoding_is_pinned() {
-        let buf = vec![0u64; 8];
+        let buf = [0u64; 8];
         let pa = buf.as_ptr() as u64;
         write_desc(pa, 0x1234_5000, 512, DESC_F_NEXT | DESC_F_WRITE, 2);
         assert_eq!(memops::read_u64(pa), 0x1234_5000);
@@ -1303,7 +1304,7 @@ mod tests {
 
     #[test]
     fn blk_header_and_status_constants() {
-        let buf = vec![0u64; 8];
+        let buf = [0u64; 8];
         let pa = buf.as_ptr() as u64;
         write_blk_header(pa, BLK_T_IN, 42);
         assert_eq!(memops::read_u64(pa), 0); // type + reserved

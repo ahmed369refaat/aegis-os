@@ -1100,7 +1100,7 @@ mod tests {
         /// Plant a 32-bit memory BAR at slot `bar_i`.
         fn plant_bar32(&mut self, dev: u8, func: u8, bar_i: usize, base: u32, size: u32) {
             let idx = Self::idx(dev, func);
-            self.cfg[idx][4 + bar_i] = (base & 0xFFFF_F000) | 0x0; // mem, 32-bit
+            self.cfg[idx][4 + bar_i] = base & 0xFFFF_F000; // mem, 32-bit
             self.mask[idx] = u64::from(!(size - 1));
             self.mask_is64[idx] = false;
         }
@@ -1126,7 +1126,7 @@ mod tests {
                 let m = self.mask[idx];
                 let slot = ((off as usize) - 0x10) / 4;
                 if self.mask_is64[idx] {
-                    if slot % 2 == 0 {
+                    if slot.is_multiple_of(2) {
                         (m as u32) & 0xFFFF_F000 | 0x4
                     } else {
                         (m >> 32) as u32
@@ -1454,9 +1454,14 @@ mod walk_tests {
     /// A fake config space for the walk tests. The dwords the walk
     /// reads: 0x00 vendor/device, 0x08 class, 0x0C header type, 0x10
     /// BAR0, 0x18 the type-1 bridge buses.
+    /// One device: ((bus, dev), (vendor, device, class, header, BAR0)).
+    type FakeDev = ((u8, u8), (u16, u16, u16, u8, u32));
+    /// One bridge: (secondary bus, subordinate bus, bus dword).
+    type FakeBridge = (u8, u8, u32);
+
     struct FakeCfg {
-        devices: [((u8, u8), (u16, u16, u16, u8, u32)); 20],
-        bridges: [(u8, u8, u32); 20],
+        devices: [FakeDev; 20],
+        bridges: [FakeBridge; 20],
     }
 
     impl FakeCfg {
@@ -1465,10 +1470,7 @@ mod walk_tests {
             bridges: [(0, 0, 0); 20],
         };
 
-        fn with(
-            devices: [((u8, u8), (u16, u16, u16, u8, u32)); 20],
-            bridges: [(u8, u8, u32); 20],
-        ) -> FakeCfg {
+        fn with(devices: [FakeDev; 20], bridges: [FakeBridge; 20]) -> FakeCfg {
             FakeCfg { devices, bridges }
         }
 

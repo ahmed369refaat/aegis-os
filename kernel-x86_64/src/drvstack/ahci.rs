@@ -360,7 +360,7 @@ mod tests {
         let clb = phys.pa(0);
         let ctba = phys.pa(4096);
         let buf = phys.pa(8192);
-        let lba: u64 = 0x01_2345_6789_AB;
+        let lba: u64 = 0x0123_4567_89AB;
         build_read_dma_cmdtable(clb, ctba, buf, lba);
         // header: CFL=5, PRDTL=1, table address
         assert_eq!(crate::memops::read_u32(clb), 5 | (1 << 16));

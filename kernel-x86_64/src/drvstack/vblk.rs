@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(crate::virtio::read_u16_pa(desc + 8), 16);
         assert_eq!(
             u16::from(crate::virtio::read_u8_pa(desc + 12)),
-            u16::from(v::DESC_F_NEXT)
+            v::DESC_F_NEXT
         );
         assert_eq!(crate::virtio::read_u8_pa(desc + 14), 1);
         // desc 1: the 512-byte data page, NEXT|WRITE for IN, next=2
@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(crate::virtio::read_u16_pa(desc + 16 + 8), 512);
         assert_eq!(
             u16::from(crate::virtio::read_u8_pa(desc + 16 + 12)),
-            u16::from(v::DESC_F_NEXT) | u16::from(v::DESC_F_WRITE)
+            v::DESC_F_NEXT | v::DESC_F_WRITE
         );
         assert_eq!(crate::virtio::read_u8_pa(desc + 16 + 14), 2);
         // desc 2: the status byte, WRITE, last
@@ -585,7 +585,7 @@ mod tests {
         assert_eq!(crate::virtio::read_u16_pa(desc + 32 + 8), 1);
         assert_eq!(
             u16::from(crate::virtio::read_u8_pa(desc + 32 + 12)),
-            u16::from(v::DESC_F_WRITE)
+            v::DESC_F_WRITE
         );
         assert_eq!(crate::virtio::read_u8_pa(desc + 32 + 14), 0);
         // the avail ring: slot 0 holds desc 0, idx advanced
@@ -595,7 +595,7 @@ mod tests {
         let _ = submit(&q, data, 4, 1 /* OUT */);
         assert_eq!(
             u16::from(crate::virtio::read_u8_pa(desc + 16 + 12)),
-            u16::from(v::DESC_F_NEXT),
+            v::DESC_F_NEXT,
             "OUT: the device reads the data page"
         );
     }
@@ -620,6 +620,6 @@ mod tests {
         let idx = submit(&q, phys.pa(16384), 0, v::BLK_T_IN);
         assert_eq!(idx, 2, "the avail idx is free-running (1 + 1)");
         // the slot write went to slot 1 % 2 = 1: avail[1] holds desc 0
-        assert_eq!(crate::virtio::read_u16_pa(phys.pa(4096) + 4 + 2 * 1), 0);
+        assert_eq!(crate::virtio::read_u16_pa(phys.pa(4096) + 4 + 2), 0);
     }
 }

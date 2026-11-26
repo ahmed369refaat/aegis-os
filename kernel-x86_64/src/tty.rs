@@ -258,9 +258,9 @@ mod tests {
         while buffered() > 0 {
             let n = drain(&mut out);
             assert!(n > 0);
-            for i in 0..n {
+            for (i, &got) in out[..n].iter().enumerate() {
                 let want = ((next + i) % 251) as u8;
-                assert_eq!(out[i], want, "byte {} of the stream", next + i);
+                assert_eq!(got, want, "byte {} of the stream", next + i);
             }
             next += n;
         }

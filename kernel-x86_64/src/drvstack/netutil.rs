@@ -104,10 +104,7 @@ mod tests {
         assert_eq!(u8_at(p, 13), 0x00);
         // IPv4: v4 hl 20, total 276, proto 17 (UDP), 0.0.0.0 -> broadcast
         assert_eq!(u8_at(p, 14), 0x45);
-        assert_eq!(
-            crate::virtio::read_u16_pa(p + 16),
-            (276u16 << 8) | (276u16 >> 8)
-        );
+        assert_eq!(crate::virtio::read_u16_pa(p + 16), 276u16.rotate_right(8));
         assert_eq!(u8_at(p, 23), 17);
         // the IP header checksum VERIFIES over the built packet
         assert_eq!(
@@ -116,10 +113,7 @@ mod tests {
             "the stored checksum makes the header sum to zero"
         );
         // UDP: 68 -> 67
-        assert_eq!(
-            crate::virtio::read_u16_pa(p + 34),
-            (68u16 << 8) | (68u16 >> 8)
-        );
+        assert_eq!(crate::virtio::read_u16_pa(p + 34), (68u16 << 8));
         // DHCP: op/hlen, xid, flags, chaddr, magic cookie, option 53 = DISCOVER
         assert_eq!(u8_at(p, 42), 1, "op = BOOTREQUEST");
         assert_eq!(u8_at(p, 43), 1, "htype = Ethernet");
@@ -157,8 +151,8 @@ mod tests {
             build_dhcp_discover_at(p, mac);
             assert_eq!(crate::virtio::ip_checksum(p + 14, 20), 0);
             // the chaddr carries the MAC whatever it contains
-            for i in 0..6usize {
-                assert_eq!(u8_at(p, 42 + 28 + i as u64), mac[i]);
+            for (i, &m) in mac.iter().enumerate() {
+                assert_eq!(u8_at(p, 42 + 28 + i as u64), m);
             }
         }
     }

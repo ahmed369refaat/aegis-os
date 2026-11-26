@@ -142,7 +142,7 @@ mod tests {
         // (timespec_to_ns's own contract).
         b[..8].copy_from_slice(&u64::from(u32::MAX).to_le_bytes());
         b[8..].copy_from_slice(&0u64.to_le_bytes());
-        assert_eq!(timespec_to_ns(u64::from(u32::MAX), 0).is_some(), true);
+        assert!(timespec_to_ns(u64::from(u32::MAX), 0).is_some());
         assert_eq!(timespec_to_ns(u64::from(u32::MAX) + 1, 0), None);
     }
 
