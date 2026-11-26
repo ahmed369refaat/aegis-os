@@ -15,6 +15,43 @@
 
 ---
 
+## 0b. K20 update (the P0 hardening round) — what landed, what stayed open
+
+Delta against the rows below, in the same "proven or it didn't happen"
+method:
+
+- **P0-1 (production limits): DONE, lane-proven.** The fixed tables now
+  speak their real workloads (syscall message 2 KiB, wake frames 256,
+  children 32, IPC channels 64, pipe 16 KiB, stack 2 MiB), each raise
+  carrying a measured cost + an accounting test + the `[CAP]` boot
+  selftest. See `docs/capacity.md` for what was NOT raised and why.
+- **P0-2 (network data path): DONE on the q35 lanes, honestly partial
+  by design.** `SYS_NET_SEND/NET_RECV` live at the ring-3 entry
+  (fail-closed ordering: EMSGSIZE → ENODEV → EFAULT → the policy gate
+  → copy → the wire); a ring-3 netd domain proves the Ethernet+DHCP
+  round trip through slirp and the token bucket's edge (1+20 sends,
+  EAGAIN, EMSGSIZE). What is NOT here: no TCP/IP, the e1000 lanes'
+  arms answer ENODEV (only the virtio-net session is armed), and the
+  **open page-rewrite anomaly**: the received frame is copied
+  (arm-time snapshot + read-back byte-exact) but the user page reads
+  zero in the copied range within the syscall-return window —
+  bracketed, documented, gated on arm-time evidence, root cause open
+  (next session's first item).
+- **P0-3 (userland bootstrap): DONE, lane-proven.** A real
+  `gcc -ffreestanding -nostdlib` ELF (`/bin/hello`) rides the ext2
+  disk image, is read off AHCI at boot into the exec registry's disk
+  slot (write-once), and is execve'd by a ring-3 caller — exit 42 is
+  the image's own proof. What is NOT here: no hosted libc (musl),
+  freestanding only; the registry's disk slot is one fixed path, not
+  a VFS-backed exec.
+- **P0-4 (second ring-3 driver domain): NOT STARTED.** virtio-blk has
+  its driver domain (ADR-0017); the NIC does not — P0-2's netd sends
+  through syscalls, it does not own the device (no DEVREG channel, no
+  own rings).
+- **P0-5 (this ledger): DONE** — README's "Current status" carries the
+  K20 bullet; the "Not yet" list is re-scoped (NET live at the entry;
+  TCP/IP, musl, the NIC driver domain, SMP explicitly not).
+
 ## 0. Round 6 update (ADR-0019 + ADR-0020) — what this round closed
 
 Read this section as a delta against the rows below, which describe
