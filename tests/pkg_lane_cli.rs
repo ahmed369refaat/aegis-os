@@ -17,6 +17,7 @@
 //! remove (payload, record and state entry all gone).
 
 use aegis_os::prelude::*;
+use aegis_os::profile::{PKG_GID, PKG_UID};
 use aegis_os::sys::{SysError, SysValue};
 use aegis_os::vfs::VfsError;
 use aegis_pkg::cli::run_cli;
@@ -26,6 +27,9 @@ use aegis_pkg::{FileKind, Fs, OpenFlags, Path, Stat};
 
 const PROBE: u32 = 71;
 const PM: u32 = 70;
+/// K23: the group-carving probe (root uid, the manager's gid 150) —
+/// mints the root:150 write path; the root probe mints root:root.
+const GROUP: u32 = 73;
 
 /// The REAL fixture bytes (boot.sh step [0e] builds them; the same
 /// files the kernel's K22/K23 lane embeds). K23: the repo layout is
@@ -42,18 +46,29 @@ const PAYLOAD_V11: &[u8] = b"hello world v1.1\n";
 
 fn kernel_with_fixture() -> Kernel {
     let mut k = Kernel::new();
-    k.create_domain_with(PROBE, service_profile(), 0, 100, 0)
+    // The K23 boot tree, mirrored: the group probe (uid 0, gid 150)
+    // carves the write path, the root probe (uid 0, gid 0) carves the
+    // read-only world, and the manager runs as its OWN group.
+    k.create_domain_with(GROUP, service_profile(), 0, PKG_GID, 0)
         .unwrap();
-    k.create_domain_with(PM, aegis_os::profile::pkg_caller_profile(), 1070, 100, 0)
+    k.create_domain_with(PROBE, service_profile(), 0, 0, 0)
         .unwrap();
-    for &(path, m) in &[
-        ("/r1", 0o755u16),
-        ("/pkg", 0o770),
-        ("/pkg/repos", 0o755),
-        ("/usr", 0o770),
+    k.create_domain_with(
+        PM,
+        aegis_os::profile::pkg_caller_profile(),
+        PKG_UID,
+        PKG_GID,
+        0,
+    )
+    .unwrap();
+    for &(dom, path, m) in &[
+        (GROUP, "/pkg", 0o770u16),
+        (GROUP, "/usr", 0o770),
+        (PROBE, "/r1", 0o755),
+        (PROBE, "/pkg/repos", 0o755),
     ] {
         k.syscall(
-            PROBE,
+            dom,
             SysRequest::Mkdir {
                 path,
                 mode: Mode(m),

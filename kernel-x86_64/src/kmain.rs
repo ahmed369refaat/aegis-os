@@ -1626,15 +1626,18 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     //      carried in the kernel's SECOND 2 MiB leaf. The lane: (a) declares the
     //      PM's exec policy for the image's identity — the sh lesson:
     //      the profile's own surface, else the transaction's first
-    //      mkdir answers -EPERM at the exec boundary; (b) a root
-    //      supervisor provisions the signed repo fixture (root-owned
+    //      mkdir answers -EPERM at the exec boundary; (b) root
+    //      supervisors provision the signed repo fixture (root-owned
     //      0644: the manager READS /r1 and its anchors but can never
-    //      rewrite them) and /pkg 0770 root:100 (the manager's gid
-    //      writes inside — full uid separation is the documented next
-    //      round) — K23 provisions BOTH package versions (the repo is
-    //      version-qualified now, so the upgrade has something to move
-    //      TO); (c) a ring-3 caller execve's /bin/pkg three times —
-    //      internal nr 19, the ABI the pkg image speaks — with
+    //      rewrite them) and /pkg 0770 root:150 — the manager's OWN
+    //      gid, never a shared boot group (K23: the PM runs as
+    //      1070:150, /usr the same root:150 so the manager can build
+    //      the tree it needs, and the root:root anchors stay
+    //      read-only to it) — and provisions BOTH package versions
+    //      (the repo is version-qualified now, so the upgrade has
+    //      something to move TO); (c) a ring-3 caller execve's
+    //      /bin/pkg three times — internal nr 19, the ABI the pkg
+    //      image speaks — with
     //      ["/bin/pkg", "install", "r1/hello@1.0.0"] (PINNED: a bare
     //      name resolves newest-first, which would land 1.1.0 and
     //      leave the upgrade round nothing to move), then
@@ -1656,6 +1659,14 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         /// The provisioning supervisor (root, the round-J probe
         /// pattern; distinct id 71) — destroyed before the launch.
         const PKG_PROBE: u32 = 71;
+        /// The group-carving probe (K23: root uid, the manager's OWN
+        /// gid; distinct id 73) — the one-shot identity that mints
+        /// /pkg and /usr root:150, then dies with the root probe. Two
+        /// probes is the honest shape: a ramfs inode takes its
+        /// ownership from the creator's credentials at mkdir/create
+        /// time and the kernel has no chown, so root:root anchors and
+        /// a root:150 write path cannot come out of ONE identity.
+        const PKG_GROUP: u32 = 73;
         /// The verification supervisor (root; distinct id 72) — created
         /// only inside the post-exit CPL=0 window, destroyed before the
         /// lane ends.
@@ -1779,32 +1790,55 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
 
         // (b) provisioning: the four dirs + the five fixture files
-        // (K23: both package versions — the upgrade round needs the
-        // repo to serve 1.1.0 alongside the installed 1.0.0).
-        // The supervisor is ROOT with the manager's GROUP (uid 0,
-        // gid 100): uid 0 keeps the DAC bypass for its own writes,
-        // and everything it creates lands in the manager's group —
-        // /pkg 0770 root:100 lets the manager (uid 1070, gid 100)
-        // write inside while /pkg/trust and /pkg/repos/r1.repo stay
-        // root-owned 0644 (group read, never group write: the manager
-        // can read its anchors but not rewrite them). The first boot
-        // had this wrong (gid 0): the manager met EACCES on its own
-        // state tree ("pkg: Io(Access): syscall").
+        // (K23: BOTH package versions — the repo is version-qualified
+        // now, so the upgrade round has something to move TO).
+        // K23 killed the shared group: TWO one-shot supervisors carve
+        // the tree. The group probe (uid 0, gid 150) mints the WRITE
+        // path — /pkg and /usr 0770 root:150 — so the ONLY identity
+        // that can write either is the manager's own group (uid 0
+        // keeps the DAC bypass for the probe's own writes). The root
+        // probe (uid 0, gid 0) then mints the READ-ONLY world: /r1
+        // 0755 root:root and the anchors /pkg/trust +
+        // /pkg/repos/r1.repo 0644 root:root (its mkdir of /pkg/repos
+        // inside the root:150 /pkg rides the uid 0 bypass). The
+        // manager (uid 1070, gid 150) reads its anchors through the
+        // 0644 other bits and can never rewrite them. The K22 shape —
+        // one probe with gid 100 and /pkg 0770 root:100 — made the
+        // shared boot gid the write path: every domain the default
+        // derivation spawns carries gid 100, so any of them could
+        // have written the manager's tree. The first boot also had
+        // the plain gid-0 shape wrong: the manager met EACCES on its
+        // own state tree ("pkg: Io(Access): syscall").
+        // (Known edge, POSIX-shaped and deliberate for now:
+        // unlink/rename-into-replace are PARENT-write gated, so the
+        // manager CAN delete /pkg/trust — its parent /pkg is
+        // group-writable by design; /pkg/repos configs are safe
+        // (parent root:root 0755). A sticky bit or a root-owned
+        // anchor directory is the next hardening round.)
         let provisioned = matches!(
-            k.create_domain_with(PKG_PROBE, aegis_os::profile::service_profile(), 0, 100, 0),
+            k.create_domain_with(
+                PKG_GROUP,
+                aegis_os::profile::service_profile(),
+                0,
+                aegis_os::profile::PKG_GID,
+                0
+            ),
+            Ok(())
+        ) && matches!(
+            k.create_domain_with(PKG_PROBE, aegis_os::profile::service_profile(), 0, 0, 0),
             Ok(())
         ) && {
             use aegis_os::sys::SysRequest;
             [
-                ("/r1", 0o755u16),
-                ("/pkg", 0o770),
-                ("/pkg/repos", 0o755),
-                ("/usr", 0o770),
+                (PKG_GROUP, "/pkg", 0o770u16),
+                (PKG_GROUP, "/usr", 0o770),
+                (PKG_PROBE, "/r1", 0o755),
+                (PKG_PROBE, "/pkg/repos", 0o755),
             ]
             .iter()
-            .all(|&(path, m)| {
+            .all(|&(dom, path, m)| {
                 k.syscall(
-                    PKG_PROBE,
+                    dom,
                     SysRequest::Mkdir {
                         path,
                         mode: aegis_os::vfs::Mode(m),
@@ -1842,9 +1876,10 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 ],
             );
             let _ = k.destroy_domain(PKG_PROBE);
+            let _ = k.destroy_domain(PKG_GROUP);
             hw::halt_forever();
         }
-        // The provisioning supervisor is GONE before the launch: a
+        // The provisioning supervisors are GONE before the launch: a
         // live-but-never-launched domain in the run queue is exactly
         // what the preemptor's unparked-domain BUG guard exists to
         // catch — this lane's first boot proved it, halting the machine
@@ -1852,6 +1887,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // The verification reads below use a fresh probe (72) that
         // lives only inside a CPL=0 window, never across the drain.
         let _ = k.destroy_domain(PKG_PROBE);
+        let _ = k.destroy_domain(PKG_GROUP);
 
         // (c) K23: one execve round. The caller blob reads a COMMAND
         // SELECTOR from byte 0 of its data page (0 = install,
@@ -1874,11 +1910,22 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             // tables at +0x10 and above.
             let mut boot: [u8; 64] = [0; 64];
             boot[0] = selector;
-            let sp = match mm::user::spawn_user_blob(
+            // K23: the caller/manager identity is DECLARED, not
+            // derived — the uid stays the historical 1070 (1000 +
+            // domain 70), the gid is the manager's OWN 150
+            // (profile::PKG_UID / PKG_GID): the group that matches
+            // /pkg and /usr's 0770 group bits and nothing else's.
+            // The caller execve's into the PM image without an
+            // identity change, so this one declaration is the whole
+            // lane's identity — every round of the lifecycle runs
+            // as the same manager.
+            let sp = match mm::user::spawn_user_blob_as(
                 k,
                 pool,
                 dom,
                 aegis_os::profile::pkg_caller_profile(),
+                aegis_os::profile::PKG_UID,
+                aegis_os::profile::PKG_GID,
                 CALLER_BLOB,
                 &boot,
             ) {

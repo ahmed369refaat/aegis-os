@@ -110,6 +110,52 @@ pub fn spawn_user_blob<const N: usize>(
     blob: &[u8],
     data: &[u8],
 ) -> Result<UserSpawn, SpawnError> {
+    // Size gates first (the original order: a too-large blob answers
+    // BlobTooLarge even when the id is also invalid)...
+    if blob.len() > layout::CODE_PAGES * 4096 {
+        return Err(SpawnError::BlobTooLarge {
+            len: blob.len(),
+            capacity: layout::CODE_PAGES * 4096,
+        });
+    }
+    if data.len() > layout::DATA_PAGES * 4096 {
+        return Err(SpawnError::BlobTooLarge {
+            len: data.len(),
+            capacity: layout::DATA_PAGES * 4096,
+        });
+    }
+    // ...then credentials byte-identical to `Kernel::create_domain`'s
+    // F3 derivation (uid 1000 + id — injective and never 0 — gid 100):
+    // every existing lane keeps exactly the identity it had, and the
+    // refusal paths map to the same `SpawnError::Domain` a direct
+    // `create_domain` call produced, so failure behavior is unchanged.
+    if id > u16::MAX as u32 {
+        return Err(SpawnError::Domain);
+    }
+    let uid = match 1000u16.checked_add(id as u16) {
+        Some(u) if u != 0 => u,
+        _ => return Err(SpawnError::Domain),
+    };
+    spawn_user_blob_as(k, pool, id, profile, uid, 100, blob, data)
+}
+
+/// K23: `spawn_user_blob` with EXPLICIT credentials — the spawn path
+/// for domains whose identity is declared rather than derived (the
+/// package manager: `profile::PKG_UID`/`PKG_GID`, its own group so
+/// the /pkg write path stops riding the generic gid 100 every
+/// derived domain shares). Identity is the only axis that differs;
+/// tables, stdio triplet and the N3 rollback are the same code.
+#[allow(clippy::too_many_arguments)] // same shape the codebase's long-lane entry points use
+pub fn spawn_user_blob_as<const N: usize>(
+    k: &mut Kernel<N>,
+    pool: &mut FramePool<N>,
+    id: u32,
+    profile: DomainProfile,
+    uid: u16,
+    gid: u16,
+    blob: &[u8],
+    data: &[u8],
+) -> Result<UserSpawn, SpawnError> {
     if blob.len() > layout::CODE_PAGES * 4096 {
         return Err(SpawnError::BlobTooLarge {
             len: blob.len(),
@@ -124,7 +170,7 @@ pub fn spawn_user_blob<const N: usize>(
     }
     // Lib identity first (audit/accounting; the frame owner tag below
     // matches this id so a destroy reclaims everything at once).
-    k.create_domain(id, profile)
+    k.create_domain_with(id, profile, uid, gid, 0)
         .map_err(|_| SpawnError::Domain)?;
     // Round J: the stdio triplet. fds 0/1/2 go to the runtime (the
     // console device alias lives behind fd 1), so the domain's own

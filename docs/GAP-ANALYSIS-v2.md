@@ -209,11 +209,23 @@ ring-3 caller with real argv, and installing `r1/hello` from the
 `pkg-mkrepo`-signed local repo through the manager's own 9-syscall
 mask (verified byte-exact by the boot lane; `--verify` asserts it).
 `SYS_RENAME` moved 35 → 36 (the entry's internal-mode hybrid maps
-Linux nr 35 to nanosleep, so 35 was unreachable from ring 3). What
-remains: the repo image on the ext2 disk (the fixture is
-kernel-embedded today), uid separation for `/pkg` (currently a
-shared boot gid), remove/upgrade lanes, and the net broker fetch.
-Still nothing on: musl/libc (planned, riding the ADR-0003 ABI),
+Linux nr 35 to nanosleep, so 35 was unreachable from ring 3). The
+uid separation for `/pkg` is DONE (K23): the manager runs under a
+DECLARED identity (uid 1070 / gid 150, `profile::PKG_UID`/
+`PKG_GID`) instead of the derived gid-100 every domain shares, and
+two one-shot boot probes carve the tree — a gid-150 probe mints
+`/pkg` and `/usr` 0770 root:150 (the manager's group is the only
+writer) while a root probe keeps the anchors and the `/r1` repo
+root:root 0644/0755; the host proofs pin the foreign identity and
+the manager itself out of everything they must not touch. One hole
+is deliberately left open and documented: `/pkg/trust`'s parent is
+the PM-group-writable `/pkg`, and POSIX gates unlink/rename on the
+parent's bits alone, so the manager can still delete or
+rename-replace that one anchor — the next round is a sticky bit on
+`/pkg` or a root-owned anchor directory. What remains: the repo
+image on the ext2 disk (the fixture is
+kernel-embedded today), remove/upgrade lanes, and the net broker
+fetch. Still nothing on: musl/libc (planned, riding the ADR-0003 ABI),
 dynamic linker, coreutils. `ABI-VERSION.md` remains the versioned
 contract for the 2-s syscall surface.
 

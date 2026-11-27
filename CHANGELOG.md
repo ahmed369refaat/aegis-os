@@ -51,6 +51,61 @@
   The `dbtx::crash_during_commit_recovers` fixture was pointed at
   the version-qualified repo path (the old name-keyed path answered
   ENOENT before the crash could be simulated).
+
+- **The manager's identity is now DECLARED, not derived** —
+  `profile::PKG_UID`/`PKG_GID` (1070/150), and
+  `spawn_user_blob_as` takes explicit credentials while
+  `spawn_user_blob` delegates with the old derivation (uid 1000 + id,
+  gid 100), byte-identical for every other lane. Why this had to
+  exist: `Kernel::create_domain` hands every derived domain the same
+  generic gid 100, and K22's `/pkg` was 0770 root:100 — the shared
+  boot group WAS the write path, so any gid-100 domain could have
+  written the manager's tree. The uid stays the historical 1000 + 70
+  (domain 70's derivation) so the lane's history reads the same; gid
+  150 was picked after sweeping the tree (0 is root, 100 the derived
+  default, 1000 the fresh-domain default — nothing else declares a
+  gid, and 150 collides with none of them).
+- **Two-probe provisioning, and why two** — the boot lane carves the
+  tree with two short-lived CPL=0 probes, both destroyed on the happy
+  AND the error paths: a group-carving probe (domain 73, uid 0 /
+  gid 150) mints `/pkg` and `/usr` 0770 root:150 — the only group
+  that can write either — and a root probe (domain 71, gid 0: there
+  is no chown, and a ramfs inode takes its ownership from the
+  creator's credentials at mkdir/create time, so root:root anchors
+  and a root:150 write path cannot come out of ONE identity) mints
+  `/r1` and `/pkg/repos` 0755 plus the five 0644 fixtures (both
+  package versions — the repo is version-qualified now). The launch
+  itself is `spawn_user_blob_as(..., PKG_UID, PKG_GID, ...)`.
+- **DAC audit** — `vfs::check_access` re-read line by line against
+  POSIX: it was already owner-else-group-else-other with the uid-0
+  bypass documented. The new pin test
+  `owner_class_wins_over_group_bits` keeps it that way — the owner
+  class is never answered by the group bits.
+- **The negative lanes, proven on the host** —
+  `tests/pkg_lane_provision.rs` replays the exact boot tree through
+  the public `Kernel` API: the POSITIVE run (the manager 1070:150
+  walks its whole install and reads its anchors), the FOREIGN run
+  (uid 3000 / gid 300: EACCES creating or mkdir-ing inside `/pkg`
+  and `/usr`, cannot even list or traverse `/pkg` — a write-open of
+  a directory answers EISDIR before DAC ever runs, so the listing
+  refusal is the honest assert — while the root:root 0644 `/r1` repo
+  still serves its other bits), and the ANCHOR run (the manager
+  itself cannot write, truncate, or O_CREAT-replace `/pkg/trust` or
+  the `/r1` files, and cannot unlink or rename the repo configs,
+  whose parent `/pkg/repos` is root:root 0755).
+  `tests/pkg_lane_cli.rs` runs the REAL `run_cli("install")` against
+  the same tree and the same identity.
+- **The deliberate gap, kept honest** — `/pkg/trust`'s parent is the
+  PM-group-writable `/pkg`, and POSIX gates unlink/rename on the
+  parent's write bit alone: the manager can still delete or
+  rename-replace that one anchor. A sticky bit on `/pkg` or a
+  root-owned anchor directory is the documented next hardening step
+  (docs/GAP-ANALYSIS-v2.md §2.5).
+- Host gates green (fmt, clippy, 873 tests across aegis-os,
+  aegis-kernel and aegis-pkg — the pin test and the rewritten
+  negative lanes included), and `./boot.sh --verify` is PASS with
+  the K22 `[PKG]` markers intact: the manager installs through its
+  own group with no EACCES anywhere in the lane.
 - **The console plane's tests are serial now** — `drvstack::console`'s
   state is one set of process-wide statics, and cargo test's parallel
   threads interleaved `write_byte`s into each other's counters (found

@@ -391,6 +391,24 @@ pub const fn pkg_caller_profile() -> DomainProfile {
     }
 }
 
+/// K23: the package manager's Unix identity, DECLARED instead of
+/// derived. `Kernel::create_domain` hands every derived domain the
+/// same generic gid 100, and the K22 lane leaned on exactly that:
+/// `/pkg` was 0770 root:100, so the shared boot group WAS the write
+/// path — any gid-100 domain could have written the manager's tree.
+/// The manager now owns its group: `/pkg` and `/usr` are 0770
+/// root:PKG_GID (the only group that can write either), while the
+/// trust anchors (`/pkg/trust`, `/pkg/repos`) and the `/r1` repo
+/// stay root:root 0644/0755 — the manager reads them through the
+/// other bits and can never rewrite them. The uid stays the
+/// historical 1000 + 70 (domain 70's derivation) so the lane's
+/// history reads the same. Gid 150 was picked after sweeping the
+/// tree: 0 is root, 100 the derived default, 1000 the fresh-domain
+/// default — nothing else declares a gid, and 150 collides with
+/// none of them.
+pub const PKG_UID: u16 = 1070;
+pub const PKG_GID: u16 = 150;
+
 /// ADR-0022: the default profile for spawned processes and for any
 /// executable the exec policy table does not list — "app". File I/O +
 /// pipes + the process family (fork/exec/wait); NO kill, NO chroot,

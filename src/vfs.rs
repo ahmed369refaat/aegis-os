@@ -1427,6 +1427,48 @@ mod tests {
         );
     }
 
+    /// K23: pin the POSIX classification order itself — owner match
+    /// selects the OWNER bits alone, even when the group bits would
+    /// grant more (the conflation an if-owner-OR-group check would
+    /// commit: mode 0o070 hands the group rwx and the owner nothing,
+    /// and an owner-classified caller must still get nothing). The
+    /// K23 /pkg separation leans on exactly this: /pkg 0770 root:150
+    /// classifies the manager (uid 1070) by its GROUP (rwx), while a
+    /// same-uid foreign owner of nothing rides the other bits (---).
+    #[test]
+    fn owner_class_wins_over_group_bits() {
+        let mut fs = Vfs::new();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/d", ROOT_CREDS, Mode(0o777))
+            .unwrap();
+        // Owned by 1000:1000, group rwx, owner and other nothing.
+        let id = fs
+            .create(ROOT_REF, ROOT_REF, "/d/f", USER, Mode(0o070))
+            .unwrap();
+        // The owner (uid 1000, gid 999 — no group match) is classified
+        // by the owner bits: r and w both denied despite the group rwx.
+        let owner_no_group = Credentials {
+            uid: 1000,
+            gid: 999,
+        };
+        assert_eq!(
+            fs.read_by_id(id, owner_no_group, &mut [0; 8]),
+            Err(VfsError::PermissionDenied)
+        );
+        assert_eq!(
+            fs.write_at(id, owner_no_group, 0, b"x"),
+            Err(VfsError::PermissionDenied)
+        );
+        // A pure group member (uid 2000, gid 1000) gets the group rwx.
+        assert!(fs.read_by_id(id, GROUPIE, &mut [0; 8]).is_ok());
+        assert!(fs.write_at(id, GROUPIE, 0, b"x").is_ok());
+        // And the owner whose uid AND gid both match is STILL owner
+        // class only (uid is checked first): no group rwx for USER.
+        assert_eq!(
+            fs.write_at(id, USER, 0, b"x"),
+            Err(VfsError::PermissionDenied)
+        );
+    }
+
     #[test]
     fn uid_zero_bypasses_dac_but_not_chroot() {
         let fs = fs_with(false);
