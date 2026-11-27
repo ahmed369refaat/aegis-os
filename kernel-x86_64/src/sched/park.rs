@@ -169,6 +169,21 @@ fn record_completed(domain: u32, exit: crate::sched::context::ExitKind, facts: E
     false
 }
 
+/// The ONE raw take both drains share: pull the next entry (with its
+/// facts) out of the completed mailbox, or None. Whichever drain runs
+/// first consumes the entry — single-take semantics, one unsafe site.
+#[cfg(not(test))]
+fn completed_take_raw() -> Option<(u32, crate::sched::context::ExitKind, ExitFacts)> {
+    // SAFETY: see record_completed.
+    let completed = unsafe { &mut *core::ptr::addr_of_mut!(COMPLETED) };
+    for slot in completed.iter_mut() {
+        if let Some(x) = slot.take() {
+            return Some(x);
+        }
+    }
+    None
+}
+
 /// Drain one completed run (kmain, after the nested dispatcher
 /// returned control): (domain, exit kind). None when empty. The K23
 /// facts ride the same entry but this drain DROPS them — the
@@ -176,14 +191,7 @@ fn record_completed(domain: u32, exit: crate::sched::context::ExitKind, facts: E
 /// the lanes that need the facts call `completed_drain_facts`.
 #[cfg(not(test))]
 pub fn completed_drain() -> Option<(u32, crate::sched::context::ExitKind)> {
-    // SAFETY: see record_completed.
-    let completed = unsafe { &mut *core::ptr::addr_of_mut!(COMPLETED) };
-    for slot in completed.iter_mut() {
-        if let Some(x) = slot.take() {
-            return Some((x.0, x.1));
-        }
-    }
-    None
+    completed_take_raw().map(|(dom, exit, _)| (dom, exit))
 }
 
 /// K23: the facts-carrying twin of `completed_drain` — the same
@@ -195,14 +203,7 @@ pub fn completed_drain() -> Option<(u32, crate::sched::context::ExitKind)> {
 /// observability markers through this drain.
 #[cfg(not(test))]
 pub fn completed_drain_facts() -> Option<(u32, crate::sched::context::ExitKind, ExitFacts)> {
-    // SAFETY: see record_completed.
-    let completed = unsafe { &mut *core::ptr::addr_of_mut!(COMPLETED) };
-    for slot in completed.iter_mut() {
-        if let Some(x) = slot.take() {
-            return Some(x);
-        }
-    }
-    None
+    completed_take_raw()
 }
 
 /// wait4 (slice 3): consume ONE completed entry by domain id — the

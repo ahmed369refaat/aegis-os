@@ -673,8 +673,8 @@ mod tests {
         let mut po = 0usize;
         push(&mut pd, &mut po, 14, b".", false);
         push(&mut pd, &mut po, 2, b"..", false);
-        for i in 0..PKG_NAMES.len() - 1 {
-            push(&mut pd, &mut po, 15 + i as u32, PKG_NAMES[i], false);
+        for (i, name) in PKG_NAMES.iter().take(PKG_NAMES.len() - 1).enumerate() {
+            push(&mut pd, &mut po, 15 + i as u32, name, false);
         }
         push(
             &mut pd,
