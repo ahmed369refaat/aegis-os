@@ -196,21 +196,22 @@ capabilities. No packets exist anywhere.
 ### 2.5 Userland
 
 The shell, TTY, init and the gcc userland citizen are live (M3,
-ADR-0025/0030). The package story now exists as CODE: the `pkg/`
-crate (no_std, no_alloc, zero deps — Ed25519-verified atomic
-transactions, full threat model + 48 host tests) and its kernel arms
-(K21: `SYS_STAT` 34 / `SYS_RENAME` 35 / `SYS_LISTDIR` 32, Linux
-newfstatat 262 / rename 82 / renameat 264 / getdents64 259 mapped).
-K22 closed the in-VM half: `/bin/pkg` is the registry's third
-citizen under the SERVICE contract (a 128-page cage, an 8 MiB
-no_alloc stack — the linked install path holds 7.26 MiB of fixed
-buffers), embedded in the kernel's second 2 MiB leaf, execve'd by a
-ring-3 caller with real argv, and installing `r1/hello` from the
-`pkg-mkrepo`-signed local repo through the manager's own 9-syscall
-mask (verified byte-exact by the boot lane; `--verify` asserts it).
-`SYS_RENAME` moved 35 → 36 (the entry's internal-mode hybrid maps
-Linux nr 35 to nanosleep, so 35 was unreachable from ring 3). The
-uid separation for `/pkg` is DONE (K23): the manager runs under a
+ADR-0025/0030). The package manager is now complete host-side and
+proven in-VM through its full lifecycle: the `pkg/` crate (no_std,
+no_alloc, zero deps — Ed25519-verified atomic transactions, full
+threat model + 48 host tests) with its kernel arms (K21: `SYS_STAT`
+34 / `SYS_LISTDIR` 32 / `SYS_RENAME` — since K22 nr 36, because the
+entry's internal-mode hybrid maps Linux nr 35 to nanosleep, so 35
+was unreachable from ring 3; Linux newfstatat 262 / getdents64 259 /
+rename 82 / renameat 264 mapped). K22 closed the in-VM half:
+`/bin/pkg` is the registry's third citizen under the SERVICE
+contract (a 128-page cage, an 8 MiB no_alloc stack — the linked
+install path holds 7.26 MiB of fixed buffers), embedded in the
+kernel's second 2 MiB leaf, execve'd by a ring-3 caller with real
+argv, and installing `r1/hello` from the `pkg-mkrepo`-signed local
+repo through the manager's own 10-syscall mask (verified byte-exact
+by the boot lane; `--verify` asserts it).
+The uid separation for `/pkg` is DONE (K23): the manager runs under a
 DECLARED identity (uid 1070 / gid 150, `profile::PKG_UID`/
 `PKG_GID`) instead of the derived gid-100 every domain shares, and
 two one-shot boot probes carve the tree — a gid-150 probe mints
@@ -222,12 +223,19 @@ is deliberately left open and documented: `/pkg/trust`'s parent is
 the PM-group-writable `/pkg`, and POSIX gates unlink/rename on the
 parent's bits alone, so the manager can still delete or
 rename-replace that one anchor — the next round is a sticky bit on
-`/pkg` or a root-owned anchor directory. What remains: the repo
-image on the ext2 disk (the fixture is
-kernel-embedded today), remove/upgrade lanes, and the net broker
-fetch. Still nothing on: musl/libc (planned, riding the ADR-0003 ABI),
-dynamic linker, coreutils. `ABI-VERSION.md` remains the versioned
-contract for the 2-s syscall surface.
+`/pkg` or a root-owned anchor directory. K23 also closed the rest
+of the loop: the boot lane drives install → upgrade → remove as
+three CPL=3 rounds (the upgrade moves the payload byte-exact from
+1.0.0 to 1.1.0; the remove answers ENOENT and cleans the db), the
+repo fixture rides the ext2 disk now (`/pkgsrc` read into the
+`pkgsrc` store at CPL=0 — the kernel image stopped embedding
+package data), and the exit markers print real values (the live
+mask bits + arm set and the stack high-water, riding the
+completed-mailbox drain's ExitFacts). What remains: the net broker
+fetch. Still nothing on: musl/libc (planned, riding the ADR-0003
+ABI), dynamic linker, coreutils. `ABI-VERSION.md` remains the
+versioned contract for the syscall surface, the manager's
+internal-ABI view included.
 
 ### 2.6 Multi-architecture — the structural gap
 

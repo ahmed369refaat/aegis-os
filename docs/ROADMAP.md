@@ -94,6 +94,58 @@ all of it), the G/H fmt debt (1407 lines), and the q35/IR lane
 timeouts (240s→600s: the M2 syscall audit alone emits ~390k lines
 before the driver stack starts).
 
+**Round K21 ("the manager's kernel arms"):** `stat(2)` and `rename(2)`
+join the ring-3 file family, completing the kernel side of the
+package manager (whose host-side half — the `pkg/` crate: `no_std`,
+no allocator, zero external crates, Ed25519-verified atomic
+transactions, 48 host tests — landed as the round's first commit).
+`SYS_STAT` (34; Linux newfstatat 262, with the old stat(4)/fstat(5)
+deliberately unmapped — the subset speaks the modern arm) fills the
+24-byte record (kind u8 @0, size u64 LE @8, perm u16 LE @16; a
+shorter caller buffer is `-EINVAL` before anything runs), gated by an
+FsNode READ capability — stat reveals exactly what an open-for-read
+would. `SYS_RENAME` (Linux rename 82/renameat 264; the internal id
+moved 35 → 36 in K22, see below) is the atomic re-parent: POSIX
+file-destination replacement, inode identity preserved across the
+move (open fds survive — the contract the manager's journaled
+commits rely on), EISDIR for directory destinations and subtree
+cycles, and WRITE caps on BOTH parents (rename grants nothing either
+unlink or create alone would). Together with the getdents-family
+listing (`SYS_LISTDIR` 32, Linux getdents64 259) and the execve argv
+marshalling that landed with Phase 6 S3, the manager's full Fs
+surface is live in the kernel — core-tested
+(`stat_fills_the_24_byte_contract_and_gates`,
+`rename_reparents_replaces_and_refuses`) and lane-proven by the full
+`--verify` boot.
+
+**Round K22 ("the package manager in the VM"):** the manager runs at
+CPL=3. `/bin/pkg` is the exec registry's third citizen (after
+`/bin/exec-target` and `/bin/sh`) under the SERVICE contract — a
+128-page cage and a 2048-page / 8 MiB no_alloc stack (the real chain
+measures 7,589,376 bytes; the PM quota is 2112 pages, carried by
+`pkg_caller_profile` because the exec's quota pre-check runs against
+the CALLER's allowance) — and its 119,424-byte stripped image rides
+in the kernel's SECOND 2 MiB huge page (PA 2..6 MiB: the stub maps
+`PD_hh[0]` and `PD_hh[1]`, both linker ASSERTs moved, `image_map`
+fills two F15 tables, both leaves global). `pkg-mkrepo` builds the
+signed local repo fixture (TEST-ONLY seeds); a root supervisor
+provisions it at boot with root-owned anchors (`/r1` 0644, `/pkg`
+0770 root:100 — the manager reads its trust anchors, never rewrites
+them); the `ring3-pkg-caller` blob execve's `/bin/pkg install
+r1/hello` (the internal execve nr 19); the image resolves against the
+Ed25519-verified index, stages, and commits the transaction through
+its own 9-syscall mask (no fork/exec/mmap/net/ipc), then exit(0)s —
+and the kernel verifies the installed tree byte-exact
+(`/usr/bin/pkg-hello` + the record + the state; `--verify` asserts
+the `[PKG]` markers). Host gates 10/10 (870 tests, including the
+`pkg_lane_provision` and `pkg_lane_cli` host proofs). Found live and
+fixed in-round: the entry's internal-mode hybrid hijacked internal nr
+35 (Linux nanosleep's number), so rename's first commit answered a
+masked nanosleep — renumbered to 36; the adapter's mkdir passed mode
+0; and a live-but-never-launched probe tripped the preemptor's
+unparked-domain guard (provisioning and verification now use
+short-lived probes).
+
 **The storage-modernization path (recorded here per the
 scope-explosion rule; nothing below is claimed until its lane
 proves it):** the block stack's stated direction is parity with the
@@ -353,9 +405,20 @@ child's completion wakes the parent through the waiter registry, and
 the re-executed arm consumes the completed entry (frames via
 `free_frames_of`, then `exit_process` records the zombie) and
 answers the pid + the Linux wstatus word; the blob proves
-WNOHANG/block/reap (7 << 8)/ECHILD on all three lanes. Still ahead:
-the execve arm (the ELF loader), the errno model's full sweep, and
-the musl / busybox acceptance runs below.
+WNOHANG/block/reap (7 << 8)/ECHILD on all three lanes. **Slice 4
+landed `execve(2)`** — the ELF loader and the SYS_EXEC arm as one
+atomic change (the registry's compiled-in ELF64 images; a miss is
+`-ENOENT`), with argv/envp validated canonical AND materialized on
+the SysV initial stack (Phase 6 S3 — the execve argv marshalling the
+package manager's lane speaks). **K21 added the manager's file arms**
+(`stat(2)` at the 24-byte record, `rename(2)` the atomic re-parent —
+see the baseline's K21 paragraph), and **K22 put the ABI to real
+work: `/bin/pkg`, the exec registry's third citizen under the SERVICE
+contract (a 128-page cage, an 8 MiB no_alloc stack, the kernel's
+second 2 MiB huge page), installs a signed package at CPL=3 through
+a 9-syscall file-family mask, the commit verified byte-exact by the
+kernel** (see the baseline's K22 paragraph). Still ahead: the errno
+model's full sweep and the musl / busybox acceptance runs below.
 
 **Tasks (per ADR-0003):** a Linux-ABI dispatch table in front of the
 policy gate (internal ids stay; entry numbers are Linux's): fork (COW via

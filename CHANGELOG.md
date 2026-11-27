@@ -307,6 +307,58 @@
   `[PKG]` markers (the QEMU runtime's bundled debs were re-extracted
   after the sandbox recycle lost the system libs).
 
+## [Unreleased] — the K21 round: the package manager as a first-class crate, and stat/rename joining the ring-3 file family
+
+- **The AegisOS package manager (`pkg/`) — the host-side half, complete** —
+  `no_std`, **no allocator, zero external crates** (the supply chain
+  it defends is not extended by its own build): inline SHA-256/512
+  (FIPS vectors) and a complete Ed25519 (RFC 8032 §7.1 vector 1
+  pinned, plus randomized consistency suites — the inline curve math
+  found and fixed four real bugs on the way), CRC-32, constant-time
+  comparison. File-only packages by design (no script field; hook
+  paths refused); strict canonical manifests (parse(serialize(x)) is
+  unique, non-canonical encodings refused); the Ed25519 signature
+  covers the canonical manifest BEFORE any staging; per-file re-hash
+  through a fresh open (TOCTOU); staged extraction with a streaming
+  windowed LZ4 ring decoder and declared-size + ratio-cap bomb
+  guards; a WAL-journaled, rename-committed, crash-recoverable
+  transaction layer (O_EXCL lockout, disk-full rollback, mid-rename
+  crash reversal — test-proven); a backtracking solver with cycle
+  diagnostics and adversarial-graph budgets; the
+  root→repo→index→package trust chain with admin-pinned TOFU
+  fallback and per-repo monotonic epoch replay defense; all eleven
+  CLI commands print the plan before any filesystem action. 48 host
+  tests over the threat model (`pkg/THREAT_MODEL.md`;
+  `pkg/BUILD.md` documents the domain's least-privilege mask).
+- **`stat(2)` and `rename(2)` join the ring-3 file family — the
+  manager's kernel arms** — `SYS_STAT` (34, Linux newfstatat 262;
+  old stat(4)/fstat(5) deliberately unmapped — the subset speaks the
+  modern arm) fills the 24-byte record (kind u8 @0, size u64 LE @8,
+  perm u16 LE @16; a shorter caller buffer is `-EINVAL` before
+  anything runs), gated by an FsNode READ capability (stat reveals
+  exactly what an open-for-read would). `SYS_RENAME` (Linux rename
+  82/renameat 264; the internal id moved 35 → 36 in K22 — see the
+  round above) is the atomic re-parent: POSIX file-destination
+  replacement, inode identity preserved across the move (open fds
+  survive — the contract the manager's journaled commits rely on),
+  EISDIR for directory destinations and subtree cycles, and WRITE
+  caps on BOTH parents (rename grants nothing either alone would
+  not). Together with `SYS_LISTDIR` (getdents64 259, already live)
+  and the Phase 6 S3 execve argv marshalling, the manager's full Fs
+  surface is live in the kernel: core tests
+  (`stat_fills_the_24_byte_contract_and_gates`,
+  `rename_reparents_replaces_and_refuses` — shape, gates, refusals)
+  and the full `--verify` QEMU boot re-proven green.
+- The pkg adapter's syscall constants were renumbered from blind
+  reservations to the real arms (SYS_STAT 64→34, SYS_RENAME 65→35
+  at the time, SYS_GETDENTS 66→`SYS_LISTDIR` 32), and the crate's
+  test-side clippy findings were driven to zero across
+  `--all-targets` (`pkg/BUILD.md` rewritten to the landed truth).
+- Honest boundary as of this round: the in-VM PM domain was scoped
+  as the NEXT milestone — the exec cage was then 16 KiB while the
+  manager's fixed no-alloc buffers need a larger cage contract
+  (K22's SERVICE layout, see the round above, is the answer).
+
 ## [Unreleased] — the K19 round: MSI-X delivery proven, virtio-blk migrated to a ring-3 driver domain, and two audit finds fixed
 
 - **MSI/MSI-X messages DELIVER (ADR-0019 round two)** — both formats,

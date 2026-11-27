@@ -28,7 +28,7 @@ live domain (ADR-0003's refuse rule).
 | Linux nr | internal op | notes |
 |----|------|-------|
 | 0 read / 1 write / 3 close | 0 / 1 / 3 | identical shapes |
-| 2 open | 2 | **the O_* word translates at the arm** (slice 2): access mode (bits 0..1: RDONLY=0, WRONLY=1, RDWR=2; 3 is invalid) → the internal O_READ/O_WRITE bits, O_CREAT (0x40) and O_TRUNC (0x200) ride along; every other bit — O_EXCL (0x80), O_APPEND (0x400), O_NONBLOCK (0x800), O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, ... — **refuses -EINVAL**, never silently dropped (a bit whose semantics the internal VFS cannot honor is not a courtesy to approximate; O_EXCL's "only create if absent" would let a caller open an existing file). O_TRUNC without write then dies in the internal decoder with the same -EINVAL a native caller gets. mode is masked to 0o777 as v0.4 |
+| 2 open | 2 | **the O_* word translates at the arm** (slice 2): access mode (bits 0..1: RDONLY=0, WRONLY=1, RDWR=2; 3 is invalid) → the internal O_READ/O_WRITE bits, O_CREAT (0x40) and O_TRUNC (0x200) ride along; **O_EXCL (0x80) joined the honored set in K22** — it translates to the internal O_EXCL bit and the core's executor owns the create-only-if-absent rule (an existing path answers `-EEXIST`; O_EXCL without O_CREAT still refuses, exactly as the internal decoder does); every other bit — O_APPEND (0x400), O_NONBLOCK (0x800), O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, ... — **refuses -EINVAL**, never silently dropped (a bit whose semantics the internal VFS cannot honor is not a courtesy to approximate). O_TRUNC without write then dies in the internal decoder with the same -EINVAL a native caller gets. mode is masked to 0o777 as v0.4 |
 | 9 mmap | 4 | flags (arg4) must be exactly `MAP_PRIVATE\|MAP_ANONYMOUS` (0x22); MAP_SHARED / file-backed / MAP_FIXED refuse `-EINVAL` |
 | 11 munmap | 5 | whole-region, as v0.4 |
 | 13 rt_sigaction | 25 | |
@@ -39,6 +39,7 @@ live domain (ADR-0003's refuse rule).
 | 35 nanosleep | 20 | |
 | 57 fork | 18 | child speaks the parent's ABI (inherited) |
 | 82 rename / 264 renameat | 36 | K21 landed the arms; K22 moved the internal id 35 → 36: the entry's internal-mode hybrid maps Linux nr 35 (nanosleep) onto SYS_NANOSLEEP for the ADR-0023 sleeper blobs, so internal 35 was unreachable from ring 3 — an internal-ABI rename always answered a masked nanosleep |
+| 262 newfstatat | 34 | K21: stat(2) joins the whitelist — the **24-byte record** (kind u8 @0, size u64 LE @8, perm u16 LE @16; a caller buffer shorter than 24 is `-EINVAL` before anything runs), gated by an FsNode READ capability (stat reveals exactly what an open-for-read would). Old stat(4)/fstat(5) stay deliberately unmapped — the subset speaks the modern arm. The internal ABI passes 34 raw |
 | 59 execve | 19 | **the image replacement (slice 4)**: the path resolves against the kernel's exec registry (the compiled-in ELF64 images — no filesystem until Phase 6; a miss is `-ENOENT` exactly as Linux answers a path no filesystem resolves). The image parses through `aegis_os::elf::build_exec_plan` — every header this loader cannot honor refuses `-ENOEXEC` (PIE/`ET_DYN`, `PT_INTERP`/`PT_DYNAMIC`, unknown header types AND unknown flag bits, W+X, non-congruent vaddr/offset, two segments sharing a page, entry outside the PT_LOADs). argv/envp are validated canonical AND MATERIALIZED (Phase 6 S3): the kernel reads the caller's strings (bounded — 8 entries per table, MAX_PATH bytes each — past either is `-E2BIG` exactly like Linux) and builds the SysV x86-64 initial stack before the synthetic park: `[rsp] = argc`, the argv pointers, NULL, the envp pointers, NULL, a minimal AT_NULL auxv, then the strings — the entry RSP 16-byte aligned, every GP register still ZERO (the stack is the one thing a fresh image may read). The layout is [vector][strings][pad-to-16] — argc at the image's base; the first draft put the vector at the top and the exec-target's argc probe caught it live (argc read the pad). The materialization runs BETWEEN the new tables' activation and the old image's teardown — a refusal after the teardown would answer into a destroyed image (found live: a post-teardown `-EFAULT` made the child's next instruction fetch fault through the new tables at its own exit path). The fresh image starts at `e_entry` with a fresh stack and EVERY GP REGISTER ZERO (register contents at process start are unspecified by Unix; we specify zero — a fresh image cannot read the old image's registers). fds, pid, parent, credentials, cwd, chroot and the Linux-ABI mode survive exec (ADR-0022 D4); the mask INTERSECTS with the path's declared profile (unlisted = the app default, D5 — exec only ever narrows, never widens; a FAILED execve that got past `exec_replace` leaves the mask narrowed, documented divergence). The frame order is load-bearing: the arm runs on the OLD tables' CR3 (the SYSCALL entry never switches), so the new tables ACTIVATE before the old image's frames free — freeing first scrubs the very PML4 the next instruction fetch walks (a silent triple fault, found live in the first green boot) |
 | 60 exit / 231 exit_group | 63 | the alias |
 | 83 mkdir | 16 | Phase 6 S1: the ring-3 arm arrives with the boot root |
@@ -50,7 +51,10 @@ live domain (ADR-0003's refuse rule).
 
 `getdents64` (259) → `SYS_LISTDIR`: the shell's `ls` — names
 NUL-separated into the caller's buffer, the byte count returned (the
-documented v1 subset: names + count, not dirent64 structs).
+documented v1 subset: names + count, not dirent64 structs). K22 made
+the fd a listing **cursor**: each call fills what fits and advances
+the position, the next call resumes there, and a 0-byte answer is the
+end — the package manager loops getdents until exactly that 0.
 
 **Deliberately NOT mapped:** `dup` (32), `pipe2` (293): no ABI arm
 yet. Each answers `-ENOSYS` today. (`open` — nr 2 — lived on this edge
@@ -98,7 +102,40 @@ found live in slice 3 and moved to its true home). Red (slice 3): nr
 61 answered -ENOSYS and the run exited 222, read cleanly through the
 relocated try_take.
 
-## v0.4 — the ring-3 entry surface (complete, unchanged)
+## The package manager's surface (K21/K22) — `/bin/pkg` speaks the internal ABI
+
+`/bin/pkg` — the exec registry's third citizen (after `/bin/exec-target`
+and `/bin/sh`), linked under the SERVICE contract (a 128-page cage, a
+2048-page / 8 MiB no_alloc stack; the 119,424-byte stripped image rides
+in the kernel's second 2 MiB huge page) — speaks `Abi::Internal`: the
+v0.4-space numbers below are what its `target_abi` (pkg/src/main.rs)
+issues. Its mask is `package_manager_profile` — the nine file-family
+arms plus exit, nothing else (no fork/exec/mmap/net/ipc; the exec
+narrowing rule made it so, and the boot lane asserts the live mask).
+The `ring3-pkg-caller` trigger carries `pkg_caller_profile` and
+speaks exactly one arm beyond that set: the **internal execve, nr
+19** — the same SYS_EXEC arm the Linux entry maps 59 onto (the
+internal-mode hybrid passes 19 raw; the K22 lane's blob execve's
+`/bin/pkg` with ["/bin/pkg", "install", "r1/hello"] through it).
+
+| nr (internal) | call | registers | RAX on success |
+|----|------|-----------|----------------|
+| 0 / 1 / 2 / 3 | read / write / open / close | as v0.4's file family | as v0.4 |
+| 16 | mkdir(path, mode) | RDI=path, RSI=mode (0o777 honored) | 0 |
+| 17 | unlink(path) | RDI=path | 0 (unlink(2)+rmdir(2) folded — a non-empty directory refuses `-ENOTEMPTY`) |
+| 32 | listdir(fd, buf, len) | RDI=fd (a listing cursor), RSI=buf VA, RDX=len (≤ MAX_READ) | byte count; NUL-separated names, 0 = end |
+| 34 | stat(path, out) | RDI=path, RSI=out VA (24 bytes) | 24 — the record filled: kind u8 @0 (0 file, 1 dir, 3 other), size u64 LE @8, perm u16 LE @16 |
+| 36 | rename(from, to) | RDI=from, RSI=to | 0 (the atomic re-parent) |
+| 63 | exit(code) | RDI=code | never returns |
+
+**The internal open-flag word** (`sysabi.rs`; the manager's adapter
+builds it from its own `OpenFlags`): `O_READ=0x1, O_WRITE=0x2,
+O_CREAT=0x4, O_TRUNC=0x8, O_EXCL=0x10`. K22 added `O_EXCL` — with
+`O_CREAT`, create-only-if-absent (an existing path answers
+`-EEXIST`); without `O_CREAT`, and every other unknown bit, and
+O_TRUNC without O_WRITE: `-EINVAL`. Per the Rules below this growth
+is additive (a bit that used to refuse now has full semantics) and
+is called out here and in the CHANGELOG's K22 entry.
 
 ## v0.4 — the ring-3 entry surface (complete)
 
@@ -120,8 +157,10 @@ errno` table is `sysabi::errno_of`, host-tested variant by variant).
 | 13 | dup2(fd, new_fd) | RDI=fd, RSI=new_fd | new_fd |
 | 63 | exit(code) | RDI=code | never returns |
 
-open flags: `O_READ=0x1, O_WRITE=0x2, O_CREAT=0x4, O_TRUNC=0x8` —
-unknown bits, and O_TRUNC without O_WRITE, refuse with `-EINVAL`
+open flags: `O_READ=0x1, O_WRITE=0x2, O_CREAT=0x4, O_TRUNC=0x8,
+O_EXCL=0x10` (O_EXCL joined the word in K22 — see the package
+manager's section above) — every other unknown bit, and O_TRUNC
+without O_WRITE, refuse with `-EINVAL`
 (`sysabi::open_flags`, host-tested). mode is masked to 0o777.
 
 ### The time family (ADR-0023; Linux numbers translate at the entry)
@@ -228,6 +267,13 @@ once.
 
 ## History
 
+- **K21/K22 (additive, no bump):** newfstatat 262 joins the v1
+  whitelist (SYS_STAT 34, the 24-byte record); the internal open-flag
+  word grew `O_EXCL=0x10`; the manager's surface is documented in its
+  own section above. One renumbering, called out per the Rules:
+  `SYS_RENAME` internal 35 → 36 — 35 never answered rename at the
+  ring-3 entry (the internal-mode hybrid maps 35 to nanosleep), so no
+  working ABI ever exposed it; the fix made the arm reachable.
 - **v1 (ADR-0003, round S):** the Linux-compatible entry — the
   per-domain ABI flag, the whitelist table, pipe's rax/rdx split,
   exit_group's alias, mmap's flags rule, unmapped→-ENOSYS. The
