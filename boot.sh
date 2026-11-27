@@ -98,10 +98,16 @@ strip --strip-all target/x86_64-unknown-none/pkg-image/pkg -o kernel-x86_64/blob
 
 # K22: the signed local repo fixture — the host-side repo builder
 # (pkg-mkrepo, signer feature; TEST-ONLY fixed seeds — see
-# pkg/src/bin/pkg-mkrepo.rs). Four files, each ≤ 8 KiB (the ramfs
+# pkg/src/bin/pkg-mkrepo.rs). Five files, each ≤ 8 KiB (the ramfs
 # spill-window bound — the tool fails the build if one crosses it):
-# the trust anchors, the repo config, the signed index, the signed
-# package. The kernel's K22 boot lane embeds and provisions them.
+# the trust anchors, the repo config, the signed index, and BOTH
+# version-qualified packages (the repo layout is version-qualified
+# now — the upgrade round has something to move TO). K23: the
+# fixture feeds ONLY THE DISK — scripts/mkext2.py
+# writes these bytes into the ext2 image's /pkgsrc and the boot's
+# ext2 walk reads them back (the kernel image no longer embeds
+# package data); scripts/check-pkgsrc-image.py proves them
+# byte-exact on the image at every build.
 echo "==> [0e/4] building the signed local repo fixture (pkg-mkrepo)"
 cargo build -p aegis-pkg --bin pkg-mkrepo --features signer
 target/debug/pkg-mkrepo kernel-x86_64/blob/pkg-fixture
@@ -137,7 +143,18 @@ fi
 # DMAR present); `q35-neg` is the same machine WITHOUT intel-iommu —
 # the fail-closed negative proof (`[IOMMU] dmar: absent`).
 MODE=run
-MACHINE_ARGS=(-machine pc -cpu max -m 128M)
+# K23: the repo fixture rides the ext2 disk (target/sdisk0.img —
+# built for every boot mode below), so the BASE pc machine carries
+# an AHCI controller with the disk on port 0: the driver stack's PCI
+# scan finds a plain -device ahci on bus 0 (the NoDmar arm drives
+# it in identity mode), and the K22 lane's [PKG] greps stay green
+# without the kernel image carrying package data. The q35-family
+# lanes attach the same image to their BUILT-IN SATA port instead
+# (bus=ide.0 — see each lane's MACHINE_ARGS).
+MACHINE_ARGS=(-machine pc -cpu max -m 128M
+              -drive id=sd0,if=none,format=raw,file=target/sdisk0.img
+              -device ahci,id=ahci0
+              -device ide-hd,drive=sd0,bus=ahci0.0)
 EXTRA_GREPS=()
 # Every QEMU run's stdin is EXPLICIT: /dev/null unless a lane feeds a
 # session. Hermetic lanes (and CI without a terminal) never hang on a
@@ -282,6 +299,10 @@ case "${1:-}" in
     MODE=verify
     MACHINE_ARGS=(-machine q35 -cpu max -m 128M
                   -device intel-iommu,intremap=off
+                  # K23: the repo fixture's disk (the K22 [PKG] greps
+                  # run on this lane too — the common verify block).
+                  -drive id=sd0,if=none,format=raw,file=target/sdisk0.img
+                  -device ide-hd,drive=sd0,bus=ide.0
                   -qmp unix:/tmp/qmp.sock,server,nowait)
     EXTRA_GREPS=(
       "[IRQ ] ioapic live @"  # the interrupt view probed from the MADT
@@ -332,7 +353,12 @@ case "${1:-}" in
                   -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on
                   -netdev user,id=n1
                   -device e1000,netdev=n1
-                  -drive id=vd0,if=none,format=raw,file=target/vdisk0.img)
+                  -drive id=vd0,if=none,format=raw,file=target/vdisk0.img
+                  # K23: the repo fixture's disk — the K22 [PKG] greps
+                  # are in the COMMON verify block, so this lane needs
+                  # the /pkgsrc bytes as much as the base one does.
+                  -drive id=sd0,if=none,format=raw,file=target/sdisk0.img
+                  -device ide-hd,drive=sd0,bus=ide.0)
     EXTRA_GREPS=(
       "[IOMMU] dmar: pa="
       "[IOMMU] dmar: "  # the struct markers (drhd line)
@@ -364,7 +390,11 @@ case "${1:-}" in
     # shell's idle exit keeps them green.
     MODE=verify
     MACHINE_ARGS=(-machine q35 -cpu max -m 128M
-                  -device intel-iommu,intremap=off)
+                  -device intel-iommu,intremap=off
+                  # K23: the repo fixture's disk (the K22 [PKG] greps
+                  # run on this lane too — the common verify block).
+                  -drive id=sd0,if=none,format=raw,file=target/sdisk0.img
+                  -device ide-hd,drive=sd0,bus=ide.0)
     STDIN_FILE=scripts/shell-session.txt
     EXTRA_GREPS=(
       "[TTY] armed: isa irq 4"  # the IRQ-driven TTY (the interrupt -> ring chain, live)
@@ -391,6 +421,10 @@ case "${1:-}" in
     MODE=verify
     MACHINE_ARGS=(-machine q35 -cpu max -m 128M
                   -device intel-iommu,intremap=off
+                  # K23: the repo fixture's disk (the K22 [PKG] greps
+                  # run on this lane too — the common verify block).
+                  -drive id=sd0,if=none,format=raw,file=target/sdisk0.img
+                  -device ide-hd,drive=sd0,bus=ide.0
                   -drive id=vd0,if=none,format=raw,file=target/vdisk0.img
                   -device virtio-blk-pci,disable-legacy=on,iommu_platform=on,drive=vd0
                   -device pcie-root-port,id=rp1,bus=pcie.0
@@ -442,8 +476,20 @@ if [ "$MODE" = "verify" ] && [ "${1:-}" = "--verify-persist" ]; then
   rm -f target/persist.img
   python3 "$(dirname "$0")/scripts/mkext2-rw.py"
 fi
-if [ "$MODE" = "verify" ] && { [ "${1:-}" = "--verify-q35" ] || [ "${1:-}" = "--verify-q35-noiommu" ]; }; then
+# K23: the repo fixture rides the ext2 disk — sdisk0 is built for
+# EVERY boot mode (run included: a plain `./boot.sh` needs the
+# /pkgsrc bytes or the K22 lane halts on provisioning), then proven
+# on the host: check-pkgsrc-image.py re-parses the image with the
+# same ext2 logic the kernel runs and asserts the five fixture
+# files byte-exact (both version-qualified packages included). mkfat32.py still grows the SAME image for the
+# q35/noiommu lanes only (GPT partition 2, the ESP) — it runs AFTER
+# the check, appending past the ext2 partition (LBA 296 > 289) so
+# the /pkgsrc bytes survive untouched.
+if [ "$MODE" = "verify" ] || [ "$MODE" = "run" ]; then
   python3 "$(dirname "$0")/scripts/mkext2.py"
+  python3 "$(dirname "$0")/scripts/check-pkgsrc-image.py"
+fi
+if [ "$MODE" = "verify" ] && { [ "${1:-}" = "--verify-q35" ] || [ "${1:-}" = "--verify-q35-noiommu" ]; }; then
   # The ESP slice: mkfat32.py grows the SAME disk with GPT partition 2
   # (an honest FAT32 volume — see its header for the geometry).
   python3 "$(dirname "$0")/scripts/mkfat32.py"
@@ -680,6 +726,11 @@ if [ "$MODE" = "verify" ]; then
   # exec by design, ADR-0022 D4), parsed by the loader, mapped at its
   # declared vaddrs, entered at e_entry, bss zero-filled.
   grep -qF "[M3] exec-target: bss-clean entry live" "$LOG" || { echo "VERIFY FAIL: M3 exec slice marker missing (execve/ELF path)"; ok=0; }
+  # K23: the repo fixture rides the ext2 disk — the driver stack's
+  # /pkgsrc walk must have printed its source lines on EVERY lane
+  # (the disks are attached above; the K22 [PKG] greps below depend
+  # on this store being full).
+  grep -qF "[PKGSRC] repo source: " "$LOG" || { echo "VERIFY FAIL: K23 pkgsrc marker missing (the repo fixture must ride the disk)"; ok=0; }
   # K22: the package manager domain — /bin/pkg at CPL=3, installing
   # from the signed local repo (the registry's SERVICE-contract image).
   grep -qF "[PKG] /bin/pkg: execve'd at CPL=3 under the SERVICE contract" "$LOG" || { echo "VERIFY FAIL: K22 pkg exec marker missing"; ok=0; }

@@ -1672,17 +1672,15 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         /// lane ends.
         const PKG_VERIFY: u32 = 72;
         static CALLER_BLOB: &[u8] = include_bytes!("../blob/ring3-pkg-caller.bin");
-        /// pkg-mkrepo's outputs (boot.sh step [0e]; TEST-ONLY seeds —
-        /// see pkg/src/bin/pkg-mkrepo.rs).
-        static FIXTURE_TRUST: &[u8] = include_bytes!("../blob/pkg-fixture/trust");
-        static FIXTURE_REPO: &[u8] = include_bytes!("../blob/pkg-fixture/r1.repo");
-        static FIXTURE_INDEX: &[u8] = include_bytes!("../blob/pkg-fixture/index.aki");
-        /// K23: the repo layout is version-qualified, so the fixture
-        /// carries BOTH versions — the install round reads 1.0.0, the
-        /// upgrade round's solver picks 1.1.0 and its transaction
-        /// reads the 1.1.0 file.
-        static FIXTURE_PKG_V10: &[u8] = include_bytes!("../blob/pkg-fixture/r1.hello-1.0.0.akp");
-        static FIXTURE_PKG_V11: &[u8] = include_bytes!("../blob/pkg-fixture/r1.hello-1.1.0.akp");
+        // K23: the repo fixture rides the ext2 disk now — the kernel
+        // image stopped carrying package data. The driver stack's
+        // ext2 walk reads /pkgsrc into the crate::pkgsrc store (the
+        // [PKGSRC] markers) BEFORE this lane runs; the TEST-ONLY seeds
+        // themselves — see pkg/src/bin/pkg-mkrepo.rs, which built the
+        // files boot.sh step [0e] put on the disk. The store carries
+        // FIVE files (both package versions — the repo is
+        // version-qualified, so the upgrade round's transaction reads
+        // the 1.1.0 one).
         /// What each version installs, byte-exact — different bytes
         /// AND a different size, so the upgrade proves the payload
         /// moved (the old no-op `pkg upgrade` kept 12 B and still
@@ -1789,9 +1787,14 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             Some(total)
         }
 
-        // (b) provisioning: the four dirs + the five fixture files
-        // (K23: BOTH package versions — the repo is version-qualified
-        // now, so the upgrade round has something to move TO).
+        // (b) provisioning: the four dirs + the five fixture files,
+        // the bytes now read off the ext2 disk (crate::pkgsrc — the
+        // store the driver stack filled at CPL=0 before this lane;
+        // `complete()` leads the chain, so an empty or partial store
+        // is a LOUD provisioning failure, never half-written repo
+        // files, and the individual `file(idx)` reads then cannot
+        // miss — `unwrap_or(&[])` only keeps the types honest if one
+        // ever does).
         // K23 killed the shared group: TWO one-shot supervisors carve
         // the tree. The group probe (uid 0, gid 150) mints the WRITE
         // path — /pkg and /usr 0770 root:150 — so the ONLY identity
@@ -1846,23 +1849,42 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 )
                 .is_ok()
             })
-        } && probe_put(&mut k, PKG_PROBE, "/r1/index.aki", 0o644, FIXTURE_INDEX)
+        } && crate::pkgsrc::complete()
+            && probe_put(
+                &mut k,
+                PKG_PROBE,
+                "/r1/index.aki",
+                0o644,
+                crate::pkgsrc::file(crate::pkgsrc::IDX_INDEX).unwrap_or(&[]),
+            )
             && probe_put(
                 &mut k,
                 PKG_PROBE,
                 "/r1/r1.hello-1.0.0.akp",
                 0o644,
-                FIXTURE_PKG_V10,
+                crate::pkgsrc::file(crate::pkgsrc::IDX_PKG_V10).unwrap_or(&[]),
             )
             && probe_put(
                 &mut k,
                 PKG_PROBE,
                 "/r1/r1.hello-1.1.0.akp",
                 0o644,
-                FIXTURE_PKG_V11,
+                crate::pkgsrc::file(crate::pkgsrc::IDX_PKG_V11).unwrap_or(&[]),
             )
-            && probe_put(&mut k, PKG_PROBE, "/pkg/trust", 0o644, FIXTURE_TRUST)
-            && probe_put(&mut k, PKG_PROBE, "/pkg/repos/r1.repo", 0o644, FIXTURE_REPO);
+            && probe_put(
+                &mut k,
+                PKG_PROBE,
+                "/pkg/trust",
+                0o644,
+                crate::pkgsrc::file(crate::pkgsrc::IDX_TRUST).unwrap_or(&[]),
+            )
+            && probe_put(
+                &mut k,
+                PKG_PROBE,
+                "/pkg/repos/r1.repo",
+                0o644,
+                crate::pkgsrc::file(crate::pkgsrc::IDX_REPO).unwrap_or(&[]),
+            );
 
         if !declared || !provisioned {
             line(

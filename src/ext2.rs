@@ -36,6 +36,9 @@ pub enum Ext2Error {
     /// A directory record could not be walked: rec_len < 8 + name_len,
     /// not 4-aligned, zero, or running past the directory's size.
     BadDirent { off: u64, rec_len: u16 },
+    /// A path step resolved to an inode that is not a directory
+    /// (carries the mode read — the walk names what it refused).
+    NotADirectory { mode: u16 },
     /// A slice shorter than the structure being parsed.
     Truncated { need: usize, have: usize },
 }
@@ -204,6 +207,36 @@ pub fn find_dirent(block: &[u8], dir_size: u32, name: &[u8]) -> Result<Option<u3
         off += u64::from(rec_len);
     }
     Ok(None)
+}
+
+/// One step of a path walk: resolve `name` in the directory `dir`.
+/// K23 extracted this from the transports — the kernel's ext2 reader
+/// walks root → `pkgsrc` → each fixture file, and the transport was
+/// hand-rolling the same three checks (`is_dir`, first block in
+/// range, `find_dirent`) at every step. The policy stays identical:
+/// `Ok(Some(ino))` when the name resolves, `Ok(None)` when the
+/// directory simply does not contain it, and a refusal when the
+/// STEP ITSELF is impossible — `dir` not a directory, or its first
+/// block past the device's block count (both carry their identity;
+/// a skipped step is never an answer here). `block_bytes` is the
+/// directory's FIRST block (the demo layout pins every directory to
+/// one 1 KiB block; the caller slices it out of whatever it read).
+pub fn dir_lookup(
+    dir: &Inode,
+    block_bytes: &[u8],
+    blocks_count: u32,
+    name: &[u8],
+) -> Result<Option<u32>, Ext2Error> {
+    if !dir.is_dir() {
+        return Err(Ext2Error::NotADirectory { mode: dir.mode });
+    }
+    if dir.block0 >= blocks_count {
+        return Err(Ext2Error::BlockOutOfRange {
+            block: dir.block0,
+            blocks: blocks_count,
+        });
+    }
+    find_dirent(block_bytes, dir.size, name)
 }
 
 // ═══ Phase 6 S4: the WRITE path — buffer-backed, host-tested ═══
@@ -575,8 +608,10 @@ pub fn free_inodes(img: &(impl ImageStore + ?Sized)) -> Result<u32, Ext2WriteErr
 mod tests {
     use super::*;
 
-    /// The mkext2.py layout, mirrored: 128 × 1 KiB blocks, 16 inodes,
-    /// root dir block 20, hello.txt inode 12 block 21.
+    /// The mkext2.py layout, mirrored: 128 × 1 KiB blocks, 24 inodes
+    /// (K23 raised the count for /pkgsrc), root dir block 20,
+    /// hello.txt inode 12 block 21, /pkgsrc dir inode 14 block 31,
+    /// its five fixture files inodes 15-19 blocks 32-36.
     fn build_image() -> Vec<u8> {
         let mut img = vec![0u8; 128 * 1024];
         let put = |img: &mut Vec<u8>, off: usize, bytes: &[u8]| {
@@ -584,7 +619,7 @@ mod tests {
         };
         // superblock at byte 1024
         let mut sb = vec![0u8; 1024];
-        sb[0..4].copy_from_slice(&16u32.to_le_bytes()); // inodes_count
+        sb[0..4].copy_from_slice(&24u32.to_le_bytes()); // inodes_count
         sb[4..8].copy_from_slice(&128u32.to_le_bytes()); // blocks_count
         sb[56..58].copy_from_slice(&MAGIC.to_le_bytes());
         sb[88..90].copy_from_slice(&128u16.to_le_bytes()); // inode_size
@@ -604,29 +639,86 @@ mod tests {
         };
         inode(&mut img, 2, 0x41ED, 1024, 20);
         inode(&mut img, 12, 0x81A4, 17, 21);
-        // root dir block 20: ".", "..", "hello.txt"
+        // K23: /pkgsrc — dir inode 14 at block 31, files 15-19 at
+        // blocks 32-36 (the real sizes; deterministic bodies, see
+        // `pkg_body`).
+        inode(&mut img, 14, 0x41ED, 1024, 31);
+        for i in 0..PKG_NAMES.len() {
+            inode(&mut img, 15 + i as u32, 0x81A4, PKG_SIZES[i], PKG_BLOCKS[i]);
+        }
+        // One dirent writer: real 4-aligned record sizes, the LAST
+        // record padded to the block end (the shape every mkext2
+        // directory block has).
+        let push = |d: &mut Vec<u8>, o: &mut usize, ino: u32, name: &[u8], last: bool| {
+            let real = (8 + name.len() + 3) & !3;
+            let rec = if last { 1024 - *o } else { real };
+            d[*o..*o + 4].copy_from_slice(&ino.to_le_bytes());
+            d[*o + 4..*o + 6].copy_from_slice(&(rec as u16).to_le_bytes());
+            d[*o + 6] = name.len() as u8;
+            d[*o + 8..*o + 8 + name.len()].copy_from_slice(name);
+            *o += rec;
+        };
+        // root dir block 20: ".", "..", "hello.txt", "hello" (both
+        // real records now), "pkgsrc" (terminal).
         let mut d = vec![0u8; 1024];
         let mut o = 0usize;
-        for name in [&b"."[..], &b".."[..]] {
-            let rec = (8 + name.len() + 3) & !3;
-            d[o..o + 4].copy_from_slice(&2u32.to_le_bytes());
-            d[o + 4..o + 6].copy_from_slice(&(rec as u16).to_le_bytes());
-            d[o + 6] = name.len() as u8;
-            d[o + 8..o + 8 + name.len()].copy_from_slice(name);
-            o += rec;
-        }
-        d[o..o + 4].copy_from_slice(&12u32.to_le_bytes());
-        d[o + 4..o + 6].copy_from_slice(&((1024 - o) as u16).to_le_bytes());
-        d[o + 6] = 9;
-        d[o + 8..o + 17].copy_from_slice(b"hello.txt");
+        push(&mut d, &mut o, 2, b".", false);
+        push(&mut d, &mut o, 2, b"..", false);
+        push(&mut d, &mut o, 12, b"hello.txt", false);
+        push(&mut d, &mut o, 13, b"hello", false);
+        push(&mut d, &mut o, 14, b"pkgsrc", true);
         put(&mut img, 20 * 1024, &d);
+        // /pkgsrc dir block 31: ".", "..", the five files.
+        let mut pd = vec![0u8; 1024];
+        let mut po = 0usize;
+        push(&mut pd, &mut po, 14, b".", false);
+        push(&mut pd, &mut po, 2, b"..", false);
+        for i in 0..PKG_NAMES.len() - 1 {
+            push(&mut pd, &mut po, 15 + i as u32, PKG_NAMES[i], false);
+        }
+        push(
+            &mut pd,
+            &mut po,
+            14 + PKG_NAMES.len() as u32,
+            PKG_NAMES[PKG_NAMES.len() - 1],
+            true,
+        );
+        put(&mut img, 31 * 1024, &pd);
         put(&mut img, 21 * 1024, b"HELLO-AEGIS-EXT2\n");
+        for i in 0..PKG_NAMES.len() {
+            let body = pkg_body(0x41 + i as u8 * 8, PKG_SIZES[i] as usize);
+            put(&mut img, PKG_BLOCKS[i] as usize * 1024, &body);
+        }
         img
     }
 
+    /// The mirror's /pkgsrc file set: names, sizes, and first blocks
+    /// (one per file — the real fixture's byte-exact proof is
+    /// scripts/check-pkgsrc-image.py against the built image; this
+    /// mirror proves the WALK with deterministic distinct bodies).
+    /// K23 integration: five files — the repo is version-qualified,
+    /// so BOTH packages ride the disk (sizes are the real v2
+    /// fixture's: index 273 B, v1.0.0 186 B, v1.1.0 191 B).
+    const PKG_NAMES: [&[u8]; 5] = [
+        b"trust",
+        b"r1.repo",
+        b"index.aki",
+        b"r1.hello-1.0.0.akp",
+        b"r1.hello-1.1.0.akp",
+    ];
+    const PKG_SIZES: [u32; 5] = [39, 47, 273, 186, 191];
+    const PKG_BLOCKS: [u32; 5] = [32, 33, 34, 35, 36];
+
+    /// A deterministic, per-file-distinct body for the pkgsrc mirror.
+    fn pkg_body(seed: u8, n: usize) -> Vec<u8> {
+        (0..n).map(|i| seed.wrapping_add((i % 97) as u8)).collect()
+    }
+
     /// The HONEST write-path fixture: the mkext2 layout with the real
-    /// occupancy the read-only demo never needed — block bitmap
-    /// {1..6, 20, 21}, inode bitmap {2, 12}, GDT free counts set.
+    /// occupancy the read-only demo never needed — block bitmap {0
+    /// (placeholder), 1..7, 20, 21, 22..36} (metadata, hello.txt,
+    /// the gcc ELF, /pkgsrc), inode bitmap {0 reserved, 2 root, 12
+    /// hello.txt, 13 hello, 14-19 pkgsrc}, GDT free counts set.
     fn build_rw_image() -> Vec<u8> {
         let mut img = build_image();
         let put = |img: &mut Vec<u8>, off: usize, bytes: &[u8]| {
@@ -634,23 +726,26 @@ mod tests {
         };
         // Bitmaps at blocks 3/4 (per the GDT). Mark honestly.
         let mut bb = vec![0u8; 1024];
-        for b in [1u32, 2, 3, 4, 5, 6, 20, 21] {
+        let mut used_blocks: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 20, 21];
+        used_blocks.extend(22..37); // the ELF's 9 blocks + pkgsrc's 6
+        for b in used_blocks {
             bb[(b / 8) as usize] |= 1 << (b % 8);
         }
         put(&mut img, 3 * 1024, &bb);
         let mut ib = vec![0u8; 1024];
-        for i in [0u32, 1, 11] {
-            // bit i = inode i+1: 1 reserved (bad-blocks inode), 2 root, 12 hello
+        for i in [0u32, 1, 11, 12, 13, 14, 15, 16, 17, 18] {
+            // bit i = inode i+1: 1 reserved (bad-blocks inode), 2
+            // root, 12 hello.txt, 13 hello, 14-19 pkgsrc.
             ib[(i / 8) as usize] |= 1 << (i % 8);
         }
         put(&mut img, 4 * 1024, &ib);
-        // GDT free counts: blocks 128-8 used = 120 free; inodes 16-2 = 14.
+        // GDT free counts: blocks 128-25 = 103 free; inodes 24-10 = 14.
         let mut gdt = vec![0u8; 32];
         gdt[0..4].copy_from_slice(&3u32.to_le_bytes());
         gdt[4..8].copy_from_slice(&4u32.to_le_bytes());
         gdt[8..12].copy_from_slice(&5u32.to_le_bytes());
-        gdt[12..14].copy_from_slice(&120u16.to_le_bytes());
-        gdt[14..16].copy_from_slice(&13u16.to_le_bytes());
+        gdt[12..14].copy_from_slice(&103u16.to_le_bytes());
+        gdt[14..16].copy_from_slice(&14u16.to_le_bytes());
         put(&mut img, 2048, &gdt);
         img
     }
@@ -679,12 +774,12 @@ mod tests {
         let ino = create_file(img.as_mut_slice(), b"persist.txt").unwrap();
         assert_ne!(ino, ROOT_INO);
         assert_ne!(ino, 12); // hello.txt stays live
-        assert_eq!(free_inodes(img.as_slice()).unwrap(), 12);
+        assert_eq!(free_inodes(img.as_slice()).unwrap(), 13);
         // A 3-block body crossing every boundary (256 bytes short of
         // 3 KiB, offset past 1 KiB to prove the head math).
         let body: Vec<u8> = (0..2560).map(|i| (i % 241) as u8).collect();
         write_file(img.as_mut_slice(), ino, 1000, &body).unwrap();
-        assert_eq!(free_blocks(img.as_slice()).unwrap(), 120 - 4); // blocks 22..25
+        assert_eq!(free_blocks(img.as_slice()).unwrap(), 103 - 4); // blocks 8..11
                                                                    // Read back through the READ-ONLY parser (the round-trip proof).
         let sb = Superblock::parse(&img[1024..]).unwrap();
         let root_off = sb.inode_byte(5, ROOT_INO).unwrap() as usize;
@@ -737,9 +832,9 @@ mod tests {
             write_file(img2.as_mut_slice(), ino2, 0, &vec![0u8; 12 * 1024 + 1]),
             Err(Ext2WriteError::TooLarge)
         );
-        // Filling the inode bitmap: NoFreeInodes.
+        // Filling the inode bitmap: NoFreeInodes (14 free of 24).
         let mut img3 = build_rw_image();
-        for i in 0..13 {
+        for i in 0..14 {
             create_file(img3.as_mut_slice(), format!("f{i}").as_bytes()).unwrap();
         }
         assert_eq!(
@@ -752,7 +847,7 @@ mod tests {
     fn the_real_image_parses_end_to_end() {
         let img = build_image();
         let sb = Superblock::parse(&img[1024..]).unwrap();
-        assert_eq!(sb.inodes_count, 16);
+        assert_eq!(sb.inodes_count, 24);
         assert_eq!(sb.blocks_count, 128);
         assert_eq!(sb.inode_size, 128);
         // root inode
@@ -774,6 +869,116 @@ mod tests {
         assert_eq!(
             &img[f.block0 as usize * 1024..][..17],
             b"HELLO-AEGIS-EXT2\n"
+        );
+        // K23: the same walk through `dir_lookup` — root → pkgsrc →
+        // a fixture file, the two-step path the kernel's reader
+        // drives on the real image.
+        let pkg_ino = dir_lookup(
+            &root,
+            &img[20 * 1024..21 * 1024],
+            sb.blocks_count,
+            b"pkgsrc",
+        )
+        .unwrap()
+        .expect("pkgsrc is in the root dir");
+        assert_eq!(pkg_ino, 14);
+        let p_off = sb.inode_byte(5, pkg_ino).unwrap() as usize;
+        let pkg = Inode::parse(&img, p_off, sb.inode_size).unwrap();
+        let trust = dir_lookup(
+            &pkg,
+            &img[pkg.block0 as usize * 1024..][..1024],
+            sb.blocks_count,
+            b"trust",
+        )
+        .unwrap()
+        .expect("trust is in pkgsrc");
+        assert_eq!(trust, 15);
+    }
+
+    /// K23: the full walk the kernel's ext2 reader drives — root →
+    /// `pkgsrc` → each fixture file — through `dir_lookup`, every
+    /// body read back through the direct blocks.
+    #[test]
+    fn dir_lookup_walks_root_to_the_pkgsrc_files() {
+        let img = build_image();
+        let sb = Superblock::parse(&img[1024..]).unwrap();
+        let root_off = sb.inode_byte(5, ROOT_INO).unwrap() as usize;
+        let root = Inode::parse(&img, root_off, sb.inode_size).unwrap();
+        let dir_ino = dir_lookup(
+            &root,
+            &img[20 * 1024..21 * 1024],
+            sb.blocks_count,
+            b"pkgsrc",
+        )
+        .unwrap()
+        .expect("pkgsrc is in the root dir");
+        assert_eq!(dir_ino, 14);
+        let d_off = sb.inode_byte(5, dir_ino).unwrap() as usize;
+        let dir = Inode::parse(&img, d_off, sb.inode_size).unwrap();
+        assert!(dir.is_dir());
+        let dir_blk = dir.block0 as usize * 1024;
+        for i in 0..PKG_NAMES.len() {
+            let ino = dir_lookup(
+                &dir,
+                &img[dir_blk..dir_blk + 1024],
+                sb.blocks_count,
+                PKG_NAMES[i],
+            )
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} must resolve in pkgsrc",
+                    String::from_utf8_lossy(PKG_NAMES[i])
+                )
+            });
+            assert_eq!(ino, 15 + i as u32);
+            let f_off = sb.inode_byte(5, ino).unwrap() as usize;
+            let f = Inode::parse(&img, f_off, sb.inode_size).unwrap();
+            assert_eq!(f.size, PKG_SIZES[i]);
+            let want = pkg_body(0x41 + i as u8 * 8, PKG_SIZES[i] as usize);
+            for (j, w) in want.iter().enumerate() {
+                assert_eq!(img[f.block0 as usize * 1024 + j], *w, "byte {j}");
+            }
+        }
+        // A name the directory does not contain: Ok(None), not an
+        // error — the same contract find_dirent keeps.
+        assert_eq!(
+            dir_lookup(
+                &dir,
+                &img[dir_blk..dir_blk + 1024],
+                sb.blocks_count,
+                b"nope"
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    /// The step's own refusals: walking INTO a regular file, and a
+    /// directory whose first block is past the device's end — both
+    /// named, never a silent Ok(None).
+    #[test]
+    fn dir_lookup_refuses_non_directories_and_far_blocks() {
+        let img = build_image();
+        let sb = Superblock::parse(&img[1024..]).unwrap();
+        let root_off = sb.inode_byte(5, ROOT_INO).unwrap() as usize;
+        let root = Inode::parse(&img, root_off, sb.inode_size).unwrap();
+        // hello.txt is a regular file: a path step through it refuses.
+        let f_off = sb.inode_byte(5, 12).unwrap() as usize;
+        let f = Inode::parse(&img, f_off, sb.inode_size).unwrap();
+        assert_eq!(
+            dir_lookup(&f, &img[21 * 1024..22 * 1024], sb.blocks_count, b"anything"),
+            Err(Ext2Error::NotADirectory { mode: f.mode })
+        );
+        // A directory whose first block is past the device's blocks.
+        let mut far = root;
+        far.block0 = sb.blocks_count;
+        assert_eq!(
+            dir_lookup(&far, &img[20 * 1024..21 * 1024], sb.blocks_count, b"pkgsrc"),
+            Err(Ext2Error::BlockOutOfRange {
+                block: far.block0,
+                blocks: sb.blocks_count
+            })
         );
     }
 
@@ -814,8 +1019,10 @@ mod tests {
             Err(Ext2Error::InodeOutOfRange { ino: 0, .. })
         ));
         assert!(matches!(
-            sb.inode_byte(5, 17),
-            Err(Ext2Error::InodeOutOfRange { ino: 17, .. })
+            // one PAST the 24-inode table (K23 grew it 16 -> 24; 17
+            // is a live pkgsrc file now)
+            sb.inode_byte(5, 25),
+            Err(Ext2Error::InodeOutOfRange { ino: 25, .. })
         ));
         assert!(matches!(
             sb.inode_byte(200, 2),
@@ -910,7 +1117,18 @@ mod tests {
             // the parser walks (SB at 1024, GDT at 2048, inodes at
             // 5*1024.., dir block 20*1024..).
             for _ in 0..1 + (next() % 3) {
-                let hot = [1024usize, 2048, 5120, 20 * 1024, 21 * 1024];
+                // K23: the pkgsrc dir block (31) and one file block
+                // (34) joined the hot list — the walk now touches
+                // them, so the corpus must too.
+                let hot = [
+                    1024usize,
+                    2048,
+                    5120,
+                    20 * 1024,
+                    21 * 1024,
+                    31 * 1024,
+                    34 * 1024,
+                ];
                 let base = hot[(next() as usize) % hot.len()];
                 let off = base + (next() as usize) % 1024;
                 if off < m.len() {

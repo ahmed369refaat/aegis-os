@@ -264,6 +264,19 @@ impl Inventory {
             .find(|d| d.vendor == vendor && (d.class >> 8) as u8 == class_hi)
     }
 
+    /// K23: the first device matching vendor + DEVICE id. The AHCI
+    /// controller is looked up by its PCI id (ich9-ahci 8086:2922),
+    /// never by the mass-storage class: the pc machine's PIIX IDE
+    /// controller (8086:7010, class 0x0101) precedes an add-on AHCI
+    /// card on bus 0, and the class-only lookup drove the WRONG
+    /// device (no BAR5 — an "ABAR unresolved" refusal).
+    #[must_use]
+    pub fn find_by_dev(&self, vendor: u16, device: u16) -> Option<&PciDev> {
+        self.devices[..self.count]
+            .iter()
+            .find(|d| d.vendor == vendor && d.device == device)
+    }
+
     /// ADR-0018 + round I: record a claimed device's domain by vendor
     /// + DEVICE id — the virtio family's class codes are ambiguous
     ///   (rng/console/balloon share "uncategorized"), so their claims

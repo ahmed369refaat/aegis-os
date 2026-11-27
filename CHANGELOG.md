@@ -106,6 +106,69 @@
   negative lanes included), and `./boot.sh --verify` is PASS with
   the K22 `[PKG]` markers intact: the manager installs through its
   own group with no EACCES anywhere in the lane.
+
+- **`/pkgsrc` on the ext2 root (mkext2.py)** — the lane's five
+  pkg-mkrepo outputs (trust, r1.repo, index.aki, and BOTH
+  version-qualified packages) are
+  byte-exact reads of the blob copies written into the image's new
+  root-owned `/pkgsrc` directory: inode 14 (0755) plus file inodes
+  15-19 (0644) at blocks 31-36, the inode count raised 16 → 24 (the
+  table spans blocks 5-7, still clear of the data at 20), the new
+  inodes and blocks honestly marked in both bitmaps — and a
+  long-standing write-to-the-wrong-block bug fixed on the way (the
+  updated BLOCK bitmap was being written to the INODE bitmap's
+  block; the read-only path never reads bitmaps, so nothing ever
+  noticed). The block cursor keeps a grown fixture honest without
+  redesign (the K23 v1.1 package was added exactly that way during
+  the integration); each file asserts under
+  the reader's 12 KiB direct-block ceiling.
+- **The host proof (`scripts/check-pkgsrc-image.py`)** — runs right
+  after mkext2.py in boot.sh: re-parses `target/sdisk0.img` with the
+  same ext2 logic the kernel runs (GPT → superblock → root →
+  /pkgsrc → direct blocks) and asserts the five files byte-exact
+  against the blobs. A stale blob, a botched mkext2 edit, or a block
+  collision fails at BUILD time, not three minutes later inside
+  QEMU at the K22 provisioning halt.
+- **`dir_lookup` (src/ext2.rs)** — the one-directory-step helper
+  (`is_dir` + first-block-in-range + `find_dirent`) extracted from
+  the transports, with a new refusal identity
+  `Ext2Error::NotADirectory { mode }`: a path step through a
+  non-directory is named, never a silent `Ok(None)`. The host
+  mirror tests walk root → pkgsrc → each file through it; the
+  fuzz corpus's hot list gained the pkgsrc blocks.
+- **The store (`kernel-x86_64/src/pkgsrc.rs`)** — a 5-slot × 8 KiB
+  write-once `.bss` store, the exec registry's disk-slot discipline
+  times five (zero-init static, per-slot claim, length published
+  after the bytes, read-only forever, `check_unsafe.sh`-allowlisted
+  with SAFETY notes at both unsafe sites). The slot count and the
+  file order are a named const pair (`SLOT_COUNT` / `FILE_ORDER`):
+  the fifth slot (the v1.1 package) landed exactly that way during
+  the K23 integration — a two-line change, not a redesign.
+- **The walk (`drvstack/ext2.rs`)** — after /bin/hello, the ext2
+  reader walks root → `pkgsrc` → each file through `dir_lookup` and
+  the proven direct-block read loop (reusing the registry buffer
+  the ELF just vacated) into the store, printing
+  `[PKGSRC] repo source: <name>, <n> bytes → store slot <i>` per
+  file. Failures print and skip — the driver stack never halts —
+  and the K22 lane fails LOUDLY at provisioning when the store is
+  incomplete.
+- **Kmain stops embedding the fixture** — the `FIXTURE_*`
+  include_bytes statics are gone (five of them after the
+  version-qualified upgrade); the provisioning chain now leads
+  with `crate::pkgsrc::complete()` (an empty store is a loud
+  failure, never half-written repo files) and passes
+  `pkgsrc::file(IDX_*)` for the bytes. The VFS tree, modes, owners,
+  and the probe lifecycle are EXACTLY as K22 left them.
+- **Every lane carries the disk (boot.sh)** — the base pc machine
+  gains `-device ahci` + the sdisk0 image on port 0 (the PCI scan's
+  recursive bus-0 walk finds it; the NoDmar arm drives it in
+  identity mode), and the ir/ps2/shell/persist q35 lanes attach the
+  same image to their built-in SATA port. sdisk0 is built for every
+  boot mode (`run` included — a plain `./boot.sh` would halt at
+  provisioning without it); mkfat32 still grows the image only for
+  q35/noiommu, appending past the ext2 partition (LBA 296 > 289) so
+  the /pkgsrc bytes survive. One common `[PKGSRC] repo source:`
+  grep joins the [PKG] block — enforced on every verify lane.
 - **The console plane's tests are serial now** — `drvstack::console`'s
   state is one set of process-wide statics, and cargo test's parallel
   threads interleaved `write_byte`s into each other's counters (found

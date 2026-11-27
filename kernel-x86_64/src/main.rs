@@ -29,6 +29,12 @@
 //! - [`sched`] — the ring-3 launch/resume pair, the parked-run table,
 //!   and the timer's context switch (PR-1.4 / ADR-0012).
 //!
+//! Two later exceptions carry the same per-site `SAFETY` discipline
+//! (CI's `scripts/check_unsafe.sh` allowlists them): the exec
+//! registry's disk-image slot (K20/P0-3) and [`pkgsrc`]'s four-slot
+//! repo-fixture store (K23) — both zero-init `.bss` statics written
+//! once at boot, read-only forever after.
+//!
 //! Notably **unsafe-free by design**: [`mm`] (the memory-layout layer —
 //! all its raw access goes through `memops`/`hw`), the LAPIC driver
 //! (`arch::lapic` — same discipline), the tick orchestration
@@ -58,11 +64,16 @@ pub mod boot;
 pub mod clock;
 pub mod drvstack;
 pub mod exec_registry;
+// K23: the repo fixture's boot-side store — the /pkgsrc bytes the
+// ext2 walk reads off the disk, handed to the K22 provisioning
+// probe. Same write-once .bss discipline as exec_registry's disk
+// slot (four slots instead of one).
 pub mod ipc_mmio;
 #[cfg(not(test))]
 pub mod kmain;
 pub mod mm;
 pub mod mmio;
+pub mod pkgsrc;
 #[cfg(not(test))]
 pub mod serial;
 pub mod session;

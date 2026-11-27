@@ -91,7 +91,11 @@ pub(crate) fn ahci_step<const N: usize>(
 ) {
     use aegis_os::dma::DmaVerdict;
 
-    let Some(dev) = inv.find_by(0x8086, 0x01) else {
+    // K23: the ich9-ahci by its PCI id, not the mass-storage class —
+    // the pc lane's add-on AHCI card sits BEHIND the PIIX IDE
+    // controller on bus 0, and the class-only match drove the IDE
+    // (no BAR5) instead of the disk.
+    let Some(dev) = inv.find_by_dev(0x8086, 0x2922) else {
         line(out, &["[AHCI] no AHCI to drive on this machine"]);
         return;
     };

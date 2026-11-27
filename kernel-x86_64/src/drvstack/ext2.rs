@@ -21,6 +21,7 @@ fn err_name(e: &aegis_os::ext2::Ext2Error) -> &'static str {
         E::BlockOutOfRange { .. } => "block out of range",
         E::InodeOutOfRange { .. } => "inode out of range",
         E::BadDirent { .. } => "malformed dirent",
+        E::NotADirectory { .. } => "not a directory",
         E::Truncated { .. } => "truncated",
     }
 }
@@ -507,6 +508,218 @@ pub(crate) fn ext2_over_ahci(
             " direct blocks) → the exec registry's disk slot",
         ],
     );
+
+    // ── K23: the repo fixture comes OFF THE DISK ──
+    // /pkgsrc (scripts/mkext2.py) carries the K22 lane's five
+    // provisioning files — the pkg-mkrepo outputs the kernel image
+    // used to embed. The walk is the same two steps the hello path
+    // hand-rolled, now through the policy core's `dir_lookup`: root
+    // → pkgsrc → each file, then the proven direct-block read loop
+    // into the pkgsrc store's write-once slots. Failures print and
+    // SKIP — this is the driver stack; the K22 lane fails LOUDLY at
+    // provisioning time when the store is incomplete.
+    if root.block0 >= sb.blocks_count || !load(base + u64::from(root.block0) * 2, &mut sec) {
+        line(
+            out,
+            &["[PKGSRC] root-dir re-read failed — skipping the repo source"],
+        );
+        return;
+    }
+    let pkg_ino = match aegis_os::ext2::dir_lookup(&root, &sec, sb.blocks_count, b"pkgsrc") {
+        Ok(Some(ino)) => ino,
+        Ok(None) => {
+            line(
+                out,
+                &["[PKGSRC] no /pkgsrc directory on this image — skipping (the K22 provisioning fails loudly on an empty store)"],
+            );
+            return;
+        }
+        Err(e) => {
+            line(
+                out,
+                &[
+                    "[PKGSRC] root directory walk refused — skipping: ",
+                    err_name(&e),
+                ],
+            );
+            return;
+        }
+    };
+    let p_byte = match sb.inode_byte(itable, pkg_ino) {
+        Ok(b) => b,
+        Err(e) => {
+            line(
+                out,
+                &[
+                    "[PKGSRC] pkgsrc inode geometry refused — skipping: ",
+                    err_name(&e),
+                ],
+            );
+            return;
+        }
+    };
+    if !load(base + p_byte / 512, &mut sec) {
+        line(out, &["[PKGSRC] pkgsrc inode read failed — skipping"]);
+        return;
+    }
+    let pkgdir = match aegis_os::ext2::Inode::parse(&sec, (p_byte % 512) as usize, sb.inode_size) {
+        Ok(i) => i,
+        Err(e) => {
+            line(
+                out,
+                &[
+                    "[PKGSRC] pkgsrc inode parse refused — skipping: ",
+                    err_name(&e),
+                ],
+            );
+            return;
+        }
+    };
+    if !pkgdir.is_dir() {
+        line(out, &["[PKGSRC] pkgsrc is not a directory — skipping"]);
+        return;
+    }
+    // The store's slot set and this walk's file order are ONE const
+    // pair (crate::pkgsrc::FILE_ORDER) — a later fixture file joins
+    // both, never a redesign here.
+    for (idx, name) in crate::pkgsrc::FILE_ORDER.iter().enumerate() {
+        // The file reads below clobber `sec`, so the directory block's
+        // first sector is re-read per step (the walk's own rule).
+        if pkgdir.block0 >= sb.blocks_count || !load(base + u64::from(pkgdir.block0) * 2, &mut sec)
+        {
+            line(
+                out,
+                &["[PKGSRC] pkgsrc directory re-read failed — skipping"],
+            );
+            return;
+        }
+        let ino = match aegis_os::ext2::dir_lookup(&pkgdir, &sec, sb.blocks_count, name.as_bytes())
+        {
+            Ok(Some(ino)) => ino,
+            Ok(None) => {
+                line(
+                    out,
+                    &["[PKGSRC] ", name, ": not found in /pkgsrc — skipping"],
+                );
+                continue;
+            }
+            Err(e) => {
+                line(
+                    out,
+                    &[
+                        "[PKGSRC] ",
+                        name,
+                        ": pkgsrc walk refused — skipping: ",
+                        err_name(&e),
+                    ],
+                );
+                continue;
+            }
+        };
+        let f_byte = match sb.inode_byte(itable, ino) {
+            Ok(b) => b,
+            Err(_) => {
+                line(
+                    out,
+                    &["[PKGSRC] ", name, ": inode geometry refused — skipping"],
+                );
+                continue;
+            }
+        };
+        if !load(base + f_byte / 512, &mut sec) {
+            line(out, &["[PKGSRC] ", name, ": inode read failed — skipping"]);
+            continue;
+        }
+        let fnode = match aegis_os::ext2::Inode::parse(&sec, (f_byte % 512) as usize, sb.inode_size)
+        {
+            Ok(i) => i,
+            Err(_) => {
+                line(
+                    out,
+                    &["[PKGSRC] ", name, ": inode parse refused — skipping"],
+                );
+                continue;
+            }
+        };
+        let fsize = fnode.size as usize;
+        if fsize == 0 || fsize > crate::pkgsrc::SLOT_MAX {
+            line(
+                out,
+                &[
+                    "[PKGSRC] ",
+                    name,
+                    ": size outside the slot's bounds — skipping",
+                ],
+            );
+            continue;
+        }
+        let blocks_needed = fsize.div_ceil(1024);
+        if blocks_needed > 12 {
+            line(
+                out,
+                &[
+                    "[PKGSRC] ",
+                    name,
+                    ": needs an indirect chain — refusing (direct only)",
+                ],
+            );
+            continue;
+        }
+        // The same buffer /bin/hello just vacated (the registry
+        // copied its bytes out) — reused rather than a second
+        // multi-KiB stack array in this already-deep frame.
+        let mut off = 0usize;
+        let mut read_ok = true;
+        for b in fnode.direct.iter().take(blocks_needed) {
+            let lba = base + u64::from(*b) * 2;
+            if *b >= sb.blocks_count || !load(lba, &mut sec) {
+                read_ok = false;
+                break;
+            }
+            let take1 = 512.min(fsize - off);
+            image[off..off + take1].copy_from_slice(&sec[..take1]);
+            off += take1;
+            if off >= fsize {
+                continue;
+            }
+            if !load(lba + 1, &mut sec) {
+                read_ok = false;
+                break;
+            }
+            let take2 = 512.min(fsize - off);
+            image[off..off + take2].copy_from_slice(&sec[..take2]);
+            off += take2;
+        }
+        if !read_ok || off != fsize {
+            line(
+                out,
+                &["[PKGSRC] ", name, ": data read failed or short — skipping"],
+            );
+            continue;
+        }
+        if !crate::pkgsrc::install(idx, &image[..fsize]) {
+            line(
+                out,
+                &[
+                    "[PKGSRC] ",
+                    name,
+                    ": the store refused the install (slot already written?) — skipping",
+                ],
+            );
+            continue;
+        }
+        line(
+            out,
+            &[
+                "[PKGSRC] repo source: ",
+                name,
+                ", ",
+                strutil::dec(fsize as u64, &mut [0u8; 20]),
+                " bytes → store slot ",
+                strutil::dec(idx as u64, &mut [0u8; 20]),
+            ],
+        );
+    }
 }
 
 // ── xHCI TRB machinery (item 12, second slice): event ring + the

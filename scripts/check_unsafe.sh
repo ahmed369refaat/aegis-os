@@ -9,7 +9,9 @@
 #    src/hw.rs (port I/O, rdtsc, poweroff), src/memops.rs (volatile
 #    memory primitives), src/exec_registry.rs (K20/P0-3: the one
 #    static-mut disk-image slot — write-once at boot, SAFETY-documented
-#    at both sites). Every item there carries a SAFETY note.
+#    at both sites), src/pkgsrc.rs (K23: the repo fixture's four-slot
+#    write-once store — the same discipline times four). Every item
+#    there carries a SAFETY note.
 #
 # Comment lines (//, ///, //! and /*) are ignored.
 set -euo pipefail
@@ -29,7 +31,7 @@ done < <(grep -rn "unsafe" src/ --include="*.rs" \
 while IFS= read -r line; do
   file=${line%%:*}
   case "$file" in
-    kernel-x86_64/src/arch/*|kernel-x86_64/src/boot/*|kernel-x86_64/src/hw.rs|kernel-x86_64/src/memops.rs|kernel-x86_64/src/sched/*|kernel-x86_64/src/exec_registry.rs)
+    kernel-x86_64/src/arch/*|kernel-x86_64/src/boot/*|kernel-x86_64/src/hw.rs|kernel-x86_64/src/memops.rs|kernel-x86_64/src/sched/*|kernel-x86_64/src/exec_registry.rs|kernel-x86_64/src/pkgsrc.rs)
       # allowlisted — and the module must actually carry the allow attribute
       ;;
     *)
@@ -48,7 +50,8 @@ for f in kernel-x86_64/src/arch/gdt.rs kernel-x86_64/src/arch/idt.rs kernel-x86_
          kernel-x86_64/src/arch/exceptions.rs kernel-x86_64/src/arch/syscall_entry.rs \
          kernel-x86_64/src/boot/mod.rs kernel-x86_64/src/sched/context.rs \
          kernel-x86_64/src/hw.rs kernel-x86_64/src/memops.rs \
-         kernel-x86_64/src/exec_registry.rs; do
+         kernel-x86_64/src/exec_registry.rs \
+         kernel-x86_64/src/pkgsrc.rs; do
   grep -q "allow(unsafe_code)" "$f" || { echo "FAIL: $f lost its allow(unsafe_code) declaration" >&2; fail=1; }
 done
 
