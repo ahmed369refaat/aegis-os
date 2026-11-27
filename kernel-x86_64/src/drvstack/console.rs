@@ -599,6 +599,21 @@ pub fn init_pending() -> bool {
 mod tests {
     use super::*;
 
+    /// The console's state is one set of process-wide statics, so the
+    /// stateful tests here are serial by necessity: cargo test runs
+    /// them on parallel threads and interleaved `write_byte`s corrupt
+    /// each other's counters (found live on bebefab: 3–4 of the 6
+    /// failed per scheduling; single-threaded always green). One
+    /// mutex, one guard per stateful test. The two pure tests (`step`,
+    /// `glyph`) never touch the statics and need no guard.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the console-plane lock; a poisoned mutex (a previous test
+    /// panicked mid-flight) is recovered, not propagated.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Reset the plane between tests (the shadow, the cursor, the
     /// counters — everything but FB, which the tests set themselves).
     fn reset() {
@@ -644,6 +659,7 @@ mod tests {
 
     #[test]
     fn writing_scrolls_exactly_when_the_last_cell_fills_and_the_status_row_survives() {
+        let _serial = serial();
         reset();
         set_status_row("STATUS");
         FB.store(0x1000, Ordering::Relaxed); // live plane, host blit = no-op
@@ -688,6 +704,7 @@ mod tests {
 
     #[test]
     fn newline_and_tab_at_the_edges_behave() {
+        let _serial = serial();
         reset();
         FB.store(0x1000, Ordering::Relaxed);
         // A newline per body row, then one more: 29 newlines total,
@@ -707,6 +724,7 @@ mod tests {
 
     #[test]
     fn the_status_row_write_never_moves_the_body_cursor() {
+        let _serial = serial();
         reset();
         FB.store(0x1000, Ordering::Relaxed);
         write_byte(b'x');
@@ -761,6 +779,7 @@ mod tests {
 
     #[test]
     fn a_dead_plane_swallows_everything() {
+        let _serial = serial();
         reset();
         FB.store(0, Ordering::Relaxed);
         write_str("nothing lands before init");

@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased] — the K23 round
+
+- **The console plane's tests are serial now** — `drvstack::console`'s
+  state is one set of process-wide statics, and cargo test's parallel
+  threads interleaved `write_byte`s into each other's counters (found
+  live on `bebefab`: 3–4 of the 6 failed per scheduling;
+  `--test-threads=1` always green). The four stateful tests take a
+  module mutex (panic-safe: a poisoned lock is recovered); the two
+  pure tests (`step`, `glyph`) never touch the statics and stay
+  unguarded. The K22 gates run had passed this module by scheduling
+  luck.
+
 ## [Unreleased] — the K22 round: the package manager runs in the VM — a signed package installs at CPL=3
 
 - **Exec got a memory contract (`ExecLayout`)** — `CANONICAL` (7 image
