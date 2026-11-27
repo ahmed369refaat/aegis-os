@@ -169,6 +169,55 @@
   q35/noiommu, appending past the ext2 partition (LBA 296 > 289) so
   the /pkgsrc bytes survive. One common `[PKGSRC] repo source:`
   grep joins the [PKG] block — enforced on every verify lane.
+
+- **`ExitFacts` on the completed mailbox** — a ring-3 run's exit rode
+  the parked-mailbox handover, and the `UserRun` (exec tables, live
+  mask, layout) was dropped at the dispatcher's run-slot drain, so
+  the K22 lane's two observability markers printed "unavailable
+  (parked handover)": the tables were already reclaimed by the time
+  the lane read them. The mailbox entry now carries the two facts the
+  lanes need, captured AT the run-slot drain while the run is still
+  in hand: the run's LIVE syscall mask (post every attenuation) and
+  its stack high-water in pages. `completed_drain` keeps its
+  historical `(domain, exit)` shape (every existing lane unchanged);
+  the new `completed_drain_facts` twin hands the facts to readers that
+  want them; `completed_take` (wait4) ignores them. Read-only
+  accounting — no mask bit moves, no page is touched; the
+  attenuation-only invariants are untouched by construction.
+- **`UserRun::stack_high_water_pages`** — the K22 lane's inline
+  top-down stack scan, extracted into one shared, CR3-independent
+  helper (PTE walk and byte reads both go through the kernel direct
+  map, PML4[273], shared by every CR3) with its decision core pure
+  and host-tested (`scan_high_water_pages`: the first unmapped or
+  all-zero page from the top is the frontier — exec zero-fills the
+  stack, so a nonzero byte IS a touch). Both drain arms (kmain's
+  run-slot take and the dispatcher's record path) now use the same
+  definition; the scan is bounded by the run's OWN layout (1 page
+  canonical, 2048 pages — 8 MiB — for the PM's SERVICE stack). The
+  host test's fake translate oracle originally answered in BYTES
+  below the top while the touched oracle compared page INDICES, so
+  the frontier never saw the intended depths; the oracle now returns
+  the page index (`(TOP - va - 4096) / 4096`) and the pinned
+  semantics hold.
+- **`SyscallMask::arm_ids_csv`** (lib) — the mask as a SET for the
+  markers: the permitted ids as an ascending comma-separated list
+  into a caller buffer (no_alloc; 191 bytes bound every mask; a short
+  buffer truncates, never panics). Host tests pin the behavior and
+  the `package_manager_profile` surface itself: 10 arms,
+  `0x800000150003000f`, `0,1,2,3,16,17,32,34,36,63`.
+- **The K22 lane's `[PKG]` markers print real values** — the live-mask
+  line keeps its `verified` verdict (now backed by whichever drain
+  arm delivered the exit) and gains a bits line
+  (`[PKG] live mask bits: 0x… (arms: …)`); the stack high-water
+  prints the real page-index × 4096 bytes instead of the parked-
+  handover zero. `boot.sh --verify` fails the lane if either marker
+  regresses to "unavailable", if the verdict is not `verified`, or if
+  the high-water is zero, not page-aligned, or not strictly below the
+  8 MiB service stack (deliberately NOT asserted against the static
+  7,589,376 B chain measure — a real run may be shallower). The
+  verdict line's prose count is corrected too: the profile arms TEN
+  syscalls (the K22 prose said 9, silently dropping `SYS_EXIT`),
+  matching the 10-entry arm set the bits line now prints beside it.
 - **The console plane's tests are serial now** — `drvstack::console`'s
   state is one set of process-wide statics, and cargo test's parallel
   threads interleaved `write_byte`s into each other's counters (found

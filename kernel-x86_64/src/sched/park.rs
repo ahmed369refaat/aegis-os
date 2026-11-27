@@ -22,6 +22,7 @@
 #![allow(unsafe_code)]
 
 use crate::sched::context::ParkedContext;
+use aegis_os::syscall::SyscallMask;
 
 /// The current R12 (diagnostics/profiling; pure register read).
 ///
@@ -118,28 +119,50 @@ pub(crate) fn parked_from_syscall(img: SyscallImage) -> ParkedContext {
     }
 }
 
+/// K23: the accounting facts that ride a completed exit through the
+/// mailbox. The run's live mask and its stack high-water die WITH the
+/// run at the run-slot drain — `dispatch_next`'s `try_take` drops the
+/// whole `UserRun` (exec tables, mask, layout) after recording — so a
+/// reader that drains the mailbox later finds nothing but the exit
+/// kind (the K22 lane's markers printed "unavailable (parked
+/// handover)" for exactly this reason). The facts are captured AT the
+/// drain, while the run is still in hand, and ride the entry to
+/// whichever drain consumes it. READ-ONLY observability: both fields
+/// report what the run HELD; no mask bit moves, no page is touched
+/// (the attenuation-only invariants are untouched by construction).
+#[derive(Clone, Copy)]
+pub struct ExitFacts {
+    /// The run's LIVE syscall mask at its exit — post every
+    /// attenuation, the exact bits the gate consulted for this run.
+    pub mask: SyscallMask,
+    /// The stack high-water in pages below the run's layout stack top
+    /// (`UserRun::stack_high_water_pages`; × 4096 for bytes, 0 = the
+    /// stack read untouched).
+    pub stack_pages: u64,
+}
+
 /// ADR-0023: the completed-run mailbox — the nested dispatcher parks
-/// exited runs here (domain + exit kind; the RUN's resource teardown
-/// stays the SPAWNER's contract, so kmain drains this on regaining
-/// control). Bounded; overflow refuses loudly (a boot that parks more
-/// than MAX_COMPLETED exits without draining is a boot bug, not a
-/// leak to hide).
+/// exited runs here (domain + exit kind + the K23 exit facts; the
+/// RUN's resource teardown stays the SPAWNER's contract, so kmain
+/// drains this on regaining control). Bounded; overflow refuses
+/// loudly (a boot that parks more than MAX_COMPLETED exits without
+/// draining is a boot bug, not a leak to hide).
 #[cfg(not(test))]
 const MAX_COMPLETED: usize = 16;
 
 #[cfg(not(test))]
-static mut COMPLETED: [Option<(u32, crate::sched::context::ExitKind)>; MAX_COMPLETED] =
+static mut COMPLETED: [Option<(u32, crate::sched::context::ExitKind, ExitFacts)>; MAX_COMPLETED] =
     [const { None }; MAX_COMPLETED];
 
 /// Record a completed run (the nested dispatcher, on resume return).
 #[cfg(not(test))]
-fn record_completed(domain: u32, exit: crate::sched::context::ExitKind) -> bool {
+fn record_completed(domain: u32, exit: crate::sched::context::ExitKind, facts: ExitFacts) -> bool {
     // SAFETY: single CPU, IF=0 through the dispatcher; the only writers
     // are the nested dispatcher and kmain's drain, never concurrent.
     let completed = unsafe { &mut *core::ptr::addr_of_mut!(COMPLETED) };
     for slot in completed.iter_mut() {
         if slot.is_none() {
-            *slot = Some((domain, exit));
+            *slot = Some((domain, exit, facts));
             return true;
         }
     }
@@ -147,9 +170,31 @@ fn record_completed(domain: u32, exit: crate::sched::context::ExitKind) -> bool 
 }
 
 /// Drain one completed run (kmain, after the nested dispatcher
-/// returned control): (domain, exit kind). None when empty.
+/// returned control): (domain, exit kind). None when empty. The K23
+/// facts ride the same entry but this drain DROPS them — the
+/// historical shape, kept so every existing lane reads unchanged;
+/// the lanes that need the facts call `completed_drain_facts`.
 #[cfg(not(test))]
 pub fn completed_drain() -> Option<(u32, crate::sched::context::ExitKind)> {
+    // SAFETY: see record_completed.
+    let completed = unsafe { &mut *core::ptr::addr_of_mut!(COMPLETED) };
+    for slot in completed.iter_mut() {
+        if let Some(x) = slot.take() {
+            return Some((x.0, x.1));
+        }
+    }
+    None
+}
+
+/// K23: the facts-carrying twin of `completed_drain` — the same
+/// slots, the same single-take semantics (whichever drain runs first
+/// consumes the entry), but the caller also receives the exit's
+/// accounting snapshot: the live mask the run held and its stack
+/// high-water, both captured at the run-slot drain while the run was
+/// still in hand. The K22 package lane reads its two `[PKG]`
+/// observability markers through this drain.
+#[cfg(not(test))]
+pub fn completed_drain_facts() -> Option<(u32, crate::sched::context::ExitKind, ExitFacts)> {
     // SAFETY: see record_completed.
     let completed = unsafe { &mut *core::ptr::addr_of_mut!(COMPLETED) };
     for slot in completed.iter_mut() {
@@ -172,8 +217,8 @@ pub fn completed_take(domain: u32) -> Option<crate::sched::context::ExitKind> {
     // that reaches here (the syscall arm or the dispatcher).
     let completed = unsafe { &mut *core::ptr::addr_of_mut!(COMPLETED) };
     for slot in completed.iter_mut() {
-        if matches!(&*slot, Some((d, _)) if *d == domain) {
-            return slot.take().map(|(_, exit)| exit);
+        if matches!(&*slot, Some((d, _, _)) if *d == domain) {
+            return slot.take().map(|(_, exit, _)| exit);
         }
     }
     None
@@ -549,7 +594,25 @@ mod boot {
                             // IPC receivers' poll loops tripped the
                             // strict take). The parked case just loops.
                             if let Some(exited) = context::try_take() {
-                                if !record_completed(exited.domain, exited.exit) {
+                                // K23: snapshot the exit's accounting
+                                // facts while the run is still in hand
+                                // — the live mask it held and its
+                                // stack high-water. This is the ONLY
+                                // moment both are readable: the run
+                                // (tables, mask, layout) is dropped
+                                // when this block ends, and the
+                                // mailbox readers that come later
+                                // would otherwise find nothing but
+                                // the exit kind. Pure reads — the
+                                // scan is bounded by the run's OWN
+                                // layout (1 page canonical, 2048 for
+                                // the PM's SERVICE stack), and every
+                                // access goes through the direct map.
+                                let facts = super::ExitFacts {
+                                    mask: exited.mask,
+                                    stack_pages: exited.stack_high_water_pages(),
+                                };
+                                if !record_completed(exited.domain, exited.exit, facts) {
                                     serial::write_str(
                                         "[SCHD] KERNEL BUG: completed mailbox overflow\n",
                                     );

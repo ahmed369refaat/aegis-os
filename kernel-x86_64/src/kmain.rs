@@ -1915,9 +1915,21 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // SELECTOR from byte 0 of its data page (0 = install,
         // 1 = upgrade, 2 = remove), so the same embedded binary drives
         // the whole lifecycle — the lane only varies the boot data.
-        // Returns the PM's exit, the live-mask verdict and the stack
-        // high-water; `None` means the round could not even run
-        // (spawn or drain failure) and the round driver halts.
+        // Returns the PM's exit, the live-mask verdict, the stack
+        // high-water and the live mask itself (the bits + arm set the
+        // run actually held); `None` means the round could not even
+        // run (spawn or drain failure) and the round driver halts.
+        /// One round's drained facts: the exit, the live-mask verdict,
+        /// the stack high-water (pages) and the live mask itself (K23:
+        /// the bits + arm set the run actually held — printed by
+        /// `round_common_markers` from whichever drain arm delivered).
+        type RoundFacts = (
+            crate::sched::context::ExitKind,
+            Option<bool>,
+            Option<u64>,
+            Option<aegis_os::syscall::SyscallMask>,
+        );
+
         fn pkg_round<const N: usize>(
             k: &mut aegis_os::Kernel<N>,
             pool: &mut FramePool<N>,
@@ -1925,7 +1937,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             dom: u32,
             pm_mask: aegis_os::syscall::SyscallMask,
             selector: u8,
-        ) -> Option<(crate::sched::context::ExitKind, Option<bool>, Option<u64>)> {
+        ) -> Option<RoundFacts> {
             // The boot data's byte 0 IS the selector the blob reads
             // first (examples/ring3-pkg-caller/src/lib.rs); the rest
             // stays zero — the blob writes its own strings and argv
@@ -1972,52 +1984,44 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             // NEW image; the PM runs on scheduler ticks and its exit
             // arrives EITHER in the run slot (tables + live mask available
             // for the verification below) OR through the parked mailbox. A
-            // stall is a loud refusal, never a hang.
+            // stall is a loud refusal, never a hang. K23: the mailbox arm
+            // now drains WITH the exit facts — the mask and stack
+            // high-water are captured at the run-slot drain inside the
+            // dispatcher (while the run is still in hand), so both
+            // markers read real values on EITHER arm; the reclaimed exec
+            // tables are no longer the only source.
             let mut pm_exit: Option<crate::sched::context::ExitKind> = None;
             let mut mask_verified: Option<bool> = None;
             let mut high_water: Option<u64> = None;
+            // The live mask itself (K23 — the round prints the bits and
+            // the arm set the run actually held, not just the ==
+            // verdict).
+            let mut live_mask: Option<aegis_os::syscall::SyscallMask> = None;
             let mut spins = 0u64;
             while pm_exit.is_none() && spins < 20_000_000 {
                 if let Some(run) = crate::sched::context::try_take() {
                     if run.domain == dom {
                         mask_verified = Some(run.mask == pm_mask);
-                        // Stack high-water: the deepest page with a nonzero
-                        // byte (the exec zero-fills the stack, so a nonzero
-                        // byte IS a touch). Pages that do not translate end
-                        // the scan — nothing legitimate lives below.
-                        let svc = crate::mm::user_layout::SERVICE;
-                        let top = svc.stack_top();
-                        let mut deepest = 0u64;
-                        for page in 0..svc.stack_pages {
-                            let va = top - 4096 * (page as u64 + 1);
-                            let Some(pa) = run.tables.translate(va) else {
-                                break;
-                            };
-                            let mut nonzero = false;
-                            let mut b = 0u64;
-                            while b < 4096 {
-                                if crate::virtio::read_u8_pa(pa + b) != 0 {
-                                    nonzero = true;
-                                    break;
-                                }
-                                b += 1;
-                            }
-                            if nonzero {
-                                deepest = page as u64 + 1;
-                            } else {
-                                // The first untouched page is the frontier:
-                                // the stack is zero-filled at exec, nothing
-                                // legitimate lives below it.
-                                break;
-                            }
-                        }
-                        high_water = Some(deepest);
+                        live_mask = Some(run.mask);
+                        // Stack high-water (K23: the shared scan — the same
+                        // helper the dispatcher's record path uses, one
+                        // definition of "deepest touched page", CR3-
+                        // independent through the direct map). The exec
+                        // zero-fills the stack, so a nonzero byte IS a
+                        // touch; the first untouched (or unmapped) page
+                        // from the top is the frontier.
+                        high_water = Some(run.stack_high_water_pages());
                         pm_exit = Some(run.exit);
                     }
                 }
                 if pm_exit.is_none() {
-                    if let Some((exit_dom, exit)) = crate::sched::park::completed_drain() {
+                    if let Some((exit_dom, exit, facts)) =
+                        crate::sched::park::completed_drain_facts()
+                    {
                         if exit_dom == dom {
+                            mask_verified = Some(facts.mask == pm_mask);
+                            live_mask = Some(facts.mask);
+                            high_water = Some(facts.stack_pages);
                             pm_exit = Some(exit);
                         }
                     }
@@ -2028,7 +2032,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 spins += 1;
             }
             match pm_exit {
-                Some(e) => Some((e, mask_verified, high_water)),
+                Some(e) => Some((e, mask_verified, high_water, live_mask)),
                 None => {
                     line(
                         out,
@@ -2053,13 +2057,15 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             }
         }
 
-        // The three markers every round prints from its own run: the
-        // exec fact, the live-mask verdict and the stack high-water
-        // (the tree markers are per-command, printed by the rounds).
+        // The markers every round prints from its own run: the exec
+        // fact, the live-mask verdict (with the bits and the arm set
+        // the run actually held) and the stack high-water (the tree
+        // markers are per-command, printed by the rounds).
         fn round_common_markers(
             out: &mut dyn FnMut(&str),
             mask_verified: Option<bool>,
             high_water: Option<u64>,
+            live_mask: Option<aegis_os::syscall::SyscallMask>,
         ) {
             line(
                 out,
@@ -2070,12 +2076,35 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             line(
                 out,
                 &[
-                    "[PKG] live mask after exec == package_manager_profile (9 syscall arms — no fork/exec/mmap/net/ipc): ",
+                    // K23: 10 arms, not the K22 prose's 9 — the count
+                    // must agree with the bits line below (SYS_EXIT is
+                    // the arm the old line dropped).
+                    "[PKG] live mask after exec == package_manager_profile (10 syscall arms — no fork/exec/mmap/net/ipc): ",
                     match mask_verified {
                         Some(true) => "verified",
                         Some(false) => "MISMATCH — LOUD",
-                        None => "unavailable (parked handover reclaimed the run)",
+                        // K23: both drain arms fill the verdict — None
+                        // is unreachable; if it ever prints, the
+                        // verify's regression grep fails.
+                        None => "unavailable — BUG (neither drain arm delivered the facts)",
                     },
+                ],
+            );
+            // K23: the mask as REAL values — the raw bitset the
+            // kernel's telemetry uses (`SyscallMask::bits`) and the
+            // arm set (the lib's pure formatter). Printed from
+            // whichever drain arm delivered the exit.
+            let mut hb = [0u8; 18];
+            let mut ids = [0u8; 192];
+            let shown = live_mask.unwrap_or_default();
+            line(
+                out,
+                &[
+                    "[PKG] live mask bits: ",
+                    strutil::hex(shown.bits(), &mut hb),
+                    " (arms: ",
+                    shown.arm_ids_csv(&mut ids),
+                    ")",
                 ],
             );
             let mut b = [0u8; 20];
@@ -2083,7 +2112,14 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 out,
                 &[
                     "[PKG] stack high-water: ",
-                    strutil::dec(high_water.unwrap_or(0) * 4096, &mut b),
+                    match high_water {
+                        // K23: bytes = page count × 4096 — the count
+                        // comes from the run-slot drain (either arm),
+                        // so the number is the real deepest touched
+                        // page.
+                        Some(pages) => strutil::dec(pages * 4096, &mut b),
+                        None => "0 — BUG (neither drain arm delivered the facts)",
+                    },
                     " of 8388608 B below the 8 MiB stack top",
                 ],
             );
@@ -2095,7 +2131,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // a bare name resolves NEWEST-first — unpinned, the install
         // would land 1.1.0 and leave the upgrade round nothing to
         // move. ──
-        let (run_exit, mask_verified, high_water) =
+        let (run_exit, mask_verified, high_water, live_mask) =
             match pkg_round(&mut k, &mut pool, &mut out, PKG_DOM, pm_mask, 0) {
                 Some(r) => r,
                 None => {
@@ -2145,7 +2181,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                             "[PKG] the installed tree: /usr/bin/pkg-hello byte-exact, /pkg/db/r1.hello + /pkg/db/state written",
                         ],
                     );
-                    round_common_markers(&mut out, mask_verified, high_water);
+                    round_common_markers(&mut out, mask_verified, high_water, live_mask);
                 } else {
                     line(
                         &mut out,
@@ -2180,7 +2216,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         //      version-qualified r1.hello-1.1.0.akp file, and the
         //      commit's rename overwrites the installed payload with
         //      the 17-B v1.1 bytes. ──
-        let (run_exit, mask_verified, high_water) =
+        let (run_exit, mask_verified, high_water, live_mask) =
             match pkg_round(&mut k, &mut pool, &mut out, PKG_DOM, pm_mask, 1) {
                 Some(r) => r,
                 None => {
@@ -2228,7 +2264,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                             "[PKG] the upgraded tree: /usr/bin/pkg-hello == 17-B \"hello world v1.1\" payload, byte-exact — the payload moved",
                         ],
                     );
-                    round_common_markers(&mut out, mask_verified, high_water);
+                    round_common_markers(&mut out, mask_verified, high_water, live_mask);
                 } else {
                     line(
                         &mut out,
@@ -2267,7 +2303,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         //      removals' backups), and the state file must survive
         //      as a valid count-0 ASTT that no longer lists
         //      r1/hello. ──
-        let (run_exit, mask_verified, high_water) =
+        let (run_exit, mask_verified, high_water, live_mask) =
             match pkg_round(&mut k, &mut pool, &mut out, PKG_DOM, pm_mask, 2) {
                 Some(r) => r,
                 None => {
@@ -2331,7 +2367,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                             "[PKG] the removed tree: stat /usr/bin/pkg-hello = ENOENT, /pkg/db/r1.hello gone, no r1/hello in /pkg/db/state",
                         ],
                     );
-                    round_common_markers(&mut out, mask_verified, high_water);
+                    round_common_markers(&mut out, mask_verified, high_water, live_mask);
                 } else {
                     line(
                         &mut out,

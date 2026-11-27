@@ -165,6 +165,56 @@ impl UserRun {
             layout: &crate::mm::user_layout::CANONICAL,
         }
     }
+
+    /// K23: this run's stack high-water, in PAGES below its layout's
+    /// stack top (× 4096 for bytes). READ-ONLY accounting — the
+    /// attenuation-only rule holds: nothing here moves a mask bit or
+    /// touches a user page, it only walks the run's OWN tables and
+    /// reads what the run already wrote. CR3-independent on purpose:
+    /// the PTE walk and the byte reads both go through the kernel
+    /// direct map (PML4[273], shared by every CR3 in the machine),
+    /// so the scan is safe from the dispatcher's exit handling, from
+    /// kmain's drain, or anywhere the run is still in hand — the
+    /// K22 lane previously could only run it after switching back to
+    /// the kernel CR3, which the parked handover makes impossible.
+    pub fn stack_high_water_pages(&self) -> u64 {
+        scan_high_water_pages(
+            self.layout.stack_top(),
+            self.layout.stack_pages,
+            &|va| self.tables.translate(va),
+            &|pa| (0..4096u64).any(|b| crate::virtio::read_u8_pa(pa + b) != 0),
+        )
+    }
+}
+
+/// K23: the high-water scan's decision core — PURE, host-tested. Pages
+/// are probed from the stack TOP downward; the first page that does
+/// not translate, or whose bytes read all zero, is the FRONTIER: exec
+/// zero-fills the stack, so a nonzero byte IS a touch, and nothing
+/// legitimate lives below the frontier (bytes deeper down are not this
+/// run's watermark — that is exactly why the scan stops instead of
+/// hunting further). Returns the count of touched pages counting from
+/// the top — the high-water page INDEX; 0 means even the top page read
+/// untouched. The oracles are the caller's: translation (`va → pa`)
+/// and "is this physical page touched"; the boot caller feeds the
+/// run's tables and the direct-map byte reads, the host test fixed
+/// fakes.
+fn scan_high_water_pages(
+    stack_top: u64,
+    stack_pages: usize,
+    translate: &dyn Fn(u64) -> Option<u64>,
+    touched: &dyn Fn(u64) -> bool,
+) -> u64 {
+    let mut deepest = 0u64;
+    for page in 0..stack_pages {
+        let va = stack_top - 4096 * (page as u64 + 1);
+        let Some(pa) = translate(va) else { break };
+        if !touched(pa) {
+            break;
+        }
+        deepest = page as u64 + 1;
+    }
+    deepest
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -262,6 +312,45 @@ pub fn set_gpr_at(frame: &mut ExceptionFrame, i: usize, v: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// K23: the high-water scan is pure given its two oracles — the
+    /// test pins the frontier semantics with fixed fakes. The
+    /// translate oracle maps a stack VA to its page INDEX below the
+    /// stack top (the real oracle returns a PA, but the scan only
+    /// ever forwards it to the touched oracle); the touched oracle
+    /// answers for a given depth.
+    #[test]
+    fn high_water_scan_stops_at_the_frontier() {
+        const TOP: u64 = 0x9000;
+        const PAGES: usize = 8;
+        let translate = |va: u64| Some((TOP - va - 4096) / 4096); // page index as "pa"
+
+        // Pages 0..2 (from the top) touched, page 3 untouched: the
+        // watermark is 3 pages; the touched page BELOW the frontier
+        // (page 4, stale bytes) must NOT count.
+        let depth3 = |pa: u64| pa < 3 || pa == 4;
+        assert_eq!(scan_high_water_pages(TOP, PAGES, &translate, &depth3), 3);
+
+        // The same depth, but the frontier is an UNMAPPED page
+        // instead of a zero page: same watermark, same stop.
+        let translate_hole = |va: u64| {
+            let idx = (TOP - va - 4096) / 4096;
+            (idx < 3).then_some(idx)
+        };
+        assert_eq!(
+            scan_high_water_pages(TOP, PAGES, &translate_hole, &|_| true),
+            3
+        );
+
+        // Even the top page untouched: 0 (an all-but-untouched stack).
+        assert_eq!(scan_high_water_pages(TOP, PAGES, &translate, &|_| false), 0);
+
+        // The whole stack touched: the full page count (never past it).
+        assert_eq!(scan_high_water_pages(TOP, PAGES, &translate, &|_| true), 8);
+
+        // A zero-page stack cannot scan anything.
+        assert_eq!(scan_high_water_pages(TOP, 0, &translate, &|_| true), 0);
+    }
 
     #[test]
     fn context_targets_ring3_with_interrupts_on() {

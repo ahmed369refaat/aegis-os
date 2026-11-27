@@ -750,6 +750,27 @@ if [ "$MODE" = "verify" ]; then
   grep -qF "[PKG] the upgraded tree: /usr/bin/pkg-hello == 17-B \"hello world v1.1\" payload, byte-exact — the payload moved" "$LOG" || { echo "VERIFY FAIL: K23 pkg upgraded-tree marker missing"; ok=0; }
   grep -qF "[PKG] remove r1/hello: the payload, the db record and the state entry uninstalled (exit 0)" "$LOG" || { echo "VERIFY FAIL: K23 pkg remove marker missing"; ok=0; }
   grep -qF "[PKG] the removed tree: stat /usr/bin/pkg-hello = ENOENT, /pkg/db/r1.hello gone, no r1/hello in /pkg/db/state" "$LOG" || { echo "VERIFY FAIL: K23 pkg removed-tree marker missing"; ok=0; }
+  # K23: both markers must carry REAL values — a regression to the
+  # K22 "unavailable (parked handover)" placeholders fails the verify.
+  # The mask: the verdict must be "verified" (not MISMATCH, not
+  # unavailable) AND the bits line must print the live bitset + the
+  # arm set. The high-water: nonzero, page-aligned, and strictly
+  # under the 8 MiB service stack — deliberately NOT asserted against
+  # the static 7,589,376 B chain measure (a real run may be shallower).
+  grep -qF "no fork/exec/mmap/net/ipc): verified" "$LOG" || { echo "VERIFY FAIL: K23 pkg live-mask verdict is not 'verified' (mismatch or unavailable)"; ok=0; }
+  grep -qF "[PKG] live mask bits: 0x" "$LOG" || { echo "VERIFY FAIL: K23 pkg live mask bits line missing (regressed to unavailable?)"; ok=0; }
+  grep -qF "(arms: " "$LOG" || { echo "VERIFY FAIL: K23 pkg live mask arm-set missing"; ok=0; }
+  if grep "\[PKG\].*unavailable" "$LOG" >/dev/null 2>&1; then
+    echo "VERIFY FAIL: K23 a [PKG] marker regressed to 'unavailable' (the parked handover must carry the exit facts)"; ok=0
+  fi
+  hw_bytes="$(sed -n 's/^\[PKG\] stack high-water: \([0-9][0-9]*\) of 8388608 B below the 8 MiB stack top$/\1/p' "$LOG" | head -n1)"
+  if [ -z "$hw_bytes" ]; then
+    echo "VERIFY FAIL: K23 pkg stack high-water did not parse as '<bytes> of 8388608 B' (regressed?)"; ok=0
+  else
+    [ "$hw_bytes" -gt 0 ] || { echo "VERIFY FAIL: K23 pkg stack high-water is zero (no pages touched?)"; ok=0; }
+    [ $((hw_bytes % 4096)) -eq 0 ] || { echo "VERIFY FAIL: K23 pkg stack high-water ($hw_bytes) is not page-aligned"; ok=0; }
+    [ "$hw_bytes" -lt 8388608 ] || { echo "VERIFY FAIL: K23 pkg stack high-water ($hw_bytes) is not below the 8 MiB service stack"; ok=0; }
+  fi
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the
