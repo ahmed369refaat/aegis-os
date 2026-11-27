@@ -2173,6 +2173,7 @@ mod tests {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         ) {
             Ok(SysValue::Fd(fd)) => fd,
@@ -2197,6 +2198,386 @@ mod tests {
         }
         k.syscall(1, SysRequest::Unlink { path: "/pub/shdir" })
             .unwrap();
+    }
+
+    /// K22: O_EXCL is the package manager's lock primitive — "create
+    /// only if absent". The first open mints the fd; the SAME open on
+    /// the now-existing path answers EEXIST, never an fd, and the
+    /// truncate flag riding with it never reaches the file's bytes.
+    #[test]
+    fn open_excl_creates_when_absent_then_refuses_eexist_and_never_truncates() {
+        use crate::sys::{SysError, SysRequest, SysValue};
+        use crate::vfs::{Mode, VfsError};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        let lock = |k: &mut Kernel, truncate: bool| {
+            k.syscall(
+                1,
+                SysRequest::Open {
+                    path: "/pub/lock",
+                    mode: Mode(0o600),
+                    create: true,
+                    read: false,
+                    write: true,
+                    truncate,
+                    excl: true,
+                },
+            )
+        };
+        // Absent: the open creates and mints the fd.
+        let fd = match lock(&mut k, false) {
+            Ok(SysValue::Fd(fd)) => fd,
+            other => panic!(
+                "O_CREAT|O_EXCL on an absent path must open, saw {:?}",
+                other.map(|_| ())
+            ),
+        };
+        k.syscall(
+            1,
+            SysRequest::Write {
+                fd,
+                bytes: b"tx-7f3a",
+            },
+        )
+        .unwrap();
+        // Present: the identical open is EEXIST — the refusal the PM's
+        // Transaction::begin turns into ErrorKind::Locked.
+        assert_eq!(lock(&mut k, false), Err(SysError::Vfs(VfsError::Exists)));
+        // TRUNCATE riding with EXCL must not reach the file: the
+        // refusal happens at resolution, before the truncate step.
+        assert_eq!(lock(&mut k, true), Err(SysError::Vfs(VfsError::Exists)));
+        let mut buf = [0u8; 16];
+        let fd = match k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/pub/lock",
+                mode: Mode(0o600),
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+                excl: false,
+            },
+        ) {
+            Ok(SysValue::Fd(fd)) => fd,
+            other => panic!(
+                "the lock must still be readable, saw {:?}",
+                other.map(|_| ())
+            ),
+        };
+        let n = match k.syscall(1, SysRequest::Read { fd, buf: &mut buf }) {
+            Ok(SysValue::Count(n)) => n,
+            other => panic!(
+                "the lock must still hold its bytes, saw {:?}",
+                other.map(|_| ())
+            ),
+        };
+        assert_eq!(&buf[..n as usize], b"tx-7f3a");
+    }
+
+    /// K22: Linux answers EEXIST for O_CREAT|O_EXCL on ANY existing
+    /// path — a directory included — and O_EXCL without O_CREAT is the
+    /// POSIX-undefined combination: refused before any resolution, so
+    /// it never opens anything and spends no fd.
+    #[test]
+    fn open_excl_refuses_directories_with_eexist_and_excl_without_create_is_invalid() {
+        use crate::sys::{SysError, SysRequest};
+        use crate::vfs::Mode;
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        // An existing DIRECTORY: EEXIST (not EISDIR) — the "only I
+        // created this" promise holds for every kind of path.
+        assert_eq!(
+            k.syscall(
+                1,
+                SysRequest::Open {
+                    path: "/pub",
+                    mode: Mode(0o755),
+                    create: true,
+                    read: false,
+                    write: true,
+                    truncate: false,
+                    excl: true,
+                }
+            ),
+            Err(SysError::Vfs(crate::vfs::VfsError::Exists))
+        );
+        let before = k.domain(1).unwrap().fds.len();
+        // O_EXCL without O_CREAT: refused whether the path exists or
+        // not, and the refusal mints no fd.
+        for path in ["/pub", "/pub/never-made"] {
+            assert_eq!(
+                k.syscall(
+                    1,
+                    SysRequest::Open {
+                        path,
+                        mode: Mode(0o644),
+                        create: false,
+                        read: true,
+                        write: false,
+                        truncate: false,
+                        excl: true,
+                    }
+                ),
+                Err(SysError::InvalidArgument(0))
+            );
+        }
+        assert_eq!(k.domain(1).unwrap().fds.len(), before);
+        // The refused path was not created as a side effect.
+        assert_eq!(
+            k.syscall(
+                1,
+                SysRequest::Stat {
+                    path: "/pub/never-made",
+                    out: &mut [0u8; 24],
+                }
+            )
+            .map(|_| ()),
+            Err(SysError::Vfs(crate::vfs::VfsError::NotFound))
+        );
+    }
+
+    /// K22: the ListDir arm is CURSOR-based — the fd's position walks
+    /// the directory, a call fills what fits whole and the next call
+    /// resumes, and 0 is the end. The package manager loops getdents
+    /// until exactly that 0; before this the arm answered the same
+    /// first batch forever. A fresh open starts its own walk, and a
+    /// handle whose directory died fails closed (never lists the
+    /// directory that reused the slot).
+    #[test]
+    fn listdir_cursor_walks_the_whole_directory_and_zero_ends_it() {
+        use crate::sys::{SysError, SysRequest, SysValue};
+        use crate::vfs::{Mode, VfsError};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        for name in ["a", "b", "c", "d", "e"] {
+            k.syscall(
+                1,
+                SysRequest::Open {
+                    path: Box::leak(format!("/pub/{name}").into_boxed_str()),
+                    mode: Mode(0o644),
+                    create: true,
+                    read: false,
+                    write: true,
+                    truncate: false,
+                    excl: false,
+                },
+            )
+            .unwrap();
+        }
+        let open_dir = |k: &mut Kernel, path: &'static str| match k.syscall(
+            1,
+            SysRequest::Open {
+                path,
+                mode: Mode(0o755),
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+                excl: false,
+            },
+        ) {
+            Ok(SysValue::Fd(fd)) => fd,
+            other => panic!("open {path} must list, saw {:?}", other.map(|_| ())),
+        };
+        let fd = open_dir(&mut k, "/pub");
+        // A 3-byte buffer holds ONE 2-byte name ("a\0" is 2, the next
+        // would need 4): five serving calls, then the terminating 0 —
+        // the PM's loop shape.
+        let mut walked = Vec::new();
+        let mut calls = 0usize;
+        loop {
+            let mut chunk = [0u8; 3];
+            let n = match k.syscall(
+                1,
+                SysRequest::ListDir {
+                    fd,
+                    buf: &mut chunk,
+                },
+            ) {
+                Ok(SysValue::Count(n)) => n,
+                other => panic!("listdir must answer a count, saw {:?}", other.map(|_| ())),
+            };
+            calls += 1;
+            assert!(calls <= 6, "the walk must terminate");
+            if n == 0 {
+                break;
+            }
+            assert_eq!(n, 2, "whole names only");
+            walked.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(calls, 6);
+        assert_eq!(walked, b"a\0b\0c\0d\0e\0");
+        // At the end the cursor stays at the end: still 0.
+        let mut chunk = [0u8; 64];
+        assert_eq!(
+            k.syscall(
+                1,
+                SysRequest::ListDir {
+                    fd,
+                    buf: &mut chunk,
+                }
+            ),
+            Ok(SysValue::Count(0))
+        );
+        // A fresh open is an independent walk from the start, and a
+        // big buffer takes the whole directory in one call.
+        let fd2 = open_dir(&mut k, "/pub");
+        let n = match k.syscall(
+            1,
+            SysRequest::ListDir {
+                fd: fd2,
+                buf: &mut chunk,
+            },
+        ) {
+            Ok(SysValue::Count(n)) => n,
+            other => panic!("listdir must answer a count, saw {:?}", other.map(|_| ())),
+        };
+        assert_eq!(&chunk[..n], b"a\0b\0c\0d\0e\0");
+        // The stale handle: its directory is unlinked, the slot is
+        // reused by other nodes — the old fd fails closed.
+        let sub = open_dir(&mut k, "/pub");
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/gone",
+                mode: Mode(0o755),
+            },
+        )
+        .unwrap();
+        let gone = open_dir(&mut k, "/gone");
+        k.syscall(1, SysRequest::Unlink { path: "/gone" }).unwrap();
+        for name in ["x", "y", "z"] {
+            k.syscall(
+                1,
+                SysRequest::Mkdir {
+                    path: Box::leak(format!("/{name}").into_boxed_str()),
+                    mode: Mode(0o755),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            k.syscall(
+                1,
+                SysRequest::ListDir {
+                    fd: gone,
+                    buf: &mut chunk,
+                }
+            ),
+            Err(SysError::Vfs(VfsError::StaleInode))
+        );
+        let _ = sub;
+    }
+
+    /// K22: a file grows past the inline window through the syscall
+    /// layer — the package manager's smallest journal (B + 3×Move + C
+    /// = 1609 bytes) is written and read back whole.
+    #[test]
+    fn a_file_grows_past_the_inline_window_through_the_syscall_layer() {
+        use crate::sys::{SysRequest, SysValue};
+        use crate::vfs::Mode;
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o777),
+            },
+        )
+        .unwrap();
+        let fd = match k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/pub/journal",
+                mode: Mode(0o600),
+                create: true,
+                read: false,
+                write: true,
+                truncate: false,
+                excl: true,
+            },
+        ) {
+            Ok(SysValue::Fd(fd)) => fd,
+            other => panic!("journal open must succeed, saw {:?}", other.map(|_| ())),
+        };
+        let mut body: Vec<u8> = Vec::new();
+        for len in [17usize, 525, 525, 525, 17] {
+            let rec: Vec<u8> = (0..len).map(|i| ((body.len() + i) % 251) as u8).collect();
+            assert_eq!(
+                k.syscall(1, SysRequest::Write { fd, bytes: &rec }),
+                Ok(SysValue::Count(len))
+            );
+            body.extend_from_slice(&rec);
+        }
+        assert_eq!(body.len(), 1609);
+        let mut stat = [0u8; 24];
+        k.syscall(
+            1,
+            SysRequest::Stat {
+                path: "/pub/journal",
+                out: &mut stat,
+            },
+        )
+        .unwrap();
+        let size = u64::from_le_bytes(stat[8..16].try_into().unwrap());
+        assert_eq!(size, 1609);
+        let fd = match k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/pub/journal",
+                mode: Mode(0o600),
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+                excl: false,
+            },
+        ) {
+            Ok(SysValue::Fd(fd)) => fd,
+            other => panic!("journal reopen must succeed, saw {:?}", other.map(|_| ())),
+        };
+        let mut back = Vec::new();
+        let mut buf = [0u8; 400];
+        loop {
+            let n = match k.syscall(1, SysRequest::Read { fd, buf: &mut buf }) {
+                Ok(SysValue::Count(n)) => n,
+                other => panic!(
+                    "journal read must answer a count, saw {:?}",
+                    other.map(|_| ())
+                ),
+            };
+            if n == 0 {
+                break;
+            }
+            back.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(back, body);
     }
 
     /// K13 (the directory-open fix): a directory OPENS for read — that
@@ -2229,6 +2610,7 @@ mod tests {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         ) {
             Ok(SysValue::Fd(fd)) => fd,
@@ -2271,6 +2653,7 @@ mod tests {
                     read: false,
                     write: true,
                     truncate: false,
+                    excl: false,
                 },
             ),
             Err(SysError::Vfs(VfsError::IsADirectory))
@@ -2285,6 +2668,7 @@ mod tests {
                     read: true,
                     write: true,
                     truncate: true,
+                    excl: false,
                 },
             ),
             Err(SysError::Vfs(VfsError::IsADirectory))
@@ -2321,6 +2705,7 @@ mod tests {
                 read: true,
                 write: true,
                 truncate: false,
+                excl: false,
             },
         ) {
             Ok(SysValue::Fd(fd)) => {
@@ -2438,6 +2823,7 @@ mod tests {
                 read: true,
                 write: true,
                 truncate: false,
+                excl: false,
             },
         ) {
             Ok(SysValue::Fd(fd)) => fd,
@@ -2459,6 +2845,7 @@ mod tests {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         ) {
             Ok(SysValue::Fd(fd)) => fd,
@@ -2474,6 +2861,7 @@ mod tests {
                 read: true,
                 write: true,
                 truncate: false,
+                excl: false,
             },
         ) {
             Ok(SysValue::Fd(dfd)) => {
@@ -2613,6 +3001,7 @@ mod tests {
                     read: true,
                     write: true,
                     truncate: false,
+                    excl: false,
                 },
             )
             .unwrap()
@@ -2648,6 +3037,7 @@ mod tests {
                     read: true,
                     write: false,
                     truncate: false,
+                    excl: false,
                 },
             )
             .unwrap()
@@ -2681,6 +3071,7 @@ mod tests {
                     read: false,
                     write: true,
                     truncate: true,
+                    excl: false,
                 },
             )
             .unwrap()
@@ -2714,6 +3105,7 @@ mod tests {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap();
@@ -2727,7 +3119,8 @@ mod tests {
                     create: false,
                     read: false,
                     write: true,
-                    truncate: false
+                    truncate: false,
+                    excl: false,
                 }
             )
             .is_err());
@@ -2741,7 +3134,8 @@ mod tests {
                     create: false,
                     read: true,
                     write: false,
-                    truncate: false
+                    truncate: false,
+                    excl: false,
                 }
             )
             .is_ok());
@@ -3695,6 +4089,7 @@ mod tests {
                 read: true,
                 write: true,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap();
@@ -3712,6 +4107,7 @@ mod tests {
                     read: true,
                     write: false,
                     truncate: false,
+                    excl: false,
                 },
             )
         };
@@ -3859,6 +4255,7 @@ mod tests {
                 read: true,
                 write: true,
                 truncate: false,
+                excl: false,
             },
             SysRequest::Mkdir {
                 path: "/pub/d",

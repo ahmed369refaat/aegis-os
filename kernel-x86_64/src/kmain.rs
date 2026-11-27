@@ -1891,7 +1891,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         let cr2 = match run.exit {
             crate::sched::context::ExitKind::Fault {
                 vector: 14, cr2, ..
-            } if cr2 >= crate::mm::user_layout::TRAMPOLINE_BASE + 4096 => cr2,
+            } if cr2 >= run.layout.window_floor() => cr2,
             _ => {
                 line(
                     &mut out,
@@ -3215,7 +3215,8 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     //      exit, mmap (9) demands MAP_PRIVATE|MAP_ANONYMOUS; open
     //      (2) translates the Linux O_* word at the arm (create /
     //      write / close / O_RDONLY reopen with read-back through an
-    //      independent cursor, then O_EXCL and O_APPEND must REFUSE
+    //      independent cursor, then O_EXCL — K22: honored, the
+    //      existing file answers -EEXIST — and O_APPEND must REFUSE
     //      -EINVAL — a bit we cannot honor is never silently
     //      dropped); and the two whitelist probes — uname (63) must
     //      answer -ENOSYS
@@ -3320,7 +3321,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         if clean == 1 {
             line(
                 &mut out,
-                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, open(2) O_* translated (O_EXCL/O_APPEND refused), wait4(61) WNOHANG/block/reap (wstatus 7<<8, then ECHILD), execve(59) -> the compiled-in ELF64 image (bss-clean entry, wstatus 11<<8), uname(63) -> -ENOSYS, Phase-6 S1: mkdir(83)/unlink(87, rmdir-fold ENOTEMPTY)/chroot(161, the escaped path answers ENOENT inside the jail)"],
+                &["[M3] linux-abi: v1 entry live — pipe rax/rdx split, EOF, fork + exit_group, mmap flags, open(2) O_* translated (O_EXCL honored: existing file -> EEXIST; O_APPEND refused), wait4(61) WNOHANG/block/reap (wstatus 7<<8, then ECHILD), execve(59) -> the compiled-in ELF64 image (bss-clean entry, wstatus 11<<8), uname(63) -> -ENOSYS, Phase-6 S1: mkdir(83)/unlink(87, rmdir-fold ENOTEMPTY)/chroot(161, the escaped path answers ENOENT inside the jail)"],
             );
         } else {
             line(
@@ -3382,6 +3383,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                         read: true,
                         write: false,
                         truncate: false,
+                        excl: false,
                     },
                 ) else {
                     break 'probe None;
@@ -3414,6 +3416,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                             read: false,
                             write: true,
                             truncate: true,
+                            excl: false,
                         },
                     ) else {
                         break 'reseed false;

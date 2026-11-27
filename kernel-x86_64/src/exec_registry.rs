@@ -12,34 +12,76 @@
 //! `resolve` becomes a VFS lookup and every other execve guarantee in
 //! this slice is unchanged.
 //!
-//! The registry entry's second element is the IMAGE BYTES — a full
-//! ELF64 file, not a flat blob: the slice-4 loader parses it
+//! The registry entry's `image` is the IMAGE BYTES — a full ELF64
+//! file, not a flat blob: the slice-4 loader parses it
 //! (`aegis_os::elf::build_exec_plan`) and maps its PT_LOADs at their
-//! DECLARED vaddrs. The first entry is `ring3-exec-target` — the
-//! bss-probing, entry-honoring, exit_group(11) image the linux-abi
-//! lane's fork + execve + wait4 round-trip runs.
+//! DECLARED vaddrs; its `layout` is the memory contract the image was
+//! linked for (K22 — stack, trampoline, cage). The first entry is
+//! `ring3-exec-target` — the bss-probing, entry-honoring, exit_group(11)
+//! image the linux-abi lane's fork + execve + wait4 round-trip runs.
 
 // SAFETY discipline (module-level): the ONE static-mut slot below
 // (the disk-sourced exec image) is written once at boot — driver
 // stack, IF=0, before any exec-capable domain exists — and read
 // only afterwards; every access is documented at the site.
 #![allow(unsafe_code)]
+use crate::mm::user_layout::{ExecLayout, CANONICAL};
 /// The exec target: ELF64, text RX at 0x400000, data RW at 0x403000
 /// with the bss tail at 0x403800 (the zero-fill probe), entry
 /// `_start` = 0x400000. Built by boot.sh (rustc --emit=obj + ld -T
 /// exec.ld — see the script's step [0]).
 pub const EXEC_TARGET_ELF: &[u8] = include_bytes!("../blob/ring3-exec-target.bin");
 
-/// The registry: (absolute path, ELF image). Lookup is exact-match —
+/// The registry: one entry per absolute path. Lookup is exact-match —
 /// no prefix games, no wildcards; a path either names an image or it
 /// does not.
+///
+/// K22: an entry names the image's MEMORY CONTRACT beside its bytes.
+/// `CANONICAL` is the contract every earlier image is linked for (7
+/// image pages below the stack's guard page, a one-page stack); the
+/// package manager is `no_alloc` — every buffer is a fixed stack array
+/// — and links for `SERVICE` (a 128-page cage, a 256 KiB stack). The
+/// exec arm takes the stack, the trampoline, the window floor and the
+/// quota pre-check from this field, never from a constant.
 pub const EXEC_SH_ELF: &[u8] = include_bytes!("../blob/ring3-sh.bin");
 
+/// One compiled-in executable: where execve finds it, its bytes, and
+/// the layout it was linked for.
+pub struct RegistryEntry {
+    pub path: &'static str,
+    pub image: &'static [u8],
+    pub layout: &'static ExecLayout,
+}
+
 /// Phase 7: the registry's second citizen — the shell init execve's.
-pub const REGISTRY: &[(&str, &[u8])] = &[
-    ("/bin/exec-target", EXEC_TARGET_ELF),
-    ("/bin/sh", EXEC_SH_ELF),
+///
+/// K22: the package manager's image is NOT here yet. boot.sh builds it
+/// under the `SERVICE` contract (step [0d]) and the exec arm already
+/// speaks that contract, but the kernel has ONE 2 MiB page to live in
+/// and its headroom (73,728 B) is smaller than the stripped image
+/// (119,424 B). The entry lands together with a second huge page (the
+/// numbers and the options: pkg/BUILD.md).
+pub const REGISTRY: &[RegistryEntry] = &[
+    entry("/bin/exec-target", EXEC_TARGET_ELF),
+    entry("/bin/sh", EXEC_SH_ELF),
 ];
+
+const fn entry(path: &'static str, image: &'static [u8]) -> RegistryEntry {
+    RegistryEntry {
+        path,
+        image,
+        layout: &CANONICAL,
+    }
+}
+
+/// What a resolved path names: the image bytes and the contract they
+/// were linked for (both `'static` — the compiled-in table, or the
+/// boot-registered disk slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedImage {
+    pub image: &'static [u8],
+    pub layout: &'static ExecLayout,
+}
 
 // ── K20 (P0-3): the disk-sourced extension slot ──
 //
@@ -91,13 +133,21 @@ pub fn register_disk_image(bytes: &[u8]) -> bool {
 /// names an image or it does not.
 #[must_use]
 pub fn resolve(path: &str) -> Option<&'static [u8]> {
+    resolve_image(path).map(|r| r.image)
+}
+
+/// K22: resolve `path` to its image AND its memory contract — what
+/// the exec arm builds the new address space from. The disk-sourced
+/// image is linked for the canonical contract (it is a gcc-built
+/// flat-layout citizen of the same cage).
+#[must_use]
+pub fn resolve_image(path: &str) -> Option<ResolvedImage> {
     use core::sync::atomic::Ordering;
-    if let Some(image) = REGISTRY
-        .iter()
-        .find(|(p, _)| *p == path)
-        .map(|(_, image)| *image)
-    {
-        return Some(image);
+    if let Some(e) = REGISTRY.iter().find(|e| e.path == path) {
+        return Some(ResolvedImage {
+            image: e.image,
+            layout: e.layout,
+        });
     }
     if path == DISK_IMAGE_PATH {
         let len = DISK_LEN.load(Ordering::Acquire);
@@ -108,12 +158,13 @@ pub fn resolve(path: &str) -> Option<&'static [u8]> {
         // any exec-capable domain existed) and never written again;
         // the length is published after the bytes (Release/Acquire).
         // The slice borrows a static — read-only for the boot's life.
-        unsafe {
-            return Some(core::slice::from_raw_parts(
-                core::ptr::addr_of!(DISK_IMAGE) as *const u8,
-                len,
-            ));
-        }
+        let image = unsafe {
+            core::slice::from_raw_parts(core::ptr::addr_of!(DISK_IMAGE) as *const u8, len)
+        };
+        return Some(ResolvedImage {
+            image,
+            layout: &CANONICAL,
+        });
     }
     None
 }
@@ -284,15 +335,41 @@ mod n2_tests {
         );
     }
 
+    /// Every compiled-in image, checked against ITS OWN contract: the
+    /// plan fits its cage, and image + the contract's overhead fit the
+    /// quota the boot runs it under (service 256 for the canonical
+    /// citizens, the package manager's own 192 for the service one). A
+    /// new registry entry is covered the moment it is added.
     #[test]
     fn the_real_registry_images_pass_their_own_spawn_footprints() {
-        // The embedded images' plans, checked against the quotas the
-        // boot actually runs them under (service = 256).
-        for (image, name) in [(EXEC_TARGET_ELF, "exec-target"), (EXEC_SH_ELF, "sh")] {
-            let plan = aegis_os::elf::build_exec_plan(image).unwrap();
+        use crate::mm::user_layout::CANONICAL;
+        for entry in REGISTRY {
+            let plan = aegis_os::elf::build_exec_plan(entry.image)
+                .unwrap_or_else(|e| panic!("{} must be a loadable ELF: {e:?}", entry.path));
             assert!(
-                exec_quota_check(plan.map_bytes, 1, 1, 256).is_ok(),
-                "{name} must exec under the service quota"
+                crate::mm::user::exec_cage_check(&plan, entry.layout).is_ok(),
+                "{} must fit its own cage ({:?})",
+                entry.path,
+                entry.layout
+            );
+            let quota = if entry.layout == &CANONICAL {
+                aegis_os::profile::service_profile().quota_pages
+            } else {
+                aegis_os::profile::package_manager_profile().quota_pages
+            };
+            assert!(
+                exec_quota_check(plan.map_bytes, entry.layout.stack_pages, 1, quota).is_ok(),
+                "{} must exec under the quota its boot gives it ({quota})",
+                entry.path
+            );
+            assert_eq!(
+                resolve_image(entry.path),
+                Some(ResolvedImage {
+                    image: entry.image,
+                    layout: entry.layout
+                }),
+                "{} resolves to itself",
+                entry.path
             );
         }
     }

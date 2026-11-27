@@ -1,5 +1,44 @@
 # Changelog
 
+## [Unreleased] — the K22 round, part 1: exec layouts, the manager's kernel arms extended, its ring-3 image under contract
+
+- **Exec got a memory contract (`ExecLayout`)** — `CANONICAL` (7 image
+  pages below the stack's guard page, a one-page stack) and `SERVICE`
+  (a 128-page cage, a 64-page stack) replace the hard-coded exec
+  constants: the registry names the contract per image, `exec_tables`
+  takes it, `sys_exec` pre-checks the cage against it BEFORE the point
+  of no return (`-ENOMEM`, old image intact), sigaction's trampoline
+  and the mmap/munmap/grant window floors read it off the run, and
+  fork hands the child its parent's contract. The canonical cage is
+  now [0x400000, 0x407000): the page below the stack is the policy's
+  guard gap, as the mapper always refused it.
+- **`O_EXCL` and the listdir cursor** — `SysRequest::Open` carries the
+  exclusive bit (EINVAL without O_CREAT; EEXIST on any existing path),
+  and `ListDir` is a cursor: NUL-separated names, a 0-byte answer is
+  the end, the ramfs holding files above 1 KiB in four 8 KiB
+  side-table windows.
+- **`package_manager_profile`** — the least-privilege domain the
+  manager runs as: read/write/open/close/mkdir/unlink/listdir/stat/
+  rename/exit, quota 192 pages, no fork/exec/mmap/net/ipc,
+  `max_children = 0`.
+- **The manager's ring-3 image is real, built and checked at every
+  build** — `pkg/` links as a three-PT_LOAD ELF under the `SERVICE`
+  contract (opt-level z, one codegen unit: 98 KiB of text, 31 cage
+  pages, 96 of the 192 quota pages with the stack), with a `_start`
+  that reads the execve initial stack, an adapter that speaks the
+  kernel's real word (flags, one-page I/O, errno family) behind a
+  testable port, and a build-time contract check
+  (`scripts/check-pkg-image.py`: segment flags, guard pages, cage,
+  quota, the 58 KiB worst stack chain under an 80 KiB line). **Not
+  yet embedded**: the kernel has one 2 MiB page and 73,728 B of
+  headroom; the stripped image is 119,424 B. The registry entry, the
+  signed fixture, the in-VM install lane and the PM policy declaration
+  land with a second huge page (`pkg/BUILD.md`).
+- Host gates green (fmt, clippy ×3, 867 tests, unsafe, asm,
+  no-binaries, build, ist). The QEMU `--verify` lanes were NOT re-run
+  for this round (the sandbox's QEMU lacks `libcapstone.so.5`): every
+  in-VM claim of this round is unproven until they are.
+
 ## [Unreleased] — the K19 round: MSI-X delivery proven, virtio-blk migrated to a ring-3 driver domain, and two audit finds fixed
 
 - **MSI/MSI-X messages DELIVER (ADR-0019 round two)** — both formats,

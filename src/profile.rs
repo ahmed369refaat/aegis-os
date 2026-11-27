@@ -7,8 +7,10 @@
 //! - Plugins get read + IPC only.
 //! - Network egress is brokered: `netd_profile` is the ONLY profile that
 //!   carries NET_* rights, and its sends are kernel rate-limited per client.
-//! - The Linux-like process syscalls (PIPE/DUP/KILL/CHROOT/MKDIR/UNLINK/
-//!   LISTDIR/STAT/RENAME) belong to the service profile exclusively.
+//! - The Linux-like process-management syscalls (PIPE/DUP/KILL/CHROOT)
+//!   belong to the service profile exclusively; the file-family
+//!   mutators (MKDIR/UNLINK/LISTDIR/STAT/RENAME) are shared with the
+//!   package manager, whose whole surface they nearly are (K22).
 
 use crate::capability::Rights;
 use crate::syscall::{
@@ -305,6 +307,50 @@ pub const fn netd_profile() -> DomainProfile {
     }
 }
 
+/// K22: the package manager domain (`/bin/pkg`). The file family's
+/// whole working set — read, write, open (with O_EXCL), close, mkdir,
+/// unlink, listdir, stat, rename — and NOTHING from the process
+/// family: it installs files, it never starts, signals, jails or
+/// pipes anything, it holds no IPC and no network (a repo fetch is a
+/// broker round-trip that does not exist yet — until it does, the
+/// mask says so). The transaction layer's needs are exactly this
+/// list: the O_EXCL lock, staged files, journaled mkdir, the rename
+/// commit, stat for the destination-parent walks, getdents for the
+/// repo-config listing.
+///
+/// A pure attenuation of `service_profile` on every axis (the host
+/// test pins it): the quota covers the image's mapped pages plus the
+/// 64-page stack its no_alloc buffers need under the service exec
+/// layout (see `mm::user_layout::ExecLayout` in the kernel).
+pub const fn package_manager_profile() -> DomainProfile {
+    DomainProfile {
+        name: "pkg",
+        syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ)
+                | (1u64 << SYS_WRITE)
+                | (1u64 << SYS_OPEN)
+                | (1u64 << SYS_CLOSE)
+                | (1u64 << SYS_MKDIR)
+                | (1u64 << SYS_UNLINK)
+                | (1u64 << SYS_LISTDIR)
+                | (1u64 << SYS_STAT)
+                | (1u64 << SYS_RENAME)
+                | (1u64 << SYS_EXIT),
+        ),
+        // Degraded pkg: drain what is already open and leave — every
+        // path that touches the tree by name (open/mkdir/unlink/
+        // listdir/stat/rename) drops, so a tightened manager can never
+        // start a transaction.
+        degraded_syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ) | (1u64 << SYS_WRITE) | (1u64 << SYS_CLOSE) | (1u64 << SYS_EXIT),
+        ),
+        quota_pages: 192,
+        base_rights: Rights::READ.union(Rights::WRITE),
+        sensitivity: 40,
+        max_children: 0,
+    }
+}
+
 /// ADR-0022: the default profile for spawned processes and for any
 /// executable the exec policy table does not list — "app". File I/O +
 /// pipes + the process family (fork/exec/wait); NO kill, NO chroot,
@@ -371,6 +417,7 @@ mod degraded_tests {
             driver_profile(),
             plugin_profile(),
             netd_profile(),
+            package_manager_profile(),
         ];
         for p in all {
             let d = p.degraded_syscalls;
@@ -493,6 +540,7 @@ mod degraded_tests {
             driver_profile(),
             plugin_profile(),
             netd_profile(),
+            package_manager_profile(),
         ] {
             let mut d = crate::domain::Domain::new(7, p);
             d.tighten(&p.degraded_syscalls);
@@ -604,6 +652,7 @@ mod tests {
             parser_profile(),
             driver_profile(),
             plugin_profile(),
+            package_manager_profile(),
         ] {
             assert!(!p.syscalls.is_allowed(SYS_NET_SEND).unwrap(), "{}", p.name);
             assert!(!p.syscalls.is_allowed(SYS_NET_RECV).unwrap(), "{}", p.name);
@@ -619,20 +668,14 @@ mod tests {
         );
     }
 
+    /// The process-management half of the Linux-like family — pipes,
+    /// descriptor games, kill, chroot — is the service profile's
+    /// alone: no other class may hold it, the package manager
+    /// included.
     #[test]
-    fn service_holds_the_linux_like_syscalls_exclusively() {
+    fn service_holds_the_process_management_syscalls_exclusively() {
         let s = service_profile();
-        for allowed in [
-            SYS_PIPE,
-            SYS_DUP,
-            SYS_KILL,
-            SYS_CHROOT,
-            SYS_MKDIR,
-            SYS_UNLINK,
-            SYS_LISTDIR,
-            SYS_STAT,
-            SYS_RENAME,
-        ] {
+        for allowed in [SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT] {
             assert!(
                 s.syscalls.is_allowed(allowed).unwrap(),
                 "service may use {}",
@@ -644,18 +687,9 @@ mod tests {
             driver_profile(),
             plugin_profile(),
             netd_profile(),
+            package_manager_profile(),
         ] {
-            for denied in [
-                SYS_PIPE,
-                SYS_DUP,
-                SYS_KILL,
-                SYS_CHROOT,
-                SYS_MKDIR,
-                SYS_UNLINK,
-                SYS_LISTDIR,
-                SYS_STAT,
-                SYS_RENAME,
-            ] {
+            for denied in [SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT] {
                 assert!(
                     !p.syscalls.is_allowed(denied).unwrap(),
                     "{} may not use {}",
@@ -664,6 +698,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The file-family mutators are the service's and the package
+    /// manager's — K22 re-scoped the old "service exclusively" rule
+    /// for exactly these five calls; every other class still holds
+    /// none of them.
+    #[test]
+    fn the_file_family_mutators_belong_to_service_and_pkg() {
+        for p in [service_profile(), package_manager_profile()] {
+            for allowed in [SYS_MKDIR, SYS_UNLINK, SYS_LISTDIR, SYS_STAT, SYS_RENAME] {
+                assert!(
+                    p.syscalls.is_allowed(allowed).unwrap(),
+                    "{} may use {}",
+                    p.name,
+                    allowed
+                );
+            }
+        }
+        for p in [
+            parser_profile(),
+            driver_profile(),
+            plugin_profile(),
+            netd_profile(),
+        ] {
+            for denied in [SYS_MKDIR, SYS_UNLINK, SYS_LISTDIR, SYS_STAT, SYS_RENAME] {
+                assert!(
+                    !p.syscalls.is_allowed(denied).unwrap(),
+                    "{} may not use {}",
+                    p.name,
+                    denied
+                );
+            }
+        }
+    }
+
+    /// K22: the package manager's exact surface — the file family and
+    /// nothing else — and its shape as an attenuation of the service
+    /// profile on every axis (so a supervisor may hand it down to a
+    /// service's child without a policy exception).
+    #[test]
+    fn the_package_manager_is_the_file_family_and_a_service_attenuation() {
+        let p = package_manager_profile();
+        let expected = SyscallMask::from_bits(
+            (1u64 << SYS_READ)
+                | (1u64 << SYS_WRITE)
+                | (1u64 << SYS_OPEN)
+                | (1u64 << SYS_CLOSE)
+                | (1u64 << SYS_MKDIR)
+                | (1u64 << SYS_UNLINK)
+                | (1u64 << SYS_LISTDIR)
+                | (1u64 << SYS_STAT)
+                | (1u64 << SYS_RENAME)
+                | (1u64 << SYS_EXIT),
+        );
+        assert_eq!(p.syscalls, expected, "the mask is exactly the file family");
+        assert_eq!(p.name, "pkg");
+        assert_eq!(p.max_children, 0, "the manager never forks or spawns");
+        assert_eq!(p.base_rights, Rights::READ.union(Rights::WRITE));
+        assert_eq!(
+            p.degraded_syscalls,
+            SyscallMask::from_bits(
+                (1u64 << SYS_READ) | (1u64 << SYS_WRITE) | (1u64 << SYS_CLOSE) | (1u64 << SYS_EXIT)
+            )
+        );
+        for denied in [
+            SYS_PIPE,
+            SYS_DUP,
+            SYS_KILL,
+            SYS_CHROOT,
+            SYS_FORK,
+            SYS_EXEC,
+            SYS_SPAWN,
+            SYS_MMAP,
+            SYS_IPC_SEND,
+            SYS_NET_SEND,
+            SYS_NET_RECV,
+            SYS_DEVREG,
+        ] {
+            assert!(
+                !p.syscalls.is_allowed(denied).unwrap(),
+                "pkg must not use {}",
+                denied
+            );
+        }
+        let s = service_profile();
+        assert_eq!(
+            p.is_attenuation_of(&s, &s.syscalls, s.quota_pages),
+            Ok(()),
+            "pkg is a pure attenuation of service"
+        );
+        // The quota is a real ceiling for the service exec layout: the
+        // image (~35 pages) + 64 stack pages + the trampoline fit; a
+        // second image's worth on top does not.
+        assert!(p.quota_pages >= 35 + 65); // 35 image pages + 64 stack + 1 trampoline
+        assert!(p.quota_pages < s.quota_pages);
     }
 
     #[test]

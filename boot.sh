@@ -80,6 +80,22 @@ rustc --edition 2021 --crate-type=bin -C panic=abort -C opt-level=z -C codegen-u
       --target x86_64-unknown-none examples/ring3-sh/src/lib.rs \
       -o kernel-x86_64/blob/ring3-sh.bin
 
+# K22: the package manager's own image (/bin/pkg) — a REAL ELF64 under
+# the SERVICE memory contract (text RX / rodata R / data RW, one absent
+# page between them, the 256 KiB stack above the cage). Built with the
+# size recipe the K22 measurements were taken with, then checked against
+# the contract at EVERY build: a layout shift fails here instead of
+# inside execve (scripts/check-pkg-image.py).
+echo "==> [0d/4] linking the package manager (/bin/pkg — the SERVICE contract, opt-level=z)"
+cargo build -p aegis-pkg --bin pkg --profile pkg-image --target x86_64-unknown-none
+python3 scripts/check-pkg-image.py target/x86_64-unknown-none/pkg-image/pkg
+# The kernel embeds the FILE, and the kernel has ONE 2 MiB page to live
+# in: the symbol table goes (the stack-depth check above needed it; the
+# kernel's loader reads only the ELF header and the program headers).
+strip --strip-all target/x86_64-unknown-none/pkg-image/pkg -o kernel-x86_64/blob/pkg.bin
+[ "$(readelf -lW kernel-x86_64/blob/pkg.bin | grep -c '^  LOAD')" = 3 ] \
+    || { echo "FATAL: the stripped /bin/pkg image lost a PT_LOAD"; exit 1; }
+
 echo "==> [1/4] building the 64-bit kernel (x86_64-unknown-none, release)"
 cargo build -p aegis-kernel --release --target x86_64-unknown-none
 

@@ -51,7 +51,11 @@ pub const O_READ: u64 = 0x1;
 pub const O_WRITE: u64 = 0x2;
 pub const O_CREAT: u64 = 0x4;
 pub const O_TRUNC: u64 = 0x8;
-pub const KNOWN_OPEN_FLAGS: u64 = O_READ | O_WRITE | O_CREAT | O_TRUNC;
+/// K22: O_EXCL — with O_CREAT, "create only if absent": an existing
+/// path answers -EEXIST and is never opened. The package manager's
+/// transaction lock, staged files and backups are built on this bit.
+pub const O_EXCL: u64 = 0x10;
+pub const KNOWN_OPEN_FLAGS: u64 = O_READ | O_WRITE | O_CREAT | O_TRUNC | O_EXCL;
 
 /// Longest path the kernel will copy in from ring-3 (bounds the copy;
 /// component-length rules stay in the VFS, which owns NAME_MAX).
@@ -65,12 +69,14 @@ pub const MAX_PATH: usize = 128;
 /// the read/write bound tests in syscall.rs pin the refusal edge.
 pub const MAX_READ: usize = 4096;
 
-/// Decode the a2 flags word of SYS_OPEN. Unknown bits refuse (-EINVAL)
-/// rather than ignore — an ABI the caller cannot predict is not an ABI.
-/// O_TRUNC without O_WRITE refuses the same way (the lib only applies
-/// truncation on the write path; POSIX leaves this combination
-/// undefined, and undefined is not something we honor).
-pub fn open_flags(bits: u64) -> Result<(bool, bool, bool, bool), i64> {
+/// Decode the a2 flags word of SYS_OPEN into `(read, write, create,
+/// truncate, excl)`. Unknown bits refuse (-EINVAL) rather than ignore
+/// — an ABI the caller cannot predict is not an ABI. O_TRUNC without
+/// O_WRITE refuses the same way (the lib only applies truncation on
+/// the write path; POSIX leaves this combination undefined, and
+/// undefined is not something we honor). O_EXCL without O_CREAT is
+/// left to the core's executor (same refusal, one owner for the rule).
+pub fn open_flags(bits: u64) -> Result<(bool, bool, bool, bool, bool), i64> {
     if bits & !KNOWN_OPEN_FLAGS != 0 {
         return Err(-EINVAL);
     }
@@ -78,10 +84,11 @@ pub fn open_flags(bits: u64) -> Result<(bool, bool, bool, bool), i64> {
     let write = bits & O_WRITE != 0;
     let create = bits & O_CREAT != 0;
     let truncate = bits & O_TRUNC != 0;
+    let excl = bits & O_EXCL != 0;
     if truncate && !write {
         return Err(-EINVAL);
     }
-    Ok((read, write, create, truncate))
+    Ok((read, write, create, truncate, excl))
 }
 
 // ─── Linux open(2) flags (x86_64 ABI, bits/fcntl-linux.h) ───
@@ -89,8 +96,8 @@ pub fn open_flags(bits: u64) -> Result<(bool, bool, bool, bool), i64> {
 // bit is a mode!), then the single-bit modifiers. Only the bits whose
 // semantics the internal VFS honors are translated; everything else
 // refuses -EINVAL at the entry — an ABI that silently drops a bit
-// the caller relied on (O_EXCL's "only create if absent", O_APPEND's
-// write-position contract) is not an ABI.
+// the caller relied on (O_APPEND's write-position contract,
+// O_NONBLOCK's non-blocking promise) is not an ABI.
 pub const LINUX_O_ACCMODE: u64 = 0x3;
 pub const LINUX_O_WRONLY: u64 = 0x1;
 pub const LINUX_O_RDWR: u64 = 0x2;
@@ -102,10 +109,11 @@ pub const LINUX_O_NONBLOCK: u64 = 0x800;
 pub const LINUX_O_DIRECTORY: u64 = 0x10000;
 pub const LINUX_O_NOFOLLOW: u64 = 0x20000;
 pub const LINUX_O_CLOEXEC: u64 = 0x80000;
-/// The bits we honor: the access mode + O_CREAT + O_TRUNC.
-pub const LINUX_OPEN_HONORED: u64 = LINUX_O_ACCMODE | LINUX_O_CREAT | LINUX_O_TRUNC;
+/// The bits we honor: the access mode + O_CREAT + O_TRUNC + O_EXCL
+/// (K22: the core's executor owns the create-only-if-absent rule).
+pub const LINUX_OPEN_HONORED: u64 = LINUX_O_ACCMODE | LINUX_O_CREAT | LINUX_O_TRUNC | LINUX_O_EXCL;
 
-/// Translate a Linux open(2) flags word into the internal 4-bit
+/// Translate a Linux open(2) flags word into the internal 5-bit
 /// encoding (`open_flags` validates the result — O_TRUNC without
 /// write refuses exactly as it does for a native caller). acc==3 is
 /// invalid in Linux too; unknown/unhonored bits refuse rather than
@@ -126,6 +134,9 @@ pub fn linux_open_flags(bits: u64) -> Result<u64, i64> {
     }
     if bits & LINUX_O_TRUNC != 0 {
         out |= O_TRUNC;
+    }
+    if bits & LINUX_O_EXCL != 0 {
+        out |= O_EXCL;
     }
     Ok(out)
 }
@@ -255,20 +266,34 @@ mod tests {
 
     #[test]
     fn open_flags_decode_every_legal_combination() {
-        assert_eq!(open_flags(O_READ), Ok((true, false, false, false)));
-        assert_eq!(open_flags(O_WRITE), Ok((false, true, false, false)));
+        assert_eq!(open_flags(O_READ), Ok((true, false, false, false, false)));
+        assert_eq!(open_flags(O_WRITE), Ok((false, true, false, false, false)));
         assert_eq!(
             open_flags(O_READ | O_WRITE | O_CREAT | O_TRUNC),
-            Ok((true, true, true, true))
+            Ok((true, true, true, true, false))
         );
         // Flags==0 is a legal existence-probe open (no access bits).
-        assert_eq!(open_flags(0), Ok((false, false, false, false)));
+        assert_eq!(open_flags(0), Ok((false, false, false, false, false)));
+    }
+
+    /// K22: O_EXCL rides the word into the request — the package
+    /// manager's lock is O_WRITE|O_CREAT|O_EXCL, nothing else.
+    #[test]
+    fn open_flags_decode_excl() {
+        assert_eq!(
+            open_flags(O_WRITE | O_CREAT | O_EXCL),
+            Ok((false, true, true, false, true))
+        );
+        assert_eq!(
+            open_flags(O_READ | O_WRITE | O_CREAT | O_TRUNC | O_EXCL),
+            Ok((true, true, true, true, true))
+        );
     }
 
     #[test]
     fn open_flags_refuse_unknown_bits_and_trunc_without_write() {
         // A bit the ABI does not define — refuse, never ignore.
-        assert_eq!(open_flags(0x10), Err(-EINVAL));
+        assert_eq!(open_flags(0x20), Err(-EINVAL));
         assert_eq!(open_flags(0x8000_0000), Err(-EINVAL));
         // O_TRUNC without O_WRITE: POSIX-undefined, kernel-refused.
         assert_eq!(open_flags(O_READ | O_TRUNC), Err(-EINVAL));
@@ -292,10 +317,20 @@ mod tests {
             linux_open_flags(LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_TRUNC),
             Ok(O_WRITE | O_CREAT | O_TRUNC)
         );
+        // K22: O_EXCL is honored — the Linux lane and the internal
+        // lane reach the same core rule.
+        assert_eq!(
+            linux_open_flags(LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_EXCL),
+            Ok(O_WRITE | O_CREAT | O_EXCL)
+        );
         // The translated word must survive the internal decoder.
         assert_eq!(
             open_flags(linux_open_flags(LINUX_O_RDWR | LINUX_O_CREAT).unwrap()),
-            Ok((true, true, true, false))
+            Ok((true, true, true, false, false))
+        );
+        assert_eq!(
+            open_flags(linux_open_flags(LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_EXCL).unwrap()),
+            Ok((false, true, true, false, true))
         );
     }
 
@@ -304,12 +339,7 @@ mod tests {
         // acc==3 is not a Linux access mode.
         assert_eq!(linux_open_flags(0x3), Err(-EINVAL));
         // Semantic bits the internal VFS does not implement —
-        // refuse, never silently drop (O_EXCL's "only create if
-        // absent" would let a caller open an existing file).
-        assert_eq!(
-            linux_open_flags(LINUX_O_RDWR | LINUX_O_CREAT | LINUX_O_EXCL),
-            Err(-EINVAL)
-        );
+        // refuse, never silently drop.
         assert_eq!(
             linux_open_flags(LINUX_O_RDWR | LINUX_O_APPEND),
             Err(-EINVAL)
@@ -318,6 +348,13 @@ mod tests {
         assert_eq!(linux_open_flags(LINUX_O_DIRECTORY), Err(-EINVAL));
         assert_eq!(linux_open_flags(LINUX_O_NOFOLLOW), Err(-EINVAL));
         assert_eq!(linux_open_flags(LINUX_O_CLOEXEC), Err(-EINVAL));
+        // O_EXCL is honored on its own (Linux permits it without
+        // O_CREAT as a no-op); the core's executor answers the
+        // POSIX-undefined refusal — one owner for that rule.
+        assert_eq!(
+            linux_open_flags(LINUX_O_WRONLY | LINUX_O_EXCL),
+            Ok(O_WRITE | O_EXCL)
+        );
         // O_TRUNC|O_RDONLY translates to O_READ|O_TRUNC, which the
         // internal decoder then refuses (POSIX-undefined, same rule
         // as a native caller) — the two-layer contract holds.

@@ -35,3 +35,14 @@ panic = "abort"
 # same way debug builds do — a silent wrap on a counter or a size is a
 # security bug in a kernel, and the no_std panic handler halts loudly.
 overflow-checks = true
+
+# The package manager's ring-3 image (`pkg/`): the size-optimized recipe
+# the K22 measurements were taken with (opt-level z, one codegen unit —
+# the shell's codegen), inheriting release's abort / overflow
+# discipline and LTO. The image lives in a 128-page cage and inside the
+# kernel binary, so bytes are the budget: opt-level 3 links 234 KiB of
+# text, this recipe 98 KiB. boot.sh builds it with --profile pkg-image.
+[profile.pkg-image]
+inherits = "release"
+opt-level = "z"
+codegen-units = 1

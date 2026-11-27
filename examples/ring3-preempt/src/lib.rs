@@ -1455,17 +1455,18 @@ pipe_b_got:
     syscall
     cmp rax, 0
     jne 219f
-    mov eax, 2                        /* O_EXCL (0x80): we have no
-                                          exclusive-create semantics, so
-                                          the word must REFUSE -EINVAL —
-                                          silently dropping the bit would
-                                          let an "only create if absent"
-                                          caller open an existing file */
+    mov eax, 2                        /* O_EXCL (0x80), K22: HONORED — the
+                                          word translates to the internal
+                                          create-only-if-absent bit; the
+                                          path exists (written above), so
+                                          the answer is -EEXIST — never an
+                                          fd, never a truncation, and not
+                                          the -EINVAL of the old refusal */
     mov rdi, 0x004033a0
     mov esi, 0xC2                     /* O_RDWR|O_CREAT|O_EXCL */
     xor edx, edx
     syscall
-    cmp rax, -22
+    cmp rax, -17
     jne 220f
     mov eax, 2                        /* O_APPEND (0x400): no append mode
                                           in the internal VFS — refuse,
@@ -2158,7 +2159,7 @@ slow_wr_spin:
     mov edi, 219
     syscall
 220: mov eax, 231
-    mov edi, 220                      /* O_EXCL did not refuse -EINVAL */
+    mov edi, 220                      /* O_EXCL on the existing file did not answer -EEXIST */
     syscall
     mov eax, 63                       /* the internal fallback (pre-v1 legibility) */
     mov edi, 220

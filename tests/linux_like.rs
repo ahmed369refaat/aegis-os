@@ -48,6 +48,7 @@ fn kernel_with_tree() -> Kernel {
             read: true,
             write: false,
             truncate: false,
+            excl: false,
         },
     )
     .unwrap();
@@ -61,6 +62,7 @@ fn kernel_with_tree() -> Kernel {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -95,6 +97,7 @@ fn vfs_unix_permissions_end_to_end() {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -131,7 +134,8 @@ fn vfs_unix_permissions_end_to_end() {
                 create: true,
                 read: true,
                 write: false,
-                truncate: false
+                truncate: false,
+                excl: false,
             }
         ),
         Err(SysError::Vfs(VfsError::PermissionDenied))
@@ -149,6 +153,7 @@ fn vfs_unix_permissions_end_to_end() {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -176,6 +181,7 @@ fn vfs_unix_permissions_end_to_end() {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -208,6 +214,7 @@ fn file_cursor_reads_short_then_eof() {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -236,6 +243,7 @@ fn file_cursor_reads_short_then_eof() {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -305,7 +313,8 @@ fn parser_is_masked_out_of_all_linux_syscalls() {
                 create: false,
                 read: true,
                 write: false,
-                truncate: false
+                truncate: false,
+                excl: false,
             }
         ),
         Err(SysError::Masked(SYS_OPEN))
@@ -474,6 +483,7 @@ fn chroot_confinement_through_syscalls() {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -501,7 +511,8 @@ fn chroot_confinement_through_syscalls() {
                 create: false,
                 read: true,
                 write: false,
-                truncate: false
+                truncate: false,
+                excl: false,
             }
         ),
         Err(SysError::Vfs(VfsError::NotFound))
@@ -516,7 +527,8 @@ fn chroot_confinement_through_syscalls() {
                 create: false,
                 read: true,
                 write: false,
-                truncate: false
+                truncate: false,
+                excl: false,
             }
         ),
         Err(SysError::Vfs(VfsError::NotFound))
@@ -541,7 +553,8 @@ fn chroot_confinement_through_syscalls() {
                 create: false,
                 read: true,
                 write: false,
-                truncate: false
+                truncate: false,
+                excl: false,
             }
         )
         .is_ok());
@@ -567,7 +580,8 @@ fn chroot_confinement_through_syscalls() {
                 create: false,
                 read: true,
                 write: false,
-                truncate: false
+                truncate: false,
+                excl: false,
             }
         ),
         Err(SysError::Vfs(VfsError::NotFound))
@@ -644,7 +658,8 @@ fn kill_permissions_and_fatal_signal_delivery() {
                 create: false,
                 read: true,
                 write: false,
-                truncate: false
+                truncate: false,
+                excl: false,
             }
         ),
         Err(SysError::Quarantined(SYS_OPEN))
@@ -885,6 +900,7 @@ fn mkdir_unlink_roundtrip_and_nonempty_dir() {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -916,7 +932,8 @@ fn mkdir_unlink_roundtrip_and_nonempty_dir() {
                 create: false,
                 read: true,
                 write: false,
-                truncate: false
+                truncate: false,
+                excl: false,
             }
         ),
         Err(SysError::Vfs(VfsError::NotFound))
@@ -945,7 +962,8 @@ fn reserve_stdio_moves_allocation_past_the_triplet() {
                 create: true,
                 read: true,
                 write: true,
-                truncate: false
+                truncate: false,
+                excl: false,
             }
         ),
         Ok(SysValue::Fd(5))
@@ -1018,6 +1036,7 @@ fn reserve_stdio_refuses_real_targets_and_is_idempotent() {
             read: true,
             write: false,
             truncate: false,
+            excl: false,
         },
     )
     .unwrap(); // fd 0
@@ -1063,6 +1082,7 @@ fn open_notes() -> SysRequest<'static> {
         read: true,
         write: false,
         truncate: false,
+        excl: false,
     }
 }
 
@@ -1111,6 +1131,7 @@ fn files_blob_phase_f_on_the_host() {
                 read: true,
                 write: true,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -1202,6 +1223,7 @@ fn devfs_null_and_zero_semantics() {
                 read: true,
                 write: true,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -1244,6 +1266,7 @@ fn devfs_null_and_zero_semantics() {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()
@@ -1290,6 +1313,7 @@ fn procfs_self_names_the_caller() {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()

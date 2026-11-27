@@ -130,6 +130,9 @@ fn the_syscall_storm_never_panics_and_never_widens_a_mask() {
                 read: true,
                 write: r & 2 != 0,
                 truncate: r & 4 != 0,
+                // K22: O_EXCL rides the storm too (one open in eight)
+                // — create-only-if-absent must hold under the churn.
+                excl: rng.byte() & 0x80 != 0,
             },
             1 => SysRequest::Read {
                 fd: rng.byte(),

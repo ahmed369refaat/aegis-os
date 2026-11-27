@@ -120,6 +120,13 @@ pub struct UserRun {
     /// consumed by rt_sigreturn) — the kernel's own frame record; the
     /// user-side frame is never trusted without it.
     pub delivered: Option<Delivered>,
+    /// K22: the memory contract this address space was built for — where
+    /// the stack, the trampoline and the mmap window floor live. A
+    /// spawned flat blob and every earlier image run under
+    /// `CANONICAL`; the package manager's image declares `SERVICE`. A
+    /// fork inherits the parent's contract (the child maps the same
+    /// addresses); an exec takes the new image's.
+    pub layout: &'static crate::mm::user_layout::ExecLayout,
 }
 
 /// ADR-0023 D8: the delivery record — what the kernel knows about the
@@ -155,6 +162,7 @@ impl UserRun {
             denied: 0,
             roundtrip_tsc: 0,
             delivered: None,
+            layout: &crate::mm::user_layout::CANONICAL,
         }
     }
 }

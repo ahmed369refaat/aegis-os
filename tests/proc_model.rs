@@ -44,6 +44,7 @@ fn kernel_with_parent() -> Kernel {
             read: false,
             write: true,
             truncate: false,
+            excl: false,
         },
     )
     .unwrap();
@@ -74,6 +75,7 @@ fn kernel_with_parent() -> Kernel {
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         )
         .unwrap()

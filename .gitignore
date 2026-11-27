@@ -13,3 +13,5 @@ core
 core.*
 *.core
 vgcore.*
+kernel-x86_64/blob/pkg.bin
+__pycache__/

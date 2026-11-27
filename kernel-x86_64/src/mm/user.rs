@@ -48,15 +48,16 @@ impl From<MapError> for SpawnError {
 }
 
 /// Why building the exec image's tables failed. `CageViolation` is the
-/// address policy: an exec'd image lives in the SAME user cage every
-/// spawned blob lives in (code+data, below the guards) — the ELF
-/// machinery honors every header it was given, and the kernel's
-/// layout policy holds where it always held.
+/// address policy: an exec'd image lives inside ITS OWN contract's
+/// cage (`ExecLayout`, K22 — canonical for every earlier image, the
+/// service cage for the package manager) — the ELF machinery honors
+/// every header it was given, and the kernel's layout policy holds
+/// where it always held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecMapError {
-    /// A PT_LOAD sits (even partially) outside the code/data cage —
-    /// the stack, trampoline, guard gaps, and everything above are
-    /// kernel-provisioned and non-negotiable.
+    /// A PT_LOAD sits (even partially) outside the contract's image
+    /// cage — the stack, trampoline, guard gaps, and everything above
+    /// are kernel-provisioned and non-negotiable.
     CageViolation { vaddr: u64 },
     /// The ten-check policy or the page-table walk refused a region.
     Map(MapError),
@@ -68,20 +69,23 @@ impl From<MapError> for ExecMapError {
     }
 }
 
-/// The exec cage: [CODE_BASE, DATA_END) — the same region a flat
-/// blob's code+data pages occupy. An image whose PT_LOADs stay here
-/// cannot collide with the stack (0x408000), the trampoline
-/// (0x40C000), or any guard gap; anything else refuses before a
-/// frame is touched.
-/// Phase 7 (the shell): the exec cage now reaches the STACK base.
-/// The flat-blob layout (2 code pages + the data page at 0x403000)
-/// stays the spawn path's world — unchanged. An exec image is a REAL
-/// linked program (the shell's Rust codegen is ~10 KiB): it may span
-/// [CODE_BASE, STACK_BASE) with the policy's guard gaps doing the
-/// internal separation (the shell: text 0x400000..0x404000, one guard
-/// page, data at 0x405000). The bound is still explicit and checked —
-/// a child cannot exec into existence anything at or above the stack.
-pub const EXEC_CAGE_END: u64 = layout::STACK_BASE;
+/// K22: the cage half of an exec, pure — every PT_LOAD must sit inside
+/// `[layout.code_base, layout.cage_end)` (page-rounded extents). The
+/// same function runs twice: as the pre-exec check (a plain refusal,
+/// the old image untouched) and inside `exec_tables` (the mapper's own
+/// gate — the pre-check is a courtesy, not a substitute).
+pub fn exec_cage_check(
+    plan: &aegis_os::elf::ExecPlan,
+    contract: &layout::ExecLayout,
+) -> Result<(), ExecMapError> {
+    for seg in &plan.segments[..plan.n_segments] {
+        let (first, last) = seg.page_range();
+        if first < contract.code_base || last > contract.cage_end {
+            return Err(ExecMapError::CageViolation { vaddr: seg.vaddr });
+        }
+    }
+    Ok(())
+}
 
 /// Everything kmain needs to run one user domain: the lib identity,
 /// the entry context, and the run state to install before launching.
@@ -222,21 +226,24 @@ fn build_user_tables<const N: usize>(
 /// Every frame allocates under the caller's id via the same
 /// `PoolSource` the spawn path uses, so a later `free_frames_of`
 /// reclaims the new image exactly like the old one.
+///
+/// K22: the image runs under ITS OWN memory contract (`contract`) — the
+/// registry names it per image. The canonical contract is the old
+/// fixed layout ([CODE_BASE, STACK_BASE - 4096) for the image, the
+/// stack at 0x408000, the trampoline at 0x40C000); the package
+/// manager's service contract widens the image cage to 128 pages and
+/// the stack to 64. Everything is taken from the layout — nothing in
+/// here assumes the canonical addresses.
 pub fn exec_tables<const N: usize>(
     k: &mut Kernel<N>,
     pool: &mut FramePool<N>,
     id: u32,
     plan: &aegis_os::elf::ExecPlan,
     image: &[u8],
+    contract: &layout::ExecLayout,
     quota_pages: usize,
 ) -> Result<(PageTables, AddressSpace), ExecMapError> {
-    let cage_end = EXEC_CAGE_END;
-    for seg in &plan.segments[..plan.n_segments] {
-        let (first, last) = seg.page_range();
-        if first < layout::CODE_BASE || last > cage_end {
-            return Err(ExecMapError::CageViolation { vaddr: seg.vaddr });
-        }
-    }
+    exec_cage_check(plan, contract)?;
     let mut src = PoolSource::new(pool, &mut k.frames, id);
     let mut tables = PageTables::new(&mut src)?;
     tables.install_kernel_entries();
@@ -262,19 +269,19 @@ pub fn exec_tables<const N: usize>(
     }
     tables.map_region(
         &mut space,
-        layout::STACK_BASE,
-        layout::STACK_PAGES * 4096,
+        contract.stack_base,
+        contract.stack_pages * 4096,
         layout::stack_flags(),
         &mut src,
     )?;
     tables.map_region(
         &mut space,
-        layout::TRAMPOLINE_BASE,
+        contract.trampoline_base,
         layout::TRAMPOLINE_PAGES * 4096,
         layout::code_flags(),
         &mut src,
     )?;
-    copy_into_frame(&tables, layout::TRAMPOLINE_BASE, &layout::TRAMPOLINE);
+    copy_into_frame(&tables, contract.trampoline_base, &layout::TRAMPOLINE);
     Ok((tables, space))
 }
 
@@ -512,5 +519,191 @@ mod transaction_tests {
             assert_eq!(freed, ballast, "deficit {deficit}: ballast recoverable");
             assert_eq!(k.frames.frames_in_use(), 0);
         }
+    }
+
+    // ── K22: the per-image memory contract ──
+
+    /// A synthetic plan with the SHAPE of the package manager's image:
+    /// text RX, read-only data (a guard page above), writable data (a
+    /// guard page above that) — placed where a `SERVICE` image links.
+    /// Returns the plan and the image bytes its offsets index into.
+    fn service_shaped_plan() -> (aegis_os::elf::ExecPlan, Vec<u8>) {
+        plan_of(&[
+            (0x0040_0000, 0x2000, 0x2000, false, true),
+            (0x0040_5000, 0x1000, 0x1000, false, false),
+            (0x0040_8000, 0x0080, 0x0100, true, false),
+        ])
+    }
+
+    /// A plan with the shape of every earlier image: one RX page at
+    /// CODE_BASE, one RW page at DATA_BASE.
+    fn canonical_shaped_plan() -> (aegis_os::elf::ExecPlan, Vec<u8>) {
+        plan_of(&[
+            (layout::CODE_BASE, 0x1000, 0x1000, false, true),
+            (layout::DATA_BASE, 0x0080, 0x0100, true, false),
+        ])
+    }
+
+    /// `(vaddr, filesz, memsz, writable, executable)` rows → a plan
+    /// whose file bytes are laid out back to back (offset = the running
+    /// sum), each byte carrying its own offset (so a copy is provable).
+    fn plan_of(rows: &[(u64, u64, u64, bool, bool)]) -> (aegis_os::elf::ExecPlan, Vec<u8>) {
+        use aegis_os::elf::{ExecPlan, SegmentPlan, MAX_SEGMENTS};
+        let mut image = Vec::new();
+        let mut segments = [SegmentPlan {
+            vaddr: 0,
+            offset: 0,
+            filesz: 0,
+            memsz: 0,
+            readable: false,
+            writable: false,
+            executable: false,
+        }; MAX_SEGMENTS];
+        for (i, (vaddr, filesz, memsz, writable, executable)) in rows.iter().enumerate() {
+            let offset = image.len() as u64;
+            for b in 0..*filesz {
+                image.push((b & 0xff) as u8 ^ (i as u8 * 0x5a));
+            }
+            segments[i] = SegmentPlan {
+                vaddr: *vaddr,
+                offset,
+                filesz: *filesz,
+                memsz: *memsz,
+                readable: true,
+                writable: *writable,
+                executable: *executable,
+            };
+        }
+        // Sum of the page-rounded extents, as the loader would count.
+        let map_bytes = rows
+            .iter()
+            .map(|(v, _, m, _, _)| {
+                let first = v & !4095;
+                let last = (v + m + 4095) & !4095;
+                last - first
+            })
+            .sum();
+        let plan = ExecPlan {
+            entry: rows[0].0,
+            segments,
+            n_segments: rows.len(),
+            map_bytes,
+        };
+        (plan, image)
+    }
+
+    /// K22: the cage check is exact at both edges — the last cage page
+    /// is image land, the page above it is not, and nothing sits below
+    /// the code base.
+    #[test]
+    fn exec_cage_check_is_exact_at_both_edges() {
+        for contract in [&layout::CANONICAL, &layout::SERVICE] {
+            let (ok, _) = plan_of(&[(contract.cage_end - 4096, 0x10, 0x10, false, true)]);
+            assert_eq!(exec_cage_check(&ok, contract), Ok(()), "{contract:?}");
+
+            let (past, _) =
+                plan_of(&[(contract.cage_end - 4096, 0x10, 0x1000 + 0x10, false, true)]);
+            assert_eq!(
+                exec_cage_check(&past, contract),
+                Err(ExecMapError::CageViolation {
+                    vaddr: contract.cage_end - 4096
+                }),
+                "{contract:?}: a segment crossing the cage end refuses"
+            );
+            let (below, _) = plan_of(&[(4096, 0x10, 0x10, false, true)]);
+            assert_eq!(
+                exec_cage_check(&below, contract),
+                Err(ExecMapError::CageViolation { vaddr: 4096 }),
+                "{contract:?}: below the code base refuses"
+            );
+        }
+    }
+
+    /// K22: a service-shaped image builds through the REAL mapper under
+    /// the service contract — stack, trampoline and image exactly where
+    /// the contract says — and the very same plan is a cage violation
+    /// under the canonical one (the old fixed world refuses it up
+    /// front, before any frame is spent).
+    #[test]
+    fn exec_tables_builds_a_service_image_under_its_own_contract() {
+        use crate::mm::user_layout::SERVICE;
+        let (plan, image) = service_shaped_plan();
+        assert_eq!(
+            exec_cage_check(&plan, &layout::CANONICAL),
+            Err(ExecMapError::CageViolation { vaddr: 0x0040_8000 })
+        );
+
+        let (mut k, mut pool, _p) = setup();
+        let (tables, space) = exec_tables(
+            &mut k,
+            &mut pool,
+            7,
+            &plan,
+            &image,
+            &SERVICE,
+            aegis_os::profile::package_manager_profile().quota_pages,
+        )
+        .expect("the service-shaped image builds under SERVICE");
+        // The image: every segment page present, the guard pages absent.
+        for va in [0x0040_0000u64, 0x0040_1000, 0x0040_5000, 0x0040_8000] {
+            assert!(tables.translate(va).is_some(), "{va:#x} mapped");
+        }
+        for va in [0x0040_2000u64, 0x0040_6000, 0x0040_9000] {
+            assert!(tables.translate(va).is_none(), "{va:#x} is a guard page");
+        }
+        // The copied bytes: the RW segment's first 8 bytes are its own
+        // image bytes (offset 0x3000, byte i = i ^ 0xb4 for row 2).
+        let data_pa = tables.translate(0x0040_8000).unwrap();
+        let mut want = [0u8; 8];
+        want.copy_from_slice(&image[0x3000..0x3008]);
+        assert_eq!(memops::read_u64(data_pa), u64::from_le_bytes(want));
+        // The bss tail (memsz 0x100, filesz 0x80): zero, explicitly.
+        assert_eq!(memops::read_u64(data_pa + 0xf8), 0);
+        // The stack: 64 pages at 0x600000, both edges, nothing around.
+        for va in [SERVICE.stack_base, SERVICE.stack_top() - 4096] {
+            assert!(tables.translate(va).is_some(), "{va:#x} stack");
+        }
+        assert!(tables.translate(SERVICE.stack_base - 4096).is_none());
+        assert!(tables.translate(SERVICE.stack_top()).is_none());
+        // The trampoline: the real 9 bytes at the contract's address.
+        let tramp_pa = tables.translate(SERVICE.trampoline_base).unwrap();
+        assert_eq!(
+            memops::read_u64(tramp_pa),
+            u64::from_le_bytes(layout::TRAMPOLINE[..8].try_into().unwrap())
+        );
+        // Nothing from the canonical layout leaked in: the canonical
+        // trampoline page is absent (the only canonical address this
+        // plan does not happen to map as image land).
+        assert!(tables.translate(layout::TRAMPOLINE_BASE).is_none());
+        // The ledger: image pages + the contract's overhead.
+        assert_eq!(
+            space.used_pages(),
+            (plan.map_bytes / 4096) as usize + SERVICE.overhead_pages()
+        );
+    }
+
+    /// K22: nothing in the mapper is hard-coded to the wide contract —
+    /// a canonical-shaped image builds under SERVICE too (its stack
+    /// then lives at the service address), and the canonical plan still
+    /// builds under CANONICAL exactly as before.
+    #[test]
+    fn either_contract_builds_either_legal_plan() {
+        use crate::mm::user_layout::SERVICE;
+        let (plan, image) = canonical_shaped_plan();
+        let (mut k, mut pool, _p) = setup();
+        let (tables, space) =
+            exec_tables(&mut k, &mut pool, 7, &plan, &image, &layout::CANONICAL, 256)
+                .expect("canonical image, canonical contract");
+        assert!(tables.translate(layout::STACK_BASE).is_some());
+        assert!(tables.translate(SERVICE.stack_base).is_none());
+        assert_eq!(space.used_pages(), 2 + layout::CANONICAL.overhead_pages());
+
+        let (mut k, mut pool, _p) = setup();
+        let (tables, space) = exec_tables(&mut k, &mut pool, 7, &plan, &image, &SERVICE, 256)
+            .expect("canonical image under the service contract");
+        assert!(tables.translate(SERVICE.stack_base).is_some());
+        assert!(tables.translate(SERVICE.stack_top() - 4096).is_some());
+        assert!(tables.translate(layout::STACK_BASE).is_none());
+        assert_eq!(space.used_pages(), 2 + SERVICE.overhead_pages());
     }
 }

@@ -425,7 +425,6 @@ mod exec {
         use crate::arch::syscall_frame::{
             OFF_R10, OFF_R11, OFF_R8, OFF_R9, OFF_RAX, OFF_RBX, OFF_RCX, OFF_RDI, OFF_RDX, OFF_RSI,
         };
-        use crate::mm::user_layout;
         use crate::mm::user_range::copy_out_bytes;
         use aegis_os::sigframe::{self, InterruptedImage};
 
@@ -491,7 +490,6 @@ mod exec {
             cookie,
             frame_rsp: new_rsp,
         });
-        let _ = user_layout::TRAMPOLINE_BASE; // doc anchor; restorer validated at sigaction
     }
 
     /// rt_sigaction(signum, handler, restorer) — ADR-0023 D8. The
@@ -505,11 +503,13 @@ mod exec {
         handler: u64,
         restorer: u64,
     ) -> u64 {
-        use crate::mm::user_layout;
+        // K22: THE trampoline is this run's (its layout's) — a service
+        // image's restorer lives at its own contract's address.
+        let trampoline = run.layout.trampoline_base;
         if handler == 0 || handler > aegis_os::sigframe::USER_CANON_MAX {
             return (-EINVAL) as u64;
         }
-        if restorer != 0 && restorer != user_layout::TRAMPOLINE_BASE {
+        if restorer != 0 && restorer != trampoline {
             return (-EINVAL) as u64;
         }
         let Some(k) = context::kernel_mut() else {
@@ -523,11 +523,7 @@ mod exec {
             aegis_os::sys::SysRequest::SigAction {
                 signum: signum8,
                 handler,
-                restorer: if restorer == 0 {
-                    user_layout::TRAMPOLINE_BASE
-                } else {
-                    restorer
-                },
+                restorer: if restorer == 0 { trampoline } else { restorer },
             },
         ) {
             Ok(_) => 0,
@@ -716,7 +712,7 @@ mod exec {
         // O_* word — the encoding is NOT the internal one (Linux's
         // O_RDONLY is 0, the internal 0 is "no access at all"), so
         // the word is translated at the entry and every bit whose
-        // semantics the internal VFS cannot honor (O_EXCL, O_APPEND,
+        // semantics the internal VFS cannot honor (O_APPEND,
         // O_NONBLOCK, O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, ...) is
         // refused -EINVAL — never silently dropped. O_TRUNC|O_RDONLY
         // then dies in `open_flags` with the same EINVAL a native
@@ -729,7 +725,7 @@ mod exec {
         } else {
             flags
         };
-        let (read, write, create, truncate) = match sysabi::open_flags(flags) {
+        let (read, write, create, truncate, excl) = match sysabi::open_flags(flags) {
             Ok(f) => f,
             Err(e) => return e as u64,
         };
@@ -751,6 +747,7 @@ mod exec {
                 read,
                 write,
                 truncate,
+                excl,
             },
         ) {
             Ok(v) => sysabi::rax_of(v),
@@ -1163,10 +1160,12 @@ mod exec {
         linux_abi: bool,
     ) -> u64 {
         use crate::mm::page_table::{MapError, PoolSource};
-        use crate::mm::user_layout;
         use aegis_os::memory::MemFlags;
 
-        const WINDOW_FLOOR: u64 = user_layout::TRAMPOLINE_BASE + 4096;
+        // K22: the window floor is the RUN's — one page above its own
+        // trampoline (a service image's floor sits far above the
+        // canonical one).
+        let window_floor = run.layout.window_floor();
         /// The per-call ceiling (matches the policy's own quota scale;
         /// a bigger ask is a program error, not an OOM).
         const MAX_MMAP: u64 = 16 << 20;
@@ -1201,12 +1200,12 @@ mod exec {
         // is page-granular anyway).
         let len_r = ((len as usize) + 4095) & !4095;
         let base = if addr == 0 {
-            match run.space.find_free_window(len_r, WINDOW_FLOOR as usize) {
+            match run.space.find_free_window(len_r, window_floor as usize) {
                 Some(b) => b as u64,
                 None => return (-ENOMEM) as u64,
             }
         } else {
-            if !addr.is_multiple_of(4096) || addr < WINDOW_FLOOR {
+            if !addr.is_multiple_of(4096) || addr < window_floor {
                 return (-EINVAL) as u64;
             }
             addr
@@ -1233,10 +1232,8 @@ mod exec {
     /// the ABI. Frames return through the pool (owner-scoped, scrubbed
     /// on free).
     fn sys_munmap(run: &mut crate::sched::context::UserRun, addr: u64, len: u64) -> u64 {
-        use crate::mm::user_layout;
-        const WINDOW_FLOOR: u64 = user_layout::TRAMPOLINE_BASE + 4096;
-
-        if !addr.is_multiple_of(4096) || addr < WINDOW_FLOOR || len == 0 {
+        let window_floor = run.layout.window_floor();
+        if !addr.is_multiple_of(4096) || addr < window_floor || len == 0 {
             return (-EINVAL) as u64;
         }
         // Whole-region: exact base AND exact length.
@@ -1314,14 +1311,16 @@ mod exec {
         };
         // The child's run: a fresh accounting shell over the shared
         // memory (the snapshot mask is the parent's — the LIVE gate
-        // reads the child's own domain record).
-        let child_run = crate::sched::context::UserRun::new(
+        // reads the child's own domain record). The memory contract is
+        // the parent's too: the clone maps the same addresses (K22).
+        let mut child_run = crate::sched::context::UserRun::new(
             tables,
             run.space.clone(),
             child,
             run.mask,
             run.quarantined,
         );
+        child_run.layout = run.layout;
         // The child's register image: the parent's in-flight syscall
         // with RAX=0 (the fork convention), stashed parked (the unsafe
         // lives in park.rs's wrapper — this module is unsafe-free).
@@ -1422,12 +1421,22 @@ mod exec {
         let Ok(cpath) = core::str::from_utf8(&canon[..clen]) else {
             return (-sysabi::EINVAL) as u64;
         };
-        let Some(image) = crate::exec_registry::resolve(cpath) else {
+        // K22: the registry names the image AND the memory contract it
+        // was linked for — the stack, the trampoline and the cage come
+        // from the entry, never from a constant.
+        let Some(resolved) = crate::exec_registry::resolve_image(cpath) else {
             return (-sysabi::ENOENT) as u64;
         };
+        let (image, layout) = (resolved.image, resolved.layout);
         let Ok(plan) = aegis_os::elf::build_exec_plan(image) else {
             return (-ENOEXEC) as u64;
         };
+        // 1a. The CAGE pre-check — pure, same stage as the quota: an
+        // image linked outside its declared contract is a plain
+        // refusal (the old image keeps running, its mask untouched).
+        if crate::mm::user::exec_cage_check(&plan, layout).is_err() {
+            return (-sysabi::ENOMEM) as u64;
+        }
         // 1b. (round N2) The QUOTA pre-check — pure, BEFORE the point
         // of no return: the image's mapped pages + stack + trampoline
         // must fit the caller's LIVE quota. A refusal is a plain
@@ -1441,7 +1450,7 @@ mod exec {
             .unwrap_or(0);
         if crate::exec_registry::exec_quota_check(
             plan.map_bytes,
-            crate::mm::user_layout::STACK_PAGES,
+            layout.stack_pages,
             crate::mm::user_layout::TRAMPOLINE_PAGES,
             live_quota,
         )
@@ -1479,6 +1488,7 @@ mod exec {
                 crate::exec_registry::EXEC_SCRATCH_OWNER,
                 &plan,
                 image,
+                layout,
                 live_quota,
             )
         };
@@ -1506,6 +1516,7 @@ mod exec {
         // image down, from the safety of the new one.
         let old_tables = core::mem::replace(&mut run.tables, tables);
         run.space = space;
+        run.layout = layout;
         run.tables.activate();
         // ── Phase 6 S3: materialize the initial stack — BETWEEN the
         // activation and the teardown, so every possible failure is
@@ -1519,8 +1530,7 @@ mod exec {
         // the whole image, never an alignment. ──
         let entry_rsp = {
             let mut stack_img = [0u8; EXEC_STACK_IMG];
-            let (total, entry_rsp) =
-                build_initial_stack(&args, crate::mm::user_layout::STACK_TOP, &mut stack_img);
+            let (total, entry_rsp) = build_initial_stack(&args, layout.stack_top(), &mut stack_img);
             debug_assert!(total <= EXEC_STACK_IMG);
             if !validate_user_range(run, entry_rsp, total as u64, EXEC_STACK_IMG as u64) {
                 // Unreachable by construction (exec_tables maps the
@@ -2011,8 +2021,6 @@ mod exec {
         len: u64,
     ) -> u64 {
         use crate::mm::page_table::{MapError, SharesSource};
-        use crate::mm::user_layout;
-        const WINDOW_FLOOR: u64 = user_layout::TRAMPOLINE_BASE + 4096;
 
         if dst > u32::MAX as u64 || va > u32::MAX as u64 || len > u32::MAX as u64 {
             return (-EINVAL) as u64;
@@ -2059,9 +2067,12 @@ mod exec {
             // ESRCH — the same truth the core's liveness check speaks.
             return (-sysabi::ESRCH) as u64;
         };
+        // K22: the RECEIVER's window floor — its layout, not the
+        // granter's (a grant into a service image lands above ITS
+        // trampoline).
         let base = match brun
             .space
-            .find_free_window(pages * 4096, WINDOW_FLOOR as usize)
+            .find_free_window(pages * 4096, brun.layout.window_floor() as usize)
         {
             Some(b) => b as u64,
             None => {

@@ -28,6 +28,20 @@ pub const MAX_INODES: usize = 128;
 /// deep-park host tests' stacks at 64 inodes. Real file data goes
 /// through the ext2/FAT32 paths — this is the boot-time ramfs.
 pub const FILE_DATA_MAX: usize = 1024;
+/// K22: the ramfs large-file budget. The inline window above is
+/// per-inode, so it multiplies `MAX_INODES`; the package manager's
+/// journal alone is ≥ 1.6 KiB for the smallest install (3.2 KiB for a
+/// one-file package), so a file that outgrows the window MOVES into
+/// one of these side-table slots instead of answering ENOSPC
+/// mid-transaction: `LARGE_FILE_SLOTS` files of up to `LARGE_FILE_MAX`
+/// bytes may be live at once, the rest stay inline exactly as before.
+/// The table is a flat 32 KiB of `Kernel` state (never per-inode);
+/// a file that needs a slot when all are taken still answers the
+/// honest `NoSpace`.
+pub const LARGE_FILE_MAX: usize = 8192;
+pub const LARGE_FILE_SLOTS: usize = 4;
+/// `Inode.spill` value for "data is inline".
+const NO_SPILL: u8 = 0xFF;
 /// K20 (P0-1): 28 -> 64 bytes per path component — real file names
 /// ("aegis-session-2026-11-26.log") no longer bounce off NAME_MAX.
 /// Measured cost: +36 B per inode, +4.6 KiB over the table.
@@ -139,6 +153,9 @@ struct Inode {
     name_len: usize,
     data: [u8; FILE_DATA_MAX],
     size: usize,
+    /// K22: `NO_SPILL` while the bytes live in `data`; otherwise the
+    /// index of the `Vfs::spills` slot holding the whole file.
+    spill: u8,
 }
 
 pub struct Vfs {
@@ -146,6 +163,10 @@ pub struct Vfs {
     /// F10: per-slot generation counter — bumped on every allocation
     /// into the slot, so stale references never alias new occupants.
     generations: [u32; MAX_INODES],
+    /// K22: the large-file side table (see `LARGE_FILE_MAX`). A slot
+    /// is owned by exactly the inode whose `spill` names it, so
+    /// unlink/replace free it with the inode — no separate free list.
+    spills: [[u8; LARGE_FILE_MAX]; LARGE_FILE_SLOTS],
 }
 
 impl Vfs {
@@ -153,6 +174,7 @@ impl Vfs {
         let mut fs = Vfs {
             inodes: [None; MAX_INODES],
             generations: [0; MAX_INODES],
+            spills: [[0; LARGE_FILE_MAX]; LARGE_FILE_SLOTS],
         };
         fs.generations[0] = 1;
         fs.inodes[0] = Some(Inode {
@@ -166,6 +188,7 @@ impl Vfs {
             name_len: 0,
             data: [0; FILE_DATA_MAX],
             size: 0,
+            spill: NO_SPILL,
         });
         fs
     }
@@ -200,6 +223,24 @@ impl Vfs {
             }
         }
         Err(VfsError::TableFull)
+    }
+
+    /// K22: the first spill slot no live inode owns, or `None` when
+    /// every slot is taken (the caller answers `NoSpace`).
+    fn free_slot(inodes: &[Option<Inode>; MAX_INODES]) -> Option<u8> {
+        (0..LARGE_FILE_SLOTS as u8).find(|s| !inodes.iter().flatten().any(|i| i.spill == *s))
+    }
+
+    /// K22: the bytes of `inode` — inline, or its spill slot.
+    fn bytes_of<'a>(
+        spills: &'a [[u8; LARGE_FILE_MAX]; LARGE_FILE_SLOTS],
+        inode: &'a Inode,
+    ) -> &'a [u8] {
+        if inode.spill == NO_SPILL {
+            &inode.data
+        } else {
+            &spills[usize::from(inode.spill)]
+        }
     }
 
     fn child_by_name(&self, dir: u32, name: &str) -> Option<u32> {
@@ -417,6 +458,7 @@ impl Vfs {
             name_len: name.len(),
             data: [0; FILE_DATA_MAX],
             size: 0,
+            spill: NO_SPILL,
         });
         Ok(InodeRef { id, generation })
     }
@@ -452,6 +494,7 @@ impl Vfs {
             name_len: name.len(),
             data: [0; FILE_DATA_MAX],
             size: 0,
+            spill: NO_SPILL,
         });
         Ok(InodeRef { id, generation })
     }
@@ -618,13 +661,17 @@ impl Vfs {
         }
         let avail = inode.size - offset;
         let n = buf.len().min(avail);
-        buf[..n].copy_from_slice(&inode.data[offset..offset + n]);
+        buf[..n].copy_from_slice(&Self::bytes_of(&self.spills, inode)[offset..offset + n]);
         Ok(n)
     }
 
     /// F11(c): write at the fd's offset — existing bytes stay, the file
     /// only grows past them. Truncation is an explicit Open flag
-    /// (`truncate`), never a side effect of writing.
+    /// (`truncate`), never a side effect of writing. K22: a file that
+    /// outgrows the inline window moves into a spill slot first (the
+    /// inline bytes ride along); the capacity then is `LARGE_FILE_MAX`,
+    /// and a gap between the old size and the offset is zeroed — a
+    /// slot's previous tenant must never show through a sparse write.
     pub fn write_at(
         &mut self,
         r: InodeRef,
@@ -648,13 +695,50 @@ impl Vfs {
         }
         self.check_access(id, creds, Access::Write)?;
         let end = offset.saturating_add(bytes.len());
-        if end > FILE_DATA_MAX {
+        let spilled = self
+            .inodes
+            .get(id as usize)
+            .and_then(|s| s.as_ref())
+            .is_some_and(|i| i.spill != NO_SPILL);
+        // The capacity edge: nothing past the slot; an inline file
+        // crossing the window needs a free spill slot.
+        if end > LARGE_FILE_MAX {
             return Err(VfsError::NoSpace);
         }
-        let inode = self.inode_mut(id)?;
-        inode.data[offset..end].copy_from_slice(bytes);
-        if end > inode.size {
-            inode.size = end;
+        let free = if !spilled && end > FILE_DATA_MAX {
+            Some(Self::free_slot(&self.inodes).ok_or(VfsError::NoSpace)?)
+        } else {
+            None
+        };
+        // Field-split borrows: the inode and the side table are
+        // distinct fields of self.
+        let Self {
+            inodes,
+            spills,
+            generations: _,
+        } = self;
+        let slot = inodes
+            .get_mut(id as usize)
+            .and_then(|s| s.as_mut())
+            .ok_or(VfsError::NotFound)?;
+        if let Some(free) = free {
+            // Promote: the inline bytes ride along, the rest of the
+            // slot starts clean.
+            spills[usize::from(free)][..FILE_DATA_MAX].copy_from_slice(&slot.data);
+            spills[usize::from(free)][FILE_DATA_MAX..].fill(0);
+            slot.spill = free;
+        }
+        let data: &mut [u8] = if slot.spill == NO_SPILL {
+            &mut slot.data
+        } else {
+            &mut spills[usize::from(slot.spill)]
+        };
+        if offset > slot.size {
+            data[slot.size..offset].fill(0);
+        }
+        data[offset..end].copy_from_slice(bytes);
+        if end > slot.size {
+            slot.size = end;
         }
         Ok(bytes.len())
     }
@@ -720,18 +804,23 @@ impl Vfs {
             name_len: name.len(),
             data: [0; FILE_DATA_MAX],
             size: 0,
+            spill: NO_SPILL,
         });
         Ok(InodeRef { id, generation })
     }
 
-    /// F11(c): explicit truncation (Open with the truncate flag).
+    /// F11(c): explicit truncation (Open with the truncate flag). K22:
+    /// an emptied file is inline again — its spill slot goes free with
+    /// the bytes it held.
     pub fn truncate(&mut self, r: InodeRef, creds: Credentials) -> Result<(), VfsError> {
         let id = self.live(r)?;
         if self.inode(id)?.kind != InodeKind::File {
             return Err(VfsError::IsADirectory);
         }
         self.check_access(id, creds, Access::Write)?;
-        self.inode_mut(id)?.size = 0;
+        let inode = self.inode_mut(id)?;
+        inode.size = 0;
+        inode.spill = NO_SPILL;
         Ok(())
     }
 
@@ -786,37 +875,75 @@ impl Vfs {
     }
 
     /// List a directory's children as NUL-separated names into `out`
-    /// (the write stops when `out` fills — a partial name is a lie, so
-    /// a child that does not fit whole is skipped and later siblings
-    /// with it). Returns the byte count written. Phase 7: the shell's
-    /// `ls` surface; the bound discipline is the syscall arm's (the
-    /// span is validated before this runs).
+    /// from the first entry (the one-shot form; see `list_dir_at`).
     pub fn list_dir(&self, dir: u32, out: &mut [u8]) -> Result<usize, VfsError> {
+        self.list_dir_at(dir, out, 0).map(|(n, _)| n)
+    }
+
+    /// K22: list a directory's children as NUL-separated names into
+    /// `out`, resuming at table slot `start`; returns the byte count
+    /// written and the cursor for the next call. A partial name is a
+    /// lie, so a child that does not fit whole is left for the next
+    /// call. The cursor is a slot index (stable while nothing is
+    /// created or unlinked in the directory): a cursor at or past the
+    /// last child writes nothing — 0 is the caller's end-of-list.
+    pub fn list_dir_at(
+        &self,
+        dir: u32,
+        out: &mut [u8],
+        start: u32,
+    ) -> Result<(usize, u32), VfsError> {
         let node = self.inode(dir)?;
         if node.kind != InodeKind::Dir {
             return Err(VfsError::NotADirectory);
         }
         let mut n = 0usize;
+        let mut next = start.min(MAX_INODES as u32);
         for (i, slot) in self.inodes.iter().enumerate() {
+            if (i as u32) < start {
+                continue; // served on an earlier call
+            }
             // The root is its own parent (Vfs::new): listing a
             // directory never lists the directory itself.
-            if i as u32 == dir {
-                continue;
-            }
-            if let Some(child) = slot {
-                if child.parent != dir {
-                    continue;
+            if (i as u32) != dir {
+                if let Some(child) = slot {
+                    if child.parent == dir {
+                        let need = child.name_len + 1;
+                        if n + need > out.len() {
+                            break; // does not fit whole: left for the next call
+                        }
+                        out[n..n + child.name_len].copy_from_slice(&child.name[..child.name_len]);
+                        out[n + child.name_len] = 0;
+                        n += need;
+                    }
                 }
-                let need = child.name_len + 1;
-                if n + need > out.len() {
-                    break;
-                }
-                out[n..n + child.name_len].copy_from_slice(&child.name[..child.name_len]);
-                out[n + child.name_len] = 0;
-                n += need;
             }
+            next = i as u32 + 1;
         }
-        Ok(n)
+        Ok((n, next))
+    }
+
+    /// K22: resolve a listing handle's reference to a live directory
+    /// id. A stale (id, generation) pair fails closed (StaleInode —
+    /// never the directory that may have reused the slot) and a file
+    /// answers NotADirectory.
+    pub fn dir_of(&self, r: InodeRef) -> Result<u32, VfsError> {
+        let id = self.live(r)?;
+        if self.inode(id)?.kind != InodeKind::Dir {
+            return Err(VfsError::NotADirectory);
+        }
+        Ok(id)
+    }
+
+    /// K22: how many spill slots are in use (introspection for the
+    /// capacity tests and the boot's marker).
+    #[must_use]
+    pub fn spill_slots_used(&self) -> usize {
+        self.inodes
+            .iter()
+            .flatten()
+            .filter(|i| i.spill != NO_SPILL)
+            .count()
     }
 
     /// All children ids of a directory (test/introspection helper).
@@ -931,6 +1058,236 @@ mod tests {
             .resolve(ROOT_REF, ROOT_REF, "/pub/data.txt", USER)
             .unwrap();
         assert_eq!(fs.list_dir(f.id, &mut out), Err(VfsError::NotADirectory));
+    }
+
+    /// K22: the listing cursor. A buffer too small for the whole
+    /// directory is filled with whole names only; the returned cursor
+    /// resumes exactly at the first name that did not fit; a cursor at
+    /// the end writes nothing (the caller's end-of-list), forever.
+    #[test]
+    fn list_dir_at_resumes_where_the_last_call_stopped() {
+        let mut fs = Vfs::new();
+        fs.mkdir(ROOT_REF, ROOT_REF, "/d", ROOT_CREDS, Mode(0o755))
+            .unwrap();
+        for i in 0..5 {
+            fs.create(
+                ROOT_REF,
+                ROOT_REF,
+                &format!("/d/file{i}"),
+                ROOT_CREDS,
+                Mode(0o644),
+            )
+            .unwrap();
+        }
+        let dir = fs.resolve(ROOT_REF, ROOT_REF, "/d", ROOT_CREDS).unwrap().id;
+        // "fileN\0" is 6 bytes: a 13-byte buffer holds two whole names.
+        let mut whole = [0u8; 64];
+        let n = fs.list_dir(dir, &mut whole).unwrap();
+        let mut walked = Vec::new();
+        let mut cursor = 0u32;
+        let mut calls = 0;
+        loop {
+            let mut chunk = [0u8; 13];
+            let (got, next) = fs.list_dir_at(dir, &mut chunk, cursor).unwrap();
+            assert!(got % 6 == 0, "whole names only, saw {got} bytes");
+            walked.extend_from_slice(&chunk[..got]);
+            calls += 1;
+            assert!(calls < 10, "the walk must terminate");
+            if got == 0 {
+                assert_eq!(next, MAX_INODES as u32, "the end cursor is past the table");
+                break;
+            }
+            assert_ne!(next, cursor, "the cursor must advance on a non-empty call");
+            cursor = next;
+        }
+        // 5 names / 2 per call = 3 serving calls + the terminating 0.
+        assert_eq!(calls, 4);
+        assert_eq!(walked, &whole[..n]);
+        // At the end cursor: nothing, and the cursor stays put.
+        assert_eq!(
+            fs.list_dir_at(dir, &mut [0u8; 64], cursor).unwrap(),
+            (0, MAX_INODES as u32)
+        );
+        // A hostile cursor is clamped, never indexed out of bounds.
+        assert_eq!(
+            fs.list_dir_at(dir, &mut [0u8; 64], u32::MAX).unwrap(),
+            (0, MAX_INODES as u32)
+        );
+        // The walk is idempotent from 0: a second full walk matches.
+        let mut again = Vec::new();
+        let mut cursor = 0u32;
+        loop {
+            let mut chunk = [0u8; 7];
+            let (got, next) = fs.list_dir_at(dir, &mut chunk, cursor).unwrap();
+            again.extend_from_slice(&chunk[..got]);
+            cursor = next;
+            if got == 0 {
+                break;
+            }
+        }
+        assert_eq!(again, walked);
+        // Not a directory → the same refusal on the cursor form.
+        let f = fs
+            .resolve(ROOT_REF, ROOT_REF, "/d/file0", ROOT_CREDS)
+            .unwrap();
+        assert_eq!(
+            fs.list_dir_at(f.id, &mut [0u8; 8], 0),
+            Err(VfsError::NotADirectory)
+        );
+        assert_eq!(fs.dir_of(f), Err(VfsError::NotADirectory));
+        assert_eq!(
+            fs.dir_of(InodeRef {
+                id: f.id,
+                generation: 99
+            }),
+            Err(VfsError::StaleInode)
+        );
+        assert_eq!(fs.dir_of(ROOT_REF), Ok(ROOT_ID));
+    }
+
+    /// K22: a file that outgrows the inline window moves into a spill
+    /// slot with its bytes intact, reads back whole through the
+    /// window, and an emptied file releases the slot again.
+    #[test]
+    fn large_file_promotes_into_a_spill_slot_and_back() {
+        let mut fs = Vfs::new();
+        assert_eq!(fs.spill_slots_used(), 0);
+        let id = fs
+            .create(ROOT_REF, ROOT_REF, "/journal", ROOT_CREDS, Mode(0o600))
+            .unwrap();
+        assert_eq!(fs.spill_slots_used(), 0, "inline files take no slot");
+        // The PM's journal shape: a run of small appends crossing the
+        // window (17-byte and 525-byte records).
+        let mut offset = 0usize;
+        let mut body: Vec<u8> = Vec::new();
+        for len in [17usize, 525, 525, 525, 17, 525, 525, 17] {
+            let rec: Vec<u8> = (0..len).map(|i| ((offset + i) % 253) as u8).collect();
+            assert_eq!(fs.write_at(id, ROOT_CREDS, offset, &rec).unwrap(), len);
+            offset += len;
+            body.extend_from_slice(&rec);
+        }
+        assert_eq!(offset, 2676, "the walk really crossed the window");
+        assert_eq!(fs.size_of(id), Some(offset));
+        assert_eq!(fs.spill_slots_used(), 1, "the file moved into a slot");
+        let mut back = vec![0u8; offset];
+        assert_eq!(
+            fs.read_by_id_at(id, ROOT_CREDS, 0, &mut back).unwrap(),
+            offset
+        );
+        assert_eq!(back, body);
+        // Reads straddling the old window edge are seamless.
+        let mut edge = [0u8; 8];
+        fs.read_by_id_at(id, ROOT_CREDS, 1020, &mut edge).unwrap();
+        assert_eq!(&edge, &body[1020..1028]);
+        // Overwrite inside the slot, re-read.
+        assert_eq!(fs.write_at(id, ROOT_CREDS, 2000, &[9u8; 16]).unwrap(), 16);
+        fs.read_by_id_at(id, ROOT_CREDS, 2000, &mut edge).unwrap();
+        assert_eq!(edge, [9u8; 8]);
+        // The slot's ceiling is the honest ENOSPC now.
+        assert_eq!(
+            fs.write_at(id, ROOT_CREDS, LARGE_FILE_MAX, &[1u8]),
+            Err(VfsError::NoSpace)
+        );
+        assert_eq!(
+            fs.write_at(id, ROOT_CREDS, 0, &[0u8; LARGE_FILE_MAX + 1]),
+            Err(VfsError::NoSpace)
+        );
+        // Truncate: empty AND inline again — the slot is free.
+        fs.truncate(id, ROOT_CREDS).unwrap();
+        assert_eq!(fs.size_of(id), Some(0));
+        assert_eq!(fs.spill_slots_used(), 0);
+        assert_eq!(fs.read_by_id_at(id, ROOT_CREDS, 0, &mut edge).unwrap(), 0);
+    }
+
+    /// K22: exactly `LARGE_FILE_SLOTS` large files at once; the next
+    /// one answers NoSpace at the window edge (its inline bytes stay
+    /// intact — a refused write is a no-op), and an unlink frees the
+    /// slot for it.
+    #[test]
+    fn spill_slots_run_out_then_free_on_unlink() {
+        let mut fs = Vfs::new();
+        let over = [7u8; FILE_DATA_MAX + 1];
+        for i in 0..LARGE_FILE_SLOTS {
+            let id = fs
+                .create(
+                    ROOT_REF,
+                    ROOT_REF,
+                    &format!("/big{i}"),
+                    ROOT_CREDS,
+                    Mode(0o644),
+                )
+                .unwrap();
+            assert_eq!(fs.write_at(id, ROOT_CREDS, 0, &over).unwrap(), over.len());
+            assert_eq!(fs.spill_slots_used(), i + 1);
+        }
+        let fifth = fs
+            .create(ROOT_REF, ROOT_REF, "/fifth", ROOT_CREDS, Mode(0o644))
+            .unwrap();
+        assert_eq!(
+            fs.write_at(fifth, ROOT_CREDS, 0, &over),
+            Err(VfsError::NoSpace)
+        );
+        // Inline-sized writes still work on the refused file.
+        assert_eq!(fs.write_at(fifth, ROOT_CREDS, 0, &[3u8; 100]).unwrap(), 100);
+        assert_eq!(fs.size_of(fifth), Some(100));
+        // The refused write left nothing behind at the window edge.
+        let mut probe = [0u8; 4];
+        assert_eq!(
+            fs.read_by_id_at(fifth, ROOT_CREDS, 100, &mut probe)
+                .unwrap(),
+            0
+        );
+        // Free one slot: the fifth file's retry succeeds.
+        fs.unlink(ROOT_REF, ROOT_REF, "/big2", ROOT_CREDS).unwrap();
+        assert_eq!(fs.spill_slots_used(), LARGE_FILE_SLOTS - 1);
+        assert_eq!(
+            fs.write_at(fifth, ROOT_CREDS, 0, &over).unwrap(),
+            over.len()
+        );
+        assert_eq!(fs.spill_slots_used(), LARGE_FILE_SLOTS);
+        // rename over a spilled destination frees ITS slot with it.
+        fs.create(ROOT_REF, ROOT_REF, "/fresh", ROOT_CREDS, Mode(0o644))
+            .unwrap();
+        fs.rename(ROOT_REF, ROOT_REF, "/fresh", "/big0", ROOT_CREDS)
+            .unwrap();
+        assert_eq!(fs.spill_slots_used(), LARGE_FILE_SLOTS - 1);
+        // A brand-new file can take the slot.
+        let again = fs
+            .create(ROOT_REF, ROOT_REF, "/again", ROOT_CREDS, Mode(0o644))
+            .unwrap();
+        assert_eq!(
+            fs.write_at(again, ROOT_CREDS, 0, &over).unwrap(),
+            over.len()
+        );
+    }
+
+    /// K22: a recycled slot must never show its previous tenant through
+    /// a sparse write — every byte below `size` was written or zeroed.
+    #[test]
+    fn a_recycled_spill_slot_never_leaks_the_previous_tenant() {
+        let mut fs = Vfs::new();
+        let secret = fs
+            .create(ROOT_REF, ROOT_REF, "/secret", ROOT_CREDS, Mode(0o600))
+            .unwrap();
+        fs.write_at(secret, ROOT_CREDS, 0, &[0xAB; 2048]).unwrap();
+        fs.unlink(ROOT_REF, ROOT_REF, "/secret", ROOT_CREDS)
+            .unwrap();
+        assert_eq!(fs.spill_slots_used(), 0);
+        let heir = fs
+            .create(ROOT_REF, ROOT_REF, "/heir", ROOT_CREDS, Mode(0o644))
+            .unwrap();
+        // One byte, then a byte far past the window: the gap (and the
+        // slot's tail) must read as zeros, never as 0xAB.
+        fs.write_at(heir, ROOT_CREDS, 0, &[1u8]).unwrap();
+        fs.write_at(heir, ROOT_CREDS, 1500, &[2u8]).unwrap();
+        let mut back = [0u8; 1501];
+        assert_eq!(
+            fs.read_by_id_at(heir, ROOT_CREDS, 0, &mut back).unwrap(),
+            1501
+        );
+        assert_eq!(back[0], 1);
+        assert_eq!(back[1500], 2);
+        assert!(back[1..1500].iter().all(|&b| b == 0), "no previous tenant");
     }
 
     #[test]
@@ -1224,15 +1581,23 @@ mod tests {
         let id = fs
             .create(ROOT_REF, ROOT_REF, "/f", ROOT_CREDS, Mode(0o644))
             .unwrap();
+        // K22: one byte past the INLINE window is no longer the edge —
+        // the file promotes into a spill slot and the write lands.
         assert_eq!(
-            fs.write_at(id, ROOT_CREDS, 0, &[0u8; FILE_DATA_MAX + 1]),
+            fs.write_at(id, ROOT_CREDS, 0, &[0u8; FILE_DATA_MAX + 1])
+                .unwrap(),
+            FILE_DATA_MAX + 1
+        );
+        // The spill slot's ceiling is the refusal edge.
+        assert_eq!(
+            fs.write_at(id, ROOT_CREDS, 0, &[0u8; LARGE_FILE_MAX + 1]),
             Err(VfsError::NoSpace)
         );
         // Exactly capacity is fine.
         assert_eq!(
-            fs.write_at(id, ROOT_CREDS, 0, &[1u8; FILE_DATA_MAX])
+            fs.write_at(id, ROOT_CREDS, 0, &[1u8; LARGE_FILE_MAX])
                 .unwrap(),
-            FILE_DATA_MAX
+            LARGE_FILE_MAX
         );
         // Long name.
         let long = "a".repeat(NAME_MAX + 1);

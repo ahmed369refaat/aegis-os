@@ -130,3 +130,67 @@ u16 LE @16` (0o777).
   db/...             records, state, journal, repo epochs
   cache/  stage/  lock
 ```
+
+## K22 — the ring-3 image (built and contract-checked; not yet in the kernel)
+
+`./boot.sh` step `[0d]` links the image and checks it at every build:
+
+```bash
+cargo build -p aegis-pkg --bin pkg --profile pkg-image --target x86_64-unknown-none
+python3 scripts/check-pkg-image.py target/x86_64-unknown-none/pkg-image/pkg
+strip --strip-all target/x86_64-unknown-none/pkg-image/pkg -o kernel-x86_64/blob/pkg.bin
+```
+
+- **The link layout** (`pkg/pkg.ld`, `pkg/build.rs`): three PT_LOADs
+  under the kernel's `SERVICE` contract (`mm/user_layout.rs`) — text
+  R+X at 0x400000, rodata R, data R+W with the bss tail contiguous in
+  the SAME phdr — one ABSENT page between neighbours (the kernel's
+  ten-check policy refuses adjacent regions). `.eh_frame*`, `.note*`
+  and `.comment` are discarded: the loader refuses unknown header
+  types.
+- **The size recipe** (`[profile.pkg-image]`: opt-level z, one codegen
+  unit): text 98,671 B / rodata 10,684 B / data 288 B / no bss; 29
+  image pages + 2 guard pages = 31 of the 128-page cage; with the
+  64-page stack and the trampoline, 96 of the PM quota's 192 pages.
+  The same code at opt-level 3 links 234 KiB of text.
+- **The entry**: `_start` reads the SysV initial stack the kernel's
+  execve builds (`[rsp] = argc`, then the argv pointers), aligns,
+  calls `pkg_main(argc, argv)` and exits with its answer through
+  SYS_EXIT (63).
+- **The adapter** (`target_abi` in `src/main.rs`) behind a testable
+  `Io` port: the crate's `OpenFlags` become the kernel's word
+  (`RDONLY`→O_READ, `RDONLY|DIRECTORY`→O_READ,
+  `WRONLY`→O_WRITE|O_TRUNC, `+CREATE`→O_WRITE|O_TRUNC|O_CREAT,
+  `+EXCL`→O_WRITE|O_CREAT|O_EXCL); `read`/`write`/`getdents` go out
+  in 4096-byte pages (the kernel answers `-EINVAL` above one page); a
+  short read is asked again and only a 0 ends the fill; the kernel's
+  errno words map onto the crate's family (EACCES/EPERM→Access,
+  ENOENT→NoEnt, ENOMEM/ENOSPC→NoSpace, EEXIST→Exists,
+  ENOTDIR→NotDir, EISDIR→IsDir, ENOTEMPTY→NotEmpty). Output goes
+  through a 4096-byte buffer to fd 1. Eleven host tests pin all of it
+  (`target_abi_tests`).
+- **The stack budget**: the static worst direct-call stack chain is
+  58,352 B of the 256 KiB stack (`scripts/pkg-stack-depth.py`; the
+  check fails the build above 80 KiB). The solver's recursion
+  (~3,448 B a level, depth 48 ≈ 161.6 KiB adversarial) is why the
+  chain has to stay under that line.
+
+**Why `/bin/pkg` is not in the kernel's exec registry yet.** The
+kernel image lives in ONE 2 MiB huge page (PA 2..4 MiB; the linker
+script's ASSERT). The last kernel that links is text 733,184 B +
+data 86,016 B + bss 1,204,224 B = 2,023,424 B — 73,728 B of headroom
+— while the stripped image is 119,424 B: 45,696 B over, and the link
+fails with "kernel image exceeds the single 2 MiB higher-half huge
+page". Nothing about the image is wrong; it does not fit beside the
+kernel. The two honest ways out:
+
+1. a second huge page (PA 4..6 MiB) in the boot stub's mapping, the
+   kernel's own tables, the linker ASSERT, and the frame allocator's
+   first free frame (today 0x400000);
+2. a disk-sourced slot like `/bin/hello` — which needs a ≥ 128 KiB
+   static buffer, i.e. the same bss headroom, so (1) comes first
+   either way.
+
+Until then `kernel-x86_64/blob/pkg.bin` is a build output
+(gitignored), the registry keeps its two `CANONICAL` citizens, and
+the exec arm's `SERVICE` path is proven by host tests only.

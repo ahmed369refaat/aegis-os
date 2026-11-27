@@ -725,6 +725,7 @@ fn vfs_import<const N: usize>(k: &mut aegis_os::Kernel<N>, out: &mut dyn FnMut(&
                 read: false,
                 write: true,
                 truncate: true,
+                excl: false,
             },
         ) {
             Ok(SysValue::Fd(fd)) => fd,
@@ -748,6 +749,7 @@ fn vfs_import<const N: usize>(k: &mut aegis_os::Kernel<N>, out: &mut dyn FnMut(&
                 read: true,
                 write: false,
                 truncate: false,
+                excl: false,
             },
         ) {
             Ok(SysValue::Fd(fd)) => fd,

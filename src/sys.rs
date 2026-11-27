@@ -36,10 +36,16 @@ use crate::{
 /// A fully-marshaled syscall request (the ABI of this sample kernel).
 #[derive(Debug)]
 pub enum SysRequest<'a> {
-    /// open(path, mode, O_CREAT?, READ?, WRITE?, TRUNC?) — returns a
-    /// file descriptor. F11(b): the requested access is checked at open
-    /// time; F11(c): truncation is this explicit flag, never a side
-    /// effect of writing.
+    /// open(path, mode, O_CREAT?, READ?, WRITE?, TRUNC?, O_EXCL?) —
+    /// returns a file descriptor. F11(b): the requested access is
+    /// checked at open time; F11(c): truncation is this explicit flag,
+    /// never a side effect of writing.
+    ///
+    /// K22: `excl` is O_EXCL — with `create`, an existing path refuses
+    /// `VfsError::Exists` (never opens it, never truncates it). This is
+    /// the atomic "only I created this" primitive the package manager's
+    /// transaction lock, staged files and backups are built on; without
+    /// it a crashed predecessor's lock file would be silently reopened.
     Open {
         path: &'a str,
         mode: Mode,
@@ -47,6 +53,7 @@ pub enum SysRequest<'a> {
         read: bool,
         write: bool,
         truncate: bool,
+        excl: bool,
     },
     /// read(fd, buf) — returns bytes read (short reads; 0 at EOF).
     Read {
@@ -335,7 +342,15 @@ impl<const N: usize> Kernel<N> {
                 read,
                 write,
                 truncate,
+                excl,
             } => {
+                // K22: O_EXCL without O_CREAT is POSIX-undefined — the
+                // same "undefined is not honored" rule O_TRUNC without
+                // write follows. Checked before any resolution work so
+                // the refusal has zero side effects.
+                if excl && !create {
+                    return Err(SysError::InvalidArgument(0));
+                }
                 // F18 (ADR-0009): the capability gate runs BEFORE any
                 // resolution work — an FsNode capability covering the
                 // path's parent directory, with the requested access.
@@ -356,6 +371,13 @@ impl<const N: usize> Kernel<N> {
                 let r = if create {
                     match self.vfs.resolve(root, cwd, path, creds) {
                         Ok(found) => {
+                            // K22: O_CREAT|O_EXCL on ANY existing path is
+                            // EEXIST (Linux answers it for a directory
+                            // too) — the fd is never minted, the
+                            // truncate flag below never reaches it.
+                            if excl {
+                                return Err(SysError::Vfs(VfsError::Exists));
+                            }
                             if self.vfs.kind_of(found) != Some(InodeKind::File) {
                                 return Err(SysError::Vfs(VfsError::IsADirectory));
                             }
@@ -909,16 +931,31 @@ impl<const N: usize> Kernel<N> {
                 // The fd's open already gated the path (an FsNode READ
                 // capability on the directory); listing adds no right
                 // beyond the names of what the caller can already name.
-                let target = self
-                    .domain_mut(domain_id)
-                    .map_err(into_sys)?
-                    .fds
-                    .get(fd)
-                    .ok_or(SysError::BadFd(fd))?
-                    .target;
+                // K22: the fd's `pos` is the listing CURSOR. A call
+                // fills what fits whole and advances the cursor; the
+                // next call resumes there; 0 bytes = end of list. The
+                // package manager loops getdents until exactly that 0 —
+                // a cursor-less arm answered the same first batch
+                // forever.
+                let (target, cursor) = {
+                    let fds = &mut self.domain_mut(domain_id).map_err(into_sys)?.fds;
+                    let entry = fds.get_mut(fd).ok_or(SysError::BadFd(fd))?;
+                    (entry.target, entry.pos)
+                };
                 match target {
                     FdTarget::File(r) => {
-                        let n = self.vfs.list_dir(r.id, buf).map_err(SysError::Vfs)?;
+                        // Stale references fail closed here too (F10):
+                        // the handle never lists the directory that may
+                        // have reused its slot.
+                        let dir = self.vfs.dir_of(r).map_err(SysError::Vfs)?;
+                        let (n, next) = self
+                            .vfs
+                            .list_dir_at(dir, buf, cursor)
+                            .map_err(SysError::Vfs)?;
+                        let fds = &mut self.domain_mut(domain_id).map_err(into_sys)?.fds;
+                        if let Some(entry) = fds.get_mut(fd) {
+                            entry.pos = next;
+                        }
                         Ok(SysValue::Count(n))
                     }
                     _ => Err(SysError::BadFd(fd)),
