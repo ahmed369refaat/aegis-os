@@ -93,11 +93,9 @@ static SNAP_LEN: AtomicU32 = AtomicU32::new(0);
 static SNAP_PA: AtomicU64 = AtomicU64::new(0);
 static SNAP_READBACK: AtomicU8 = AtomicU8::new(0);
 
-/// Record the copy target + the post-copy read-back (K20 debug).
-/// `va_readback` is the SAME byte read through the USER VA at arm
-/// time (under STAC): if it disagrees with `readback` (the PA read),
-/// the VA mapping and the translated PA diverge; if they agree and
-/// the blob later reads 0, the zeroer is in the return path.
+/// Record the copy target + the post-copy read-back (K20 debug,
+/// exonerated in K25: the va read-back and the PA read-back agree —
+/// the old "zeroer" was the test's own hex/decimal offset bug).
 pub(crate) fn snapshot_target(pa: u64, readback: u8, va_readback: u8) {
     SNAP_PA.store(pa, Ordering::Relaxed);
     SNAP_READBACK.store(readback, Ordering::Relaxed);
@@ -105,9 +103,6 @@ pub(crate) fn snapshot_target(pa: u64, readback: u8, va_readback: u8) {
 }
 
 static SNAP_VA_READBACK: AtomicU8 = AtomicU8::new(0);
-
-/// The arm-time read of frame+42 through the USER VA.
-#[cfg(not(test))]
 pub(crate) fn snap_va_readback() -> u8 {
     SNAP_VA_READBACK.load(Ordering::Relaxed)
 }

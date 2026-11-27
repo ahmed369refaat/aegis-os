@@ -65,7 +65,12 @@ _ring3_start:
     dec r13d
     jnz 1b
 2:  mov qword ptr [0x403C08], rax     /* the recv's raw return */
-    movzx eax, byte ptr [0x403842]
+    /* K25: the op byte is frame+42 DECIMAL = buf+0x2A — the old
+     * 0x842 literal read frame+0x42(=66), a zero chaddr field, and
+     * fueled five rounds of "page rewritten post-recv" forensics
+     * against a page that was never touched. The copy was always
+     * byte-exact; the TEST's offset was wrong. */
+    movzx eax, byte ptr [0x40382A]
     mov qword ptr [0x403C30], rax     /* the op byte AS THE BLOB SEES IT right after the recv */
 
     /* 3. the throttle exhaustion: 60-byte null frames until the
@@ -90,7 +95,7 @@ _ring3_start:
     mov esi, 1515
     syscall
     mov qword ptr [0x403C28], rax     /* the probe's raw return */
-    movzx eax, byte ptr [0x403842]
+    movzx eax, byte ptr [0x40382A]
     mov qword ptr [0x403C38], rax     /* the op byte after the throttle loop + probe */
 
     /* 5. exit 0 — the report IS the raw truth; the kernel verifies. */

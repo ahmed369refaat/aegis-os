@@ -1,5 +1,60 @@
 # Changelog
 
+## [Unreleased] — the K25 round: the "page rewritten post-recv" anomaly, CLOSED — root-caused, fixed, and gated
+
+**The anomaly:** five rounds of boot logs said the netd blob's received
+DHCP frame was copied byte-exact (the arm's own PA read-back AND an
+STAC read through the user VA both saw the op byte = 2) yet the page
+"read zero" right after SYSRET — with no fault, no frame collision, and
+(as this round proved) no writer anywhere in the window.
+
+**The hunt (kept as the round's artifact, `scripts/k25_gdb_watch.py`):**
+- Kernel-side brackets sampled the byte at the arm's last statement, the
+  dispatch tail, every later syscall entry, and the timer IRQ — the byte
+  was already 0 three statements after reading 2.
+- A live CR3→PML4→PDPT→PD→PT walk inside the arm printed the PTE —
+  constant and perfect (`0x8000000001339067`: frame 0x1339000, RW|USER,
+  walk and hardware agreeing).
+- A from-scratch GDB-remote client (the environment has no gdb binary;
+  ~150 lines of raw `$packet#checksum` protocol) planted write
+  watchpoints on BOTH aliases — the direct-map VA and the user VA — and
+  symbolized every hit against the kernel ELF: the copy loop
+  (`sys_net_recv+0x4ff`) writing the word correctly, the post-teardown
+  `scrub_frame`, a later spawn's `map_region`/`copy_into_frame` reusing
+  the freed frame — and NO write in the anomaly's window. The watch
+  also ruled out device DMA (the RX used-cursor never advanced).
+- The tell that ended it: **impossible physics means there is no crime** —
+  a byte cannot be written, read twice as 2, and become 0 with zero
+  writers, a perfect PTE, and no faults. The only un-audited component
+  left was the READER.
+
+**The root cause — a hex/decimal offset bug in K20's test evidence
+chain:** the DHCP op byte sits at frame+42 **decimal** = page+`0x82A`.
+The blob's `[0x403842]` and the verifier's `data_pa + 0x842` compute
+frame+**0x42** = 66 — a zero chaddr/sname field 24 bytes past the op.
+The kernel's `buf + 42` (Rust, decimal) read the real op (= 2) while
+every hex-literal reader read a zero neighbor (= 0) — "the byte flips
+inside the syscall-return window" was two reads of two different bytes.
+Likewise the yiaddr check read `0x858` (frame+88) instead of `0x838`
+(frame+58) — it passed by accident on nonzero sname bytes. The data
+path — the PA write loop, the RMW, the PTE, the SYSRET — was never
+broken.
+
+**The fix:** the blob reads `[0x40382A]` (both probe sites), the
+verifier reads `data_pa + 0x82A` / `+ 0x838`, and the page's integrity
+(`dhcp_op == 2 && yiaddr != 0` at exit) is now PART of the lane's ok
+gate — any future divergence fails the boot loudly instead of printing
+a soft marker. The dbg bracket line, five rounds of `t0va=2 t1=0
+t2=0 verify=0`, now reads `t0va=2 t1=2 t2=2 verify=2` on the live q35
+lane; `BOOT VERIFY: PASS` with the marker replaced by
+"arm-time snapshot + read-back + exit-time page verified".
+
+**The lesson, written down where the next anomaly hunter will read it
+(README + this entry):** when the instrumentation insists a write
+happened, was read back, and vanished with no writer, no fault, and a
+perfect PTE — audit the READER's arithmetic before the memory system.
+Two bytes of offset can masquerade as a five-round ghost.
+
 ## [Unreleased] — the K24 round: the TCP/IP stack — a complete, no_alloc, zero-dependency, zero-unsafe netstack for the netd domain
 
 - **`src/netstack/` — the stack itself** (9 modules, ~3.4 k lines,
