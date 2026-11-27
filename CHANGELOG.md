@@ -1,5 +1,66 @@
 # Changelog
 
+## [Unreleased] — the K26 round: the e1000, the THIRD ring-3 driver domain — the real-NIC-class migration
+
+**The gap (the user's words):** "the network runs on virtio-net (a
+virtual environment); the e1000 driver is still disabled (returns
+ENODEV) — the system cannot run on real network hardware yet."
+
+**What landed:** the e1000 joins virtio-blk and virtio-net as the
+third ring-3 driver domain (`drvstack/e1kdom.rs` +
+`examples/ring3-e1kdom`), the ADR-0017 migration pattern now
+three-for-three. The kernel keeps the minimal ring-0 half: the claim,
+ONE registered device-core window (the whole BAR0 — every register
+this legacy driver touches, window-checked on every SYS_DEVREG
+message at serve time), the broker mapping of the domain's own page
+into the NIC's IOMMU domain, the DHCP seed (a message, never device
+control), the run, and the teardown. Everything that used to be
+driver logic runs at CPL=3 in the flat blob: the quiesce, the MAC +
+link read through the devreg channel, BOTH legacy descriptor ring
+programs (RDBAL/RDBAH/RDLEN/RDT/RCTL, TDBAL/TDLEN/TCTL), the RX
+buffer post, the TX descriptor build + the tail kick, and both
+completion polls — including the RCTL flush-queue timer's full-second
+virtual-clock patience, now proven from ring 3.
+
+**The proof (live on the q35 lane, every boot):** 18 devreg ops
+served / 0 refused; a full DHCP exchange through the domain's OWN
+legacy rings — 290-byte DISCOVER out, 594-byte OFFER back, op=BOOTREPLY
+and the 10.0.2.x yiaddr verified; the MAC read through the devreg
+channel matches the kernel's own RAL/RAH read (two independent paths
+through the same device); the domain's own STATUS link-up read is
+part of the gate; the teardown closes channel → mapping → identity;
+and the rogue containment proves a hostile driver domain loses its
+device (5 out-of-window messages refused, the ladder closed the
+channel, a legal read then refuses too).
+
+**The round's own story — the layout test that earned its keep on
+day one:** the new host test pins the data-page map (report slots,
+both 16-entry descriptor rings, both frame buffers — every offset
+DERIVED, with its arithmetic stated, never a bare literal). Its
+first run FAILED — catching a real 2-byte offset bug in the very fix
+K25 had just shipped: the K25 yiaddr literal `0x838` reads frame+56
+(two bytes short of the true `0x83A` = frame+58), and the weak
+`yiaddr != 0` gate had passed accidentally on ciaddr zeros plus
+yiaddr's first two bytes leaking into the read window. Both fixed:
+the offset to `0x83A`, the gate to the 10.0.2.x address-class check.
+The K25 lesson now has enforcement teeth — offset literals are
+derived and tested, not written and believed.
+
+**Two blob-authoring finds on the way (both the same class, both
+caught by the lane's loud markers):** the legacy RX descriptor's
+length field sits at desc+8 (buffer_addr(8)+length(2) — the TX
+layout's mirror), not desc+4; and the RCTL broadcast-accept bit (BAM)
+matters from ring 3 exactly as it did from ring 0 — the OFFER is a
+broadcast and is dropped silently without it.
+
+**The state after K26:** every NIC this machine models — virtio-net
+ring-0 AND ring-3, e1000 ring-0 AND ring-3 — runs the full
+IOMMU-enforced DHCP round trip on the live q35 boot, with the
+devreg-window discipline meaning no ring-3 driver can even NAME a
+register outside its grant. Gates 10/10; 550 tests green, zero
+failures; the migration pattern is documented and reusable for the
+next device family (NVMe/AHCI remain ring-0 — the natural K27+).
+
 ## [Unreleased] — the K25 round: the "page rewritten post-recv" anomaly, CLOSED — root-caused, fixed, and gated
 
 **The anomaly:** five rounds of boot logs said the netd blob's received

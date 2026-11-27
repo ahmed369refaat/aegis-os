@@ -29,6 +29,7 @@ pub(crate) mod irq;
 pub(crate) mod kbd;
 mod legacy;
 // K20 (P0-2): the live virtio-net session the ring-3 NET_* arms drive.
+mod e1kdom;
 pub(crate) mod netdata;
 mod netutil;
 mod nvme;
@@ -150,6 +151,11 @@ pub fn driver_stack_step<const N: usize>(
                 vnetdom::vnetdom_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_cross_device_probe_step(k, pool, out, &mut broker, &inv);
+                // K26: the THIRD migrated driver — the e1000. Runs
+                // AFTER the ring-0 proof and the cross-device probe:
+                // this domain repoints the NIC onto its OWN legacy
+                // rings at CPL=3 through the devreg channel.
+                e1kdom::e1kdom_step(k, pool, out, &mut broker, &inv);
                 nvme::nvme_step(k, pool, out, &mut broker, &inv);
                 ahci::ahci_step(k, pool, out, &mut broker, &inv);
                 // Phase 6 S5: the M3 exit criterion — files that survive

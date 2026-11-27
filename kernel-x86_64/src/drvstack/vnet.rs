@@ -707,13 +707,17 @@ fn ring3_net_step(out: &mut dyn FnMut(&str), mac: &[u8; 6]) {
     let throttle_refusal = crate::memops::read_u64(data_pa + 0xC18);
     let null_sends = crate::memops::read_u64(data_pa + 0xC20);
     let emsgsize_ret = crate::memops::read_u64(data_pa + 0xC28);
-    // K25: the frame's true offsets — op at frame+42 DECIMAL
-    // (page+0x82A), yiaddr at frame+58 (page+0x838). The old
-    // 0x842/0x858 literals were "42/58" written as HEX — 24 and 30
-    // bytes past the fields, reading zeros: the "page rewritten
-    // post-recv" anomaly was this offset pair, never a rewrite.
+    // K25 + K26: the frame's true offsets — op at frame+42 DECIMAL
+    // (page+0x82A), yiaddr at frame+58 (page+0x83A; the K25 fix said
+    // 0x838 — frame+56, two bytes short — and the weak `!= 0` gate
+    // passed on ciaddr zeros plus yiaddr's first two bytes leaking
+    // into the window; the K26 layout test caught it and the gate is
+    // now the address-class check, not merely nonzero). The original
+    // 0x842/0x858 literals were "42/58" written as HEX — reading
+    // zero fields: the "page rewritten post-recv" anomaly was that
+    // offset pair, never a rewrite.
     let dhcp_op = u64::from(crate::virtio::read_u8_pa(data_pa + 0x82A));
-    let yiaddr = u64::from(crate::memops::read_u32(data_pa + 0x838));
+    let yiaddr = u64::from(crate::memops::read_u32(data_pa + 0x83A).swap_bytes());
     // The arm-time snapshot: the frame as the recv arm saw it.
     let snap_op = crate::drvstack::netdata::snap_byte(42).unwrap_or(0);
     let snap_yiaddr: u64 = (0..4u64)
@@ -743,7 +747,7 @@ fn ring3_net_step(out: &mut dyn FnMut(&str), mac: &[u8; 6]) {
     // "OPEN: page rewritten post-recv" was the test's own hex/decimal
     // offset bug: 0x842 read frame+66, a zero field, while the op sat
     // byte-exact at frame+42 = +0x82A all along).
-    let page_stuck = dhcp_op == 2 && yiaddr != 0;
+    let page_stuck = dhcp_op == 2 && (yiaddr & 0xFF00_0000) == 0x0A00_0000;
     let ok = page_stuck
         && matches!(run.exit, ExitKind::Exited(0))
         && send1_ret == 290
