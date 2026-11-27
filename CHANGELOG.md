@@ -1,5 +1,62 @@
 # Changelog
 
+## [Unreleased] — the K24 round: the TCP/IP stack — a complete, no_alloc, zero-dependency, zero-unsafe netstack for the netd domain
+
+- **`src/netstack/` — the stack itself** (9 modules, ~3.4 k lines,
+  `no_std`/`no_alloc`, zero external crates, ZERO `unsafe`):
+  Ethernet II framing; ARP (fixed 16-entry cache, 60 s TTL,
+  gratuitous support, bounded retry); IPv4 (full header validation,
+  ones'-complement checksums inline, bounded reassembly — 4 slots ×
+  1480 B, 10 s lifetime, **overlap refused whole-datagram** — the
+  teardrop shape never reaches a copy loop); ICMP (echo, unreachable,
+  two anti-amplification token buckets, redirects ignored by policy);
+  UDP (datagram-boundary-preserving 4×512 B queues, checksummed);
+  **TCP** — the eleven-state machine, a fixed 8-TCB pool, RFC 793
+  wrapping sequence arithmetic, sliding windows both ways, RTO with
+  exponential backoff to ETIMEDOUT, delayed ACKs, congestion window
+  (slow start + congestion avoidance + fast retransmit), active and
+  passive teardown, TIME_WAIT bounded by 2×MSL, zero-window persist
+  probes; and a capability-gated sockets layer (per-domain quotas,
+  POSIX errno surface, non-blocking everywhere).
+- **SYN flood defense in depth**: per-source rate windows, a half-open
+  budget, and **SYN cookies** — when the budget is spent the SYN-ACK's
+  ISN IS a per-boot-secret keyed cookie over the 4-tuple and a 64 s
+  time bucket; the TCB materializes only when the returning ACK proves
+  the cookie. Zero per-source state in cookie mode. (Why cookies, not
+  a SYN cache: THREAT_MODEL.md §3.)
+- **The Broker contract holds**: every frame the stack emits goes
+  through the caller's `FrameSink` — there is exactly one egress door
+  (TCP's builders, IPv4/ICMP/UDP transmit, ARP's frames all funnel to
+  it), so the kernel's token bucket and per-domain accounting sit
+  under every byte. Egress refusals surface as EAGAIN-shaped errors,
+  never covert retries.
+- **Four found-live bugs, each now pinned by a test** (§9 of the
+  threat model): reassembly "completed" without the final fragment
+  (fixed with the MF=0 end oracle); the cookie SYN-ACK's data_offset
+  ignored its own MSS option (the peer ate 4 option bytes as payload);
+  **FIN acks never advanced `snd_una`** (advancement was capped by the
+  send ring, but a FIN consumes sequence without a ring byte — both
+  teardowns wedged); and the retransmit/persist pair desynced the
+  receiver past `snd_nxt` while a payload-less probe never reopened a
+  zero window (fixed: retransmit bounded to the in-flight range,
+  window tracking on every segment, window-update ACKs on drain,
+  1-byte persist probes, poll-driven transmission).
+- **The test suite**: 57 netstack tests (deterministic — hand-driven
+  clock, seeded xorshift entropy, a two-stack fake wire): ARP
+  resolution and expiry, ping end-to-end, UDP boundaries, the full
+  TCP handshake/data/teardown across both stacks, malformed-packet
+  rejection at every layer, wire-level fragmentation (out-of-order
+  delivery, overlap refusal, timeout), SYN flood + cookie completion,
+  RTO backoff to ETIMEDOUT, window-full stall and byte-exact drain,
+  the errno surface (EAGAIN/ECONNREFUSED/EADDRINUSE/EINPROGRESS/
+  EMFILE/EMSGSIZE/EOPNOTSUPP/EINVAL), broker exhaustion, and pool
+  exhaustion. Total workspace: 550 tests, gates 10/10, clippy clean
+  on both lanes.
+- **THREAT_MODEL.md** (ten sections, each naming the enforcing code
+  and the proving test) and **BUILD.md** (the domain wiring, the
+  syscall mapping, the capacity bill, and the K25 VM-integration
+  steps).
+
 ## [Unreleased] — the K23 round: the full package lifecycle in the VM — upgrade becomes a real move, remove closes the loop
 
 - **Found-live bug: `pkg upgrade` was structurally a no-op.** The
