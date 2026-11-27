@@ -408,7 +408,10 @@ mod transaction_tests {
         _mem: Vec<u64>,
     }
 
-    const N: usize = 256;
+    /// K22: 256 -> 4096 — the SERVICE contract's exec now provisions
+    /// the manager's 2048-page (8 MiB) no_alloc stack in one call, and
+    /// the pool must cover image + stack + trampoline (2080 frames).
+    const N: usize = 4096;
 
     fn setup() -> (Kernel<N>, FramePool<N>, Phys) {
         // Page-align the backing buffer: the map path requires
@@ -699,8 +702,16 @@ mod transaction_tests {
         assert_eq!(space.used_pages(), 2 + layout::CANONICAL.overhead_pages());
 
         let (mut k, mut pool, _p) = setup();
-        let (tables, space) = exec_tables(&mut k, &mut pool, 7, &plan, &image, &SERVICE, 256)
-            .expect("canonical image under the service contract");
+        let (tables, space) = exec_tables(
+            &mut k,
+            &mut pool,
+            7,
+            &plan,
+            &image,
+            &SERVICE,
+            aegis_os::profile::package_manager_profile().quota_pages,
+        )
+        .expect("canonical image under the service contract");
         assert!(tables.translate(SERVICE.stack_base).is_some());
         assert!(tables.translate(SERVICE.stack_top() - 4096).is_some());
         assert!(tables.translate(layout::STACK_BASE).is_none());

@@ -193,7 +193,15 @@ pub const SYS_STAT: u8 = 34;
 /// commit step). WRITE caps on BOTH parents; a file destination is
 /// replaced; a directory destination is refused; the inode keeps its
 /// identity (same id + generation). K21.
-pub const SYS_RENAME: u8 = 35;
+///
+/// K22: 35 was unreachable from ring 3 — the entry's internal-mode
+/// hybrid table maps Linux nr 35 (nanosleep(2), which the ADR-0023
+/// sleeper blobs legitimately call) onto SYS_NANOSLEEP, so an
+/// internal-ABI domain's `SYS_RENAME` call was ALWAYS hijacked into a
+/// masked nanosleep (found live: the in-VM manager's commit rename
+/// answered EPERM dressed as EACCES). 36 has no collision; the
+/// rename(2)/renameat(2) Linux whitelist entries follow this const.
+pub const SYS_RENAME: u8 = 36;
 
 pub const SYS_EXIT: u8 = 63;
 

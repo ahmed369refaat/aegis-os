@@ -61,7 +61,7 @@ method to exactly one syscall:
 | `unlink`     | SYS_UNLINK                              | 17  |
 | `exit`       | SYS_EXIT                                | 63  |
 | `stat`       | SYS_STAT (Linux: newfstatat 262)         | 34  |
-| `rename`     | SYS_RENAME (Linux: rename 82/renameat 264) | 35 |
+| `rename`     | SYS_RENAME (Linux: rename 82/renameat 264) | 36 |
 | `getdents`   | SYS_LISTDIR (Linux: getdents64 259)      | 32  |
 
 Network access goes **only through the broker**: the domain's mask
@@ -131,7 +131,7 @@ u16 LE @16` (0o777).
   cache/  stage/  lock
 ```
 
-## K22 — the ring-3 image (built and contract-checked; not yet in the kernel)
+## K22 — the ring-3 image: built, embedded, and installing inside the VM
 
 `./boot.sh` step `[0d]` links the image and checks it at every build:
 
@@ -175,22 +175,56 @@ strip --strip-all target/x86_64-unknown-none/pkg-image/pkg -o kernel-x86_64/blob
   (~3,448 B a level, depth 48 ≈ 161.6 KiB adversarial) is why the
   chain has to stay under that line.
 
-**Why `/bin/pkg` is not in the kernel's exec registry yet.** The
-kernel image lives in ONE 2 MiB huge page (PA 2..4 MiB; the linker
-script's ASSERT). The last kernel that links is text 733,184 B +
-data 86,016 B + bss 1,204,224 B = 2,023,424 B — 73,728 B of headroom
-— while the stripped image is 119,424 B: 45,696 B over, and the link
-fails with "kernel image exceeds the single 2 MiB higher-half huge
-page". Nothing about the image is wrong; it does not fit beside the
-kernel. The two honest ways out:
+**The image is IN the kernel now** (the second-leaf round): the
+boot stub maps TWO 2 MiB huge pages (PD_hh[0] @ PA 2 MiB, PD_hh[1] @
+PA 4 MiB — PA 2..6 MiB), the linker ASSERTs moved to 0x600000, and
+`arch::image_map` fills TWO 4 KiB page tables (the F15 W^X rebuild
+covers both leaves). The stripped image (119,424 B) rides in
+`.rodata`; the registry's third entry is
+`service_entry("/bin/pkg", EXEC_PKG_ELF)`.
 
-1. a second huge page (PA 4..6 MiB) in the boot stub's mapping, the
-   kernel's own tables, the linker ASSERT, and the frame allocator's
-   first free frame (today 0x400000);
-2. a disk-sourced slot like `/bin/hello` — which needs a ≥ 128 KiB
-   static buffer, i.e. the same bss headroom, so (1) comes first
-   either way.
+**The stack is 8 MiB, and that is the design, not a bug.** The first
+lane built a 256 KiB stack on a static measure of 57.6 KiB — the
+measure was wrong: rustc emits large frames as a probe loop
+(`mov %rsp,%r11; sub $frame,%r11`, then 4 KiB steps), and the tool
+read the loop's `sub $0x1000` as the frame. The fixed tool
+(`scripts/pkg-stack-depth.py`) measures the REAL chain: 7,589,376 B
+(run_cli 2.2 MiB + do_solve_and_install 3.8 MiB + load_repos 1.3 MiB
++ ...). `pkg/BUILD.md`'s own "stack ≥ 2 MiB (no_alloc)" was the
+number all along. SERVICE.stack_pages = 2048; the PM quota 2112; the
+boot lane's caller profile (`pkg_caller_profile`) carries the same
+grant — the exec's quota pre-check runs against the CALLER's live
+allowance.
 
-Until then `kernel-x86_64/blob/pkg.bin` is a build output
-(gitignored), the registry keeps its two `CANONICAL` citizens, and
-the exec arm's `SERVICE` path is proven by host tests only.
+**Two found-live adapter bugs the VM exposed** (both now fixed and
+documented at their sites): `mkdir` passed mode 0 as the second
+syscall word (the kernel takes the mode from a2 — the manager's own
+dirs were created 0o000 and the transaction died of EACCES inside
+its own staging tree); and `pkg_main` handed `run_cli` the full argv
+INCLUDING argv[0], so `/bin/pkg install r1/hello` answered "unknown
+command" on its own name.
+
+**SYS_RENAME is 36, not 35.** The entry's internal-mode hybrid
+(`linux_to_core`) maps Linux nr 35 — nanosleep(2), which the
+ADR-0023 sleeper blobs legitimately call — onto SYS_NANOSLEEP, so an
+internal-ABI domain's rename syscall at 35 was ALWAYS translated
+into a masked nanosleep: the first in-VM commit answered EPERM
+dressed as EACCES. The internal id moved to 36 (35 was unreachable,
+so nothing working ever used it); the Linux whitelist's rename(82) /
+renameat(264) rows follow the const.
+
+**The in-VM lane** (kmain's `[PKG]` step, asserted by
+`boot.sh --verify`): a root supervisor (uid 0, gid 100 — the
+manager's group) provisions `/r1` (the pkg-mkrepo fixture: index +
+package, root-owned 0644) and `/pkg` 0770 root:100 with
+`/pkg/trust` + `/pkg/repos/r1.repo` root-owned 0644 (the manager
+reads its anchors, never rewrites them); the `ring3-pkg-caller`
+blob execve's `/bin/pkg` with ["/bin/pkg", "install", "r1/hello"]
+(internal nr 19); the image runs under its declared 9-syscall mask,
+resolves against the Ed25519-verified index, stages, commits
+(`/usr/bin/pkg-hello` = "hello world\n" byte-exact + the record +
+the state), and exit(0)s; the kernel verifies the tree through a
+fresh root probe. The host proofs: `tests/pkg_lane_provision.rs`
+(the DAC walk as the manager's exact credentials) and
+`tests/pkg_lane_cli.rs` (the REAL `run_cli` over the REAL kernel
+through the REAL fixture bytes).

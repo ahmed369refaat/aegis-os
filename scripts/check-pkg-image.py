@@ -10,11 +10,14 @@ The contract (kernel-x86_64/src/mm/user_layout.rs `SERVICE`):
   - one ABSENT page between neighbouring segments (the kernel's
     ten-check policy refuses adjacent regions — GuardGap);
   - the entry inside the executable segment;
-  - image pages + the contract's overhead (64 stack + 1 trampoline)
-    within the package manager's quota (192 pages);
-  - the static worst direct-call stack chain under 80 KiB: the solver
-    recurses ~3.4 KiB per level, and chain + recursion must fit the
-    256 KiB stack (measured by scripts/pkg-stack-depth.py).
+  - image pages + the contract's overhead (2048 stack + 1 trampoline)
+    within the package manager's quota (2112 pages);
+  - the static worst direct-call stack chain under 7.5 MiB: the
+    no_alloc design puts every buffer on the stack (the linked install
+    path holds 7.26 MiB of them: run_cli 2.2 + do_solve 3.8 +
+    load_repos 1.3 + ...) and the solver recurses ~3.4 KiB a level —
+    chain + recursion must fit the 8 MiB stack (measured by
+    scripts/pkg-stack-depth.py, probe-loop prologues included).
 
 Exit status 0 = the image honors the contract.
 """
@@ -24,11 +27,11 @@ import sys
 
 CAGE_BASE = 0x400000
 CAGE_END = 0x480000
-STACK_PAGES = 64
+STACK_PAGES = 2048
 TRAMPOLINE_PAGES = 1
-QUOTA_PAGES = 192
+QUOTA_PAGES = 2112
 STACK_BYTES = STACK_PAGES * 4096
-CHAIN_BUDGET = 80 * 1024
+CHAIN_BUDGET = 7680 * 1024
 PAGE = 4096
 
 LOAD_RE = re.compile(

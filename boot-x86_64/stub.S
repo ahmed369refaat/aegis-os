@@ -13,7 +13,7 @@
  *   4. builds the bring-up page tables (ADR-0002): the low identity
  *      window for the stub itself (first 1 GiB, torn down by the kernel
  *      right after entry), the higher-half kernel window
- *      (VA 0xFFFFFFFF80000000 → PA 2 MiB, one 2 MiB huge page), and the
+ *      (VA 0xFFFFFFFF80000000 → PA 2 MiB, two 2 MiB huge pages — PA 2..6 MiB), and the
  *      direct map (VA 0xFFFF888000000000 + PA, first 1 GiB),
  *   5. enables PAE -> EFER.LME -> CR0.PG and far-jumps into 64-bit code,
  *   6. jumps to the 64-bit kernel entry (a higher-half VA, staged on the
@@ -91,10 +91,14 @@ _start:
     jb      2b
 
     /* ── higher-half kernel window (ADR-0002) ──
-     * PML4[511] → PDPT_hh; PDPT_hh[510] → PD_hh; PD_hh[0] = 2 MiB huge
-     * page @ PA 2 MiB. This makes VA 0xFFFFFFFF80000000 (the kernel link
-     * base) the kernel image. The kernel later adds PDPT_hh[509] itself
-     * for the guarded-stack region. */
+     * PML4[511] → PDPT_hh; PDPT_hh[510] → PD_hh; PD_hh[0] and PD_hh[1]
+     * = 2 MiB huge pages @ PA 2 and 4 MiB. This makes VA
+     * 0xFFFFFFFF80000000 (the kernel link base) the kernel image. The
+     * kernel later adds PDPT_hh[509] itself for the guarded-stack
+     * region. K22 grew the image past one leaf (/bin/pkg's 119 KiB
+     * rides in .rodata): mm::init's F15 rebuild splits BOTH leaves
+     * into 4 KiB PTEs, so the leaves being huge here is only the
+     * bring-up state. */
     movl    $boot_pml4, %eax
     movl    $boot_pdpt_hh, %ecx
     orl     $3, %ecx
@@ -106,6 +110,8 @@ _start:
     movl    $boot_pd_hh, %eax
     movl    $(0x200000 | 0x83), %ecx /* PA 2 MiB | PRESENT|WRITE|HUGE */
     movl    %ecx, (%eax)
+    movl    $(0x400000 | 0x83), %ecx /* PA 4 MiB | PRESENT|WRITE|HUGE */
+    movl    %ecx, 8(%eax)            /* PD_hh[1] — the K22 leaf */
 
     /* ── direct map (ADR-0002) ──
      * PML4[273] → PDPT_dm; PDPT_dm[0] = 1 GiB huge page @ PA 0. Every

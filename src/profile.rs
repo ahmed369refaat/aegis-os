@@ -318,10 +318,14 @@ pub const fn netd_profile() -> DomainProfile {
 /// commit, stat for the destination-parent walks, getdents for the
 /// repo-config listing.
 ///
-/// A pure attenuation of `service_profile` on every axis (the host
-/// test pins it): the quota covers the image's mapped pages plus the
-/// 64-page stack its no_alloc buffers need under the service exec
-/// layout (see `mm::user_layout::ExecLayout` in the kernel).
+/// An attenuation of `service_profile` on every axis but MEMORY: the
+/// no_alloc design puts every buffer on the stack (the linked
+/// `run_cli` frame alone is 2.2 MiB), so the quota covers the image's
+/// mapped pages plus the 2048-page (8 MiB) stack the SERVICE exec
+/// layout provisions (see `mm::user_layout::ExecLayout` in the
+/// kernel). The widening is a boot-time grant: a 256-page service
+/// parent still cannot spawn a PM child — the live-quota axis of
+/// `is_attenuation_of` refuses it.
 pub const fn package_manager_profile() -> DomainProfile {
     DomainProfile {
         name: "pkg",
@@ -344,7 +348,43 @@ pub const fn package_manager_profile() -> DomainProfile {
         degraded_syscalls: SyscallMask::from_bits(
             (1u64 << SYS_READ) | (1u64 << SYS_WRITE) | (1u64 << SYS_CLOSE) | (1u64 << SYS_EXIT),
         ),
-        quota_pages: 192,
+        quota_pages: 2112,
+        base_rights: Rights::READ.union(Rights::WRITE),
+        sensitivity: 40,
+        max_children: 0,
+    }
+}
+
+/// K22: the boot lane's CALLER profile — the execve trigger that
+/// becomes the package manager. The exec's quota pre-check runs against
+/// the CALLER's live allowance, and the image it becomes needs the
+/// image's pages plus the service contract's 768-page stack — so this
+/// profile carries the PM's memory grant and the PM's surface plus
+/// exactly the one arm the trigger itself speaks (execve; exit is
+/// already in the PM surface). The exec then NARROWS the live mask to
+/// `package_manager_profile` by the image's declared policy — never
+/// wider. Boot-time grant only: a service-domain parent (256 pages)
+/// can never spawn or spawn-into this allowance.
+pub const fn pkg_caller_profile() -> DomainProfile {
+    DomainProfile {
+        name: "pkg-caller",
+        syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ)
+                | (1u64 << SYS_WRITE)
+                | (1u64 << SYS_OPEN)
+                | (1u64 << SYS_CLOSE)
+                | (1u64 << SYS_MKDIR)
+                | (1u64 << SYS_UNLINK)
+                | (1u64 << SYS_LISTDIR)
+                | (1u64 << SYS_STAT)
+                | (1u64 << SYS_RENAME)
+                | (1u64 << SYS_EXIT)
+                | (1u64 << SYS_EXEC),
+        ),
+        degraded_syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ) | (1u64 << SYS_WRITE) | (1u64 << SYS_CLOSE) | (1u64 << SYS_EXIT),
+        ),
+        quota_pages: 2112,
         base_rights: Rights::READ.union(Rights::WRITE),
         sensitivity: 40,
         max_children: 0,
@@ -783,16 +823,23 @@ mod tests {
             );
         }
         let s = service_profile();
+        // Every axis but MEMORY attenuates: prove it by granting the
+        // parent the PM's own quota in the check (the memory axis is
+        // the one deliberate widening — no_alloc's fixed buffers).
         assert_eq!(
-            p.is_attenuation_of(&s, &s.syscalls, s.quota_pages),
+            p.is_attenuation_of(&s, &s.syscalls, p.quota_pages),
             Ok(()),
-            "pkg is a pure attenuation of service"
+            "pkg attenuates service on every axis but memory"
         );
+        // The memory axis is deliberately WIDER than service — a
+        // boot-time grant, never a spawn-time widening: a service
+        // parent (256 pages live) is still refused by the quota axis.
+        assert!(p.quota_pages > s.quota_pages);
         // The quota is a real ceiling for the service exec layout: the
-        // image (~35 pages) + 64 stack pages + the trampoline fit; a
-        // second image's worth on top does not.
-        assert!(p.quota_pages >= 35 + 65); // 35 image pages + 64 stack + 1 trampoline
-        assert!(p.quota_pages < s.quota_pages);
+        // image (31 pages) + the 768-page stack + the trampoline fit;
+        // a second image's worth on top does not.
+        assert!(p.quota_pages >= 31 + 2049); // 31 image + 2048 stack + 1 trampoline
+        assert!(p.quota_pages < 31 + 2049 + 128);
     }
 
     #[test]

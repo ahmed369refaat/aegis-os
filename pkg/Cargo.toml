@@ -21,3 +21,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "pkg"
 path = "src/main.rs"
+
+# K22: the boot fixture builder — a HOST tool under the signer feature
+# (the deployed manager verifies only). boot.sh step [0e] runs it to
+# produce the signed local repo the in-VM package-manager lane
+# installs from; `required-features` keeps it out of every default
+# build, test and clippy pass.
+[[bin]]
+name = "pkg-mkrepo"
+path = "src/bin/pkg-mkrepo.rs"
+required-features = ["signer"]

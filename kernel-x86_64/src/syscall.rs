@@ -938,7 +938,36 @@ mod exec {
         };
         match k.execute(run.domain, SysRequest::Rename { from, to }) {
             Ok(v) => sysabi::rax_of(v),
-            Err(e) => sysabi::errno_of(&e) as u64,
+            Err(e) => {
+                // K22 diagnostic: a DAC refusal names the caller and
+                // both paths — the manager's identity is the fact the
+                // serial log cannot otherwise see.
+                if matches!(
+                    e,
+                    aegis_os::sys::SysError::Vfs(aegis_os::vfs::VfsError::PermissionDenied)
+                ) {
+                    let mut bd = [0u8; 20];
+                    let mut bu = [0u8; 20];
+                    let mut bg = [0u8; 20];
+                    let (uid, gid) = k
+                        .domain(run.domain)
+                        .map(|d| d.creds())
+                        .map(|c| (c.uid, c.gid))
+                        .unwrap_or((0, 0));
+                    serial::write_str("[VFS] rename denied: domain=");
+                    serial::write_str(strutil::dec(run.domain as u64, &mut bd));
+                    serial::write_str(" uid=");
+                    serial::write_str(strutil::dec(uid as u64, &mut bu));
+                    serial::write_str(" gid=");
+                    serial::write_str(strutil::dec(gid as u64, &mut bg));
+                    serial::write_str(" from=");
+                    serial::write_str(from);
+                    serial::write_str(" to=");
+                    serial::write_str(to);
+                    serial::write_str("\n");
+                }
+                sysabi::errno_of(&e) as u64
+            }
         }
     }
 

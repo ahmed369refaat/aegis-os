@@ -201,11 +201,18 @@ crate (no_std, no_alloc, zero deps — Ed25519-verified atomic
 transactions, full threat model + 48 host tests) and its kernel arms
 (K21: `SYS_STAT` 34 / `SYS_RENAME` 35 / `SYS_LISTDIR` 32, Linux
 newfstatat 262 / rename 82 / renameat 264 / getdents64 259 mapped).
-What remains for the package story: the in-VM PM domain — the exec
-cage is 16 KiB while the manager's fixed no-alloc buffers (candidate
-universe, staging, LZ4 ring) need a larger cage contract; the
-`/pkg` tree + a repo image on the ext2 disk; argv provisioning at
-spawn. The design is `pkg/BUILD.md`'s boot-integration section.
+K22 closed the in-VM half: `/bin/pkg` is the registry's third
+citizen under the SERVICE contract (a 128-page cage, an 8 MiB
+no_alloc stack — the linked install path holds 7.26 MiB of fixed
+buffers), embedded in the kernel's second 2 MiB leaf, execve'd by a
+ring-3 caller with real argv, and installing `r1/hello` from the
+`pkg-mkrepo`-signed local repo through the manager's own 9-syscall
+mask (verified byte-exact by the boot lane; `--verify` asserts it).
+`SYS_RENAME` moved 35 → 36 (the entry's internal-mode hybrid maps
+Linux nr 35 to nanosleep, so 35 was unreachable from ring 3). What
+remains: the repo image on the ext2 disk (the fixture is
+kernel-embedded today), uid separation for `/pkg` (currently a
+shared boot gid), remove/upgrade lanes, and the net broker fetch.
 Still nothing on: musl/libc (planned, riding the ADR-0003 ABI),
 dynamic linker, coreutils. `ABI-VERSION.md` remains the versioned
 contract for the 2-s syscall surface.

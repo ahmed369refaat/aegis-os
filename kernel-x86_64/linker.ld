@@ -5,8 +5,8 @@
  * base 0xFFFFFFFF80000000 but LOADED at physical 2 MiB (`AT(0x200000)`;
  * objcopy -O binary places sections by their LMA, so the flat blob still
  * starts at PA 2 MiB, exactly where the boot stub embeds it). The stub
- * maps this window with one 2 MiB huge page (PML4[511] → PDPT[510] →
- * PD[0]) before entering the kernel at the high entry address.
+ * maps this window with two 2 MiB huge pages (PML4[511] → PDPT[510] →
+ * PD[0] and PD[1], PA 2..6 MiB) before entering the kernel at the high entry address.
  *
  * `aegis_entry_64` stays pinned to the very start of .text so the entry
  * address is deterministic (0xFFFFFFFF80000000); boot.sh reads the real
@@ -76,8 +76,8 @@ SECTIONS
          * measured 216 KiB to ~460 KiB (64 domains x 3.4 KiB + 128
          * inodes + 32 endpoints — docs/capacity.md). The chain margin
          * keeps the Round-J discipline: deepest measured chain ~40 KiB,
-         * >= 250 KiB of slack. Image + bss + stack still fit the single
-         * 2 MiB page; the ASSERT below fails the link loudly if not. */
+         * >= 250 KiB of slack. Image + bss + stack still fit the two
+         * 2 MiB leaves (PA 2..6 MiB); the ASSERT below fails the link loudly if not. */
         . += 1024K;
         stack_top = .;
         . = ALIGN(4096);
@@ -96,7 +96,8 @@ SECTIONS
     }
 }
 
-/* The whole kernel (image + bss + boot stack) must fit inside the single
- * 2 MiB huge page the stub maps at PA 2 MiB (PA 2..4 MiB) — which also
- * keeps it far below the frame pool at 16 MiB. */
-ASSERT(_kernel_phys_end <= 0x400000, "kernel image exceeds the single 2 MiB higher-half huge page (PA 2..4 MiB)")
+/* The whole kernel (image + bss + boot stack) must fit inside the two
+ * 2 MiB huge pages the stub maps at PA 2..6 MiB (K22: /bin/pkg's image
+ * rides in .rodata and outgrew the single leaf) — which also keeps it
+ * far below the frame pool at 16 MiB. */
+ASSERT(_kernel_phys_end <= 0x600000, "kernel image exceeds the two 2 MiB higher-half huge pages (PA 2..6 MiB)")

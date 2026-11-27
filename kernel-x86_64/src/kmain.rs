@@ -1618,6 +1618,397 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
     }
 
+    // ── K22: the package manager domain — /bin/pkg runs at CPL=3 and
+    //      installs a signed package from a local repo. The image is
+    //      the registry's third citizen, linked for the SERVICE memory
+    //      contract (a 128-page cage, an 8 MiB no_alloc stack) and
+    //      carried in the kernel's SECOND 2 MiB leaf. The lane: (a) declares the
+    //      PM's exec policy for the image's identity — the sh lesson:
+    //      the profile's own surface, else the transaction's first
+    //      mkdir answers -EPERM at the exec boundary; (b) a root
+    //      supervisor provisions the signed repo fixture (root-owned
+    //      0644: the manager READS /r1 and its anchors but can never
+    //      rewrite them) and /pkg 0770 root:100 (the manager's gid
+    //      writes inside — full uid separation is the documented next
+    //      round); (c) a ring-3 caller execve's /bin/pkg with
+    //      ["/bin/pkg", "install", "r1/hello"] — internal nr 19, the
+    //      ABI the pkg image speaks; (d) the exit code, the installed
+    //      tree, the live mask and the stack high-water are all
+    //      verified from the run the exit rode.
+    {
+        /// The caller's domain id (K20's userland caller is 68, the
+        /// vnetd 66, vblkdom 61 — this lane takes 70).
+        const PKG_DOM: u32 = 70;
+        /// The provisioning supervisor (root, the round-J probe
+        /// pattern; distinct id 71) — destroyed before the launch.
+        const PKG_PROBE: u32 = 71;
+        /// The verification supervisor (root; distinct id 72) — created
+        /// only inside the post-exit CPL=0 window, destroyed before the
+        /// lane ends.
+        const PKG_VERIFY: u32 = 72;
+        static CALLER_BLOB: &[u8] = include_bytes!("../blob/ring3-pkg-caller.bin");
+        /// pkg-mkrepo's outputs (boot.sh step [0e]; TEST-ONLY seeds —
+        /// see pkg/src/bin/pkg-mkrepo.rs).
+        static FIXTURE_TRUST: &[u8] = include_bytes!("../blob/pkg-fixture/trust");
+        static FIXTURE_REPO: &[u8] = include_bytes!("../blob/pkg-fixture/r1.repo");
+        static FIXTURE_INDEX: &[u8] = include_bytes!("../blob/pkg-fixture/index.aki");
+        static FIXTURE_PKG: &[u8] = include_bytes!("../blob/pkg-fixture/r1.hello.akp");
+        /// What the installed file must carry, byte-exact.
+        const PAYLOAD: &[u8] = b"hello world\n";
+
+        // (a) the exec policy for the PM image's identity.
+        let declared = k
+            .exec_policy_declare(
+                aegis_os::proc::image_id(crate::exec_registry::EXEC_PKG_ELF),
+                &aegis_os::profile::package_manager_profile().syscalls,
+                None,
+            )
+            .is_ok();
+        let pm_mask = aegis_os::profile::package_manager_profile().syscalls;
+
+        // A root supervisor's write helper: create-or-truncate, then
+        // the whole file in ≤ 4096-B calls (the kernel's per-write
+        // bound — the same chunking the PM's own adapter does).
+        fn probe_put<const N: usize>(
+            k: &mut aegis_os::Kernel<N>,
+            dom: u32,
+            path: &'static str,
+            mode: u16,
+            bytes: &[u8],
+        ) -> bool {
+            use aegis_os::sys::{SysRequest, SysValue};
+            let Ok(SysValue::Fd(fd)) = k.syscall(
+                dom,
+                SysRequest::Open {
+                    path,
+                    mode: aegis_os::vfs::Mode(mode),
+                    create: true,
+                    read: false,
+                    write: true,
+                    truncate: true,
+                    excl: false,
+                },
+            ) else {
+                return false;
+            };
+            let mut off = 0usize;
+            let mut ok = true;
+            while off < bytes.len() && ok {
+                let want = (bytes.len() - off).min(4096);
+                ok = matches!(
+                    k.syscall(
+                        dom,
+                        SysRequest::Write {
+                            fd,
+                            bytes: &bytes[off..off + want],
+                        }
+                    ),
+                    Ok(SysValue::Count(_))
+                );
+                off += want;
+            }
+            let _ = k.syscall(dom, SysRequest::Close { fd });
+            ok
+        }
+
+        // ... and its read helper: ≤ 4096-B reads until EOF.
+        fn probe_read<const N: usize>(
+            k: &mut aegis_os::Kernel<N>,
+            dom: u32,
+            path: &'static str,
+            buf: &mut [u8],
+        ) -> Option<usize> {
+            use aegis_os::sys::{SysRequest, SysValue};
+            let Ok(SysValue::Fd(fd)) = k.syscall(
+                dom,
+                SysRequest::Open {
+                    path,
+                    mode: aegis_os::vfs::Mode(0),
+                    create: false,
+                    read: true,
+                    write: false,
+                    truncate: false,
+                    excl: false,
+                },
+            ) else {
+                return None;
+            };
+            let mut total = 0usize;
+            while total < buf.len() {
+                let want = (buf.len() - total).min(4096);
+                match k.syscall(
+                    dom,
+                    SysRequest::Read {
+                        fd,
+                        buf: &mut buf[total..total + want],
+                    },
+                ) {
+                    Ok(SysValue::Count(0)) => break,
+                    Ok(SysValue::Count(n)) => total += n,
+                    _ => {
+                        let _ = k.syscall(dom, SysRequest::Close { fd });
+                        return None;
+                    }
+                }
+            }
+            let _ = k.syscall(dom, SysRequest::Close { fd });
+            Some(total)
+        }
+
+        // (b) provisioning: the four dirs + the four fixture files.
+        // The supervisor is ROOT with the manager's GROUP (uid 0,
+        // gid 100): uid 0 keeps the DAC bypass for its own writes,
+        // and everything it creates lands in the manager's group —
+        // /pkg 0770 root:100 lets the manager (uid 1070, gid 100)
+        // write inside while /pkg/trust and /pkg/repos/r1.repo stay
+        // root-owned 0644 (group read, never group write: the manager
+        // can read its anchors but not rewrite them). The first boot
+        // had this wrong (gid 0): the manager met EACCES on its own
+        // state tree ("pkg: Io(Access): syscall").
+        let provisioned = matches!(
+            k.create_domain_with(PKG_PROBE, aegis_os::profile::service_profile(), 0, 100, 0),
+            Ok(())
+        ) && {
+            use aegis_os::sys::SysRequest;
+            [
+                ("/r1", 0o755u16),
+                ("/pkg", 0o770),
+                ("/pkg/repos", 0o755),
+                ("/usr", 0o770),
+            ]
+            .iter()
+            .all(|&(path, m)| {
+                k.syscall(
+                    PKG_PROBE,
+                    SysRequest::Mkdir {
+                        path,
+                        mode: aegis_os::vfs::Mode(m),
+                    },
+                )
+                .is_ok()
+            })
+        } && probe_put(&mut k, PKG_PROBE, "/r1/index.aki", 0o644, FIXTURE_INDEX)
+            && probe_put(&mut k, PKG_PROBE, "/r1/r1.hello.akp", 0o644, FIXTURE_PKG)
+            && probe_put(&mut k, PKG_PROBE, "/pkg/trust", 0o644, FIXTURE_TRUST)
+            && probe_put(&mut k, PKG_PROBE, "/pkg/repos/r1.repo", 0o644, FIXTURE_REPO);
+
+        if !declared || !provisioned {
+            line(
+                &mut out,
+                &[
+                    "[PKG] ERROR: boot provisioning failed (policy declared=",
+                    if declared { "yes" } else { "no" },
+                    ", repo provisioned=",
+                    if provisioned { "yes" } else { "no" },
+                    ") — LOUD",
+                ],
+            );
+            let _ = k.destroy_domain(PKG_PROBE);
+            hw::halt_forever();
+        }
+        // The provisioning supervisor is GONE before the launch: a
+        // live-but-never-launched domain in the run queue is exactly
+        // what the preemptor's unparked-domain BUG guard exists to
+        // catch — this lane's first boot proved it, halting the machine
+        // on "[SCHD] KERNEL BUG: preemptor picked unparked domain 71".
+        // The verification reads below use a fresh probe (72) that
+        // lives only inside a CPL=0 window, never across the drain.
+        let _ = k.destroy_domain(PKG_PROBE);
+
+        let boot: [u8; 64] = [0; 64];
+        let sp = match mm::user::spawn_user_blob(
+            &mut k,
+            &mut pool,
+            PKG_DOM,
+            aegis_os::profile::pkg_caller_profile(),
+            CALLER_BLOB,
+            &boot,
+        ) {
+            Ok(sp) => sp,
+            Err(_) => {
+                line(&mut out, &["[PKG] ERROR: caller spawn failed; halting"]);
+                hw::halt_forever();
+            }
+        };
+        // The caller speaks INTERNAL numbers (execve = 19 — the pkg
+        // image's own ABI) and the ABI flag survives exec, so unlike
+        // K20's /bin/hello lane there is no set_domain_abi here. Its
+        // profile is pkg_caller_profile: the exec quota pre-check runs
+        // against the CALLER's live allowance, and the image it becomes
+        // needs 31 + 2048 + 1 = 2080 of the 2112 granted.
+        let kernel_cr3 = hw::read_cr3();
+        sp.run.tables.activate();
+        crate::sched::context::begin(sp.run);
+        crate::sched::context::launch(&sp.ctx);
+        hw::write_cr3(kernel_cr3);
+        // The dual drain (K20's lesson): the caller's execve parks the
+        // NEW image; the PM runs on scheduler ticks and its exit
+        // arrives EITHER in the run slot (tables + live mask available
+        // for the verification below) OR through the parked mailbox. A
+        // stall is a loud refusal, never a hang.
+        let mut pm_exit: Option<crate::sched::context::ExitKind> = None;
+        let mut mask_verified: Option<bool> = None;
+        let mut high_water: Option<u64> = None;
+        let mut spins = 0u64;
+        while pm_exit.is_none() && spins < 20_000_000 {
+            if let Some(run) = crate::sched::context::try_take() {
+                if run.domain == PKG_DOM {
+                    mask_verified = Some(run.mask == pm_mask);
+                    // Stack high-water: the deepest page with a nonzero
+                    // byte (the exec zero-fills the stack, so a nonzero
+                    // byte IS a touch). Pages that do not translate end
+                    // the scan — nothing legitimate lives below.
+                    let svc = crate::mm::user_layout::SERVICE;
+                    let top = svc.stack_top();
+                    let mut deepest = 0u64;
+                    for page in 0..svc.stack_pages {
+                        let va = top - 4096 * (page as u64 + 1);
+                        let Some(pa) = run.tables.translate(va) else {
+                            break;
+                        };
+                        let mut nonzero = false;
+                        let mut b = 0u64;
+                        while b < 4096 {
+                            if crate::virtio::read_u8_pa(pa + b) != 0 {
+                                nonzero = true;
+                                break;
+                            }
+                            b += 1;
+                        }
+                        if nonzero {
+                            deepest = page as u64 + 1;
+                        } else {
+                            // The first untouched page is the frontier:
+                            // the stack is zero-filled at exec, nothing
+                            // legitimate lives below it.
+                            break;
+                        }
+                    }
+                    high_water = Some(deepest);
+                    pm_exit = Some(run.exit);
+                }
+            }
+            if pm_exit.is_none() {
+                if let Some((dom, exit)) = crate::sched::park::completed_drain() {
+                    if dom == PKG_DOM {
+                        pm_exit = Some(exit);
+                    }
+                }
+            }
+            if pm_exit.is_none() {
+                hw::hlt_once();
+            }
+            spins += 1;
+        }
+        let run_exit = match pm_exit {
+            Some(e) => e,
+            None => {
+                line(
+                    &mut out,
+                    &["[PKG] ERROR: the manager never completed (park stalled) — LOUD"],
+                );
+                pool.free_all_owned(&mut k.frames, PKG_DOM);
+                let _ = k.destroy_domain(PKG_DOM);
+                hw::halt_forever();
+            }
+        };
+        match run_exit {
+            crate::sched::context::ExitKind::Exited(0) => {
+                // (d) the installed tree, read back through a FRESH
+                // root supervisor (id 72 — created and destroyed inside
+                // this CPL=0 window, never across a drain: the
+                // preemptor's unparked-domain guard is a hard rule).
+                let probed = matches!(
+                    k.create_domain_with(PKG_VERIFY, aegis_os::profile::service_profile(), 0, 0, 0),
+                    Ok(())
+                );
+                let mut payload = [0u8; 64];
+                let mut rec = [0u8; 4096];
+                let mut state = [0u8; 4096];
+                let (got, rec_n, state_n) = if probed {
+                    (
+                        probe_read(&mut k, PKG_VERIFY, "/usr/bin/pkg-hello", &mut payload),
+                        // The record's committed name is the package
+                        // name itself (the staged r0100000000 file
+                        // renames to /pkg/db/r1.hello — the host trace
+                        // of the real CLI is the source of truth).
+                        probe_read(&mut k, PKG_VERIFY, "/pkg/db/r1.hello", &mut rec),
+                        probe_read(&mut k, PKG_VERIFY, "/pkg/db/state", &mut state),
+                    )
+                } else {
+                    (None, None, None)
+                };
+                let _ = k.destroy_domain(PKG_VERIFY);
+                let tree_ok = got == Some(PAYLOAD.len())
+                    && &payload[..PAYLOAD.len()] == PAYLOAD
+                    && rec_n.unwrap_or(0) > 0
+                    && state_n.unwrap_or(0) > 0;
+                if tree_ok {
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] /bin/pkg: execve'd at CPL=3 under the SERVICE contract (policy = package_manager_profile)",
+                        ],
+                    );
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] install r1/hello: resolved from the signed local repo, Ed25519-verified, committed (exit 0)",
+                        ],
+                    );
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] the installed tree: /usr/bin/pkg-hello byte-exact, /pkg/db/r1.hello + /pkg/db/state written",
+                        ],
+                    );
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] live mask after exec == package_manager_profile (9 syscall arms — no fork/exec/mmap/net/ipc): ",
+                            match mask_verified {
+                                Some(true) => "verified",
+                                Some(false) => "MISMATCH — LOUD",
+                                None => "unavailable (parked handover reclaimed the run)",
+                            },
+                        ],
+                    );
+                    let mut b = [0u8; 20];
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] stack high-water: ",
+                            strutil::dec(high_water.unwrap_or(0) * 4096, &mut b),
+                            " of 8388608 B below the 8 MiB stack top",
+                        ],
+                    );
+                } else {
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] ERROR: exit 0 but the installed tree is wrong (payload/record/state) — LOUD",
+                        ],
+                    );
+                }
+            }
+            crate::sched::context::ExitKind::Exited(code) => {
+                // The caller's refusal exits are 100+|errno|; the PM's
+                // own failures are 1 (error) or 2 (usage) — both are
+                // this lane failing, loudly.
+                let mut cn = [0u8; 20];
+                line(
+                    &mut out,
+                    &["[PKG] ERROR: exit=", strutil::dec(code, &mut cn), " — LOUD"],
+                );
+            }
+            _ => {
+                line(&mut out, &["[PKG] ERROR: the manager faulted — LOUD"]);
+            }
+        }
+        pool.free_all_owned(&mut k.frames, PKG_DOM);
+        let _ = k.destroy_domain(PKG_DOM);
+    }
+
     // ── 15. ADR-0023: the sleep/idle proof — the first process that
     //      parks ITSELF and the first guarded idle the machine ever
     //      served. The sleeper (mode 2, its own data page) verifies

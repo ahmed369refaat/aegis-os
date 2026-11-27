@@ -36,7 +36,7 @@ STUB_OBJ=target/stub.o
 IMAGE=target/aegis-boot.elf
 
 echo "==> [0/4] building the ring-3 example blobs (rustc --emit=obj + objcopy)"
-for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init ring3-netd ring3-vblk ring3-rogue-drv ring3-exec-caller ring3-vnetd; do
+for b in ring3-hello ring3-rogue ring3-edge ring3-preempt ring3-files ring3-init ring3-netd ring3-vblk ring3-rogue-drv ring3-exec-caller ring3-pkg-caller ring3-vnetd; do
     rustc --edition 2021 --crate-type=lib --emit=obj \
           --target x86_64-unknown-none -O "examples/$b/src/lib.rs" \
           -o "target/$b.o"
@@ -82,7 +82,7 @@ rustc --edition 2021 --crate-type=bin -C panic=abort -C opt-level=z -C codegen-u
 
 # K22: the package manager's own image (/bin/pkg) — a REAL ELF64 under
 # the SERVICE memory contract (text RX / rodata R / data RW, one absent
-# page between them, the 256 KiB stack above the cage). Built with the
+# page between them, the 8 MiB no_alloc stack above the cage). Built with the
 # size recipe the K22 measurements were taken with, then checked against
 # the contract at EVERY build: a layout shift fails here instead of
 # inside execve (scripts/check-pkg-image.py).
@@ -95,6 +95,16 @@ python3 scripts/check-pkg-image.py target/x86_64-unknown-none/pkg-image/pkg
 strip --strip-all target/x86_64-unknown-none/pkg-image/pkg -o kernel-x86_64/blob/pkg.bin
 [ "$(readelf -lW kernel-x86_64/blob/pkg.bin | grep -c '^  LOAD')" = 3 ] \
     || { echo "FATAL: the stripped /bin/pkg image lost a PT_LOAD"; exit 1; }
+
+# K22: the signed local repo fixture — the host-side repo builder
+# (pkg-mkrepo, signer feature; TEST-ONLY fixed seeds — see
+# pkg/src/bin/pkg-mkrepo.rs). Four files, each ≤ 8 KiB (the ramfs
+# spill-window bound — the tool fails the build if one crosses it):
+# the trust anchors, the repo config, the signed index, the signed
+# package. The kernel's K22 boot lane embeds and provisions them.
+echo "==> [0e/4] building the signed local repo fixture (pkg-mkrepo)"
+cargo build -p aegis-pkg --bin pkg-mkrepo --features signer
+target/debug/pkg-mkrepo kernel-x86_64/blob/pkg-fixture
 
 echo "==> [1/4] building the 64-bit kernel (x86_64-unknown-none, release)"
 cargo build -p aegis-kernel --release --target x86_64-unknown-none
@@ -670,6 +680,14 @@ if [ "$MODE" = "verify" ]; then
   # exec by design, ADR-0022 D4), parsed by the loader, mapped at its
   # declared vaddrs, entered at e_entry, bss zero-filled.
   grep -qF "[M3] exec-target: bss-clean entry live" "$LOG" || { echo "VERIFY FAIL: M3 exec slice marker missing (execve/ELF path)"; ok=0; }
+  # K22: the package manager domain — /bin/pkg at CPL=3, installing
+  # from the signed local repo (the registry's SERVICE-contract image).
+  grep -qF "[PKG] /bin/pkg: execve'd at CPL=3 under the SERVICE contract" "$LOG" || { echo "VERIFY FAIL: K22 pkg exec marker missing"; ok=0; }
+  grep -qF "[PKG] install r1/hello: resolved from the signed local repo" "$LOG" || { echo "VERIFY FAIL: K22 pkg install marker missing"; ok=0; }
+  grep -qF "[PKG] the installed tree: /usr/bin/pkg-hello byte-exact" "$LOG" || { echo "VERIFY FAIL: K22 pkg tree marker missing"; ok=0; }
+  grep -qF "[PKG] live mask after exec == package_manager_profile" "$LOG" || { echo "VERIFY FAIL: K22 pkg live-mask marker missing"; ok=0; }
+  grep -qF "[PKG] stack high-water: " "$LOG" || { echo "VERIFY FAIL: K22 pkg stack high-water marker missing"; ok=0; }
+  grep -qF "[PKG] ERROR" "$LOG" && { echo "VERIFY FAIL: K22 pkg lane reported an ERROR"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the

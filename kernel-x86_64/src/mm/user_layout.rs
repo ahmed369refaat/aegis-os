@@ -53,10 +53,10 @@ pub const TOTAL_PAGES: usize = CODE_PAGES + DATA_PAGES + STACK_PAGES + TRAMPOLIN
 /// PT_LOADs may live, and where the kernel provisions its stack and
 /// signal trampoline. The constants above are the CANONICAL contract
 /// (every flat blob and every image so far); the package manager is
-/// `no_alloc` by design — every buffer is a fixed stack array (the
-/// measured worst direct-call chain is 57.6 KiB, the solver's
-/// recursion budget deeper still) — so its image declares a contract
-/// of its own: a wider cage for 134 KiB of code, and a 256 KiB stack.
+/// `no_alloc` by design — every buffer is a fixed stack array, and the
+/// linked `run_cli` frame alone is 2.2 MiB (the solver's recursion
+/// budget sits on top of it) — so its image declares a contract of its
+/// own: a wider cage for 134 KiB of code, and a 3 MiB stack.
 ///
 /// Invariants (host-tested against the real ten-check policy gate):
 /// - `code_base` is page-aligned and above the NULL page;
@@ -117,17 +117,24 @@ pub const CANONICAL: ExecLayout = ExecLayout {
 };
 
 /// K22: the service contract — the package manager's. The cage is
-/// 128 pages (512 KiB) for a linked `no_alloc` image (the measured
-/// `.text` + `.rodata` + `.data` is ~134 KiB, ~35 pages; the cage
-/// leaves room for the image to grow without a layout change); the
-/// stack is 64 pages (256 KiB) — 4.4× the measured worst direct-call
-/// chain — two MiB above the cage's end.
+/// 128 pages (512 KiB) for a linked `no_alloc` image (the linked
+/// `.text` + `.rodata` + `.data` is ~134 KiB, ~31 pages; the cage
+/// leaves room for the image to grow without a layout change). The
+/// stack is 2048 pages (8 MiB), two MiB above the cage's end: the
+/// no_alloc design puts EVERY buffer on the stack, and the linked
+/// install path really holds 7.26 MiB of them at once (the fixed
+/// probe-loop-aware measure: run_cli 2.2 MiB + do_solve_and_install
+/// 3.8 MiB + load_repos 1.3 MiB + parse_index 79 KiB — the first
+/// in-VM run faulted on run_cli's stack-probe loop, and the first
+/// static measure had missed that rustc presets large frames with
+/// `sub $frame, %r11`, reading 2.2 MiB frames as 4 KiB). 8 MiB leaves
+/// the solver's recursion (~3.4 KiB a level) its margin on top.
 pub const SERVICE: ExecLayout = ExecLayout {
     code_base: CODE_BASE,
     cage_end: 0x0048_0000,
     stack_base: 0x0060_0000,
-    stack_pages: 64,
-    trampoline_base: 0x0064_4000,
+    stack_pages: 2048,
+    trampoline_base: 0x00E0_4000,
 };
 
 /// K22: the image cage in pages for a layout (what
@@ -212,7 +219,9 @@ mod tests {
     fn every_exec_layout_passes_the_policy_gate_as_a_whole_image() {
         use crate::mm::pte::USER_LIMIT;
         for layout in [CANONICAL, SERVICE] {
-            let mut sp = AddressSpace::new(1024);
+            // 4096: the service contract alone is 128 + 2048 + 1 = 2177
+            // pages — the space must cover the whole grant.
+            let mut sp = AddressSpace::new(4096);
             let cage = cage_pages(&layout) * PAGE_SIZE;
             sp.map(layout.code_base as usize, cage, code_flags())
                 .expect("the whole cage is a legal image extent");
@@ -270,7 +279,7 @@ mod tests {
 
     /// K22: the two contracts at a glance — the canonical one is the
     /// constants, the service one is wider on both axes, and the
-    /// package manager's quota (192) covers its whole footprint.
+    /// package manager's quota (2112) covers its whole footprint.
     #[test]
     fn the_service_contract_is_wider_and_fits_the_pkg_quota() {
         assert_eq!(CANONICAL.stack_top(), STACK_TOP);
@@ -281,12 +290,12 @@ mod tests {
             "8 pages minus the stack's guard page"
         );
         assert_eq!(cage_pages(&SERVICE), 128);
-        assert_eq!(SERVICE.stack_pages, 64);
-        assert_eq!(SERVICE.stack_top(), 0x0064_0000);
-        assert_eq!(SERVICE.overhead_pages(), 65);
-        // The measured image: ~35 pages. 35 + 65 = 100 ≤ 192.
+        assert_eq!(SERVICE.stack_pages, 2048);
+        assert_eq!(SERVICE.stack_top(), 0x00E0_0000);
+        assert_eq!(SERVICE.overhead_pages(), 2049);
+        // The linked image: 31 pages. 31 + 2049 = 2080 ≤ 2112.
         assert!(
-            35 + SERVICE.overhead_pages()
+            31 + SERVICE.overhead_pages()
                 <= aegis_os::profile::package_manager_profile().quota_pages
         );
         // The canonical contract still fits the service quota, and

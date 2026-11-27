@@ -45,6 +45,14 @@ pub const EXEC_TARGET_ELF: &[u8] = include_bytes!("../blob/ring3-exec-target.bin
 /// quota pre-check from this field, never from a constant.
 pub const EXEC_SH_ELF: &[u8] = include_bytes!("../blob/ring3-sh.bin");
 
+/// The package manager (`pkg/`, K22): the `no_alloc` ring-3 image —
+/// three PT_LOADs under the `SERVICE` contract (a 128-page cage, a
+/// 256 KiB stack), built by boot.sh step [0d], contract-checked at
+/// every build (`scripts/check-pkg-image.py`) and carried in the
+/// kernel's SECOND 2 MiB leaf (PA 4..6 MiB): the image that outgrew
+/// the single-leaf kernel.
+pub const EXEC_PKG_ELF: &[u8] = include_bytes!("../blob/pkg.bin");
+
 /// One compiled-in executable: where execve finds it, its bytes, and
 /// the layout it was linked for.
 pub struct RegistryEntry {
@@ -54,16 +62,11 @@ pub struct RegistryEntry {
 }
 
 /// Phase 7: the registry's second citizen — the shell init execve's.
-///
-/// K22: the package manager's image is NOT here yet. boot.sh builds it
-/// under the `SERVICE` contract (step [0d]) and the exec arm already
-/// speaks that contract, but the kernel has ONE 2 MiB page to live in
-/// and its headroom (73,728 B) is smaller than the stripped image
-/// (119,424 B). The entry lands together with a second huge page (the
-/// numbers and the options: pkg/BUILD.md).
+/// K22: the third is the package manager, under its own contract.
 pub const REGISTRY: &[RegistryEntry] = &[
     entry("/bin/exec-target", EXEC_TARGET_ELF),
     entry("/bin/sh", EXEC_SH_ELF),
+    service_entry("/bin/pkg", EXEC_PKG_ELF),
 ];
 
 const fn entry(path: &'static str, image: &'static [u8]) -> RegistryEntry {
@@ -71,6 +74,15 @@ const fn entry(path: &'static str, image: &'static [u8]) -> RegistryEntry {
         path,
         image,
         layout: &CANONICAL,
+    }
+}
+
+/// An image linked for the `SERVICE` contract (the package manager).
+const fn service_entry(path: &'static str, image: &'static [u8]) -> RegistryEntry {
+    RegistryEntry {
+        path,
+        image,
+        layout: &crate::mm::user_layout::SERVICE,
     }
 }
 

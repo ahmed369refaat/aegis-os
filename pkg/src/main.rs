@@ -268,9 +268,12 @@ mod target_abi {
     /// stat(2): the 24-byte metadata struct (K21 — landed).
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
     pub const SYS_STAT: u64 = 34;
-    /// rename(2): the atomic re-parent (K21 — landed).
+    /// rename(2): the atomic re-parent (K21 — landed). K22: 36, not
+    /// 35 — the entry's internal-mode hybrid maps Linux nr 35
+    /// (nanosleep) onto SYS_NANOSLEEP, so internal 35 was ALWAYS
+    /// hijacked (the first in-VM commit died on exactly that).
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
-    pub const SYS_RENAME: u64 = 35;
+    pub const SYS_RENAME: u64 = 36;
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
     pub const SYS_EXIT: u64 = 63;
 
@@ -322,7 +325,7 @@ mod target_abi {
 
     /// Map a kernel `-errno` (the `errno_of` table in sysabi.rs) onto
     /// the crate's errno family.
-    pub fn errno_of(ret: i64) -> Error {
+    pub fn errno_of(ret: i64, op: &'static str) -> Error {
         // kernel convention: negative errno in the return value
         let eno = u32::try_from(-ret).unwrap_or(0);
         let e = match eno {
@@ -339,7 +342,7 @@ mod target_abi {
             39 => ErrorKind::Io(Errno::NotEmpty),
             _ => ErrorKind::Io(Errno::Io),
         };
-        Error::new(e, "syscall")
+        Error::new(e, op)
     }
 
     /// Translate the crate's `OpenFlags` into the kernel's internal
@@ -431,7 +434,27 @@ mod target_abi {
             let n = path.to_cstr(&mut buf)?;
             let ret = f(&mut self.io, &buf[..=n]);
             if ret < 0 {
-                Err(errno_of(ret))
+                // K22 diagnostic: a permission refusal (EPERM/EACCES)
+                // with no path named is a debugging dead end — say the
+                // path on the console (fd 1). Benign misses (ENOENT
+                // probes, EEXIST mkdirs) stay silent.
+                if ret == -1 || ret == -13 {
+                    let mut msg = [0u8; 288];
+                    let mut m = 0usize;
+                    for &b in b"[pkg]path:" {
+                        msg[m] = b;
+                        m += 1;
+                    }
+                    for &b in path.as_bytes() {
+                        if m == msg.len() {
+                            break;
+                        }
+                        msg[m] = b;
+                        m += 1;
+                    }
+                    let _ = self.io.write(1, &msg[..m]);
+                }
+                Err(errno_of(ret, "path"))
             } else {
                 Ok(())
             }
@@ -442,7 +465,7 @@ mod target_abi {
     /// never longer than the buffer it was asked to fill.
     fn count_of(ret: i64, want: usize) -> aegis_pkg::Result<usize> {
         if ret < 0 {
-            return Err(errno_of(ret));
+            return Err(errno_of(ret, "io"));
         }
         Ok((ret as usize).min(want))
     }
@@ -451,7 +474,7 @@ mod target_abi {
         fn open(&mut self, path: &Path, flags: OpenFlags) -> aegis_pkg::Result<u32> {
             let ret = self.open_path(path, flags)?;
             if ret < 0 {
-                return Err(errno_of(ret));
+                return Err(errno_of(ret, "open"));
             }
             Ok(ret as u32)
         }
@@ -469,7 +492,7 @@ mod target_abi {
                     // Bytes already gathered are returned; the caller
                     // retries and meets the errno on the next call.
                     return if total == 0 {
-                        Err(errno_of(ret))
+                        Err(errno_of(ret, "read"))
                     } else {
                         Ok(total)
                     };
@@ -495,7 +518,7 @@ mod target_abi {
                     return if total > 0 {
                         Ok(total)
                     } else if ret < 0 {
-                        Err(errno_of(ret))
+                        Err(errno_of(ret, "write"))
                     } else {
                         // A zero-length answer makes no progress: fail
                         // rather than spin on a kernel that answers 0.
@@ -510,7 +533,7 @@ mod target_abi {
         fn close(&mut self, fd: u32) -> aegis_pkg::Result<()> {
             let ret = self.io.close(fd);
             if ret < 0 {
-                Err(errno_of(ret))
+                Err(errno_of(ret, "close"))
             } else {
                 Ok(())
             }
@@ -529,7 +552,7 @@ mod target_abi {
             let mut out = [0u8; STAT_SIZE];
             let ret = self.io.stat(&buf[..=n], &mut out);
             if ret < 0 {
-                return Err(errno_of(ret));
+                return Err(errno_of(ret, "stat"));
             }
             Ok(parse_stat(&out))
         }
@@ -549,7 +572,28 @@ mod target_abi {
             let n2 = to.to_cstr(&mut b2)?;
             let ret = self.io.rename(&b1[..=n1], &b2[..=n2]);
             if ret < 0 {
-                Err(errno_of(ret))
+                // K22 diagnostic (same rule as path_call): a permission
+                // refusal names BOTH paths on the console.
+                if ret == -1 || ret == -13 {
+                    let mut msg = [0u8; 560];
+                    let mut m = 0usize;
+                    for src in [
+                        b"[pkg]rename:" as &[u8],
+                        from.as_bytes(),
+                        b" -> ",
+                        to.as_bytes(),
+                    ] {
+                        for &b in src {
+                            if m == msg.len() {
+                                break;
+                            }
+                            msg[m] = b;
+                            m += 1;
+                        }
+                    }
+                    let _ = self.io.write(1, &msg[..m]);
+                }
+                Err(errno_of(ret, "rename"))
             } else {
                 Ok(())
             }
@@ -619,7 +663,11 @@ mod target_main {
         fn mkdir(&mut self, path: &[u8]) -> i64 {
             // SAFETY: the slice is this method's own argument — a
             // valid pointer/length pair for exactly this call.
-            unsafe { raw(SYS_MKDIR, path.as_ptr() as u64, 0, 0) }
+            // a2 IS the mode (sys_mkdir masks it to 0o777): 0o755, the
+            // manager's own dirs — the first in-VM run passed 0 here
+            // and the transaction died on EACCES inside its own
+            // 0o000-mode staging tree.
+            unsafe { raw(SYS_MKDIR, path.as_ptr() as u64, 0o755, 0) }
         }
         fn unlink(&mut self, path: &[u8]) -> i64 {
             // SAFETY: the slice is this method's own argument — a
@@ -764,11 +812,17 @@ extern "C" fn pkg_main(argc: i32, argv: *const *const u8) -> i32 {
         let end = lens[i];
         refs[i] = &storage[i][..end];
     }
+    // Unix convention: argv[0] is the program path, and run_cli's
+    // args[0] is the COMMAND — the host tests call it without a
+    // program name (run(&[b"install", b"r1/hello"])). Skipping argv[0]
+    // here is what keeps the execve'd `/bin/pkg install r1/hello` from
+    // answering "unknown command" on its own name.
+    let cmd_args: &[&[u8]] = if n > 1 { &refs[1..n] } else { &[] };
     let mut fs = target_abi::SysFs::new(target_main::Syscall);
     let paths = aegis_pkg::database::PkgPaths::new(b"/pkg")
         .unwrap_or_else(|_| aegis_pkg::database::PkgPaths::new(b"/").expect("root path"));
     let mut out = target_main::OutBuf::new();
-    let code = aegis_pkg::cli::run_cli(&refs[..n], &mut fs, &paths, None, &mut out);
+    let code = aegis_pkg::cli::run_cli(cmd_args, &mut fs, &paths, None, &mut out);
     out.flush();
     code
 }
@@ -1044,7 +1098,7 @@ mod target_abi_tests {
     /// primitive, ENOSPC triggers the rollback, ENOENT is a plain miss.
     #[test]
     fn the_kernel_errnos_map_onto_the_crate_family() {
-        let kind = |ret: i64| match errno_of(ret).kind() {
+        let kind = |ret: i64| match errno_of(ret, "test").kind() {
             ErrorKind::Io(e) => e,
             other => panic!("expected an Io error, got {other:?}"),
         };

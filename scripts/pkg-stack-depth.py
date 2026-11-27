@@ -60,11 +60,23 @@ def frame_of(body):
     positive zeroed 20 real frames on the first run of this tool).
     """
     cur = peak = 0
+    r11_is_rsp = False
     for mn, ops in body:
         if mn.startswith("push"):
             cur += 8
         elif mn.startswith("pop"):
             cur -= 8
+        elif mn == "mov" and ops == "%rsp,%r11":
+            # rustc's large-frame prologue: preset r11 = rsp - frame,
+            # then a probe loop walks pages down to it. The FRAME size
+            # rides on r11, not rsp — missing this read 2.2 MiB frames
+            # as 4 KiB (K22's first in-VM run faulted on it).
+            r11_is_rsp = True
+        elif mn.rstrip("qwl") == "sub" and r11_is_rsp and ops.endswith("%r11"):
+            m = IMM_RE.match(ops)
+            if m:
+                cur += int(m.group(1), 16)
+            r11_is_rsp = False
         elif mn.rstrip("qwl") in ("sub", "add") and ops.endswith("%rsp"):
             m = IMM_RE.match(ops)
             if m:

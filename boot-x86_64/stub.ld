@@ -57,7 +57,9 @@ SECTIONS
         _bss_end = .;
     }
 
-    /* The 64-bit kernel blob at its 2 MiB link base. */
+    /* The 64-bit kernel blob at its 2 MiB link base; the window is TWO
+     * 2 MiB huge pages (PA 2..6 MiB) — K22: the package manager's image
+     * is embedded in the kernel's .rodata and does not fit one leaf. */
     . = 2M;
     .kernel : ALIGN(4096)
     {
@@ -76,4 +78,4 @@ SECTIONS
     }
 }
 
-ASSERT(_stub_end <= 4M, "kernel blob exceeds the 2..4 MiB window")
+ASSERT(_stub_end <= 6M, "kernel blob exceeds the 2..6 MiB window")

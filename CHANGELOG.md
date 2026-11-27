@@ -1,10 +1,10 @@
 # Changelog
 
-## [Unreleased] — the K22 round, part 1: exec layouts, the manager's kernel arms extended, its ring-3 image under contract
+## [Unreleased] — the K22 round: the package manager runs in the VM — a signed package installs at CPL=3
 
 - **Exec got a memory contract (`ExecLayout`)** — `CANONICAL` (7 image
   pages below the stack's guard page, a one-page stack) and `SERVICE`
-  (a 128-page cage, a 64-page stack) replace the hard-coded exec
+  (a 128-page cage, a 2048-page — 8 MiB — no_alloc stack) replace the hard-coded exec
   constants: the registry names the contract per image, `exec_tables`
   takes it, `sys_exec` pre-checks the cage against it BEFORE the point
   of no return (`-ENOMEM`, old image intact), sigaction's trampoline
@@ -19,25 +19,65 @@
   side-table windows.
 - **`package_manager_profile`** — the least-privilege domain the
   manager runs as: read/write/open/close/mkdir/unlink/listdir/stat/
-  rename/exit, quota 192 pages, no fork/exec/mmap/net/ipc,
-  `max_children = 0`.
-- **The manager's ring-3 image is real, built and checked at every
-  build** — `pkg/` links as a three-PT_LOAD ELF under the `SERVICE`
-  contract (opt-level z, one codegen unit: 98 KiB of text, 31 cage
-  pages, 96 of the 192 quota pages with the stack), with a `_start`
-  that reads the execve initial stack, an adapter that speaks the
-  kernel's real word (flags, one-page I/O, errno family) behind a
-  testable port, and a build-time contract check
-  (`scripts/check-pkg-image.py`: segment flags, guard pages, cage,
-  quota, the 58 KiB worst stack chain under an 80 KiB line). **Not
-  yet embedded**: the kernel has one 2 MiB page and 73,728 B of
-  headroom; the stripped image is 119,424 B. The registry entry, the
-  signed fixture, the in-VM install lane and the PM policy declaration
-  land with a second huge page (`pkg/BUILD.md`).
-- Host gates green (fmt, clippy ×3, 867 tests, unsafe, asm,
-  no-binaries, build, ist). The QEMU `--verify` lanes were NOT re-run
-  for this round (the sandbox's QEMU lacks `libcapstone.so.5`): every
-  in-VM claim of this round is unproven until they are.
+  rename/exit, quota 2112 pages (the 8 MiB stack + the image — a
+  boot-time widening, never a spawn-time one), no
+  fork/exec/mmap/net/ipc, `max_children = 0`.
+- **The second 2 MiB huge page (PA 2..6 MiB)** — the kernel outgrew
+  its single leaf when `/bin/pkg`'s 119,424 B image rode into
+  `.rodata` (45,696 B over the old ASSERT): the stub maps
+  PD_hh[0] and PD_hh[1], both linker ASSERTs moved, `image_map`
+  fills TWO page tables for the F15 W^X rebuild, and both leaves are
+  global — proven by every `--verify` marker, not least the
+  guard-page probe.
+- **The manager's ring-3 image is real, embedded, and installing** —
+  `pkg/` links as a three-PT_LOAD ELF under the `SERVICE` contract
+  (opt-level z, one codegen unit: 98 KiB of text, 31 cage pages),
+  built + contract-checked at every build
+  (`scripts/check-pkg-image.py`), stripped into the kernel's second
+  leaf, and registered as the third exec citizen. The in-VM lane: a
+  root supervisor provisions the `pkg-mkrepo`-signed repo (the host
+  tool reproduces the tests' fixture with TEST-ONLY seeds, each file
+  ≤ the ramfs window), a ring-3 caller execve's
+  `/bin/pkg install r1/hello`, and the image resolves against the
+  Ed25519-verified index, stages, commits and exit(0)s — the kernel
+  verifies `/usr/bin/pkg-hello` byte-exact plus the record and the
+  state, all asserted by `--verify` (`[PKG]` markers).
+- **The 8 MiB stack, found the hard way** — the first lane gave the
+  SERVICE contract a 256 KiB stack on a static measure of 57.6 KiB;
+  the measure was wrong (rustc emits large frames as probe loops —
+  `sub $0x233000,%r11` preset, 4 KiB steps — and the tool read the
+  loop's step as the frame) and the first in-VM run faulted on
+  run_cli's own probe loop. The fixed `scripts/pkg-stack-depth.py`
+  measures the real no_alloc chain: 7,589,376 B (run_cli 2.2 MiB +
+  do_solve_and_install 3.8 MiB + load_repos 1.3 MiB + ...).
+  SERVICE.stack_pages = 2048, the PM quota 2112, and the new
+  `pkg_caller_profile` carries the grant (the exec's quota pre-check
+  runs against the CALLER's live allowance). The PM profile is now
+  honestly NOT an attenuation of service on the memory axis — the
+  host test says so, and the widening is boot-time only.
+- **SYS_RENAME moved 35 → 36** — the entry's internal-mode hybrid
+  maps Linux nr 35 (nanosleep, which the ADR-0023 sleeper blobs
+  call) onto SYS_NANOSLEEP, so an internal-ABI rename at 35 was
+  ALWAYS hijacked into a masked nanosleep: the first in-VM commit
+  answered EPERM dressed as EACCES. 35 was unreachable from ring 3,
+  so nothing working ever used it. Found by the audit line
+  (`[SYSC] domain 70 nr=21 denied`) after three wrong theories died.
+- **Two adapter bugs the VM exposed**: `mkdir` passed mode 0 as the
+  second word (the kernel takes the mode from a2 — the manager's own
+  dirs landed 0o000 and the transaction died of EACCES inside its
+  own staging tree); `pkg_main` handed `run_cli` the full argv
+  including argv[0], so `install` answered "unknown command".
+- **The lane's supervision discipline** (a boot lesson): a
+  live-but-never-launched probe domain cannot coexist with the
+  scheduler's drain — the preemptor's unparked-domain BUG guard
+  halted the machine on domain 71; provisioning and verification now
+  use two short-lived probes, created and destroyed inside CPL=0
+  windows.
+- Host gates green (fmt, clippy ×3, 870 tests — including the new
+  `pkg_lane_provision` and `pkg_lane_cli` host proofs, unsafe, asm,
+  no-binaries, build, ist), and `./boot.sh --verify` is PASS with the
+  `[PKG]` markers (the QEMU runtime's bundled debs were re-extracted
+  after the sandbox recycle lost the system libs).
 
 ## [Unreleased] — the K19 round: MSI-X delivery proven, virtio-blk migrated to a ring-3 driver domain, and two audit finds fixed
 

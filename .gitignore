@@ -15,3 +15,5 @@ core.*
 vgcore.*
 kernel-x86_64/blob/pkg.bin
 __pycache__/
+kernel-x86_64/blob/pkg-fixture/
+kernel-x86_64/blob/ring3-pkg-caller.bin

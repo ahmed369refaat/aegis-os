@@ -18,8 +18,8 @@
 //!                         │ guarded kernel stacks (mm/stacks.rs)   │
 //!   0xFFFF_FFFF_8000_0000 ├────────────────────────────────────────┤ PML4[511]·PDPT[510]
 //!                         │ kernel image: RX text, RO data, RW     │
-//!                         │ data+bss+boot stack (one 2 MiB huge    │
-//!                         │ page @ PA 2 MiB)                       │
+//!                         │ data+bss+boot stack (two 2 MiB huge    │
+//!                         │ leaves @ PA 2..6 MiB)                  │
 //!                         └────────────────────────────────────────┘
 //! ```
 
@@ -38,7 +38,7 @@ pub mod user;
 pub mod user_layout;
 pub mod user_range;
 
-/// The kernel link base (one 2 MiB huge page at PA 2 MiB).
+/// The kernel link base (two 2 MiB huge pages, PA 2..6 MiB).
 pub const KERNEL_BASE: u64 = 0xFFFF_FFFF_8000_0000;
 
 /// Page/frame size in bytes.
@@ -83,15 +83,18 @@ pub fn init() {
 
     // Mark the shared kernel leaves global, and the direct map
     // non-executable (ADR-0002: RW only, never X):
-    //   pml4[273] → pdpt_dm[0]   (1 GiB direct map)       |= G | NX
-    //   pml4[511] → pdpt_hh[510] → pd_hh[0] (kernel image) |= G
+    //   pml4[273] → pdpt_dm[0]   (1 GiB direct map)        |= G | NX
+    //   pml4[511] → pdpt_hh[510] → pd_hh[0..1] (the kernel
+    //   image's two 2 MiB leaves, PA 2..6 MiB — K22)        |= G
     let dm = memops::read_u64(pml4_pa + 273 * 8) & ADDR_MASK;
     memops::write_u64(dm, memops::read_u64(dm) | pte::PTE_G | pte::PTE_NX);
     let hh = memops::read_u64(pml4_pa + 511 * 8) & ADDR_MASK;
     let pd = memops::read_u64(hh + 510 * 8) & ADDR_MASK;
     memops::write_u64(pd, memops::read_u64(pd) | pte::PTE_G);
+    // K22: the second leaf (PA 4 MiB) is a shared kernel leaf too.
+    memops::write_u64(pd + 8, memops::read_u64(pd + 8) | pte::PTE_G);
 
-    // F15 (ADR-0006): replace the image's single RWX 2 MiB leaf with
+    // F15 (ADR-0006): replace the image's two RWX 2 MiB leaves with
     // per-4KiB PTEs (.text RX, .rodata RO+NX, .data/.bss RW+NX, gaps
     // and the boot-stack guard absent) and set CR0.WP — BEFORE the CR3
     // reload below, so one flush covers both.

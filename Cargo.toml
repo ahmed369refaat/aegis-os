@@ -12,6 +12,13 @@ path = "src/lib.rs"
 # Intentionally empty: core-only, no_std, zero supply-chain surface.
 [dependencies]
 
+# The K22 lane's host proof (tests/pkg_lane_cli.rs) runs the REAL
+# package-manager CLI over the REAL kernel: a dev-only path dependency
+# on the workspace sibling — normal builds, and the bare-metal kernel,
+# never see it (same discipline as the kernel's dev-dependencies).
+[dev-dependencies]
+aegis-pkg = { path = "pkg" }
+
 # Test-only contract harness shared with the kernel's host tests
 # (ADR-0015 F1): the kernel's dev-dependency enables it; normal
 # builds — including the bare-metal kernel — never see it.

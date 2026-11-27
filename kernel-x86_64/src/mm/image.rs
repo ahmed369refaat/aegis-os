@@ -1,7 +1,7 @@
 //! The kernel image's W^X mapping (F15, ADR-0006).
 //!
-//! The stub maps the whole image as one 2 MiB RWX leaf (0x83); mm::init
-//! replaces that PD entry with a page table built here, one 4 KiB PTE
+//! The stub maps the whole image as two 2 MiB RWX leaves (0x83); mm::init
+//! replaces those PD entries with page tables built here, one 4 KiB PTE
 //! per page: `.text` RX, `.rodata` RO+NX, `.data`/`.bss`/boot stack
 //! RW+NX, everything else (inter-section gaps, the boot-stack guard
 //! page) ABSENT. CR0.WP makes the R-only pages stick for CPL0 too.
