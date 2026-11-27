@@ -694,9 +694,14 @@ mod dbtx {
             }
             let mut buf: PkgBuf = [0u8; 512 * 1024];
             let n = package::build_package(&m, &contents, &repo, &mut buf).unwrap();
-            // package path: /r1/<name with / -> .>.akp
+            // package path (K23, version-qualified):
+            // /r1/<name with / -> .>-<major.minor.patch>.akp
             let mut pp = b"/r1/".to_vec();
             pp.extend(name.iter().map(|&c| if c == b'/' { b'.' } else { c }));
+            pp.push(b'-');
+            let mut vb = [0u8; 56];
+            let vn = ver.write_bytes(&mut vb);
+            pp.extend_from_slice(&vb[..vn]);
             pp.extend_from_slice(b".akp");
             fs.put_file(&pp, &buf[..n], 0o644);
             entries.push((name, m, sha256::digest(&buf[..n]), n as u64));
@@ -816,9 +821,9 @@ mod dbtx {
         let (name, ver, files, deps) = hello_pkg();
         build_repo(&mut fs, &[(name, ver, &files, &deps)]);
         // flip one byte inside the package's manifest (signed zone)
-        let mut pkg = fs.read_file(b"/r1/r1.hello.akp").unwrap();
+        let mut pkg = fs.read_file(b"/r1/r1.hello-1.0.0.akp").unwrap();
         pkg[8 + 40] ^= 0x40;
-        fs.put_file(b"/r1/r1.hello.akp", &pkg, 0o644);
+        fs.put_file(b"/r1/r1.hello-1.0.0.akp", &pkg, 0o644);
         let (code, out) = run(&mut fs, &[b"install", b"r1/hello"]);
         assert_eq!(code, 1, "tampered package must be refused: {out}");
         assert!(
@@ -866,7 +871,10 @@ mod dbtx {
         assert_eq!(code, 0, "install v2: {out}");
         assert_eq!(fs.read_file(b"/bin/hello").unwrap(), b"hello v2\n".to_vec());
         // the repo regresses to offering only v1 (metadata rollback)
-        for k in [b"/r1/index.aki".to_vec(), b"/r1/r1.hello.akp".to_vec()] {
+        for k in [
+            b"/r1/index.aki".to_vec(),
+            b"/r1/r1.hello-2.0.0.akp".to_vec(),
+        ] {
             fs.nodes.remove(&k);
         }
         let f1: Vec<(&[u8], &[u8], u16)> = vec![(b"/bin/hello", b"hello world\n", 0o755)];
@@ -954,9 +962,12 @@ mod dbtx {
             let paths = PkgPaths::new(b"/pkg").unwrap();
             let mut tx = Transaction::begin(&mut fs, &paths).unwrap();
             let prev = None;
+            // K23: repo files are version-qualified (name-1.0.0.akp),
+            // so the crash fixture must fetch the same path build_repo
+            // wrote — the old name-keyed name now answers ENOENT.
             let _manifest = tx
                 .install_package(
-                    &Path::from_bytes(b"/r1/r1.hello.akp").unwrap(),
+                    &Path::from_bytes(b"/r1/r1.hello-1.0.0.akp").unwrap(),
                     &ed25519::public_key(&[0x22; 32]),
                     b"r1",
                     1,

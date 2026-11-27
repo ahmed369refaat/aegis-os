@@ -122,14 +122,71 @@ u16 LE @16` (0o777).
 
 ```text
 /repo-slug/
-  index.aki          signed index (AKI1)
-  repo-slug.pkg.akp  one package file per namespaced name
+  index.aki                      signed index (AKI1)
+  <name>-<major.minor.patch>.akp one VERSION-QUALIFIED file per
+                                 candidate (K23: two versions of one
+                                 package can coexist — a name-keyed
+                                 file made the second overwrite the
+                                 first, and `upgrade` had nothing
+                                 newer to resolve to)
 /pkg/
   trust              root anchors (ATST)
   repos/<slug>.repo  registered repos (ARPS: url, key, pinned)
   db/...             records, state, journal, repo epochs
   cache/  stage/  lock
 ```
+
+`LocalRepository::package_path(name, ver)` (pkg/src/repository.rs)
+builds the version-qualified name: `/` in the package name becomes
+`.`, then `-`, then the semver, then `.akp` — `r1/hello` 1.1.0 lives
+at `r1.hello-1.1.0.akp`. The index lists every version; the solver
+walks candidates newest-first, and `package_path_for(&Candidate)`
+picks the file matching the PLAN'S chosen version — not the repo's
+only one.
+
+## K23 — the lifecycle fixture and the three-round boot lane
+
+The boot fixture (`pkg/src/bin/pkg-mkrepo.rs`, `./boot.sh` step
+`[0e]`) serves FIVE files, each ≤ 8 KiB (the ramfs spill window):
+
+```text
+trust               root anchors (ATST)
+r1.repo             pinned local repo config (ARPS, url /r1)
+index.aki           root-countersigned index (AKI1, epoch 7, TWO entries)
+r1.hello-1.0.0.akp  r1/hello 1.0.0 → /usr/bin/pkg-hello = "hello world\n" (12 B)
+r1.hello-1.1.0.akp  r1/hello 1.1.0 → /usr/bin/pkg-hello = "hello world v1.1\n" (17 B)
+```
+
+Different payload bytes AND sizes, so an upgrade that "succeeded"
+without moving the file cannot pass its byte-exact check.
+
+ONE caller blob (`examples/ring3-pkg-caller/`) drives the whole
+lifecycle: the kernel writes a command selector into byte 0 of the
+blob's data page before each launch (0 = install, 1 = upgrade,
+2 = remove); the blob reads it, builds the strings and the argv
+table at `0x403060 + sel*0x20`, and execve's (internal nr 19). The
+install round's argv PINS the version (`r1/hello@1.0.0`): a bare
+name resolves newest-first, which would install 1.1.0 directly and
+leave the upgrade round nothing to move.
+
+The kmain lane (kernel-x86_64/src/kmain.rs, the K22/K23 section)
+runs three rounds — spawn → execve → dual drain → verify → destroy —
+each verified through a fresh root probe (id 72, never across a
+drain):
+
+- **install**: exit 0, `/usr/bin/pkg-hello` == the 12-B 1.0.0
+  payload, `/pkg/db/r1.hello` + `/pkg/db/state` written;
+- **upgrade**: exit 0, the payload == the 17-B v1.1 bytes (the
+  record moved too — a real MOVE, not the old no-op);
+- **remove**: exit 0, stat `/usr/bin/pkg-hello` = ENOENT, the db
+  record gone, no `r1/hello` in a still-valid count-0 ASTT state.
+
+The host mirror of the lane is `tests/pkg_lane_cli.rs`
+(`cargo test -p aegis-os --test pkg_lane_cli`): the REAL `run_cli`
+over the REAL fixture bytes through the kernel's syscall surface —
+install, upgrade (plus the up-to-date "nothing to do" answer on the
+second run), remove, and a fresh install after the remove.
+
 
 ## K22 — the ring-3 image: built, embedded, and installing inside the VM
 

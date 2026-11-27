@@ -1,5 +1,6 @@
-//! K22 end-to-end on the host: the REAL `run_cli("install")` against
-//! the REAL kernel, through the REAL pkg-mkrepo fixture bytes.
+//! K22/K23 end-to-end on the host: the REAL `run_cli` against the
+//! REAL kernel, through the REAL pkg-mkrepo fixture bytes — the whole
+//! install → upgrade → remove lifecycle the in-VM lane drives.
 //!
 //! The in-VM lane's manager answered `pkg: Io(Access)` and exit 1;
 //! the per-op DAC walk (pkg_lane_provision.rs) passed, so the refusing
@@ -11,7 +12,9 @@
 //!
 //! It is also the honest host proof of the whole lane: the provisioned
 //! tree + the manager's credentials + the signed repo = a committed
-//! install with the payload byte-exact at its destination.
+//! install with the payload byte-exact at its destination — and, since
+//! K23, a real upgrade (the payload MOVES to 1.1.0's bytes) and a real
+//! remove (payload, record and state entry all gone).
 
 use aegis_os::prelude::*;
 use aegis_os::sys::{SysError, SysValue};
@@ -25,11 +28,17 @@ const PROBE: u32 = 71;
 const PM: u32 = 70;
 
 /// The REAL fixture bytes (boot.sh step [0e] builds them; the same
-/// files the kernel's K22 lane embeds).
+/// files the kernel's K22/K23 lane embeds). K23: the repo layout is
+/// version-qualified, so the fixture carries BOTH versions.
 static TRUST: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/trust");
 static REPO_CFG: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1.repo");
 static INDEX: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/index.aki");
-static PACKAGE: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1.hello.akp");
+static PACKAGE_V10: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1.hello-1.0.0.akp");
+static PACKAGE_V11: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1.hello-1.1.0.akp");
+/// The payload each version installs — different bytes AND sizes, so
+/// an upgrade that "succeeded" without moving the payload cannot pass.
+const PAYLOAD_V10: &[u8] = b"hello world\n";
+const PAYLOAD_V11: &[u8] = b"hello world v1.1\n";
 
 fn kernel_with_fixture() -> Kernel {
     let mut k = Kernel::new();
@@ -54,7 +63,10 @@ fn kernel_with_fixture() -> Kernel {
     }
     for &(path, bytes) in &[
         ("/r1/index.aki", INDEX),
-        ("/r1/r1.hello.akp", PACKAGE),
+        // K23: BOTH versions — the upgrade round's solver picks 1.1.0
+        // and its transaction reads the 1.1.0 file.
+        ("/r1/r1.hello-1.0.0.akp", PACKAGE_V10),
+        ("/r1/r1.hello-1.1.0.akp", PACKAGE_V11),
         ("/pkg/trust", TRUST),
         ("/pkg/repos/r1.repo", REPO_CFG),
     ] {
@@ -92,6 +104,49 @@ fn kernel_with_fixture() -> Kernel {
 
 fn path_str(p: &Path) -> &str {
     core::str::from_utf8(p.as_bytes()).expect("fixture paths are ASCII")
+}
+
+/// Read a whole file back through the ROOT supervisor (the probe's
+/// DAC bypass): the verification half of every round, mirroring the
+/// in-VM lane's PKG_VERIFY reads.
+fn probe_read_all(k: &mut Kernel, path: &str) -> Option<Vec<u8>> {
+    let Ok(SysValue::Fd(fd)) = k.syscall(
+        PROBE,
+        SysRequest::Open {
+            path,
+            mode: Mode(0),
+            create: false,
+            read: true,
+            write: false,
+            truncate: false,
+            excl: false,
+        },
+    ) else {
+        return None;
+    };
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match k.syscall(PROBE, SysRequest::Read { fd, buf: &mut buf }) {
+            Ok(SysValue::Count(0)) => break,
+            Ok(SysValue::Count(n)) => out.extend_from_slice(&buf[..n]),
+            _ => {
+                let _ = k.syscall(PROBE, SysRequest::Close { fd });
+                return None;
+            }
+        }
+    }
+    let _ = k.syscall(PROBE, SysRequest::Close { fd });
+    Some(out)
+}
+
+/// Run one CLI command as the manager's domain and return (code, out).
+fn pm_cli(k: &mut Kernel, args: &[&[u8]], paths: &PkgPaths) -> (i32, String) {
+    let mut fs = KernelFs { k, dom: PM };
+    let mut out = String::new();
+    let code = run_cli(args, &mut fs, paths, None, &mut out);
+    println!("cli said (exit {code}): {out}");
+    (code, out)
 }
 
 fn vfs_err(e: SysError, ctx: &str) -> Error {
@@ -281,32 +336,111 @@ impl Fs for KernelFs<'_> {
 #[test]
 fn the_real_cli_installs_from_the_provisioned_repo() {
     let mut k = kernel_with_fixture();
-    let mut fs = KernelFs { k: &mut k, dom: PM };
     let paths = PkgPaths::new(b"/pkg").unwrap();
-    let mut out = String::new();
-    let code = run_cli(&[b"install", b"r1/hello"], &mut fs, &paths, None, &mut out);
-    println!("cli said (exit {code}): {out}");
+    let (code, out) = pm_cli(&mut k, &[b"install", b"r1/hello@1.0.0"], &paths);
     assert_eq!(code, 0, "the real install failed: {out}");
 
     // The tree, read back through the root supervisor.
-    let Ok(SysValue::Fd(fd)) = k.syscall(
-        PROBE,
-        SysRequest::Open {
-            path: "/usr/bin/pkg-hello",
-            mode: Mode(0),
-            create: false,
-            read: true,
-            write: false,
-            truncate: false,
-            excl: false,
-        },
-    ) else {
-        panic!("the payload file must exist at /usr/bin/pkg-hello");
-    };
-    let mut buf = [0u8; 64];
-    match k.syscall(PROBE, SysRequest::Read { fd, buf: &mut buf }) {
-        Ok(SysValue::Count(n)) => assert_eq!(&buf[..n], b"hello world\n"),
-        other => panic!("payload read answered {other:?}"),
-    }
-    let _ = k.syscall(PROBE, SysRequest::Close { fd });
+    assert_eq!(
+        probe_read_all(&mut k, "/usr/bin/pkg-hello").as_deref(),
+        Some(PAYLOAD_V10),
+        "the payload must be byte-exact at /usr/bin/pkg-hello"
+    );
+}
+
+/// K23: the whole lifecycle through the REAL CLI over the REAL kernel
+/// bytes — the host mirror of the boot lane's three execve rounds.
+#[test]
+fn the_real_cli_runs_the_whole_lifecycle() {
+    let mut k = kernel_with_fixture();
+    let paths = PkgPaths::new(b"/pkg").unwrap();
+
+    // ── install: 1.0.0 commits its 12-B payload ──
+    let (code, out) = pm_cli(&mut k, &[b"install", b"r1/hello@1.0.0"], &paths);
+    assert_eq!(code, 0, "install: {out}");
+    assert_eq!(
+        probe_read_all(&mut k, "/usr/bin/pkg-hello").as_deref(),
+        Some(PAYLOAD_V10)
+    );
+
+    // ── upgrade: the plan must MOVE the package to 1.1.0, not "keep"
+    // it (the found-live bug: VersionReq::any() targets resolved to
+    // [keep] forever and `pkg upgrade` was a structural no-op) ──
+    let (code, out) = pm_cli(&mut k, &[b"upgrade"], &paths);
+    assert_eq!(code, 0, "upgrade: {out}");
+    assert!(
+        out.contains("r1/hello"),
+        "the upgrade plan must name the package: {out}"
+    );
+    assert!(
+        !out.contains("nothing to do"),
+        "1.1.0 IS available — a no-op answer is the old bug back: {out}"
+    );
+    // The payload moved: 17 B, byte-exact v1.1 (different bytes AND a
+    // different size than 1.0.0's — proof the file was replaced).
+    assert_eq!(
+        probe_read_all(&mut k, "/usr/bin/pkg-hello").as_deref(),
+        Some(PAYLOAD_V11),
+        "the upgraded payload must be the v1.1 bytes"
+    );
+    // The record moved too, not just the file: `pkg list` reads the
+    // db record, so a stale 1.0.0 record would answer 1.0.0 here.
+    let (code, out) = pm_cli(&mut k, &[b"list"], &paths);
+    assert_eq!(code, 0, "list: {out}");
+    assert!(
+        out.contains("r1/hello 1.1.0"),
+        "the record must say 1.1.0: {out}"
+    );
+
+    // ── up-to-date idempotence: a second upgrade has nothing above
+    // 1.1.0, so it answers the empty-plan path (exit 0, "nothing to
+    // do") — the `up_to_date_ok` branch, proven here so the in-VM
+    // lane only needs the real-move round ──
+    let (code, out) = pm_cli(&mut k, &[b"upgrade"], &paths);
+    assert_eq!(code, 0, "second upgrade: {out}");
+    assert!(
+        out.contains("nothing to do (up to date)"),
+        "nothing above 1.1.0 — the empty-plan answer: {out}"
+    );
+
+    // ── remove: the payload, the record and the state entry go away ──
+    let (code, out) = pm_cli(&mut k, &[b"remove", b"r1/hello"], &paths);
+    assert_eq!(code, 0, "remove: {out}");
+    // stat answers ENOENT (the kernel's VfsError::NotFound — the
+    // exact errno the manager's adapter maps to NoEnt).
+    let mut st = [0u8; 24];
+    assert!(
+        matches!(
+            k.syscall(
+                PM,
+                SysRequest::Stat {
+                    path: "/usr/bin/pkg-hello",
+                    out: &mut st,
+                }
+            ),
+            Err(SysError::Vfs(VfsError::NotFound))
+        ),
+        "stat /usr/bin/pkg-hello must answer ENOENT after remove"
+    );
+    assert!(
+        probe_read_all(&mut k, "/pkg/db/r1.hello").is_none(),
+        "the db record must be gone"
+    );
+    let state =
+        probe_read_all(&mut k, "/pkg/db/state").expect("the state file survives the remove");
+    assert!(
+        state.starts_with(b"ASTT"),
+        "the state stays a valid state file: {state:?}"
+    );
+    assert!(
+        !state.windows(8).any(|w| w == b"r1/hello"),
+        "the state must not list the removed package: {state:?}"
+    );
+    // and the lifecycle is re-runnable: a fresh install commits again.
+    let (code, out) = pm_cli(&mut k, &[b"install", b"r1/hello@1.0.0"], &paths);
+    assert_eq!(code, 0, "install after remove: {out}");
+    assert_eq!(
+        probe_read_all(&mut k, "/usr/bin/pkg-hello").as_deref(),
+        Some(PAYLOAD_V10)
+    );
 }

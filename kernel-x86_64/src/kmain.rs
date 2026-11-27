@@ -1618,8 +1618,9 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         }
     }
 
-    // ── K22: the package manager domain — /bin/pkg runs at CPL=3 and
-    //      installs a signed package from a local repo. The image is
+    // ── K22/K23: the package manager domain — /bin/pkg runs at CPL=3
+    //      and drives the whole package LIFECYCLE against a signed
+    //      local repo: install, upgrade, remove. The image is
     //      the registry's third citizen, linked for the SERVICE memory
     //      contract (a 128-page cage, an 8 MiB no_alloc stack) and
     //      carried in the kernel's SECOND 2 MiB leaf. The lane: (a) declares the
@@ -1630,11 +1631,24 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
     //      0644: the manager READS /r1 and its anchors but can never
     //      rewrite them) and /pkg 0770 root:100 (the manager's gid
     //      writes inside — full uid separation is the documented next
-    //      round); (c) a ring-3 caller execve's /bin/pkg with
-    //      ["/bin/pkg", "install", "r1/hello"] — internal nr 19, the
-    //      ABI the pkg image speaks; (d) the exit code, the installed
-    //      tree, the live mask and the stack high-water are all
-    //      verified from the run the exit rode.
+    //      round) — K23 provisions BOTH package versions (the repo is
+    //      version-qualified now, so the upgrade has something to move
+    //      TO); (c) a ring-3 caller execve's /bin/pkg three times —
+    //      internal nr 19, the ABI the pkg image speaks — with
+    //      ["/bin/pkg", "install", "r1/hello@1.0.0"] (PINNED: a bare
+    //      name resolves newest-first, which would land 1.1.0 and
+    //      leave the upgrade round nothing to move), then
+    //      ["/bin/pkg", "upgrade"] and ["/bin/pkg", "remove",
+    //      "r1/hello"]. K23: ONE caller blob serves all three (the
+    //      kernel writes a command selector into the blob's data page
+    //      before each launch — see examples/ring3-pkg-caller/src/
+    //      lib.rs); (d) each round's exit code, its tree, the live
+    //      mask and the stack high-water are all verified from the
+    //      run the exit rode: the install commits 1.0.0's 12-B
+    //      payload, the upgrade moves it to 1.1.0's 17-B payload
+    //      (byte-exact, different size — proof the payload MOVED, not
+    //      just that a transaction ran), and the remove takes the
+    //      payload (ENOENT), the db record and the state entry away.
     {
         /// The caller's domain id (K20's userland caller is 68, the
         /// vnetd 66, vblkdom 61 — this lane takes 70).
@@ -1652,9 +1666,18 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         static FIXTURE_TRUST: &[u8] = include_bytes!("../blob/pkg-fixture/trust");
         static FIXTURE_REPO: &[u8] = include_bytes!("../blob/pkg-fixture/r1.repo");
         static FIXTURE_INDEX: &[u8] = include_bytes!("../blob/pkg-fixture/index.aki");
-        static FIXTURE_PKG: &[u8] = include_bytes!("../blob/pkg-fixture/r1.hello.akp");
-        /// What the installed file must carry, byte-exact.
-        const PAYLOAD: &[u8] = b"hello world\n";
+        /// K23: the repo layout is version-qualified, so the fixture
+        /// carries BOTH versions — the install round reads 1.0.0, the
+        /// upgrade round's solver picks 1.1.0 and its transaction
+        /// reads the 1.1.0 file.
+        static FIXTURE_PKG_V10: &[u8] = include_bytes!("../blob/pkg-fixture/r1.hello-1.0.0.akp");
+        static FIXTURE_PKG_V11: &[u8] = include_bytes!("../blob/pkg-fixture/r1.hello-1.1.0.akp");
+        /// What each version installs, byte-exact — different bytes
+        /// AND a different size, so the upgrade proves the payload
+        /// moved (the old no-op `pkg upgrade` kept 12 B and still
+        /// printed "done").
+        const PAYLOAD_V10: &[u8] = b"hello world\n";
+        const PAYLOAD_V11: &[u8] = b"hello world v1.1\n";
 
         // (a) the exec policy for the PM image's identity.
         let declared = k
@@ -1755,7 +1778,9 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             Some(total)
         }
 
-        // (b) provisioning: the four dirs + the four fixture files.
+        // (b) provisioning: the four dirs + the five fixture files
+        // (K23: both package versions — the upgrade round needs the
+        // repo to serve 1.1.0 alongside the installed 1.0.0).
         // The supervisor is ROOT with the manager's GROUP (uid 0,
         // gid 100): uid 0 keeps the DAC bypass for its own writes,
         // and everything it creates lands in the manager's group —
@@ -1788,7 +1813,20 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 .is_ok()
             })
         } && probe_put(&mut k, PKG_PROBE, "/r1/index.aki", 0o644, FIXTURE_INDEX)
-            && probe_put(&mut k, PKG_PROBE, "/r1/r1.hello.akp", 0o644, FIXTURE_PKG)
+            && probe_put(
+                &mut k,
+                PKG_PROBE,
+                "/r1/r1.hello-1.0.0.akp",
+                0o644,
+                FIXTURE_PKG_V10,
+            )
+            && probe_put(
+                &mut k,
+                PKG_PROBE,
+                "/r1/r1.hello-1.1.0.akp",
+                0o644,
+                FIXTURE_PKG_V11,
+            )
             && probe_put(&mut k, PKG_PROBE, "/pkg/trust", 0o644, FIXTURE_TRUST)
             && probe_put(&mut k, PKG_PROBE, "/pkg/repos/r1.repo", 0o644, FIXTURE_REPO);
 
@@ -1815,113 +1853,195 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // lives only inside a CPL=0 window, never across the drain.
         let _ = k.destroy_domain(PKG_PROBE);
 
-        let boot: [u8; 64] = [0; 64];
-        let sp = match mm::user::spawn_user_blob(
-            &mut k,
-            &mut pool,
-            PKG_DOM,
-            aegis_os::profile::pkg_caller_profile(),
-            CALLER_BLOB,
-            &boot,
-        ) {
-            Ok(sp) => sp,
-            Err(_) => {
-                line(&mut out, &["[PKG] ERROR: caller spawn failed; halting"]);
-                hw::halt_forever();
-            }
-        };
-        // The caller speaks INTERNAL numbers (execve = 19 — the pkg
-        // image's own ABI) and the ABI flag survives exec, so unlike
-        // K20's /bin/hello lane there is no set_domain_abi here. Its
-        // profile is pkg_caller_profile: the exec quota pre-check runs
-        // against the CALLER's live allowance, and the image it becomes
-        // needs 31 + 2048 + 1 = 2080 of the 2112 granted.
-        let kernel_cr3 = hw::read_cr3();
-        sp.run.tables.activate();
-        crate::sched::context::begin(sp.run);
-        crate::sched::context::launch(&sp.ctx);
-        hw::write_cr3(kernel_cr3);
-        // The dual drain (K20's lesson): the caller's execve parks the
-        // NEW image; the PM runs on scheduler ticks and its exit
-        // arrives EITHER in the run slot (tables + live mask available
-        // for the verification below) OR through the parked mailbox. A
-        // stall is a loud refusal, never a hang.
-        let mut pm_exit: Option<crate::sched::context::ExitKind> = None;
-        let mut mask_verified: Option<bool> = None;
-        let mut high_water: Option<u64> = None;
-        let mut spins = 0u64;
-        while pm_exit.is_none() && spins < 20_000_000 {
-            if let Some(run) = crate::sched::context::try_take() {
-                if run.domain == PKG_DOM {
-                    mask_verified = Some(run.mask == pm_mask);
-                    // Stack high-water: the deepest page with a nonzero
-                    // byte (the exec zero-fills the stack, so a nonzero
-                    // byte IS a touch). Pages that do not translate end
-                    // the scan — nothing legitimate lives below.
-                    let svc = crate::mm::user_layout::SERVICE;
-                    let top = svc.stack_top();
-                    let mut deepest = 0u64;
-                    for page in 0..svc.stack_pages {
-                        let va = top - 4096 * (page as u64 + 1);
-                        let Some(pa) = run.tables.translate(va) else {
-                            break;
-                        };
-                        let mut nonzero = false;
-                        let mut b = 0u64;
-                        while b < 4096 {
-                            if crate::virtio::read_u8_pa(pa + b) != 0 {
-                                nonzero = true;
+        // (c) K23: one execve round. The caller blob reads a COMMAND
+        // SELECTOR from byte 0 of its data page (0 = install,
+        // 1 = upgrade, 2 = remove), so the same embedded binary drives
+        // the whole lifecycle — the lane only varies the boot data.
+        // Returns the PM's exit, the live-mask verdict and the stack
+        // high-water; `None` means the round could not even run
+        // (spawn or drain failure) and the round driver halts.
+        fn pkg_round<const N: usize>(
+            k: &mut aegis_os::Kernel<N>,
+            pool: &mut FramePool<N>,
+            out: &mut dyn FnMut(&str),
+            dom: u32,
+            pm_mask: aegis_os::syscall::SyscallMask,
+            selector: u8,
+        ) -> Option<(crate::sched::context::ExitKind, Option<bool>, Option<u64>)> {
+            // The boot data's byte 0 IS the selector the blob reads
+            // first (examples/ring3-pkg-caller/src/lib.rs); the rest
+            // stays zero — the blob writes its own strings and argv
+            // tables at +0x10 and above.
+            let mut boot: [u8; 64] = [0; 64];
+            boot[0] = selector;
+            let sp = match mm::user::spawn_user_blob(
+                k,
+                pool,
+                dom,
+                aegis_os::profile::pkg_caller_profile(),
+                CALLER_BLOB,
+                &boot,
+            ) {
+                Ok(sp) => sp,
+                Err(_) => {
+                    line(out, &["[PKG] ERROR: caller spawn failed; halting"]);
+                    return None;
+                }
+            };
+            // The caller speaks INTERNAL numbers (execve = 19 — the pkg
+            // image's own ABI) and the ABI flag survives exec, so unlike
+            // K20's /bin/hello lane there is no set_domain_abi here. Its
+            // profile is pkg_caller_profile: the exec quota pre-check runs
+            // against the CALLER's live allowance, and the image it becomes
+            // needs 31 + 2048 + 1 = 2080 of the 2112 granted.
+            let kernel_cr3 = hw::read_cr3();
+            sp.run.tables.activate();
+            crate::sched::context::begin(sp.run);
+            crate::sched::context::launch(&sp.ctx);
+            hw::write_cr3(kernel_cr3);
+            // The dual drain (K20's lesson): the caller's execve parks the
+            // NEW image; the PM runs on scheduler ticks and its exit
+            // arrives EITHER in the run slot (tables + live mask available
+            // for the verification below) OR through the parked mailbox. A
+            // stall is a loud refusal, never a hang.
+            let mut pm_exit: Option<crate::sched::context::ExitKind> = None;
+            let mut mask_verified: Option<bool> = None;
+            let mut high_water: Option<u64> = None;
+            let mut spins = 0u64;
+            while pm_exit.is_none() && spins < 20_000_000 {
+                if let Some(run) = crate::sched::context::try_take() {
+                    if run.domain == dom {
+                        mask_verified = Some(run.mask == pm_mask);
+                        // Stack high-water: the deepest page with a nonzero
+                        // byte (the exec zero-fills the stack, so a nonzero
+                        // byte IS a touch). Pages that do not translate end
+                        // the scan — nothing legitimate lives below.
+                        let svc = crate::mm::user_layout::SERVICE;
+                        let top = svc.stack_top();
+                        let mut deepest = 0u64;
+                        for page in 0..svc.stack_pages {
+                            let va = top - 4096 * (page as u64 + 1);
+                            let Some(pa) = run.tables.translate(va) else {
+                                break;
+                            };
+                            let mut nonzero = false;
+                            let mut b = 0u64;
+                            while b < 4096 {
+                                if crate::virtio::read_u8_pa(pa + b) != 0 {
+                                    nonzero = true;
+                                    break;
+                                }
+                                b += 1;
+                            }
+                            if nonzero {
+                                deepest = page as u64 + 1;
+                            } else {
+                                // The first untouched page is the frontier:
+                                // the stack is zero-filled at exec, nothing
+                                // legitimate lives below it.
                                 break;
                             }
-                            b += 1;
                         }
-                        if nonzero {
-                            deepest = page as u64 + 1;
-                        } else {
-                            // The first untouched page is the frontier:
-                            // the stack is zero-filled at exec, nothing
-                            // legitimate lives below it.
-                            break;
-                        }
-                    }
-                    high_water = Some(deepest);
-                    pm_exit = Some(run.exit);
-                }
-            }
-            if pm_exit.is_none() {
-                if let Some((dom, exit)) = crate::sched::park::completed_drain() {
-                    if dom == PKG_DOM {
-                        pm_exit = Some(exit);
+                        high_water = Some(deepest);
+                        pm_exit = Some(run.exit);
                     }
                 }
+                if pm_exit.is_none() {
+                    if let Some((exit_dom, exit)) = crate::sched::park::completed_drain() {
+                        if exit_dom == dom {
+                            pm_exit = Some(exit);
+                        }
+                    }
+                }
+                if pm_exit.is_none() {
+                    hw::hlt_once();
+                }
+                spins += 1;
             }
-            if pm_exit.is_none() {
-                hw::hlt_once();
+            match pm_exit {
+                Some(e) => Some((e, mask_verified, high_water)),
+                None => {
+                    line(
+                        out,
+                        &["[PKG] ERROR: the manager never completed (park stalled) — LOUD"],
+                    );
+                    None
+                }
             }
-            spins += 1;
         }
-        let run_exit = match pm_exit {
-            Some(e) => e,
-            None => {
-                line(
-                    &mut out,
-                    &["[PKG] ERROR: the manager never completed (park stalled) — LOUD"],
-                );
-                pool.free_all_owned(&mut k.frames, PKG_DOM);
-                let _ = k.destroy_domain(PKG_DOM);
-                hw::halt_forever();
+
+        // One round's verification half, shared by all three commands:
+        // create the fresh root probe (id 72) inside this CPL=0
+        // window, run the reads the caller passed, destroy the probe
+        // again — never across a drain (the preemptor's
+        // unparked-domain guard is a hard rule, the K22 lesson).
+        // Returns the probe's domain id on success (the reads' fd
+        // table), or None when the probe could not be created.
+        fn verify_probe<const N: usize>(k: &mut aegis_os::Kernel<N>) -> Option<u32> {
+            match k.create_domain_with(PKG_VERIFY, aegis_os::profile::service_profile(), 0, 0, 0) {
+                Ok(()) => Some(PKG_VERIFY),
+                Err(_) => None,
             }
-        };
+        }
+
+        // The three markers every round prints from its own run: the
+        // exec fact, the live-mask verdict and the stack high-water
+        // (the tree markers are per-command, printed by the rounds).
+        fn round_common_markers(
+            out: &mut dyn FnMut(&str),
+            mask_verified: Option<bool>,
+            high_water: Option<u64>,
+        ) {
+            line(
+                out,
+                &[
+                    "[PKG] /bin/pkg: execve'd at CPL=3 under the SERVICE contract (policy = package_manager_profile)",
+                ],
+            );
+            line(
+                out,
+                &[
+                    "[PKG] live mask after exec == package_manager_profile (9 syscall arms — no fork/exec/mmap/net/ipc): ",
+                    match mask_verified {
+                        Some(true) => "verified",
+                        Some(false) => "MISMATCH — LOUD",
+                        None => "unavailable (parked handover reclaimed the run)",
+                    },
+                ],
+            );
+            let mut b = [0u8; 20];
+            line(
+                out,
+                &[
+                    "[PKG] stack high-water: ",
+                    strutil::dec(high_water.unwrap_or(0) * 4096, &mut b),
+                    " of 8388608 B below the 8 MiB stack top",
+                ],
+            );
+        }
+
+        // ── round 1: install (selector 0) — the K22 proof, with one
+        // K23 adjustment: the request PINS 1.0.0 ("r1/hello@1.0.0"),
+        // because the version-qualified repo serves two versions and
+        // a bare name resolves NEWEST-first — unpinned, the install
+        // would land 1.1.0 and leave the upgrade round nothing to
+        // move. ──
+        let (run_exit, mask_verified, high_water) =
+            match pkg_round(&mut k, &mut pool, &mut out, PKG_DOM, pm_mask, 0) {
+                Some(r) => r,
+                None => {
+                    pool.free_all_owned(&mut k.frames, PKG_DOM);
+                    let _ = k.destroy_domain(PKG_DOM);
+                    hw::halt_forever();
+                }
+            };
         match run_exit {
             crate::sched::context::ExitKind::Exited(0) => {
                 // (d) the installed tree, read back through a FRESH
                 // root supervisor (id 72 — created and destroyed inside
                 // this CPL=0 window, never across a drain: the
                 // preemptor's unparked-domain guard is a hard rule).
-                let probed = matches!(
-                    k.create_domain_with(PKG_VERIFY, aegis_os::profile::service_profile(), 0, 0, 0),
-                    Ok(())
-                );
+                let probed = verify_probe(&mut k).is_some();
                 let mut payload = [0u8; 64];
                 let mut rec = [0u8; 4096];
                 let mut state = [0u8; 4096];
@@ -1939,21 +2059,15 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                     (None, None, None)
                 };
                 let _ = k.destroy_domain(PKG_VERIFY);
-                let tree_ok = got == Some(PAYLOAD.len())
-                    && &payload[..PAYLOAD.len()] == PAYLOAD
+                let tree_ok = got == Some(PAYLOAD_V10.len())
+                    && &payload[..PAYLOAD_V10.len()] == PAYLOAD_V10
                     && rec_n.unwrap_or(0) > 0
                     && state_n.unwrap_or(0) > 0;
                 if tree_ok {
                     line(
                         &mut out,
                         &[
-                            "[PKG] /bin/pkg: execve'd at CPL=3 under the SERVICE contract (policy = package_manager_profile)",
-                        ],
-                    );
-                    line(
-                        &mut out,
-                        &[
-                            "[PKG] install r1/hello: resolved from the signed local repo, Ed25519-verified, committed (exit 0)",
+                            "[PKG] install r1/hello@1.0.0: resolved from the signed local repo, Ed25519-verified, committed (exit 0)",
                         ],
                     );
                     line(
@@ -1962,26 +2076,7 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                             "[PKG] the installed tree: /usr/bin/pkg-hello byte-exact, /pkg/db/r1.hello + /pkg/db/state written",
                         ],
                     );
-                    line(
-                        &mut out,
-                        &[
-                            "[PKG] live mask after exec == package_manager_profile (9 syscall arms — no fork/exec/mmap/net/ipc): ",
-                            match mask_verified {
-                                Some(true) => "verified",
-                                Some(false) => "MISMATCH — LOUD",
-                                None => "unavailable (parked handover reclaimed the run)",
-                            },
-                        ],
-                    );
-                    let mut b = [0u8; 20];
-                    line(
-                        &mut out,
-                        &[
-                            "[PKG] stack high-water: ",
-                            strutil::dec(high_water.unwrap_or(0) * 4096, &mut b),
-                            " of 8388608 B below the 8 MiB stack top",
-                        ],
-                    );
+                    round_common_markers(&mut out, mask_verified, high_water);
                 } else {
                     line(
                         &mut out,
@@ -2003,6 +2098,196 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
             }
             _ => {
                 line(&mut out, &["[PKG] ERROR: the manager faulted — LOUD"]);
+            }
+        }
+        pool.free_all_owned(&mut k.frames, PKG_DOM);
+        let _ = k.destroy_domain(PKG_DOM);
+
+        // ── round 2 (K23): upgrade (selector 1) — the proof that
+        //      `pkg upgrade` is a real MOVE. The solver must resolve
+        //      1.1.0 ABOVE the installed 1.0.0 (VersionReq::above —
+        //      the old any() request made the plan "keep" and the
+        //      payload never moved), the transaction reads the
+        //      version-qualified r1.hello-1.1.0.akp file, and the
+        //      commit's rename overwrites the installed payload with
+        //      the 17-B v1.1 bytes. ──
+        let (run_exit, mask_verified, high_water) =
+            match pkg_round(&mut k, &mut pool, &mut out, PKG_DOM, pm_mask, 1) {
+                Some(r) => r,
+                None => {
+                    pool.free_all_owned(&mut k.frames, PKG_DOM);
+                    let _ = k.destroy_domain(PKG_DOM);
+                    hw::halt_forever();
+                }
+            };
+        match run_exit {
+            crate::sched::context::ExitKind::Exited(0) => {
+                let probed = verify_probe(&mut k).is_some();
+                let mut payload = [0u8; 64];
+                let mut rec = [0u8; 4096];
+                let mut state = [0u8; 4096];
+                let (got, rec_n, state_n) = if probed {
+                    (
+                        probe_read(&mut k, PKG_VERIFY, "/usr/bin/pkg-hello", &mut payload),
+                        // the upgraded record replaces the old one at
+                        // the same committed name.
+                        probe_read(&mut k, PKG_VERIFY, "/pkg/db/r1.hello", &mut rec),
+                        probe_read(&mut k, PKG_VERIFY, "/pkg/db/state", &mut state),
+                    )
+                } else {
+                    (None, None, None)
+                };
+                let _ = k.destroy_domain(PKG_VERIFY);
+                // 17 B, byte-exact: a DIFFERENT payload at a DIFFERENT
+                // size is what separates a real upgrade from the old
+                // structural no-op (which printed "done" and left the
+                // 12-B 1.0.0 bytes in place).
+                let tree_ok = got == Some(PAYLOAD_V11.len())
+                    && &payload[..PAYLOAD_V11.len()] == PAYLOAD_V11
+                    && rec_n.unwrap_or(0) > 0
+                    && state_n.unwrap_or(0) > 0;
+                if tree_ok {
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] upgrade r1/hello: 1.1.0 resolved ABOVE the installed 1.0.0, Ed25519-verified, committed (exit 0)",
+                        ],
+                    );
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] the upgraded tree: /usr/bin/pkg-hello == 17-B \"hello world v1.1\" payload, byte-exact — the payload moved",
+                        ],
+                    );
+                    round_common_markers(&mut out, mask_verified, high_water);
+                } else {
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] ERROR: exit 0 but the upgraded tree is wrong (payload/record/state) — LOUD",
+                        ],
+                    );
+                }
+            }
+            crate::sched::context::ExitKind::Exited(code) => {
+                let mut cn = [0u8; 20];
+                line(
+                    &mut out,
+                    &[
+                        "[PKG] ERROR: upgrade exit=",
+                        strutil::dec(code, &mut cn),
+                        " — LOUD",
+                    ],
+                );
+            }
+            _ => {
+                line(
+                    &mut out,
+                    &["[PKG] ERROR: the manager faulted (upgrade) — LOUD"],
+                );
+            }
+        }
+        pool.free_all_owned(&mut k.frames, PKG_DOM);
+        let _ = k.destroy_domain(PKG_DOM);
+
+        // ── round 3 (K23): remove (selector 2) — the proof that the
+        //      lifecycle CLOSES. The payload file must answer ENOENT
+        //      on stat (not merely fail to open — stat is the
+        //      metadata arm the manager itself uses), the db record
+        //      must be GONE (the commit unlinks the committed
+        //      removals' backups), and the state file must survive
+        //      as a valid count-0 ASTT that no longer lists
+        //      r1/hello. ──
+        let (run_exit, mask_verified, high_water) =
+            match pkg_round(&mut k, &mut pool, &mut out, PKG_DOM, pm_mask, 2) {
+                Some(r) => r,
+                None => {
+                    pool.free_all_owned(&mut k.frames, PKG_DOM);
+                    let _ = k.destroy_domain(PKG_DOM);
+                    hw::halt_forever();
+                }
+            };
+        match run_exit {
+            crate::sched::context::ExitKind::Exited(0) => {
+                let probed = verify_probe(&mut k).is_some();
+                let mut st = [0u8; 24];
+                // stat must answer ENOENT — the kernel's
+                // VfsError::NotFound, the exact errno the manager's
+                // own adapter maps to NoEnt.
+                let stat_gone = probed
+                    && matches!(
+                        k.syscall(
+                            PKG_VERIFY,
+                            aegis_os::sys::SysRequest::Stat {
+                                path: "/usr/bin/pkg-hello",
+                                out: &mut st,
+                            },
+                        ),
+                        Err(aegis_os::sys::SysError::Vfs(
+                            aegis_os::vfs::VfsError::NotFound
+                        ))
+                    );
+                let mut rec = [0u8; 4096];
+                let mut state = [0u8; 4096];
+                let (rec_n, state_n) = if probed {
+                    (
+                        probe_read(&mut k, PKG_VERIFY, "/pkg/db/r1.hello", &mut rec),
+                        probe_read(&mut k, PKG_VERIFY, "/pkg/db/state", &mut state),
+                    )
+                } else {
+                    (None, None)
+                };
+                let _ = k.destroy_domain(PKG_VERIFY);
+                let state_n = state_n.unwrap_or(0);
+                // The state survives as a valid empty ASTT (magic +
+                // version + epoch + count=0 = 16 B) that does not
+                // list the package: a missing state file would make
+                // "gone" unfalsifiable, garbage would be corruption.
+                let state_clean = state_n >= 16
+                    && &state[..4] == b"ASTT"
+                    && !state[..state_n]
+                        .windows(8)
+                        .any(|w| w == b"r1/hello".as_slice());
+                let tree_ok = stat_gone && rec_n.is_none() && state_clean;
+                if tree_ok {
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] remove r1/hello: the payload, the db record and the state entry uninstalled (exit 0)",
+                        ],
+                    );
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] the removed tree: stat /usr/bin/pkg-hello = ENOENT, /pkg/db/r1.hello gone, no r1/hello in /pkg/db/state",
+                        ],
+                    );
+                    round_common_markers(&mut out, mask_verified, high_water);
+                } else {
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] ERROR: exit 0 but the removed tree is wrong (stat/record/state) — LOUD",
+                        ],
+                    );
+                }
+            }
+            crate::sched::context::ExitKind::Exited(code) => {
+                let mut cn = [0u8; 20];
+                line(
+                    &mut out,
+                    &[
+                        "[PKG] ERROR: remove exit=",
+                        strutil::dec(code, &mut cn),
+                        " — LOUD",
+                    ],
+                );
+            }
+            _ => {
+                line(
+                    &mut out,
+                    &["[PKG] ERROR: the manager faulted (remove) — LOUD"],
+                );
             }
         }
         pool.free_all_owned(&mut k.frames, PKG_DOM);

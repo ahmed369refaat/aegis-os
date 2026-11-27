@@ -683,11 +683,22 @@ if [ "$MODE" = "verify" ]; then
   # K22: the package manager domain — /bin/pkg at CPL=3, installing
   # from the signed local repo (the registry's SERVICE-contract image).
   grep -qF "[PKG] /bin/pkg: execve'd at CPL=3 under the SERVICE contract" "$LOG" || { echo "VERIFY FAIL: K22 pkg exec marker missing"; ok=0; }
-  grep -qF "[PKG] install r1/hello: resolved from the signed local repo" "$LOG" || { echo "VERIFY FAIL: K22 pkg install marker missing"; ok=0; }
+  grep -qF "[PKG] install r1/hello@1.0.0: resolved from the signed local repo" "$LOG" || { echo "VERIFY FAIL: K22 pkg install marker missing"; ok=0; }
   grep -qF "[PKG] the installed tree: /usr/bin/pkg-hello byte-exact" "$LOG" || { echo "VERIFY FAIL: K22 pkg tree marker missing"; ok=0; }
   grep -qF "[PKG] live mask after exec == package_manager_profile" "$LOG" || { echo "VERIFY FAIL: K22 pkg live-mask marker missing"; ok=0; }
   grep -qF "[PKG] stack high-water: " "$LOG" || { echo "VERIFY FAIL: K22 pkg stack high-water marker missing"; ok=0; }
   grep -qF "[PKG] ERROR" "$LOG" && { echo "VERIFY FAIL: K22 pkg lane reported an ERROR"; ok=0; }
+  # K23: the lifecycle rounds. The upgrade must be a real MOVE — the
+  # solver resolves 1.1.0 ABOVE the installed 1.0.0 and the 17-B v1.1
+  # payload replaces the 12-B 1.0.0 one (the old structural no-op
+  # printed "done" and kept the bytes); the remove must take the
+  # payload (ENOENT), the db record and the state entry away. The
+  # rounds share ONE caller blob (a kernel-written selector byte in
+  # its data page picks install/upgrade/remove).
+  grep -qF "[PKG] upgrade r1/hello: 1.1.0 resolved ABOVE the installed 1.0.0, Ed25519-verified, committed (exit 0)" "$LOG" || { echo "VERIFY FAIL: K23 pkg upgrade marker missing"; ok=0; }
+  grep -qF "[PKG] the upgraded tree: /usr/bin/pkg-hello == 17-B \"hello world v1.1\" payload, byte-exact — the payload moved" "$LOG" || { echo "VERIFY FAIL: K23 pkg upgraded-tree marker missing"; ok=0; }
+  grep -qF "[PKG] remove r1/hello: the payload, the db record and the state entry uninstalled (exit 0)" "$LOG" || { echo "VERIFY FAIL: K23 pkg remove marker missing"; ok=0; }
+  grep -qF "[PKG] the removed tree: stat /usr/bin/pkg-hello = ENOENT, /pkg/db/r1.hello gone, no r1/hello in /pkg/db/state" "$LOG" || { echo "VERIFY FAIL: K23 pkg removed-tree marker missing"; ok=0; }
   fi
   # M2-W2 / ADR-0012: the preemption demo boots only under
   # `--features preempt-demo` (see ADR-0012's open-issues section); the

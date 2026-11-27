@@ -1,19 +1,31 @@
-//! K22: the boot fixture builder — the SIGNED local repo the in-VM
-//! package manager installs from.
+//! K22/K23: the boot fixture builder — the SIGNED local repo the
+//! in-VM package manager installs from.
 //!
 //! A HOST tool (std, `signer` feature): signing exists for repo
 //! BUILDING, never inside the deployed manager. It reproduces the host
 //! test suite's `build_repo` recipe with TEST-ONLY fixed seeds — the
 //! same `[0x11; 32]` root and `[0x22; 32]` repo seeds the tests use,
 //! pinned here so no one mistakes them for production keys — and
-//! writes four files into the output directory (embedded by the
-//! kernel's K22 boot lane):
+//! writes five files into the output directory (embedded by the
+//! kernel's K22/K23 boot lanes):
 //!
-//!   `trust`         the root trust anchors (ATST)
-//!   `r1.repo`       the pinned local repo config (ARPS, url `/r1`)
-//!   `index.aki`     the root-countersigned index (AKI1, epoch 7)
-//!   `r1.hello.akp`  the signed package (AKP1): `r1/hello` 1.0.0, one
-//!                   file — `/usr/bin/pkg-hello` = "hello world\n"
+//!   `trust`               the root trust anchors (ATST)
+//!   `r1.repo`             the pinned local repo config (ARPS, url `/r1`)
+//!   `index.aki`           the root-countersigned index (AKI1, epoch 7,
+//!                         TWO entries — both versions of hello)
+//!   `r1.hello-1.0.0.akp`  the signed package (AKP1): `r1/hello` 1.0.0,
+//!                         one file — `/usr/bin/pkg-hello` =
+//!                         "hello world\n" (12 B)
+//!   `r1.hello-1.1.0.akp`  the signed package (AKP1): `r1/hello` 1.1.0,
+//!                         one file — `/usr/bin/pkg-hello` =
+//!                         "hello world v1.1\n" (17 B — a DIFFERENT
+//!                         payload at a DIFFERENT size, so the upgrade
+//!                         lane proves the bytes and the size moved)
+//!
+//! K23: the package files are VERSION-QUALIFIED (the repo's layout
+//! change that lets one directory serve both versions) — the install
+//! lane reads the 1.0.0 file, the upgrade lane's solver picks 1.1.0
+//! and the transaction reads the 1.1.0 file.
 //!
 //! Every file must stay ≤ 8192 B: the kernel ramfs holds files above
 //! 1 KiB in 8 KiB side-table windows (`LARGE_FILE_MAX`), so the tool
@@ -43,7 +55,11 @@ const RAMFS_WINDOW: usize = 8192;
 /// `/bin/hello` destination is the exec registry's disk slot path).
 const PKG_NAME: &[u8] = b"r1/hello";
 const PAYLOAD_PATH: &[u8] = b"/usr/bin/pkg-hello";
-const PAYLOAD: &[u8] = b"hello world\n";
+/// v1.0.0's payload — the K22 install lane's byte-exact target.
+const PAYLOAD_V10: &[u8] = b"hello world\n";
+/// v1.1.0's payload — different bytes AND a different installed size
+/// (the K23 upgrade lane's byte-exact target).
+const PAYLOAD_V11: &[u8] = b"hello world v1.1\n";
 
 fn main() {
     let dir = std::env::args()
@@ -51,26 +67,49 @@ fn main() {
         .unwrap_or_else(|| "kernel-x86_64/blob/pkg-fixture".to_string());
     std::fs::create_dir_all(&dir).expect("create the fixture dir");
 
-    // The package: r1/hello 1.0.0, one 0755 file, no dependencies.
-    let mut manifest = Manifest::new(PKG_NAME, SemVer::release(1, 0, 0)).expect("manifest");
-    manifest
-        .push_file(FileEntry {
-            path: Path::from_bytes(PAYLOAD_PATH).expect("payload path"),
-            perm: 0o755,
-            size: PAYLOAD.len() as u64,
-            sha256: sha256::digest(PAYLOAD),
-        })
-        .expect("file entry");
-    let mut pkg: PkgBuf = [0u8; 512 * 1024];
-    let pkg_len = build_package(&manifest, &[PAYLOAD], &REPO_SEED, &mut pkg).expect("package");
+    // Both packages: r1/hello 1.0.0 and 1.1.0, one 0755 file each, no
+    // dependencies — same path, different payload bytes and sizes.
+    let mut m10 = Manifest::new(PKG_NAME, SemVer::release(1, 0, 0)).expect("manifest 1.0.0");
+    m10.push_file(FileEntry {
+        path: Path::from_bytes(PAYLOAD_PATH).expect("payload path"),
+        perm: 0o755,
+        size: PAYLOAD_V10.len() as u64,
+        sha256: sha256::digest(PAYLOAD_V10),
+    })
+    .expect("file entry 1.0.0");
+    let mut m11 = Manifest::new(PKG_NAME, SemVer::release(1, 1, 0)).expect("manifest 1.1.0");
+    m11.push_file(FileEntry {
+        path: Path::from_bytes(PAYLOAD_PATH).expect("payload path"),
+        perm: 0o755,
+        size: PAYLOAD_V11.len() as u64,
+        sha256: sha256::digest(PAYLOAD_V11),
+    })
+    .expect("file entry 1.1.0");
 
-    // The signed index (repo key signs, root countersigns).
-    let entries = [(
-        PKG_NAME,
-        manifest,
-        sha256::digest(&pkg[..pkg_len]),
-        pkg_len as u64,
-    )];
+    let mut pkg10: PkgBuf = [0u8; 512 * 1024];
+    let pkg10_len =
+        build_package(&m10, &[PAYLOAD_V10], &REPO_SEED, &mut pkg10).expect("package 1.0.0");
+    let mut pkg11: PkgBuf = [0u8; 512 * 1024];
+    let pkg11_len =
+        build_package(&m11, &[PAYLOAD_V11], &REPO_SEED, &mut pkg11).expect("package 1.1.0");
+
+    // The signed index (repo key signs, root countersigns) — BOTH
+    // versions are entries; the solver's universe reads one candidate
+    // per entry, newest-first at plan time.
+    let entries = [
+        (
+            PKG_NAME,
+            m10,
+            sha256::digest(&pkg10[..pkg10_len]),
+            pkg10_len as u64,
+        ),
+        (
+            PKG_NAME,
+            m11,
+            sha256::digest(&pkg11[..pkg11_len]),
+            pkg11_len as u64,
+        ),
+    ];
     let mut index = [0u8; 96 * 1024];
     let index_len = build_index_with_hashes(
         b"r1",
@@ -83,7 +122,7 @@ fn main() {
     .expect("index");
 
     // The repo config: pinned, local, url /r1 (where the boot lane
-    // provisioned the two repo files).
+    // provisioned the repo files).
     let config = RepoConfig {
         slug: name_buf(b"r1"),
         slug_len: 2,
@@ -108,11 +147,12 @@ fn main() {
     let mut trust = [0u8; 4 + 2 + 1 + 8 * 32];
     let trust_len = anchors.serialize(&mut trust).expect("anchors");
 
-    let files: [(&str, &[u8]); 4] = [
+    let files: [(&str, &[u8]); 5] = [
         ("trust", &trust[..trust_len]),
         ("r1.repo", &cfg[..cfg_len]),
         ("index.aki", &index[..index_len]),
-        ("r1.hello.akp", &pkg[..pkg_len]),
+        ("r1.hello-1.0.0.akp", &pkg10[..pkg10_len]),
+        ("r1.hello-1.1.0.akp", &pkg11[..pkg11_len]),
     ];
     for (name, bytes) in files {
         assert!(

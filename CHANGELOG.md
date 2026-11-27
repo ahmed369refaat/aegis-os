@@ -1,7 +1,56 @@
 # Changelog
 
-## [Unreleased] — the K23 round
+## [Unreleased] — the K23 round: the full package lifecycle in the VM — upgrade becomes a real move, remove closes the loop
 
+- **Found-live bug: `pkg upgrade` was structurally a no-op.** The
+  command built `VersionReq::any()` targets, and the solver's
+  prefer-keep rule keeps ANY installed version that satisfies an
+  `any()` request — the plan resolved to `[keep]` forever, printed
+  "done", and the payload never moved. `VersionReqKind::Above`
+  (manifest kind 6) now exists: `cmd_upgrade` targets
+  `VersionReq::above(installed)`, which fails the keep test and walks
+  the candidates newest-first; `do_solve_and_install` grew
+  `up_to_date_ok` (upgrade's shape) so a package no repo version
+  beats answers "nothing to do (up to date)" with exit 0 instead of
+  the loud `ConstraintUnsat`.
+- **Found-live constraint: the repo layout was name-keyed**, so two
+  versions of one package could not coexist — the second `akp`
+  overwrote the first and `upgrade` had nothing newer to resolve to.
+  `LocalRepository::package_path(name, ver)` now emits
+  version-qualified files (`r1.hello-1.1.0.akp`), the broker
+  repository version-qualifies its cache, `fetch_object`'s buffer
+  grew 160→256 B for the longer names, `fill_universe` passes the
+  index entry's version, and `package_path_for` takes the plan's
+  chosen `&Candidate` — the transaction reads the file the solver
+  picked, not the repo's only one.
+- **The fixture grew a second version** (pkg-mkrepo v2): five files
+  ≤ 8 KiB each — `r1/hello` 1.0.0 ("hello world\n", 12 B) and 1.1.0
+  ("hello world v1.1\n", 17 B), different bytes AND sizes so an
+  upgrade that did not move the payload cannot pass its byte-exact
+  check.
+- **ONE caller blob drives the whole lifecycle**
+  (`examples/ring3-pkg-caller`): the kernel writes a command
+  selector into byte 0 of the blob's data page before launch
+  (0 = install, 1 = upgrade, 2 = remove); the blob reads it, builds
+  its strings and the argv table at `0x403060 + sel*0x20`, and
+  execve's `/bin/pkg` (internal nr 19, argv[0]-skip contract kept).
+  The install round pins `r1/hello@1.0.0` — a bare name resolves
+  newest-first and would land 1.1.0, leaving the upgrade nothing to
+  move.
+- **The boot lane is three rounds** (kmain's K22/K23 section):
+  install (12-B payload byte-exact, record + state written), upgrade
+  (the payload MOVES to the 17-B v1.1 bytes), remove (stat answers
+  ENOENT, the db record is gone, no `r1/hello` in a valid count-0
+  state). Each round spawns, drains and destroys domain 70; the
+  fresh verification probe (72) lives only inside CPL=0 windows —
+  the K22 unparked-domain lesson, kept on every path.
+- **Host proofs**: `tests/pkg_lane_cli.rs` runs the REAL `run_cli`
+  over the REAL kernel bytes through the whole lifecycle (plus the
+  up-to-date second upgrade and a reinstall after remove);
+  `tests/pkg_lane_provision.rs` walks both version-qualified files.
+  The `dbtx::crash_during_commit_recovers` fixture was pointed at
+  the version-qualified repo path (the old name-keyed path answered
+  ENOENT before the crash could be simulated).
 - **The console plane's tests are serial now** — `drvstack::console`'s
   state is one set of process-wide statics, and cargo test's parallel
   threads interleaved `write_byte`s into each other's counters (found

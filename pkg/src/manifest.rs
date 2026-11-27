@@ -347,7 +347,8 @@ fn strip_zeros(s: &[u8]) -> &[u8] {
 }
 
 /// Constraint kinds. Textual renderings (CLI display only):
-/// `=1.2.3`, `>=1.2.3`, `<2.0.0`, `>=1.0.0<2.0.0`, `^1.2.3`, `*`.
+/// `=1.2.3`, `>=1.2.3`, `<2.0.0`, `>=1.0.0<2.0.0`, `^1.2.3`, `*`,
+/// `>1.2.3`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VersionReqKind {
     /// Exactly this version.
@@ -362,6 +363,13 @@ pub enum VersionReqKind {
     Caret,
     /// Any version (downgrade policy still applies globally).
     Any,
+    /// Strictly NEWER than `lo` — the upgrade request. The solver's
+    /// prefer-keep rule fires only when the installed version
+    /// SATISFIES the request, so `any()` can never move an installed
+    /// package: `pkg upgrade` asks for `above(installed)` and the
+    /// keep shortcut does not fire (found live in K23 — the upgrade
+    /// lane's plan was [keep] forever).
+    Above,
 }
 
 /// A version request: kind plus one or two boundary versions.
@@ -436,6 +444,20 @@ impl VersionReq {
         }
     }
 
+    /// `>ver` — strictly newer than `ver`. The upgrade request (the
+    /// solver keeps an installed version only while it SATISFIES the
+    /// request; `above(installed)` therefore forces the candidate
+    /// walk, where prefer-latest plus the downgrade policy pick the
+    /// newest repo version).
+    #[must_use]
+    pub const fn above(ver: SemVer) -> Self {
+        VersionReq {
+            kind: VersionReqKind::Above,
+            lo: ver,
+            hi: SemVer::zero(),
+        }
+    }
+
     /// Does `v` satisfy this request?
     #[must_use]
     pub fn satisfied_by(&self, v: &SemVer) -> bool {
@@ -445,6 +467,7 @@ impl VersionReq {
             VersionReqKind::Min => !v.precedes(&self.lo),
             VersionReqKind::Max => v.precedes(&self.hi) && v != &self.hi,
             VersionReqKind::Range => !v.precedes(&self.lo) && v.precedes(&self.hi) && v != &self.hi,
+            VersionReqKind::Above => self.lo.precedes(v),
             VersionReqKind::Caret => {
                 // v >= lo is required
                 if v.precedes(&self.lo) && v != &self.lo {
@@ -471,6 +494,7 @@ impl VersionReq {
             Max => (b"<", false, true),
             Range => (b">=", true, true),
             Caret => (b"^", true, false),
+            Above => (b">", true, false),
             Any => (b"*", false, false),
         };
         let mut pos = 0usize;
@@ -1201,6 +1225,7 @@ fn u8_to_kind(k: u8) -> Option<VersionReqKind> {
         3 => Some(Range),
         4 => Some(Caret),
         5 => Some(Any),
+        6 => Some(Above),
         _ => None,
     }
 }
@@ -1214,6 +1239,7 @@ fn kind_to_u8(k: VersionReqKind) -> u8 {
         Range => 3,
         Caret => 4,
         Any => 5,
+        Above => 6,
     }
 }
 

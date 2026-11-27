@@ -382,6 +382,21 @@ impl<'a> Solver<'a> {
         Ok(())
     }
 
+    /// Is `name` installed with NOTHING in the universe satisfying
+    /// `req`? The upgrade command's "up to date" test: its targets
+    /// ask for `above(installed)`, so this is true exactly when the
+    /// repo offers nothing newer. A repo that dropped the package
+    /// entirely is NOT "up to date" for `install`'s loud refusal —
+    /// only the upgrade path consults this.
+    #[must_use]
+    pub fn is_up_to_date(&self, name: &[u8], req: VersionReq) -> bool {
+        self.installed_version(name).is_some()
+            && !self
+                .candidates
+                .iter()
+                .any(|c| c.name() == name && req.satisfied_by(&c.version))
+    }
+
     /// Resolve `name` at `req` into `sel` (the shared selection
     /// map), backtracking through candidate order.
     fn resolve_into(

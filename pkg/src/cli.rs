@@ -397,7 +397,7 @@ fn fill_universe(
                 return Err(Error::new(ErrorKind::TooLarge, "universe cap"));
             }
             let entry = &lr.index.entries[i];
-            let path = repo.package_path(entry.name())?;
+            let path = repo.package_path(entry.name(), &entry.version)?;
             let fd = match fs.open(&path, OpenFlags::RDONLY) {
                 Ok(fd) => fd,
                 Err(_) => continue, // index lists a file the repo lacks
@@ -456,12 +456,15 @@ fn installed_lite(fs: &mut dyn crate::Fs, paths: &PkgPaths) -> Result<InstalledL
     Ok(out)
 }
 
-fn package_path_for(repos: &RepoList, name: &[u8]) -> Result<Path> {
-    let slug = namespace_of(name)?;
+fn package_path_for(repos: &RepoList, cand: &Candidate) -> Result<Path> {
+    let slug = namespace_of(cand.name())?;
     for lr in repos.iter() {
         if lr.cfg.slug() == slug {
             let repo = LocalRepository::new(lr.cfg.url(), lr.cfg.slug())?;
-            return repo.package_path(name);
+            // K23: the candidate's OWN version — the repo file is
+            // version-qualified, so the plan's chosen version is the
+            // file the transaction must read.
+            return repo.package_path(cand.name(), &cand.version);
         }
     }
     Err(Error::new(
@@ -587,6 +590,9 @@ fn persist_repo_epochs(
 }
 
 /// The shared solve-and-install path for `install` and `upgrade`.
+/// `up_to_date_ok` (upgrade's shape) tolerates a target no repo
+/// version beats: an already-latest package resolves to "nothing to
+/// do", while `install` keeps the loud `ConstraintUnsat` refusal.
 fn do_solve_and_install(
     fs: &mut dyn crate::Fs,
     paths: &PkgPaths,
@@ -594,6 +600,7 @@ fn do_solve_and_install(
     out: &mut dyn core::fmt::Write,
     targets: &Targets,
     allow_downgrade: bool,
+    up_to_date_ok: bool,
 ) -> Result<i32> {
     // recovery first: an interrupted transaction is rolled back
     crate::transaction::recover(fs, paths)?;
@@ -614,7 +621,20 @@ fn do_solve_and_install(
     // combined plan across targets
     let mut combined = crate::solver::Plan::empty();
     for target in targets.items[..targets.len].iter() {
-        let plan = solver.resolve_install(target.name(), target.req)?;
+        let plan = match solver.resolve_install(target.name(), target.req) {
+            Ok(plan) => plan,
+            // `pkg upgrade` asking for above(installed): no repo
+            // version beats the installed one — that package is
+            // simply up to date, not an error.
+            Err(e)
+                if up_to_date_ok
+                    && e.kind() == ErrorKind::ConstraintUnsat
+                    && solver.is_up_to_date(target.name(), target.req) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         for op in plan.ops[..plan.count as usize].iter() {
             if combined.count as usize >= limits::MAX_PACKAGES {
                 return Err(Error::new(ErrorKind::TooLarge, "combined plan cap"));
@@ -622,6 +642,13 @@ fn do_solve_and_install(
             combined.ops[combined.count as usize] = *op;
             combined.count += 1;
         }
+    }
+    // every target already at its repo's latest: say so and succeed
+    // (an empty transaction would still churn the state epoch).
+    if combined.count == 0 {
+        let _ = writeln!(out, "nothing to do (up to date)");
+        persist_repo_epochs(fs, paths, &epochs)?;
+        return Ok(0);
     }
     // print the plan BEFORE touching the filesystem
     let _ = writeln!(out, "plan:");
@@ -636,7 +663,7 @@ fn do_solve_and_install(
     for op in &combined.ops[..combined.count as usize] {
         match op {
             PlanOp::Install(c) | PlanOp::Upgrade(c) => {
-                let pkg_path = package_path_for(&repos, c.name())?;
+                let pkg_path = package_path_for(&repos, c)?;
                 let prev = database::load_record(tx.fs_mut(), paths, c.name()).ok();
                 let origin = repo_slug_for(&repos, c.name())?;
                 let manifest = tx.install_package(
@@ -686,7 +713,7 @@ fn cmd_install(
         let _ = writeln!(out, "usage: pkg install <name>[@<version>]");
         return Ok(2);
     }
-    do_solve_and_install(fs, paths, &mut net, out, &targets, allow_downgrade)
+    do_solve_and_install(fs, paths, &mut net, out, &targets, allow_downgrade, false)
 }
 
 fn cmd_remove(
@@ -769,11 +796,19 @@ fn cmd_upgrade(
         let _ = writeln!(out, "nothing installed");
         return Ok(0);
     }
+    // K23: the request per installed package is STRICTLY NEWER, not
+    // `any()`. The solver keeps an installed version whenever it
+    // satisfies the request, so the old `any()` targets resolved to
+    // [keep] forever — `pkg upgrade` was structurally a no-op (found
+    // live while building the upgrade lane: the plan printed "keep
+    // r1/hello" and the payload never moved). `above(installed)`
+    // fails the keep test, walks the candidates newest-first, and
+    // the downgrade policy still refuses anything older.
     let mut targets = Targets::new();
     for inst in &installed.items[..installed.len] {
-        targets.push(make_target(inst.name(), VersionReq::any())?)?;
+        targets.push(make_target(inst.name(), VersionReq::above(inst.version))?)?;
     }
-    do_solve_and_install(fs, paths, &mut net, out, &targets, false)
+    do_solve_and_install(fs, paths, &mut net, out, &targets, false, true)
 }
 
 fn cmd_list(

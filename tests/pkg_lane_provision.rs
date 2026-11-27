@@ -45,7 +45,11 @@ fn kernel_with_tree() -> Kernel {
     }
     for &(path, bytes) in &[
         ("/r1/index.aki", b"AKI1fixture".as_slice()),
-        ("/r1/r1.hello.akp", b"AKP1fixture".as_slice()),
+        // K23: the repo layout is version-qualified — the boot lane
+        // provisions BOTH versions, and the manager must read either
+        // one the plan picks (1.0.0 for install, 1.1.0 for upgrade).
+        ("/r1/r1.hello-1.0.0.akp", b"AKP1v10fixture".as_slice()),
+        ("/r1/r1.hello-1.1.0.akp", b"AKP1v11fixture".as_slice()),
         ("/pkg/trust", b"ATSTfixture".as_slice()),
         ("/pkg/repos/r1.repo", b"ARPSfixture".as_slice()),
     ] {
@@ -103,12 +107,15 @@ fn pm_open(
 #[test]
 fn the_manager_can_walk_its_whole_install_tree() {
     let mut k = kernel_with_tree();
-    // The read side: the anchors, the repo config, the repo itself.
+    // The read side: the anchors, the repo config, the repo itself —
+    // both version-qualified package files (K23: the upgrade round's
+    // transaction reads the 1.1.0 one).
     for path in [
         "/pkg/trust",
         "/pkg/repos/r1.repo",
         "/r1/index.aki",
-        "/r1/r1.hello.akp",
+        "/r1/r1.hello-1.0.0.akp",
+        "/r1/r1.hello-1.1.0.akp",
     ] {
         pm_open(&mut k, path, false, false, false)
             .unwrap_or_else(|e| panic!("the manager must READ {path}: {e:?}"));

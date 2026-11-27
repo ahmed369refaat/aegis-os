@@ -568,18 +568,33 @@ impl LocalRepository {
         p
     }
 
-    /// The package file path for an entry.
+    /// The package file path for a name@version pair.
+    ///
+    /// K23: the file name is VERSION-QUALIFIED —
+    /// `<root>/<name with / -> .>-<major.minor.patch[-pre]>.akp` — so
+    /// one repo directory can serve SEVERAL versions of a package
+    /// side by side (the upgrade fixture holds `r1.hello-1.0.0.akp`
+    /// and `r1.hello-1.1.0.akp` at once). The K22 layout
+    /// (`<name>.akp`, one file per NAME) could only ever offer
+    /// whichever version that single file carried: the index entry's
+    /// version field was metadata the reader never acted on, and an
+    /// upgrade had nothing newer to resolve without destroying the
+    /// old file first.
     ///
     /// # Errors
     /// [`ErrorKind::InvalidFormat`] for malformed names.
-    pub fn package_path(&self, name: &[u8]) -> Result<Path> {
+    pub fn package_path(&self, name: &[u8], ver: &SemVer) -> Result<Path> {
         validate_name(name)?;
-        let mut fname = [0u8; limits::MAX_NAME + 8];
+        // name (64) + '-' + version (3×u32 + dots + pre, ≤ 49) + ".akp"
+        let mut fname = [0u8; limits::MAX_NAME + 56];
         let mut n = 0usize;
         for &b in name {
             fname[n] = if b == b'/' { b'.' } else { b };
             n += 1;
         }
+        fname[n] = b'-';
+        n += 1;
+        n += ver.write_bytes(&mut fname[n..]);
         let mut p = self.root;
         p.push(&fname[..n])?;
         p.push_last(b".akp")?;
@@ -679,8 +694,9 @@ impl<'a> BrokerRepository<'a> {
         name: &[u8],
         sink: &mut dyn FnMut(&[u8]) -> Result<()>,
     ) -> Result<u64> {
-        let mut full = [0u8; 160];
-        // url + "/" + name
+        let mut full = [0u8; 256];
+        // url + "/" + object name (K23: version-qualified, so up to
+        // name + version + ".akp" in length)
         let url = &self.url[..self.url_len as usize];
         if url.len() + 1 + name.len() > full.len() {
             return Err(Error::new(ErrorKind::TooLarge, "object path too long"));
@@ -725,16 +741,23 @@ impl<'a> BrokerRepository<'a> {
     /// # Errors
     /// As [`Self::fetch_object`] plus cache-write errors.
     pub fn fetch_package(&mut self, fs: &mut dyn crate::Fs, entry: &IndexEntry) -> Result<Path> {
-        // cache name: <name-dots>.akp
-        let mut fname = [0u8; limits::MAX_NAME + 8];
+        // K23: the remote object and the cache file are
+        // version-qualified exactly like the local layout
+        // (`<name-dots>-<version>.akp`) — a broker repo serves the
+        // same multi-version directory a local one does.
+        let mut fname = [0u8; limits::MAX_NAME + 56];
         let mut n = 0usize;
         for &b in entry.name() {
             fname[n] = if b == b'/' { b'.' } else { b };
             n += 1;
         }
+        fname[n] = b'-';
+        n += 1;
+        n += entry.version.write_bytes(&mut fname[n..]);
+        fname[n..n + 4].copy_from_slice(b".akp");
+        n += 4;
         let mut cache_path = self.cache_dir;
         cache_path.push(&fname[..n])?;
-        cache_path.push_last(b".akp")?;
         let fd = fs.open(&cache_path, OpenFlags::WRONLY | OpenFlags::CREATE)?;
         let sink = &mut |chunk: &[u8]| -> Result<()> {
             let mut off = 0;
@@ -746,7 +769,7 @@ impl<'a> BrokerRepository<'a> {
             }
             Ok(())
         };
-        let res = self.fetch_object(entry.name(), sink);
+        let res = self.fetch_object(&fname[..n], sink);
         let sync_res = fs.sync(fd);
         let close_res = fs.close(fd);
         res?;
