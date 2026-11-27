@@ -479,6 +479,89 @@ impl Vfs {
         Ok(target)
     }
 
+    /// rename(2): re-parent an inode. K21 (the package manager's
+    /// commit primitive). POSIX subset: a file destination is
+    /// REPLACED; a directory destination is refused (EISDIR — this
+    /// kernel does not fold rmdir into rename); a directory cannot
+    /// move into its own subtree (EINVAL folds into EISDIR here,
+    /// the errno subset's documented approximation); the moved
+    /// inode KEEPS its identity (same id, same generation) — stale
+    /// InodeRefs stay valid across the rename, exactly the contract
+    /// open file descriptors rely on.
+    ///
+    /// Permission model: write+exec on BOTH parents (the source
+    /// parent for removal, the destination parent for creation) —
+    /// the union of unlink's and create's rules, so rename grants
+    /// nothing either alone would not.
+    pub fn rename(
+        &mut self,
+        root: InodeRef,
+        cwd: InodeRef,
+        from: &str,
+        to: &str,
+        creds: Credentials,
+    ) -> Result<InodeRef, VfsError> {
+        let (src_parent, src_name) = self.resolve_parent(root, cwd, from, creds)?;
+        self.check_access(src_parent, creds, Access::Write)?;
+        self.check_access(src_parent, creds, Access::Exec)?;
+        let src = self
+            .child_by_name(src_parent, src_name)
+            .ok_or(VfsError::NotFound)?;
+        if src == ROOT_ID {
+            return Err(VfsError::PermissionDenied);
+        }
+        let (dst_parent, dst_name) = self.resolve_parent(root, cwd, to, creds)?;
+        self.check_access(dst_parent, creds, Access::Write)?;
+        self.check_access(dst_parent, creds, Access::Exec)?;
+        if dst_name.len() > NAME_MAX {
+            return Err(VfsError::NameTooLong);
+        }
+        // A directory moving into its own subtree would orphan the
+        // subtree: walk the destination parent chain to the root and
+        // refuse if the moved node is on it.
+        if self.inode(src)?.kind == InodeKind::Dir {
+            let mut cur = dst_parent;
+            loop {
+                if cur == src {
+                    return Err(VfsError::IsADirectory);
+                }
+                if cur == ROOT_ID {
+                    break;
+                }
+                cur = self.inode(cur)?.parent;
+            }
+        }
+        // Destination handling: same node is a POSIX no-op success;
+        // a directory destination is refused; a file destination is
+        // replaced (its slot frees — generation discipline makes
+        // every stale reference to it fail closed).
+        if let Some(dst) = self.child_by_name(dst_parent, dst_name) {
+            if dst == src {
+                let generation = self.inode(src)?.generation;
+                return Ok(InodeRef {
+                    id: src,
+                    generation,
+                });
+            }
+            if self.inode(dst)?.kind == InodeKind::Dir {
+                return Err(VfsError::IsADirectory);
+            }
+            self.inodes[dst as usize] = None;
+        }
+        let generation = self.inode(src)?.generation;
+        {
+            let node = self.inode_mut(src)?;
+            node.parent = dst_parent;
+            node.name = [0; NAME_MAX];
+            node.name[..dst_name.len()].copy_from_slice(dst_name.as_bytes());
+            node.name_len = dst_name.len();
+        }
+        Ok(InodeRef {
+            id: src,
+            generation,
+        })
+    }
+
     /// Whether a directory has any entries (no allocation).
     #[must_use]
     pub fn has_children(&self, dir: u32) -> bool {

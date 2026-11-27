@@ -195,10 +195,20 @@ capabilities. No packets exist anywhere.
 
 ### 2.5 Userland
 
-Nothing: no libc port (musl planned, riding the Linux-compatible ABI of
-ADR-0003), no dynamic linker, no init/service manager, no shell, no
-coreutils, no package story. `ABI-VERSION.md` is a versioned contract
-for a 2-s syscall surface — the surface itself is the 2.1 gap.
+The shell, TTY, init and the gcc userland citizen are live (M3,
+ADR-0025/0030). The package story now exists as CODE: the `pkg/`
+crate (no_std, no_alloc, zero deps — Ed25519-verified atomic
+transactions, full threat model + 48 host tests) and its kernel arms
+(K21: `SYS_STAT` 34 / `SYS_RENAME` 35 / `SYS_LISTDIR` 32, Linux
+newfstatat 262 / rename 82 / renameat 264 / getdents64 259 mapped).
+What remains for the package story: the in-VM PM domain — the exec
+cage is 16 KiB while the manager's fixed no-alloc buffers (candidate
+universe, staging, LZ4 ring) need a larger cage contract; the
+`/pkg` tree + a repo image on the ext2 disk; argv provisioning at
+spawn. The design is `pkg/BUILD.md`'s boot-integration section.
+Still nothing on: musl/libc (planned, riding the ADR-0003 ABI),
+dynamic linker, coreutils. `ABI-VERSION.md` remains the versioned
+contract for the 2-s syscall surface.
 
 ### 2.6 Multi-architecture — the structural gap
 

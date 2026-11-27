@@ -27,7 +27,8 @@ use crate::{
         SYS_CHROOT, SYS_CLOSE, SYS_DUP, SYS_IOCTL, SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV,
         SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND, SYS_KILL, SYS_LISTDIR, SYS_MKDIR, SYS_MMAP,
         SYS_MUNMAP, SYS_NANOSLEEP, SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_PIPE_READ,
-        SYS_PIPE_WRITE, SYS_READ, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SPAWN, SYS_UNLINK, SYS_WRITE,
+        SYS_PIPE_WRITE, SYS_READ, SYS_RENAME, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SPAWN, SYS_STAT,
+        SYS_UNLINK, SYS_WRITE,
     },
     Kernel, KernelError,
 };
@@ -106,6 +107,27 @@ pub enum SysRequest<'a> {
     /// unlink(path) — files and *empty* directories.
     Unlink {
         path: &'a str,
+    },
+    /// stat(path, out) — K21: metadata without opening (the package
+    /// manager's destination-parent walks). Gated by an FsNode READ
+    /// capability on the node itself — stat reveals exactly what an
+    /// open-for-read would. The executor fills a 24-byte struct:
+    /// kind u8 @0 (0 file, 1 dir, 3 other — this VFS has no
+    /// symlinks), size u64 LE @8, perm u16 LE @16 (0o777). v1 maps
+    /// newfstatat(262) here; the count (24) returns.
+    Stat {
+        path: &'a str,
+        out: &'a mut [u8],
+    },
+    /// rename(from, to) — K21: the atomic re-parent, the package
+    /// manager's commit step. WRITE caps on BOTH parents (unlink ∪
+    /// create rules); a file destination is replaced, a directory
+    /// destination is refused (EISDIR), a directory cannot move into
+    /// its own subtree; the inode keeps its identity. v1 maps
+    /// rename(82) and renameat(264) here.
+    Rename {
+        from: &'a str,
+        to: &'a str,
     },
     /// list_dir(fd, buf) — Phase 7: the shell's `ls`. The fd must be
     /// an open descriptor on a directory (the open's capability gate
@@ -833,6 +855,56 @@ impl<const N: usize> Kernel<N> {
                     .map_err(SysError::Vfs)?;
                 Ok(SysValue::Unit)
             }
+            SysRequest::Stat { path, out } => {
+                // K21: metadata read. The path resolve itself gates
+                // traversal (exec bits, chroot clamp); the FsNode
+                // READ capability here is the open-for-read right —
+                // stat reveals nothing an open would not.
+                let r = self
+                    .vfs
+                    .resolve(root, cwd, path, creds)
+                    .map_err(SysError::Vfs)?;
+                self.require_fs_cap(domain_id, r, Rights::READ)?;
+                let (kind, size, _uid, _gid, mode) = self
+                    .vfs
+                    .stat(root, cwd, path, creds)
+                    .map_err(SysError::Vfs)?;
+                if out.len() < 24 {
+                    return Err(SysError::InvalidArgument(out.len() as u64));
+                }
+                // The 24-byte contract (the manager's adapter, BUILD.md):
+                // kind@0, size u64 LE@8, perm u16 LE@16, reserved pad.
+                out[0] = match kind {
+                    InodeKind::File => 0,
+                    InodeKind::Dir => 1,
+                    _ => 3,
+                };
+                out[1..8].fill(0);
+                out[8..16].copy_from_slice(&(size as u64).to_le_bytes());
+                out[16..18].copy_from_slice(&(mode.0 & 0o777).to_le_bytes());
+                out[18..24].fill(0);
+                Ok(SysValue::Count(24))
+            }
+            SysRequest::Rename { from, to } => {
+                // K21: the commit primitive. Both parents carry the
+                // WRITE capability — the union of unlink's and
+                // create's rules, so rename grants nothing either
+                // alone would not.
+                let from_parent = self
+                    .vfs
+                    .parent_ref(root, cwd, from, creds)
+                    .map_err(SysError::Vfs)?;
+                self.require_fs_cap(domain_id, from_parent, Rights::WRITE)?;
+                let to_parent = self
+                    .vfs
+                    .parent_ref(root, cwd, to, creds)
+                    .map_err(SysError::Vfs)?;
+                self.require_fs_cap(domain_id, to_parent, Rights::WRITE)?;
+                self.vfs
+                    .rename(root, cwd, from, to, creds)
+                    .map_err(SysError::Vfs)?;
+                Ok(SysValue::Unit)
+            }
             SysRequest::ListDir { fd, buf } => {
                 // The fd's open already gated the path (an FsNode READ
                 // capability on the directory); listing adds no right
@@ -1355,6 +1427,8 @@ fn syscall_nr(req: &SysRequest<'_>) -> u8 {
         SysRequest::Chroot { .. } => SYS_CHROOT,
         SysRequest::Mkdir { .. } => SYS_MKDIR,
         SysRequest::Unlink { .. } => SYS_UNLINK,
+        SysRequest::Stat { .. } => SYS_STAT,
+        SysRequest::Rename { .. } => SYS_RENAME,
         SysRequest::ListDir { .. } => SYS_LISTDIR,
         SysRequest::NetSend { .. } => SYS_NET_SEND,
         SysRequest::Mmap { .. } => SYS_MMAP,

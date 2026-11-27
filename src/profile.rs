@@ -8,7 +8,7 @@
 //! - Network egress is brokered: `netd_profile` is the ONLY profile that
 //!   carries NET_* rights, and its sends are kernel rate-limited per client.
 //! - The Linux-like process syscalls (PIPE/DUP/KILL/CHROOT/MKDIR/UNLINK/
-//!   LISTDIR) belong to the service profile exclusively.
+//!   LISTDIR/STAT/RENAME) belong to the service profile exclusively.
 
 use crate::capability::Rights;
 use crate::syscall::{
@@ -16,7 +16,7 @@ use crate::syscall::{
     SYS_FORK, SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY,
     SYS_IPC_SEND, SYS_KILL, SYS_LISTDIR, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP,
     SYS_NET_RECV, SYS_NET_SEND, SYS_OPEN, SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_READ,
-    SYS_SCHED_YIELD, SYS_SIGACTION, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
+    SYS_RENAME, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_STAT, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
 };
 
 /// The surface a domain of this class keeps while *degraded* (the
@@ -154,6 +154,8 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_MKDIR)
                 | (1u64 << SYS_UNLINK)
                 | (1u64 << SYS_LISTDIR)
+                | (1u64 << SYS_STAT)
+                | (1u64 << SYS_RENAME)
                 | (1u64 << SYS_MMAP)
                 | (1u64 << SYS_MUNMAP)
                 | (1u64 << SYS_FORK)
@@ -166,8 +168,8 @@ pub const fn service_profile() -> DomainProfile {
                 | (1u64 << SYS_EXIT),
         ),
         // Degraded service: existing local I/O and IPC stay; every path
-        // that opens NEW resources (open/mkdir/unlink) or manages other
-        // domains (kill/chroot) drops.
+        // that opens NEW resources (open/mkdir/unlink/stat/rename) or
+        // manages other domains (kill/chroot) drops.
         degraded_syscalls: SyscallMask::from_bits(
             (1u64 << SYS_READ)
                 | (1u64 << SYS_WRITE)
@@ -628,6 +630,8 @@ mod tests {
             SYS_MKDIR,
             SYS_UNLINK,
             SYS_LISTDIR,
+            SYS_STAT,
+            SYS_RENAME,
         ] {
             assert!(
                 s.syscalls.is_allowed(allowed).unwrap(),
@@ -649,6 +653,8 @@ mod tests {
                 SYS_MKDIR,
                 SYS_UNLINK,
                 SYS_LISTDIR,
+                SYS_STAT,
+                SYS_RENAME,
             ] {
                 assert!(
                     !p.syscalls.is_allowed(denied).unwrap(),

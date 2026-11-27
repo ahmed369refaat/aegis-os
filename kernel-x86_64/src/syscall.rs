@@ -52,13 +52,13 @@ use aegis_os::syscall::{
     SYSCALL_COUNT, SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_DEVREG, SYS_EXEC, SYS_EXIT, SYS_FORK,
     SYS_IPC_CALL, SYS_IPC_GRANT, SYS_IPC_RECV, SYS_IPC_RECV_WAIT, SYS_IPC_REPLY, SYS_IPC_SEND,
     SYS_KILL, SYS_LISTDIR, SYS_MKDIR, SYS_MMAP, SYS_MUNMAP, SYS_NANOSLEEP, SYS_NET_RECV,
-    SYS_NET_SEND, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_SCHED_YIELD, SYS_SIGACTION, SYS_SIGRETURN,
-    SYS_UNLINK, SYS_WAIT, SYS_WRITE,
+    SYS_NET_SEND, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_RENAME, SYS_SCHED_YIELD, SYS_SIGACTION,
+    SYS_SIGRETURN, SYS_STAT, SYS_UNLINK, SYS_WAIT, SYS_WRITE,
 };
 #[cfg(test)]
 use aegis_os::syscall::{
     SYSCALL_COUNT, SYS_CLOCK_GETTIME, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_KILL, SYS_LISTDIR,
-    SYS_NANOSLEEP, SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_WAIT, SYS_WRITE,
+    SYS_NANOSLEEP, SYS_RENAME, SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_STAT, SYS_WAIT, SYS_WRITE,
 };
 
 /// errno values this layer returns (negated, Linux-style, in RAX).
@@ -195,6 +195,15 @@ mod tests {
                                                                    // Phase 7: getdents64(259) joins — the
                                                                    // shell's ls over the internal ListDir.
         assert_eq!(translate_nr(259, true), Some(SYS_LISTDIR as u64)); // getdents64 -> SYS_LISTDIR
+                                                                       // K21: the package manager's arms join the whitelist —
+                                                                       // newfstatat(262) -> STAT, rename(82)/renameat(264) ->
+                                                                       // RENAME; old stat(4) and fstat(5) stay unmapped (the
+                                                                       // subset speaks the modern arm only).
+        assert_eq!(translate_nr(262, true), Some(SYS_STAT as u64));
+        assert_eq!(translate_nr(82, true), Some(SYS_RENAME as u64));
+        assert_eq!(translate_nr(264, true), Some(SYS_RENAME as u64));
+        assert_eq!(translate_nr(4, true), None, "old stat stays unmapped");
+        assert_eq!(translate_nr(5, true), None, "fstat stays unmapped");
         for nr in [4u64, 12, 32, 39, 63, 64, 293] {
             assert_eq!(translate_nr(nr, true), None, "nr {nr}");
         }
@@ -349,6 +358,12 @@ mod exec {
             Decision::Allowed if nr8 == SYS_NET_SEND => sys_net_send(run, a1, a2),
             Decision::Allowed if nr8 == SYS_NET_RECV => sys_net_recv(run, a1, a2),
             Decision::Allowed if nr8 == SYS_UNLINK => sys_unlink(run, a1),
+            // K21: the package manager's remaining arms — stat for
+            // the destination-parent walks, rename for the journaled
+            // commit. (getdents already ran as SYS_LISTDIR; execve
+            // marshals argv since Phase 6 S3.)
+            Decision::Allowed if nr8 == SYS_STAT => sys_stat(run, a1, a2),
+            Decision::Allowed if nr8 == SYS_RENAME => sys_rename(run, a1, a2),
             Decision::Allowed if nr8 == SYS_LISTDIR => sys_listdir(run, a1, a2, a3),
             Decision::Allowed if nr8 == SYS_CHROOT => sys_chroot(run, a1),
             Decision::Allowed if nr8 == SYS_MMAP => sys_mmap(run, a1, a2, a3, _a4, linux_abi),
@@ -842,6 +857,89 @@ mod exec {
             return (-EINVAL) as u64;
         };
         match k.execute(run.domain, SysRequest::Unlink { path }) {
+            Ok(v) => sysabi::rax_of(v),
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// SYS_STAT(path, out) — K21: the 24-byte metadata struct. The
+    /// core fills a kernel buffer once (no double-fetch); the copy
+    /// out rides the blessed SMAP window like every byte-out arm.
+    /// The out-buffer bound is fixed (24) — the manager's adapter
+    /// sizes it exactly (BUILD.md); anything shorter is EINVAL
+    /// before the core runs.
+    fn sys_stat(run: &mut crate::sched::context::UserRun, path_va: u64, out_va: u64) -> u64 {
+        use crate::mm::user_range::copy_out_bytes;
+        use aegis_os::sys::SysRequest;
+        const STAT_OUT: u64 = 24;
+        if !validate_user_range(run, out_va, STAT_OUT, STAT_OUT) {
+            if let Some(k) = context::kernel_mut() {
+                let _ = k.report_fault(run.domain);
+            }
+            return (-EFAULT) as u64;
+        }
+        let Some(k) = context::kernel_mut() else {
+            return (-ENOSYS) as u64;
+        };
+        let mut pathbuf = [0u8; sysabi::MAX_PATH];
+        let len = match read_user_path(run, k, path_va, &mut pathbuf) {
+            Ok(l) => l,
+            Err(e) => return e as u64,
+        };
+        let Ok(path) = core::str::from_utf8(&pathbuf[..len]) else {
+            return (-EINVAL) as u64;
+        };
+        let mut kbuf = [0u8; 24];
+        match k.execute(
+            run.domain,
+            SysRequest::Stat {
+                path,
+                out: &mut kbuf,
+            },
+        ) {
+            Ok(SysValue::Count(24)) => {
+                IN_USER_COPY.store(true, Ordering::SeqCst);
+                if crate::hw::smap_active() {
+                    crate::hw::stac();
+                }
+                let wrote = copy_out_bytes(out_va, &kbuf, &|va, b| memops::write_u8_va(va, b));
+                if crate::hw::smap_active() {
+                    crate::hw::clac();
+                }
+                IN_USER_COPY.store(false, Ordering::SeqCst);
+                wrote
+            }
+            Ok(_) => 0,
+            Err(e) => sysabi::errno_of(&e) as u64,
+        }
+    }
+
+    /// SYS_RENAME(from, to) — K21: the atomic re-parent. Both paths
+    /// ride the SAME bounded, page-checked copy-in as every path arm
+    /// (no second path reader exists to get wrong); the core
+    /// re-resolves both parents and gates the WRITE caps itself.
+    fn sys_rename(run: &mut crate::sched::context::UserRun, from_va: u64, to_va: u64) -> u64 {
+        use aegis_os::sys::SysRequest;
+        let Some(k) = context::kernel_mut() else {
+            return (-ENOSYS) as u64;
+        };
+        let mut frombuf = [0u8; sysabi::MAX_PATH];
+        let flen = match read_user_path(run, k, from_va, &mut frombuf) {
+            Ok(l) => l,
+            Err(e) => return e as u64,
+        };
+        let Ok(from) = core::str::from_utf8(&frombuf[..flen]) else {
+            return (-EINVAL) as u64;
+        };
+        let mut tobuf = [0u8; sysabi::MAX_PATH];
+        let tlen = match read_user_path(run, k, to_va, &mut tobuf) {
+            Ok(l) => l,
+            Err(e) => return e as u64,
+        };
+        let Ok(to) = core::str::from_utf8(&tobuf[..tlen]) else {
+            return (-EINVAL) as u64;
+        };
+        match k.execute(run.domain, SysRequest::Rename { from, to }) {
             Ok(v) => sysabi::rax_of(v),
             Err(e) => sysabi::errno_of(&e) as u64,
         }

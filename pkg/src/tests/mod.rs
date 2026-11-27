@@ -376,7 +376,7 @@ mod dbtx {
     enum Node {
         File(Vec<u8>, u16),
         Dir,
-        Symlink(Vec<u8>),
+        Symlink,
     }
 
     /// In-memory `Fs` with a byte budget (None = unlimited) for the
@@ -408,9 +408,8 @@ mod dbtx {
                 .insert(path.to_vec(), Node::File(data.to_vec(), perm));
         }
 
-        fn put_symlink(&mut self, path: &[u8], target: &[u8]) {
-            self.nodes
-                .insert(path.to_vec(), Node::Symlink(target.to_vec()));
+        fn put_symlink(&mut self, path: &[u8], _target: &[u8]) {
+            self.nodes.insert(path.to_vec(), Node::Symlink);
         }
 
         fn mkdirp(&mut self, path: &[u8]) {
@@ -452,10 +451,8 @@ mod dbtx {
             let p = path.as_bytes().to_vec();
             let writable = flags.has(OpenFlags::WRONLY);
             if writable {
-                if flags.has(OpenFlags::EXCL) {
-                    if self.nodes.contains_key(&p) {
-                        return Err(exists_err());
-                    }
+                if flags.has(OpenFlags::EXCL) && self.nodes.contains_key(&p) {
+                    return Err(exists_err());
                 }
                 if flags.has(OpenFlags::CREATE) && !self.nodes.contains_key(&p) {
                     // parent must exist and be a dir
@@ -547,7 +544,7 @@ mod dbtx {
                     size: 0,
                     perm: 0o755,
                 }),
-                Some(Node::Symlink(_)) => Ok(Stat {
+                Some(Node::Symlink) => Ok(Stat {
                     kind: FileKind::Symlink,
                     size: 0,
                     perm: 0o777,
@@ -572,7 +569,7 @@ mod dbtx {
         fn unlink(&mut self, path: &Path) -> crate::Result<()> {
             let p = path.as_bytes().to_vec();
             match self.nodes.get(&p) {
-                Some(Node::File(..)) | Some(Node::Symlink(_)) => {
+                Some(Node::File(..)) | Some(Node::Symlink) => {
                     self.nodes.remove(&p);
                     Ok(())
                 }
@@ -667,35 +664,13 @@ mod dbtx {
 
     // ── repo fixtures ──
 
-    struct RepoKeys {
-        _root: ed25519::SecretKey,
-        repo: ed25519::SecretKey,
-    }
-
     /// Build a test repo: MemFs layout at `/r1` with a signed index,
     /// packages, and a config under `/pkg/repos`.
-    fn build_repo(
-        fs: &mut MemFs,
-        pkgs: &[(
-            &[u8],
-            SemVer,
-            &[(&[u8], &[u8], u16)],
-            &[(&[u8], VersionReq)],
-        )],
-    ) -> RepoKeys {
-        build_repo_epoch(fs, pkgs, 7)
+    fn build_repo(fs: &mut MemFs, pkgs: &[BorrowedPkgSpec<'_>]) {
+        build_repo_epoch(fs, pkgs, 7);
     }
 
-    fn build_repo_epoch(
-        fs: &mut MemFs,
-        pkgs: &[(
-            &[u8],
-            SemVer,
-            &[(&[u8], &[u8], u16)],
-            &[(&[u8], VersionReq)],
-        )],
-        epoch: u64,
-    ) -> RepoKeys {
+    fn build_repo_epoch(fs: &mut MemFs, pkgs: &[BorrowedPkgSpec<'_>], epoch: u64) {
         let root = [0x11; 32];
         let repo = [0x22; 32];
         fs.mkdirp(b"/r1");
@@ -765,7 +740,6 @@ mod dbtx {
         let mut abuf = [0u8; 4 + 2 + 1 + 8 * 32];
         let an = anchors.serialize(&mut abuf).unwrap();
         fs.put_file(b"/pkg/trust", &abuf[..an], 0o644);
-        RepoKeys { _root: root, repo }
     }
 
     fn run(fs: &mut MemFs, args: &[&[u8]]) -> (i32, String) {
@@ -778,11 +752,21 @@ mod dbtx {
         (code, out)
     }
 
+    /// One repo package spec: (name, version, files, deps).
     type PkgSpec = (
         &'static [u8],
         SemVer,
         Vec<(&'static [u8], &'static [u8], u16)>,
         Vec<(&'static [u8], VersionReq)>,
+    );
+
+    /// The borrowed shape `build_repo` consumes (callers declare
+    /// specs as arrays of tuples; this keeps signatures readable).
+    type BorrowedPkgSpec<'a> = (
+        &'a [u8],
+        SemVer,
+        &'a [(&'a [u8], &'a [u8], u16)],
+        &'a [(&'a [u8], VersionReq)],
     );
 
     fn hello_pkg() -> PkgSpec {
@@ -1022,7 +1006,7 @@ mod dbtx {
             let tx2 = Transaction::begin(tx1.fs_field(), &paths);
             match tx2 {
                 Err(e) => assert_eq!(e.kind(), ErrorKind::Locked, "second must be Locked"),
-                Ok(mut t2) => {
+                Ok(t2) => {
                     let _ = t2.rollback();
                     panic!("second begin must fail while the lock is held");
                 }
@@ -1037,7 +1021,7 @@ mod dbtx {
         let (name, ver, files, deps) = hello_pkg();
         build_repo(&mut fs, &[(name, ver, &files, &deps)]);
         // plant /bin as a symlink to /pkg (the manager's tree)
-        fs.nodes.remove(&b"/bin".to_vec());
+        fs.nodes.remove(b"/bin".as_slice());
         fs.put_symlink(b"/bin", b"/pkg");
         let (code, out) = run(&mut fs, &[b"install", b"r1/hello"]);
         assert_eq!(code, 1, "symlink parent must be refused: {out}");
@@ -1046,8 +1030,8 @@ mod dbtx {
             "nothing may land through the symlink"
         );
         assert!(matches!(
-            fs.nodes.get(&b"/bin".to_vec()),
-            Some(crate::tests::dbtx::Node::Symlink(_))
+            fs.nodes.get(b"/bin".as_slice()),
+            Some(crate::tests::dbtx::Node::Symlink)
         ));
         // and the manager's own state is untouched
         assert!(!fs.exists(b"/pkg/db/hello"), "no file inside /pkg");
@@ -1063,7 +1047,7 @@ mod dbtx {
         // manifest whose file size = seed + 20 repeated bytes
         let mut out_expected = seed.to_vec();
         let last = *seed.last().unwrap();
-        out_expected.extend(core::iter::repeat(last).take(20));
+        out_expected.extend(std::iter::repeat_n(last, 20));
         let mut m = Manifest::new(b"r1/lz", SemVer::release(1, 0, 0)).unwrap();
         m.push_file(FileEntry {
             path: Path::from_bytes(b"/bin/lz").unwrap(),
@@ -1081,8 +1065,8 @@ mod dbtx {
         let mut mbuf = [0u8; 4096];
         let mlen = m.serialize(&mut mbuf).unwrap();
         let payload_off = 4 + 4 + mlen + 64;
-        for i in payload_off..n2 {
-            buf[i] = 0;
+        for b in buf[payload_off..n2].iter_mut() {
+            *b = 0;
         }
         buf[payload_off..payload_off + n].copy_from_slice(&payload[..n]);
         let total = payload_off + n;
@@ -1123,7 +1107,7 @@ mod dbtx {
         // third block, mid-decode
         // token 0x1F: literal count 1, match nibble 15 (extended)
         let mut block = vec![0x1Fu8, 0x41, 0x01, 0x00];
-        block.extend(core::iter::repeat(0xFFu8).take(15));
+        block.extend(std::iter::repeat_n(0xFFu8, 15));
         block.push(0xFB); // mlen = 4 + 15 + 15*255 + 251 = 4095
         let mut payload = vec![1u8]; // mode = lz4
         for _ in 0..3 {
@@ -1150,8 +1134,8 @@ mod dbtx {
         let mut mbuf = [0u8; 4096];
         let mlen = m.serialize(&mut mbuf).unwrap();
         let payload_off = 4 + 4 + mlen + 64;
-        for i in payload_off..n2 {
-            buf[i] = 0;
+        for b in buf[payload_off..n2].iter_mut() {
+            *b = 0;
         }
         buf[payload_off..payload_off + payload.len()].copy_from_slice(&payload);
         let total = payload_off + payload.len();

@@ -66,9 +66,13 @@ pub fn linux_nr_to_core(nr: u64) -> Option<u64> {
         231 => Some(SYS_EXIT as u64),          // exit_group(2) — the alias
         83 => Some(SYS_MKDIR as u64),          // mkdir(2) — the Phase-6 ring-3 arm
         87 => Some(SYS_UNLINK as u64),         // unlink(2) — unlink+rmdir folded, errno-exact
-        161 => Some(SYS_CHROOT as u64),        // chroot(2) — the cwd moves with the root
+        82 => Some(SYS_RENAME as u64),         // rename(2) — K21: the PM's commit primitive
+        264 => Some(SYS_RENAME as u64),        // renameat(2) — the dirfd-prefixed alias
+        262 => Some(SYS_STAT as u64),          // newfstatat(2) — K21; old stat(4)/fstat(5) stay
+        // unmapped (the subset speaks the modern arm)
+        161 => Some(SYS_CHROOT as u64), // chroot(2) — the cwd moves with the root
         259 => Some(SYS_LISTDIR as u64), // getdents64(2) — names NUL-separated, count returned
-        _ => None,                       // the whitelist's edge
+        _ => None,                      // the whitelist's edge
     }
 }
 
@@ -179,6 +183,17 @@ pub const SYS_LISTDIR: u8 = 32;
 /// register value on this bus family). Internal nr only — not a
 /// Linux ABI number.
 pub const SYS_DEVREG: u8 = 33;
+
+/// stat(2)-like: metadata of a path without opening it. The executor
+/// fills a 24-byte user struct — kind u8 @0 (0 file, 1 dir, 3 other;
+/// this VFS has no symlinks), size u64 LE @8, perm u16 LE @16
+/// (0o777). K21: the package manager's destination-parent walks.
+pub const SYS_STAT: u8 = 34;
+/// rename(2)-like: the atomic re-parent (the package manager's
+/// commit step). WRITE caps on BOTH parents; a file destination is
+/// replaced; a directory destination is refused; the inode keeps its
+/// identity (same id + generation). K21.
+pub const SYS_RENAME: u8 = 35;
 
 pub const SYS_EXIT: u8 = 63;
 
@@ -473,6 +488,9 @@ mod adr0003_tests {
             (83, SYS_MKDIR),          // mkdir(2) — the Phase-6 ring-3 arm
             (87, SYS_UNLINK),         // unlink(2) — unlink+rmdir folded
             (161, SYS_CHROOT),        // chroot(2) — confinement, cwd moves with the root
+            (82, SYS_RENAME),         // rename(2) — K21: the PM's commit primitive
+            (264, SYS_RENAME),        // renameat(2) — the dirfd-prefixed alias
+            (262, SYS_STAT),          // newfstatat(2) — K21: the PM's parent walks
         ];
         for &(nr, op) in cases {
             assert_eq!(linux_nr_to_core(nr), Some(u64::from(op)), "nr {nr}");

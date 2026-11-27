@@ -67,7 +67,6 @@ mod host_main {
 
     impl Fs for StdFs {
         fn open(&mut self, path: &Path, flags: OpenFlags) -> aegis_pkg::Result<u32> {
-            use std::io::Write;
             let real = self.real(path);
             let mut opts = std::fs::OpenOptions::new();
             if flags.has(OpenFlags::WRONLY) {
@@ -84,10 +83,8 @@ mod host_main {
             } else {
                 opts.read(true);
             }
-            if flags.has(OpenFlags::DIRECTORY) {
-                if !real.is_dir() {
-                    return Err(io_err(std::io::Error::from(std::io::ErrorKind::NotFound)));
-                }
+            if flags.has(OpenFlags::DIRECTORY) && !real.is_dir() {
+                return Err(io_err(std::io::Error::from(std::io::ErrorKind::NotFound)));
             }
             let f = opts.open(&real).map_err(io_err)?;
             let fd = next_fd();
@@ -123,7 +120,6 @@ mod host_main {
         }
 
         fn sync(&mut self, fd: u32) -> aegis_pkg::Result<()> {
-            use std::io::Write;
             let mut table = fd_table().lock().unwrap();
             match table.get_mut(&fd) {
                 Some(f) => f.sync_all().map_err(io_err),
@@ -255,12 +251,13 @@ mod target_main {
     pub const SYS_MKDIR: u64 = 16;
     pub const SYS_UNLINK: u64 = 17;
     pub const SYS_EXIT: u64 = 63;
-    // K21 wiring points: the VFS arms the kernel still has to
-    // expose for the manager's full surface (BUILD.md documents
-    // these; until then these numbers are reserved).
-    pub const SYS_STAT: u64 = 64;
-    pub const SYS_RENAME: u64 = 65;
-    pub const SYS_GETDENTS: u64 = 66;
+    /// stat(2): the 24-byte metadata struct (K21 — landed).
+    pub const SYS_STAT: u64 = 34;
+    /// rename(2): the atomic re-parent (K21 — landed).
+    pub const SYS_RENAME: u64 = 35;
+    /// list_dir(fd, buf): NUL-separated names + count (the kernel's
+    /// getdents64 subset; Linux 259 maps here).
+    pub const SYS_GETDENTS: u64 = 32;
 
     /// Raw syscall. Register order follows the kernel's ABI:
     /// rdi, rsi, rdx, with the number in rax.

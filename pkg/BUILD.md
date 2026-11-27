@@ -60,9 +60,9 @@ method to exactly one syscall:
 | `mkdir`      | SYS_MKDIR                               | 16  |
 | `unlink`     | SYS_UNLINK                              | 17  |
 | `exit`       | SYS_EXIT                                | 63  |
-| `stat`       | SYS_STAT *(reserved nr 64)*            | 64* |
-| `rename`     | SYS_RENAME *(reserved nr 65)*          | 65* |
-| `getdents`   | SYS_GETDENTS *(reserved nr 66)*        | 66* |
+| `stat`       | SYS_STAT (Linux: newfstatat 262)         | 34  |
+| `rename`     | SYS_RENAME (Linux: rename 82/renameat 264) | 35 |
+| `getdents`   | SYS_LISTDIR (Linux: getdents64 259)      | 32  |
 
 Network access goes **only through the broker**: the domain's mask
 additionally admits `SYS_NET_SEND`/`SYS_NET_RECV` (nr 9/10) — the
@@ -75,16 +75,31 @@ future cached VFS becomes correct without touching this crate).
 `PROT_EXEC`), `spawn`, `ipc_send/recv`, `kill`, `chroot` — and the
 mask is attenuation-only, so nothing downstream can widen it.
 
-### Kernel wiring points (K21, honestly stated)
+### Kernel wiring (K21 — landed)
 
-The kernel today exposes `read/write/open/close/mkdir/unlink/exit`
-and the broker net arms; `stat`, `rename`, and `getdents` are
-reserved numbers in the adapter with the arms still to land in the
-VFS (the K21 items). Until they do, the target binary compiles and
-boots but install/verify return ENOSYS for those three — the
-library, transactions, solver, and all 48 host tests are fully
-proven meanwhile (the `Fs` trait is the exact contract the kernel
-must implement).
+The whole `Fs` surface is live in the kernel now:
+
+- `read/write/open/close/mkdir/unlink/exit` — since Phase 6/K20.
+- `stat` — `SYS_STAT` (34): the 24-byte struct contract below, core
+  executor gated by an FsNode READ capability, Linux `newfstatat`
+  (262) mapped in the v1 whitelist (old stat(4)/fstat(5) stay
+  deliberately unmapped). Core-tested
+  (`stat_fills_the_24_byte_contract_and_gates`).
+- `rename` — `SYS_RENAME` (35): the atomic re-parent with POSIX
+  file-destination replacement, identity preservation (same inode
+  id + generation), EISDIR refusals for directory destinations and
+  subtree cycles, WRITE caps on both parents; Linux `rename`(82) /
+  `renameat`(264) mapped. Core-tested
+  (`rename_reparents_replaces_and_refuses`).
+- `getdents` — the kernel's existing `SYS_LISTDIR` (32): NUL-separated
+  names + count (the documented getdents64 subset semantics; Linux
+  259 maps there since Phase 7).
+- `execve` argv marshalling — live since Phase 6 S3 (`sys_exec` builds
+  the `[rsp] = argc, argv pointers` user stack).
+
+The `Fs` trait's 24-byte stat struct: `kind u8 @0` (0 file, 1 dir, 3
+other — the kernel VFS has no symlinks), `size u64 LE @8`, `perm
+u16 LE @16` (0o777).
 
 ## Wiring into the boot image
 
@@ -98,8 +113,8 @@ must implement).
    fixed arrays — the no-alloc design), and the standard data-page
    boot info.
 3. The entry contract: `pkg_main(argc, argv)` with NUL-terminated
-   byte-string arguments (the execve argv marshalling is the same
-   K21 wiring item as `/bin/hello`'s argument passing).
+   byte-string arguments (the execve argv marshalling landed with
+   Phase 6 S3; the boot-spawn path is the remaining integration).
 4. Provision `/pkg/trust` (root anchors) at image build time —
    never through the manager.
 

@@ -2291,6 +2291,308 @@ mod tests {
         ));
     }
 
+    /// K21: stat(path, out) — the 24-byte metadata contract (the
+    /// package manager's parent-walk primitive). Shape: kind u8 @0
+    /// (0 file, 1 dir), size u64 LE @8, perm u16 LE @16; a short
+    /// out-buffer is InvalidArgument before anything runs; a
+    /// missing path is NotFound; the mask (parser profile, no
+    /// SYS_STAT) refuses before the VFS is touched.
+    #[test]
+    fn stat_fills_the_24_byte_contract_and_gates() {
+        use crate::sys::{SysError, SysRequest, SysValue};
+        use crate::vfs::{Mode, VfsError};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/pub",
+                mode: Mode(0o755),
+            },
+        )
+        .unwrap();
+        // create a file with known content and mode
+        match k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/pub/hello",
+                mode: Mode(0o750),
+                create: true,
+                read: true,
+                write: true,
+                truncate: false,
+            },
+        ) {
+            Ok(SysValue::Fd(fd)) => {
+                let payload = b"hello world\n";
+                match k.syscall(1, SysRequest::Write { fd, bytes: payload }) {
+                    Ok(SysValue::Count(n)) => assert_eq!(n, payload.len()),
+                    other => panic!("write failed: {:?}", other.map(|_| ())),
+                }
+                let _ = k.syscall(1, SysRequest::Close { fd });
+            }
+            other => panic!("create failed: {:?}", other.map(|_| ())),
+        }
+        // stat the file
+        let mut out = [0u8; 24];
+        match k.syscall(
+            1,
+            SysRequest::Stat {
+                path: "/pub/hello",
+                out: &mut out,
+            },
+        ) {
+            Ok(SysValue::Count(n)) => assert_eq!(n, 24, "the struct is exactly 24 bytes"),
+            other => panic!("stat failed: {:?}", other.map(|_| ())),
+        }
+        assert_eq!(out[0], 0, "kind: file");
+        assert_eq!(
+            u64::from_le_bytes([
+                out[8], out[9], out[10], out[11], out[12], out[13], out[14], out[15]
+            ]),
+            12,
+            "size"
+        );
+        assert_eq!(u16::from_le_bytes([out[16], out[17]]), 0o750, "perm");
+        // stat the directory
+        let mut dout = [0u8; 24];
+        match k.syscall(
+            1,
+            SysRequest::Stat {
+                path: "/pub",
+                out: &mut dout,
+            },
+        ) {
+            Ok(SysValue::Count(n)) => assert_eq!(n, 24),
+            other => panic!("dir stat failed: {:?}", other.map(|_| ())),
+        }
+        assert_eq!(dout[0], 1, "kind: dir");
+        // short buffer: refused before anything runs
+        let mut short = [0u8; 23];
+        assert!(matches!(
+            k.syscall(
+                1,
+                SysRequest::Stat {
+                    path: "/pub/hello",
+                    out: &mut short
+                }
+            ),
+            Err(SysError::InvalidArgument(23))
+        ));
+        // missing path
+        let mut out2 = [0u8; 24];
+        assert!(matches!(
+            k.syscall(
+                1,
+                SysRequest::Stat {
+                    path: "/pub/nope",
+                    out: &mut out2
+                }
+            ),
+            Err(SysError::Vfs(VfsError::NotFound))
+        ));
+        // the mask gate: parser profile has no SYS_STAT
+        k.create_domain(2, parser_profile()).unwrap();
+        let mut out3 = [0u8; 24];
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::Stat {
+                    path: "/pub/hello",
+                    out: &mut out3
+                }
+            ),
+            Err(SysError::Masked(crate::syscall::SYS_STAT))
+        ));
+    }
+
+    /// K21: rename(from, to) — the atomic re-parent (the package
+    /// manager's commit step). Identity survives (same inode id +
+    /// generation — the fd stays valid, exactly the POSIX contract);
+    /// a file destination is REPLACED; a directory destination is
+    /// refused EISDIR; a directory cannot move into its own
+    /// subtree; a parser-profile domain (no SYS_RENAME) is Masked.
+    #[test]
+    fn rename_reparents_replaces_and_refuses() {
+        use crate::sys::{SysError, SysRequest, SysValue};
+        use crate::vfs::{Mode, VfsError};
+        let mut k = Kernel::new();
+        k.create_domain_with(1, service_profile(), 0, 0, 0).unwrap();
+        for d in ["/a", "/b"] {
+            k.syscall(
+                1,
+                SysRequest::Mkdir {
+                    path: d,
+                    mode: Mode(0o755),
+                },
+            )
+            .unwrap();
+        }
+        // /a/src with content "MOVE"
+        let fd = match k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/a/src",
+                mode: Mode(0o755),
+                create: true,
+                read: true,
+                write: true,
+                truncate: false,
+            },
+        ) {
+            Ok(SysValue::Fd(fd)) => fd,
+            other => panic!("create: {:?}", other.map(|_| ())),
+        };
+        match k.syscall(1, SysRequest::Write { fd, bytes: b"MOVE" }) {
+            Ok(SysValue::Count(4)) => {}
+            other => panic!("write: {:?}", other.map(|_| ())),
+        }
+        // a READ fd on the source (offset 0), held across the
+        // rename — the identity proof: after the move it still
+        // reads the moved content.
+        let rfd = match k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/a/src",
+                mode: Mode(0o755),
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+            },
+        ) {
+            Ok(SysValue::Fd(fd)) => fd,
+            other => panic!("read-open: {:?}", other.map(|_| ())),
+        };
+        // a pre-existing destination file to replace
+        match k.syscall(
+            1,
+            SysRequest::Open {
+                path: "/b/dst",
+                mode: Mode(0o755),
+                create: true,
+                read: true,
+                write: true,
+                truncate: false,
+            },
+        ) {
+            Ok(SysValue::Fd(dfd)) => {
+                let _ = k.syscall(
+                    1,
+                    SysRequest::Write {
+                        fd: dfd,
+                        bytes: b"OLD",
+                    },
+                );
+                let _ = k.syscall(1, SysRequest::Close { fd: dfd });
+            }
+            other => panic!("dest create: {:?}", other.map(|_| ())),
+        }
+        // the rename itself
+        k.syscall(
+            1,
+            SysRequest::Rename {
+                from: "/a/src",
+                to: "/b/dst",
+            },
+        )
+        .unwrap();
+        // the read fd opened BEFORE the rename reads the moved
+        // content — the inode kept its identity (POSIX: open fds
+        // survive renames).
+        let mut buf = [0u8; 16];
+        match k.syscall(
+            1,
+            SysRequest::Read {
+                fd: rfd,
+                buf: &mut buf,
+            },
+        ) {
+            Ok(SysValue::Count(n)) => assert_eq!(&buf[..n], b"MOVE", "identity survives"),
+            other => panic!("post-rename read: {:?}", other.map(|_| ())),
+        }
+        let _ = k.syscall(1, SysRequest::Close { fd: rfd });
+        // the source is gone, the destination holds the moved bytes
+        let mut gone = [0u8; 24];
+        assert!(matches!(
+            k.syscall(
+                1,
+                SysRequest::Stat {
+                    path: "/a/src",
+                    out: &mut gone
+                }
+            ),
+            Err(SysError::Vfs(VfsError::NotFound))
+        ));
+        let mut out = [0u8; 24];
+        k.syscall(
+            1,
+            SysRequest::Stat {
+                path: "/b/dst",
+                out: &mut out,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            u64::from_le_bytes([
+                out[8], out[9], out[10], out[11], out[12], out[13], out[14], out[15]
+            ]),
+            4,
+            "replaced file carries the moved size"
+        );
+        // directory destination: refused (EISDIR, not folded rmdir)
+        k.syscall(
+            1,
+            SysRequest::Mkdir {
+                path: "/b/adir",
+                mode: Mode(0o755),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            k.syscall(
+                1,
+                SysRequest::Rename {
+                    from: "/b/dst",
+                    to: "/b/adir",
+                }
+            ),
+            Err(SysError::Vfs(VfsError::IsADirectory))
+        ));
+        // a directory into its own subtree: refused
+        assert!(matches!(
+            k.syscall(
+                1,
+                SysRequest::Rename {
+                    from: "/b",
+                    to: "/b/adir/inside",
+                }
+            ),
+            Err(SysError::Vfs(VfsError::IsADirectory))
+        ));
+        // same source and destination: the POSIX no-op success
+        k.syscall(
+            1,
+            SysRequest::Rename {
+                from: "/b/dst",
+                to: "/b/dst",
+            },
+        )
+        .unwrap();
+        // the mask gate: parser profile has no SYS_RENAME
+        k.create_domain(2, parser_profile()).unwrap();
+        assert!(matches!(
+            k.syscall(
+                2,
+                SysRequest::Rename {
+                    from: "/b/dst",
+                    to: "/b/x",
+                }
+            ),
+            Err(SysError::Masked(crate::syscall::SYS_RENAME))
+        ));
+    }
+
     /// F11(b)+(c): Open takes read/write flags and checks permission at
     /// open time; Write writes at the fd offset; truncation is an
     /// explicit Open flag, not a side effect of every write.
