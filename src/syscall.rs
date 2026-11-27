@@ -300,6 +300,55 @@ impl SyscallMask {
     pub fn bits(&self) -> u64 {
         self.bits
     }
+
+    /// K23 (observability): the permitted syscall ids as a
+    /// comma-separated decimal list, written into `buf` — the mask as
+    /// a SET, the shape the completed-exit markers print (a live mask
+    /// is accounting state; this only READS it, no bit ever moves).
+    /// Ascending id order; an empty mask writes the empty string.
+    /// PURE, no allocation: the caller owns the buffer. Ids are
+    /// `< SYSCALL_COUNT = 64`, so two digits bound every id and
+    /// `64×2 + 63` commas = 191 bytes bound every mask; a short
+    /// buffer truncates (never panics — telemetry must not kill the
+    /// boot).
+    pub fn arm_ids_csv<'a>(&self, buf: &'a mut [u8]) -> &'a str {
+        /// Write one id (0..64 — at most two digits) as decimal into
+        /// `out`; the byte count written (0 when `out` is too short).
+        fn write_id(id: u8, out: &mut [u8]) -> usize {
+            let len = if id >= 10 { 2 } else { 1 };
+            if out.len() < len {
+                return 0;
+            }
+            out[0] = b'0' + id % 10;
+            if len == 2 {
+                out[1] = out[0];
+                out[0] = b'0' + id / 10;
+            }
+            len
+        }
+        let mut n = 0usize;
+        for id in 0..SYSCALL_COUNT {
+            if self.bits & (1u64 << id) == 0 {
+                continue;
+            }
+            if n > 0 {
+                if n >= buf.len() {
+                    break;
+                }
+                buf[n] = b',';
+                n += 1;
+            }
+            let w = write_id(id, &mut buf[n..]);
+            if w == 0 {
+                break;
+            }
+            n += w;
+        }
+        // Every byte above is ASCII by construction; the unwrap_or
+        // only guards a buffer that shrank between the write and the
+        // read (impossible — same borrow).
+        core::str::from_utf8(&buf[..n]).unwrap_or("")
+    }
 }
 
 /// The pure syscall gate (PR-1.4): the decision every caller gets, with
@@ -440,6 +489,58 @@ mod tests {
         let m = SyscallMask::from_ids(&[SYS_EXIT]).unwrap();
         assert_eq!(m.bits(), 1u64 << SYS_EXIT);
         assert_eq!(SyscallMask::from_bits(m.bits()), m);
+    }
+
+    #[test]
+    fn arm_ids_csv_lists_the_set_in_id_order() {
+        // Empty mask: empty string, not a stray comma.
+        let mut buf = [0u8; 192];
+        assert_eq!(SyscallMask::NONE.arm_ids_csv(&mut buf), "");
+        // One id, two-digit ids, and non-contiguous ids all round-trip.
+        let one = SyscallMask::from_ids(&[SYS_MKDIR]).unwrap();
+        assert_eq!(one.arm_ids_csv(&mut buf), "16");
+        let two_digit = SyscallMask::from_ids(&[SYS_RENAME, SYS_EXIT]).unwrap();
+        assert_eq!(two_digit.arm_ids_csv(&mut buf), "36,63");
+        let wide = SyscallMask::from_ids(&[SYS_READ, SYS_WRITE, SYS_OPEN, SYS_CLOSE]).unwrap();
+        assert_eq!(wide.arm_ids_csv(&mut buf), "0,1,2,3");
+        // The csv must agree with the bits: re-derive the mask from the
+        // text and compare — the SET and the BITSET are one mask.
+        for m in [one, two_digit, wide] {
+            let text = m.arm_ids_csv(&mut buf);
+            let ids: Vec<u8> = text
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse::<u8>().unwrap())
+                .collect();
+            assert_eq!(SyscallMask::from_ids(&ids).unwrap(), m);
+            assert_eq!(ids.len(), m.count() as usize);
+        }
+        // A short buffer truncates instead of panicking (telemetry
+        // must never kill the boot); what IS written stays ASCII.
+        let mut tiny = [0u8; 3];
+        assert_eq!(wide.arm_ids_csv(&mut tiny), "0,1");
+        assert!(SyscallMask::NONE.arm_ids_csv(&mut tiny).is_ascii());
+    }
+
+    #[test]
+    fn package_manager_profile_arms_are_pinned() {
+        // K23: the completed-exit markers print this mask's bits and
+        // arm set — pin BOTH so a profile edit that silently moves an
+        // arm fails here, not in the VM lane.
+        use crate::profile::package_manager_profile;
+        let pm = package_manager_profile().syscalls;
+        assert_eq!(pm.count(), 10);
+        assert_eq!(pm.bits(), 0x8000_0015_0003_000f);
+        let mut buf = [0u8; 192];
+        assert_eq!(
+            pm.arm_ids_csv(&mut buf),
+            "0,1,2,3,16,17,32,34,36,63",
+            "read/write/open/close/mkdir/unlink/listdir/stat/rename/exit"
+        );
+        // The profile stays attenuated by the service surface it
+        // derives from (the lane's MISMATCH guard reads the same
+        // relation on the live mask).
+        assert!(pm.is_subset_of(&crate::profile::service_profile().syscalls));
     }
 
     #[test]
