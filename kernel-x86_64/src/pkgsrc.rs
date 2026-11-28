@@ -38,11 +38,12 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The number of fixture files the store holds — the named half of
 /// the const pair with [`FILE_ORDER`]. `mkext2.py` writes the same
-/// six files to `/pkgsrc` and `drvstack/ext2.rs` walks them in
-/// order; a seventh file extends BOTH consts and nothing else changes
-/// (P1-2 added the sixth — the netcat client's package — as exactly
-/// that two-line change, the way the doc promised).
-pub const SLOT_COUNT: usize = 6;
+/// seven files to `/pkgsrc` and `drvstack/ext2.rs` walks them in
+/// order; an eighth file extends BOTH consts and nothing else changes
+/// (P1-2 added the sixth and seventh — the netcat and rust-hello
+/// packages — as exactly that two-line change, the way the doc
+/// promised).
+pub const SLOT_COUNT: usize = 7;
 
 /// One slot's capacity. The ext2 reader's direct-block ceiling is
 /// 12 KiB; the repo fixture's builder bound (pkg-mkrepo's spill
@@ -65,6 +66,7 @@ pub const FILE_ORDER: [&str; SLOT_COUNT] = [
     "r1.hello-1.0.0.akp",
     "r1.hello-1.1.0.akp",
     "r1.netcat-1.0.0.akp",
+    "r1.rust-hello-1.0.0.akp",
 ];
 
 /// Slot 0: the trust anchors (`/pkg/trust` at provisioning).
@@ -83,6 +85,9 @@ pub const IDX_PKG_V11: usize = 4;
 /// Slot 5: the netcat client's signed package (`/r1/r1.netcat-1.0.0.akp`
 /// — P1-2's third package, a REAL third-party static binary).
 pub const IDX_NETCAT: usize = 5;
+/// Slot 6: the rustc citizen's signed package (`/r1/r1.rust-hello-1.0.0.akp`
+/// — P1-2's fourth package, the Rust compiler path's REAL ELF).
+pub const IDX_RUSTHELLO: usize = 6;
 
 static mut SLOTS: [[u8; SLOT_MAX]; SLOT_COUNT] = [[0; SLOT_MAX]; SLOT_COUNT];
 static INSTALLED: [AtomicBool; SLOT_COUNT] = [const { AtomicBool::new(false) }; SLOT_COUNT];

@@ -13,8 +13,8 @@
 //!   `trust`               the root trust anchors (ATST)
 //!   `r1.repo`             the pinned local repo config (ARPS, url `/r1`)
 //!   `index.aki`           the root-countersigned index (AKI1, epoch 7,
-//!                         THREE entries — both versions of hello and
-//!                         the netcat client)
+//!                         FOUR entries — both versions of hello, the
+//!                         netcat client, the rustc citizen)
 //!   `r1.hello-1.0.0.akp`  the signed package (AKP1): `r1/hello` 1.0.0,
 //!                         one file — `/usr/bin/pkg-hello` =
 //!                         "hello world\n" (12 B)
@@ -31,6 +31,12 @@
 //!                         the P1-1 socket citizen) — a third-party
 //!                         static binary delivered through the signed
 //!                         package path
+//!   `r1.rust-hello-1.0.0.akp` the signed package (AKP1): `r1/rust-hello`
+//!                         1.0.0, one file — `/usr/bin/rust-hello` = the
+//!                         REAL rustc-built ELF (`blob/rust-hello.elf`,
+//!                         512 B, `ld -n`-packed segments): the THIRD
+//!                         citizen type — a Rust image, not gcc — through
+//!                         the same signed path
 //!
 //! K23: the package files are VERSION-QUALIFIED (the repo's layout
 //! change that lets one directory serve both versions) — the install
@@ -72,6 +78,10 @@ const PAYLOAD_PATH: &[u8] = b"/usr/bin/pkg-hello";
 /// a REAL third-party static binary delivered through the signed path.
 const NETCAT_NAME: &[u8] = b"r1/netcat";
 const NETCAT_PATH: &[u8] = b"/usr/bin/netcat";
+/// P1-2's third package: the RUSTC citizen — the third compiler path
+/// through the signed repo (gcc, gcc, rustc).
+const RUSTHELLO_NAME: &[u8] = b"r1/rust-hello";
+const RUSTHELLO_PATH: &[u8] = b"/usr/bin/rust-hello";
 /// v1.0.0's payload — the K22 install lane's byte-exact target.
 const PAYLOAD_V10: &[u8] = b"hello world\n";
 /// v1.1.0's payload — the REAL stripped gcc userland ELF (read from
@@ -92,9 +102,11 @@ fn main() {
     std::fs::create_dir_all(&dir).expect("create the fixture dir");
 
     // P1-2: the REAL payloads — the stripped gcc ELFs the earlier
-    // boot.sh steps built (and the ext2 disk carries as /bin/hello).
+    // boot.sh steps built (and the ext2 disk carries as /bin/hello),
+    // plus the packed rustc ELF (step [0b], 512 B).
     let payload_v11 = read_payload("kernel-x86_64/blob/userland-hello.elf");
     let payload_netcat = read_payload("kernel-x86_64/blob/netcatd.bin");
+    let payload_rusthello = read_payload("kernel-x86_64/blob/rust-hello.elf");
 
     // Three packages: r1/hello 1.0.0 (the small string) and 1.1.0 (the
     // REAL gcc ELF — same path, different payload bytes and sizes), plus
@@ -134,8 +146,20 @@ fn main() {
     let mut pkgnc: PkgBuf = [0u8; 512 * 1024];
     let pkgnc_len =
         build_package(&mnc, &[&payload_netcat], &REPO_SEED, &mut pkgnc).expect("package netcat");
+    let mut mrh =
+        Manifest::new(RUSTHELLO_NAME, SemVer::release(1, 0, 0)).expect("manifest rust-hello");
+    mrh.push_file(FileEntry {
+        path: Path::from_bytes(RUSTHELLO_PATH).expect("rust-hello path"),
+        perm: 0o755,
+        size: payload_rusthello.len() as u64,
+        sha256: sha256::digest(&payload_rusthello),
+    })
+    .expect("file entry rust-hello");
+    let mut pkgrh: PkgBuf = [0u8; 512 * 1024];
+    let pkgrh_len = build_package(&mrh, &[&payload_rusthello], &REPO_SEED, &mut pkgrh)
+        .expect("package rust-hello");
 
-    // The signed index (repo key signs, root countersigns) — ALL THREE
+    // The signed index (repo key signs, root countersigns) — ALL FOUR
     // packages are entries; the solver's universe reads one candidate
     // per entry, newest-first at plan time.
     let entries = [
@@ -156,6 +180,12 @@ fn main() {
             mnc,
             sha256::digest(&pkgnc[..pkgnc_len]),
             pkgnc_len as u64,
+        ),
+        (
+            RUSTHELLO_NAME,
+            mrh,
+            sha256::digest(&pkgrh[..pkgrh_len]),
+            pkgrh_len as u64,
         ),
     ];
     let mut index = [0u8; 96 * 1024];
@@ -195,13 +225,14 @@ fn main() {
     let mut trust = [0u8; 4 + 2 + 1 + 8 * 32];
     let trust_len = anchors.serialize(&mut trust).expect("anchors");
 
-    let files: [(&str, &[u8]); 6] = [
+    let files: [(&str, &[u8]); 7] = [
         ("trust", &trust[..trust_len]),
         ("r1.repo", &cfg[..cfg_len]),
         ("index.aki", &index[..index_len]),
         ("r1.hello-1.0.0.akp", &pkg10[..pkg10_len]),
         ("r1.hello-1.1.0.akp", &pkg11[..pkg11_len]),
         ("r1.netcat-1.0.0.akp", &pkgnc[..pkgnc_len]),
+        ("r1.rust-hello-1.0.0.akp", &pkgrh[..pkgrh_len]),
     ];
     for (name, bytes) in files {
         assert!(

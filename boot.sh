@@ -58,6 +58,24 @@ rustc --edition 2021 --crate-type=lib --emit=obj \
       -o "target/ring3-exec-target.o"
 ld -T "examples/ring3-exec-target/exec.ld" \
    -o "kernel-x86_64/blob/ring3-exec-target.bin" "target/ring3-exec-target.o"
+# P1-2 (the third citizen): the RUSTC userland image — the same recipe
+# (rustc --emit=obj + ld), linked with `ld -n` (nmagic: segments
+# PACKED in the file instead of padded to 4-KiB offsets), with the
+# vaddrs pinned congruent (mod 4096) to those file offsets — the
+# loader's own gate (src/elf.rs: vaddr%4096 == offset%4096, the byte
+# copy must be page-honest) holds BY CONSTRUCTION. The page geometry
+# stays the canonical cage's (the same two RX/RW pages, guard gap
+# between). 512 B: under the ramfs's 1-KiB INLINE window, so the third
+# package costs no large-file spill slot. check-citizen.py pins the
+# congruence at every build — an ld layout drift dies here.
+rustc --edition 2021 --crate-type=lib --emit=obj \
+      --target x86_64-unknown-none -O "examples/userland-rust-hello/src/lib.rs" \
+      -o "target/rust-hello.o"
+ld -n -T "examples/userland-rust-hello/image.ld" \
+   -o "kernel-x86_64/blob/rust-hello.elf" "target/rust-hello.o"
+strip --strip-all kernel-x86_64/blob/rust-hello.elf
+[ -s "kernel-x86_64/blob/rust-hello.elf" ] || { echo "FATAL: rust-hello link failed"; exit 1; }
+python3 scripts/check-citizen.py || { echo "FATAL: the rust-hello citizen broke its contract"; exit 1; }
 # K20 (P0-3): the gcc userland citizen — a REAL compiler's ELF.
 # -ffreestanding -nostdlib: no libc, no startup files; the program is
 # the whole image. Linked at the exec cage's declared vaddrs; carried
@@ -848,10 +866,13 @@ if [ "$MODE" = "verify" ]; then
   # delivered a genuine program, byte-exact, in every lane.
   grep -qF "[PKG] install r1/netcat@1.0.0: the REAL third-party binary resolved" "$LOG" || { echo "VERIFY FAIL: P1-2 netcat install marker missing"; ok=0; }
   grep -qF "[PKG] the installed citizen: /usr/bin/netcat == the stripped gcc socket client" "$LOG" || { echo "VERIFY FAIL: P1-2 netcat citizen marker missing"; ok=0; }
+  # P1-2's fifth round: the RUSTC citizen — the third compiler path.
+  grep -qF "[PKG] install r1/rust-hello@1.0.0: the RUSTC citizen resolved" "$LOG" || { echo "VERIFY FAIL: P1-2 rust-hello install marker missing"; ok=0; }
+  grep -qF "[PKG] the third citizen: /usr/bin/rust-hello == the rustc-built ELF" "$LOG" || { echo "VERIFY FAIL: P1-2 rust-hello citizen marker missing"; ok=0; }
   grep -qF "[PKG] live mask after exec == package_manager_profile" "$LOG" || { echo "VERIFY FAIL: K22 pkg live-mask marker missing"; ok=0; }
   grep -qF "[PKG] stack high-water: " "$LOG" || { echo "VERIFY FAIL: K22 pkg stack high-water marker missing"; ok=0; }
   grep -qF "[PKG] ERROR" "$LOG" && { echo "VERIFY FAIL: K22 pkg lane reported an ERROR"; ok=0; }
-  # K23/P1-2: the lifecycle rounds. The upgrade must be a real MOVE —
+  # K23/P1-2 (five rounds): the lifecycle rounds. The upgrade must be a real MOVE —
   # the solver resolves 1.1.0 ABOVE the installed 1.0.0 and the REAL
   # stripped gcc ELF (the same bytes the disk serves as /bin/hello)
   # replaces the 12-B 1.0.0 string (the old structural no-op printed

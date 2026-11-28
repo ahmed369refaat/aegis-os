@@ -5,13 +5,13 @@
 //! K23/P1-2: ONE blob now drives the whole lifecycle. The kernel
 //! writes a COMMAND SELECTOR into byte 0 of this blob's data page
 //! before launch (0 = install hello, 1 = upgrade, 2 = remove,
-//! 3 = install netcat — P1-2's REAL third-party binary round); the
-//! blob reads it first thing, builds the strings and the matching
-//! argv table in the same page, and execve's with that table. The
-//! K22 shape (a separate blob per command) would have needed four
-//! more embedded binaries for three extra commands — the selector
-//! keeps the registry and the boot image size flat while the lane
-//! grows.
+//! 3 = install netcat — P1-2's REAL third-party binary round,
+//! 4 = install rust-hello — the RUSTC citizen round); the blob reads
+//! it first thing, builds the strings and the matching argv table in
+//! the same page, and execve's with that table. The K22 shape (a
+//! separate blob per command) would have needed five more embedded
+//! binaries for four extra commands — the selector keeps the
+//! registry and the boot image size flat while the lane grows.
 //!
 //! On success the syscall never returns: the image replaces this blob
 //! under the `SERVICE` memory contract (its own profile's policy —
@@ -46,7 +46,9 @@
 //!   +0x38  "r1/hello@1.0.0\0"   +0x48 "r1/hello\0" (remove's name)
 //!   +0x52  "r1/netcat@1.0.0\0" (P1-2's fourth round, pinned — clear
 //!          of r1/hello's NUL at +0x51)
-//!   +0x80 + sel*0x20  the FOUR argv tables (4 qwords, NULL-
+//!   +0x68  "r1/rust-hello@1.0.0\0" (the fifth round — ends at
+//!          +0x7C, clear of the argv tables at +0x80)
+//!   +0x80 + sel*0x20  the FIVE argv tables (4 qwords, NULL-
 //!          terminated — the exec arm reads them BEFORE the point of
 //!          no return, from this blob's pages)
 //!
@@ -97,6 +99,13 @@ _ring3_start:
     mov qword ptr [0x00403052], rax
     movabs rax, 0x00302e302e314074    /* "t@1.0.0\0\0" */
     mov qword ptr [0x0040305a], rax
+    /* The fifth round's target: the rustc citizen's pinned request
+     * at +0x68 (ends +0x7C, clear of the tables at +0x80). */
+    movabs rax, 0x2d747375722f3172    /* "r1/rust-" */
+    mov qword ptr [0x00403068], rax
+    movabs rax, 0x2e31406f6c6c6568    /* "hello@1." */
+    mov qword ptr [0x00403070], rax
+    mov dword ptr [0x00403078], 0x00302e30    /* "0.0\0" */
     /* argv tables at +0x80 + sel*0x20 — ["/bin/pkg", cmd, target?,
      * NULL]. upgrade takes no argument (cmd_upgrade walks the
      * installed set), so its table ends at the NULL after the
@@ -117,6 +126,10 @@ _ring3_start:
     mov qword ptr [0x004030e8], 0x00403020
     mov qword ptr [0x004030f0], 0x00403052
     mov qword ptr [0x004030f8], 0
+    mov qword ptr [0x00403100], 0x00403010
+    mov qword ptr [0x00403108], 0x00403020
+    mov qword ptr [0x00403110], 0x00403068
+    mov qword ptr [0x00403118], 0
     /* rcx = the selected table (base + sel*0x20, computed above). */
     add rcx, 0x00403080
     /* execve(path, argv, envp=NULL) — INTERNAL nr 19. */

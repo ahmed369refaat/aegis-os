@@ -43,6 +43,9 @@ static PACKAGE_V11: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1
 /// binary through the signed path (the in-VM lane's fourth round).
 static PACKAGE_NETCAT: &[u8] =
     include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1.netcat-1.0.0.akp");
+/// P1-2's fourth package: the RUSTC citizen (the lane's fifth round).
+static PACKAGE_RUSTHELLO: &[u8] =
+    include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1.rust-hello-1.0.0.akp");
 /// The payload each version installs — different bytes AND sizes, so
 /// an upgrade that "succeeded" without moving the payload cannot pass.
 /// P1-2: the 1.1.0 payload is the REAL stripped gcc ELF (the same
@@ -52,6 +55,7 @@ static PACKAGE_NETCAT: &[u8] =
 const PAYLOAD_V10: &[u8] = b"hello world\n";
 static PAYLOAD_V11: &[u8] = include_bytes!("../kernel-x86_64/blob/userland-hello.elf");
 static NETCAT_ELF: &[u8] = include_bytes!("../kernel-x86_64/blob/netcatd.bin");
+static RUSTHELLO_ELF: &[u8] = include_bytes!("../kernel-x86_64/blob/rust-hello.elf");
 
 fn kernel_with_fixture() -> Kernel {
     let mut k = Kernel::new();
@@ -89,10 +93,11 @@ fn kernel_with_fixture() -> Kernel {
         ("/r1/index.aki", INDEX),
         // K23: BOTH versions — the upgrade round's solver picks 1.1.0
         // and its transaction reads the 1.1.0 file. P1-2: the netcat
-        // package rides the same repo.
+        // and rust-hello packages ride the same repo.
         ("/r1/r1.hello-1.0.0.akp", PACKAGE_V10),
         ("/r1/r1.hello-1.1.0.akp", PACKAGE_V11),
         ("/r1/r1.netcat-1.0.0.akp", PACKAGE_NETCAT),
+        ("/r1/r1.rust-hello-1.0.0.akp", PACKAGE_RUSTHELLO),
         ("/pkg/trust", TRUST),
         ("/pkg/repos/r1.repo", REPO_CFG),
     ] {
@@ -490,5 +495,26 @@ fn the_real_cli_runs_the_whole_lifecycle() {
     assert!(
         out.contains("r1/netcat 1.0.0"),
         "the record must say r1/netcat 1.0.0: {out}"
+    );
+
+    // ── P1-2's fifth round: the RUSTC citizen — the third compiler
+    // path through one signed repo, byte-exact + plan-parsed (the
+    // host mirror of the lane's round 5). ──
+    let (code, out) = pm_cli(&mut k, &[b"install", b"r1/rust-hello@1.0.0"], &paths);
+    assert_eq!(code, 0, "install rust-hello: {out}");
+    assert_eq!(
+        probe_read_all(&mut k, "/usr/bin/rust-hello").as_deref(),
+        Some(RUSTHELLO_ELF),
+        "the installed rust-hello must be the packed rustc ELF, byte-exact"
+    );
+    assert!(
+        aegis_os::elf::build_exec_plan(RUSTHELLO_ELF).is_ok(),
+        "the third citizen must parse as a genuine exec image"
+    );
+    let (code, out) = pm_cli(&mut k, &[b"list"], &paths);
+    assert_eq!(code, 0, "list after rust-hello: {out}");
+    assert!(
+        out.contains("r1/rust-hello 1.0.0"),
+        "the record must say r1/rust-hello 1.0.0: {out}"
     );
 }

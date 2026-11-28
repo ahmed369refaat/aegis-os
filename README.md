@@ -93,8 +93,11 @@
 5. **NVMe and AHCI at ring 3**: the three NIC/disk driver migrations are done
    (virtio-blk, virtio-net, e1000 — each a CPL=3 domain on its OWN rings); NVMe and
    AHCI still run ring-0 proofs.
-6. **aarch64**: the HAL seam is designed (ADR-0011) and CI cross-arch builds the
-   policy core, but no second boot exists.
+6. **aarch64, past the smoke**: the HAL seam (ADR-0011) is guarded by a gate
+   (the policy core cross-builds for `aarch64-unknown-none-softfloat`) and a
+   `-M virt` boot smoke is live (PL011 markers + a semihosting exit, gate
+   `aa64`); what remains is the real second boot — MMU, exception vectors,
+   the driver stack — a named P2 slice, not a redesign.
 7. **KVM and real hardware**: never run — this sandbox is TCG-only.
 
 Live and lane-proven (the gaps the list above is NOT about): the ring-3 syscall

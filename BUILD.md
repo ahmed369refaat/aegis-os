@@ -127,10 +127,13 @@ manager installs from — and since P1-2 the packages carry REAL
 programs, not fixture strings:
 
 ```text
-r1.hello-1.0.0.akp   /usr/bin/pkg-hello = "hello world\n" (12 B)
-r1.hello-1.1.0.akp   /usr/bin/pkg-hello = the REAL stripped gcc hello ELF
-                     (the SAME bytes the ext2 disk serves as /bin/hello)
-r1.netcat-1.0.0.akp  /usr/bin/netcat    = the REAL stripped socket client
+r1.hello-1.0.0.akp    /usr/bin/pkg-hello  = "hello world\n" (12 B)
+r1.hello-1.1.0.akp    /usr/bin/pkg-hello  = the REAL stripped gcc hello ELF
+                      (the SAME bytes the ext2 disk serves as /bin/hello)
+r1.netcat-1.0.0.akp   /usr/bin/netcat     = the REAL stripped socket client
+r1.rust-hello-1.0.0.akp /usr/bin/rust-hello = the REAL rustc ELF (512 B,
+                      `ld -n`-packed, congruent vaddrs — the third compiler
+                      path, and small enough to ride the INLINE window)
 ```
 
 Two bounds rule the path, both measured, not round: **12 KiB, the
@@ -142,15 +145,39 @@ image fits BECAUSE its pinned blocks and buffers ride the NOLOAD tail
 (§3a); a bigger program needs the ext2 indirect-block read, which is
 deliberately not built yet.
 
-The in-VM lane (kmain's `[PKG]` section, four rounds now) proves the
+The in-VM lane (kmain's `[PKG]` section, FIVE rounds now) proves the
 whole path per boot: install → upgrade-to-a-real-ELF → remove →
-install-the-real-netcat, each round verified byte-exact through a
-fresh root probe, the installed files additionally parsed by the
-loader's own plan gate (`build_exec_plan`) — a package that delivered
-bytes that are not a genuine image cannot pass. The host mirror is
-`tests/pkg_lane_cli.rs`.
+install-the-real-netcat → install-the-rustc-citizen, each round
+verified byte-exact through a fresh root probe, the installed files
+additionally parsed by the loader's own plan gate (`build_exec_plan`)
+— a package that delivered bytes that are not a genuine image cannot
+pass. The host mirror is `tests/pkg_lane_cli.rs`. The packed citizen's
+congruence (vaddr ≡ file offset mod 4096, the loader's own gate) is
+pinned at build time by `scripts/check-citizen.py`.
 
-## 6. The build order (why boot.sh's steps are numbered)
+## 6. The second architecture — the aarch64 smoke (P1-4)
+
+The smoke (`examples/aarch64-smoke`, gate `aa64`) proves the whole
+path with the SAME toolchain — no aarch64 binutils, no cross-gcc:
+
+```sh
+rustc --crate-type=lib --emit=obj --target aarch64-unknown-none-softfloat       -O examples/aarch64-smoke/src/lib.rs -o target/aa64-smoke.o
+ld.lld -T examples/aarch64-smoke/smoke.ld -o target/aa64-smoke.elf target/aa64-smoke.o
+qemu-system-aarch64 -M virt -cpu cortex-a57 -nographic -nic none       -semihosting -kernel target/aa64-smoke.elf
+```
+
+rustc's bundled LLVM assembles the AArch64 `global_asm!`, `rust-lld`
+links it (the `gcc-ld/ld.lld` wrapper in the toolchain's rustlib),
+and the gate requires BOTH PL011 markers AND the semihosting
+`SYS_EXIT` exit (rc=0 — a hang fails). The same gate runs the HAL
+seam guard: `cargo build -p aegis-os --target
+aarch64-unknown-none-softfloat` — the policy core, 100% of the
+kernel's platform-independent logic, must cross-build while only the
+x86 boot stub exists (ADR-0011). The emulator itself was a download
+away (`qemu-system-arm` from the same Debian pool that built the x86
+toolchain — see `tools/qemu-system-aarch64`).
+
+## 7. The build order (why boot.sh's steps are numbered)
 
 ```text
 [0/4]  the flat blobs + the delta gate
@@ -160,7 +187,7 @@ bytes that are not a genuine image cannot pass. The host mirror is
 [0d/4] /bin/pkg (cargo, pkg-image profile + the contract check)
 [0e/4] the netcat client (gcc, STRIPPED — the package payload)
 [0f/4] the tcpip service (cargo, the NETSVC contract check)
-[0g/4] the signed repo fixture (pkg-mkrepo — LAST: it embeds [0c]/[0e])
+[0g/4] the signed repo fixture (pkg-mkrepo — LAST: it embeds [0c]/[0e]/[0b])
 [1..3] the kernel (release), objcopy, the multiboot stub
 [4/4]  QEMU + the verify greps
 ```

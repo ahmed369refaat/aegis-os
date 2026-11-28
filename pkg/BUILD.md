@@ -147,40 +147,45 @@ only one.
 ## K23/P1-2 — the lifecycle fixture and the four-round boot lane
 
 The boot fixture (`pkg/src/bin/pkg-mkrepo.rs`, `./boot.sh` step
-`[0g]`) serves SIX files, each ≤ 12 KiB (the ext2 direct-block
+`[0g]`) serves SEVEN files, each ≤ 12 KiB (the ext2 direct-block
 ceiling — the one bound that rules the whole repo path: the disk
 walk, the store slot, the ramfs spill window):
 
 ```text
 trust               root anchors (ATST)
 r1.repo             pinned local repo config (ARPS, url /r1)
-index.aki           root-countersigned index (AKI1, epoch 7, THREE entries)
+index.aki           root-countersigned index (AKI1, epoch 7, FOUR entries)
 r1.hello-1.0.0.akp  r1/hello 1.0.0 → /usr/bin/pkg-hello = "hello world\n" (12 B)
 r1.hello-1.1.0.akp  r1/hello 1.1.0 → /usr/bin/pkg-hello = the REAL stripped
                     gcc userland ELF (8,496 B — the same bytes the ext2 disk
                     serves as /bin/hello)
 r1.netcat-1.0.0.akp r1/netcat 1.0.0 → /usr/bin/netcat = the REAL stripped
                     gcc socket client (the P1-1 citizen, 8,576 B)
+r1.rust-hello-1.0.0.akp r1/rust-hello 1.0.0 → /usr/bin/rust-hello = the
+                    REAL rustc ELF (512 B, `ld -n`-packed, congruent vaddrs —
+                    the third compiler path through one signed repo)
 ```
 
 P1-2 made the payloads REAL programs: the upgrade round now installs a
 genuine loadable image (byte-exact AND parsed by the loader's own
-`build_exec_plan` gate), and a fourth round installs the netcat client
-— a third-party static binary delivered through the signed path. The
-1.0.0 payload stays a 12-B string: different bytes AND sizes is what
-separates a real upgrade from the old structural no-op.
+`build_exec_plan` gate), the fourth round installs the netcat client
+— a third-party static binary delivered through the signed path — and
+the fifth installs the RUSTC citizen (512 B: small enough to ride the
+ramfs's 1-KiB inline window, so it costs no large-file spill slot).
+The 1.0.0 payload stays a 12-B string: different bytes AND sizes is
+what separates a real upgrade from the old structural no-op.
 
 ONE caller blob (`examples/ring3-pkg-caller/`) drives the whole
 lifecycle: the kernel writes a command selector into byte 0 of the
 blob's data page before each launch (0 = install, 1 = upgrade,
-2 = remove, 3 = install the netcat package); the blob reads it, builds
-the strings and the argv table at `0x40403080 + sel*0x20`, and
-execve's (internal nr 19). The install round's argv PINS the version
+2 = remove, 3 = install the netcat package, 4 = install the
+rust-hello package); the blob reads it, builds the strings and the
+argv table at `0x403080 + sel*0x20`, and execve's (internal nr 19). The install round's argv PINS the version
 (`r1/hello@1.0.0`): a bare name resolves newest-first, which would
 install 1.1.0 directly and leave the upgrade round nothing to move.
 
 The kmain lane (kernel-x86_64/src/kmain.rs, the K22/K23/P1-2 section)
-runs FOUR rounds — spawn → execve → dual drain → verify → destroy —
+runs FIVE rounds — spawn → execve → dual drain → verify → destroy —
 each verified through a fresh root probe (id 72, never across a
 drain):
 
@@ -194,7 +199,10 @@ drain):
 - **install netcat (P1-2)**: exit 0 on the warm, clean tree,
   `/usr/bin/netcat` == the stripped socket client byte-exact, the
   plan gate parses it, `/pkg/db/r1.netcat` written — a signed
-  package delivered a genuine third-party program.
+  package delivered a genuine third-party program;
+- **install rust-hello (P1-2)**: exit 0, `/usr/bin/rust-hello` == the
+  packed rustc ELF byte-exact, the plan gate parses it — the third
+  compiler path (gcc, gcc, rustc) through one signed repo.
 
 The host mirror of the lane is `tests/pkg_lane_cli.rs`
 (`cargo test -p aegis-os --test pkg_lane_cli`): the REAL `run_cli`

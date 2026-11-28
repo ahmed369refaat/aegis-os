@@ -2,10 +2,10 @@
 """Build a minimal (but structurally honest) read-only ext2 image,
 GPT-wrapped: protective MBR (LBA0) + GPT header (LBA1) + entries
 (LBA2, partition 'aegis-root' at LBA 34..=289) + the filesystem
-(LBA 34..) + the backup GPT at the tail. 1KiB blocks, rev 1, 25
+(LBA 34..) + the backup GPT at the tail. 1KiB blocks, rev 1, 26
 inodes (the table spans blocks 5-7, still below the data at 20),
 root dir with hello.txt, the gcc /bin/hello ELF, and — K23 — the
-/pkgsrc directory carrying the K23 repo fixture (the six
+/pkgsrc directory carrying the K23 repo fixture (the seven
 pkg-mkrepo outputs — trust, the repo config, the signed index, and
 BOTH version-qualified packages — byte-exact reads of
 kernel-x86_64/blob/
@@ -77,12 +77,13 @@ put((TOTAL - 1) * 512, gpt_header(TOTAL - 1, 1, TOTAL - 2))
 FS = PART_FIRST * 512
 
 # Superblock at block 1 (byte 1024), for 1KiB blocks. K23 raised the
-# inode count 16 -> 24; P1-2's sixth fixture file (the netcat package)
-# raised it again to 25: /pkgsrc adds the directory inode 14 plus six
-# file inodes 15-20; 25 * 128 B = 4 blocks (5-8), still clear of the
+# inode count 16 -> 24; P1-2's sixth and seventh fixture files (the
+# netcat and rust-hello packages) raised it to 26: /pkgsrc adds the
+# directory inode 14 plus seven file inodes 15-21; 26 * 128 B = 4
+# blocks (5-8), still clear of the
 # data at 20.
 sb = bytearray(1024)
-struct.pack_into('<I', sb, 0, 25)      # s_inodes_count
+struct.pack_into('<I', sb, 0, 26)      # s_inodes_count
 struct.pack_into('<I', sb, 4, 128)     # s_blocks_count
 struct.pack_into('<I', sb, 20, 1)      # s_first_data_block
 struct.pack_into('<I', sb, 24, 0)      # s_log_block_size (1KiB)
@@ -133,9 +134,9 @@ for b in range(22, 22 + len(hello_blocks)):
     bb[b >> 3] |= 1 << (b & 7)
 
 # ── K23: /pkgsrc — the repo fixture rides the disk ──
-# The K23 lane's SIX provisioning files (pkg-mkrepo's outputs, built
-# by boot.sh step [0g] — P1-2: the two REAL-binary packages ride here
-# too) as byte-exact reads of the blob copies: the
+# The K23 lane's SEVEN provisioning files (pkg-mkrepo's outputs, built
+# by boot.sh step [0g] — P1-2: the three REAL-binary packages ride
+# here too) as byte-exact reads of the blob copies: the
 # kernel image stops carrying package data. The directory is
 # root-owned 0755; the files are 0644 regular files (the manager READS
 # its anchors, it can never rewrite them). Inode 14, data blocks after
@@ -148,7 +149,7 @@ pkg_files = []                            # (name, ino, data, first_blk, nblocks
 cursor = pkg_dir_blk + 1
 for i, name in enumerate(
     ['trust', 'r1.repo', 'index.aki', 'r1.hello-1.0.0.akp', 'r1.hello-1.1.0.akp',
-     'r1.netcat-1.0.0.akp']
+     'r1.netcat-1.0.0.akp', 'r1.rust-hello-1.0.0.akp']
 ):
     data = open(f'kernel-x86_64/blob/pkg-fixture/{name}', 'rb').read()
     assert len(data) <= 12 * BS, f'{name} exceeds the direct-block ceiling'
@@ -195,7 +196,7 @@ struct.pack_into('<IHBB', d, o, ino, BS - o, len(name), ftype)
 d[o+8:o+8+len(name)] = name
 put(FS + 20*BS, d)
 
-# The /pkgsrc directory block: ".", "..", then the six files (the
+# The /pkgsrc directory block: ".", "..", then the seven files (the
 # last record pads to the block end, exactly as the root's does).
 pd = bytearray(BS)
 o = 0

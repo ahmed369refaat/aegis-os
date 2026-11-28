@@ -1678,9 +1678,9 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // [PKGSRC] markers) BEFORE this lane runs; the TEST-ONLY seeds
         // themselves — see pkg/src/bin/pkg-mkrepo.rs, which built the
         // files boot.sh step [0g] put on the disk. The store carries
-        // SIX files (both package versions, the netcat client — the
-        // repo is version-qualified, so the upgrade round's
-        // transaction reads the 1.1.0 one).
+        // SEVEN files (both hello versions, the netcat client, the
+        // rustc citizen — the repo is version-qualified, so the
+        // upgrade round's transaction reads the 1.1.0 one).
         /// What each version installs, byte-exact — different bytes
         /// AND a different size, so the upgrade proves the payload
         /// moved (the old no-op `pkg upgrade` kept 12 B and still
@@ -1696,6 +1696,11 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         /// THIRD package — a REAL third-party static binary delivered
         /// through the signed path and installed byte-exact.
         static NETCAT_ELF: &[u8] = include_bytes!("../blob/netcatd.bin");
+        /// P1-2's fourth package: the RUSTC citizen — the third
+        /// compiler path (gcc, gcc, rustc) through one signed repo.
+        /// 512 B, `ld -n`-packed segments: small enough to ride the
+        /// ramfs's INLINE window, so it costs no large-file spill slot.
+        static RUSTHELLO_ELF: &[u8] = include_bytes!("../blob/rust-hello.elf");
 
         // (a) the exec policy for the PM image's identity.
         let declared = k
@@ -1954,6 +1959,13 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 "/r1/r1.netcat-1.0.0.akp",
                 0o644,
                 crate::pkgsrc::file(crate::pkgsrc::IDX_NETCAT).unwrap_or(&[]),
+            )
+            && probe_put(
+                &mut k,
+                PKG_PROBE,
+                "/r1/r1.rust-hello-1.0.0.akp",
+                0o644,
+                crate::pkgsrc::file(crate::pkgsrc::IDX_RUSTHELLO).unwrap_or(&[]),
             )
             && probe_put(
                 &mut k,
@@ -2567,6 +2579,92 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 line(
                     &mut out,
                     &["[PKG] ERROR: the manager faulted (netcat install) — LOUD"],
+                );
+            }
+        }
+        pool.free_all_owned(&mut k.frames, PKG_DOM);
+        let _ = k.destroy_domain(PKG_DOM);
+
+        // ── round 5 (P1-2): install r1/rust-hello@1.0.0 (selector 4)
+        //      — the RUSTC citizen: the third compiler path through
+        //      one signed repo (gcc, gcc, rustc). The image is the
+        //      SAME recipe as the exec target's (rustc --emit=obj +
+        //      ld), linked with `ld -n` so its segments PACK in the
+        //      file instead of padding to 4-KiB offsets — the
+        //      loader's contract (src/elf.rs) never trusts p_align,
+        //      and the 512-B image rides the ramfs INLINE window, so
+        //      this round costs no large-file spill slot. The
+        //      verification is the same three-sided shape: byte-exact
+        //      against the same ELF boot.sh step [0b] linked, parsed
+        //      as a GENUINE exec image by the loader's own plan gate,
+        //      and the record written. ──
+        let (run_exit, mask_verified, high_water, live_mask) =
+            match pkg_round(&mut k, &mut pool, &mut out, PKG_DOM, pm_mask, 4) {
+                Some(r) => r,
+                None => {
+                    pool.free_all_owned(&mut k.frames, PKG_DOM);
+                    let _ = k.destroy_domain(PKG_DOM);
+                    hw::halt_forever();
+                }
+            };
+        match run_exit {
+            crate::sched::context::ExitKind::Exited(0) => {
+                let probed = verify_probe(&mut k).is_some();
+                let mut rec = [0u8; 4096];
+                let mut state = [0u8; 4096];
+                let (payload_ok, rec_n, state_n) = if probed {
+                    (
+                        probe_verify_file(&mut k, PKG_VERIFY, "/usr/bin/rust-hello", RUSTHELLO_ELF)
+                            && aegis_os::elf::build_exec_plan(RUSTHELLO_ELF).is_ok(),
+                        probe_read(&mut k, PKG_VERIFY, "/pkg/db/r1.rust-hello", &mut rec),
+                        probe_read(&mut k, PKG_VERIFY, "/pkg/db/state", &mut state),
+                    )
+                } else {
+                    (false, None, None)
+                };
+                let _ = k.destroy_domain(PKG_VERIFY);
+                let tree_ok = payload_ok && rec_n.unwrap_or(0) > 0 && state_n.unwrap_or(0) > 0;
+                if tree_ok {
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] install r1/rust-hello@1.0.0: the RUSTC citizen resolved, Ed25519-verified, committed (exit 0)",
+                        ],
+                    );
+                    let mut binsz = [0u8; 20];
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] the third citizen: /usr/bin/rust-hello == the rustc-built ELF (",
+                            strutil::dec(RUSTHELLO_ELF.len() as u64, &mut binsz),
+                            " B, byte-exact, exec-plan parses) — three compiler paths through one signed repo",
+                        ],
+                    );
+                    round_common_markers(&mut out, mask_verified, high_water, live_mask);
+                } else {
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] ERROR: exit 0 but the installed rust-hello is wrong (payload/record/state) — LOUD",
+                        ],
+                    );
+                }
+            }
+            crate::sched::context::ExitKind::Exited(code) => {
+                let mut cn = [0u8; 20];
+                line(
+                    &mut out,
+                    &[
+                        "[PKG] ERROR: rust-hello install exit=",
+                        strutil::dec(code, &mut cn),
+                        " — LOUD",
+                    ],
+                );
+            }
+            _ => {
+                line(
+                    &mut out,
+                    &["[PKG] ERROR: the manager faulted (rust-hello install) — LOUD"],
                 );
             }
         }
