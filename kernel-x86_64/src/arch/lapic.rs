@@ -175,6 +175,23 @@ fn read32(offset: u64) -> u32 {
     }
 }
 
+/// P1-1: is vector `v` in-service (ISR)? — the tick guard's halt line.
+/// The 256-bit ISR/IRR files live at 0x100/0x200, 32 vectors per
+/// 16-byte register group.
+#[cfg(not(test))]
+pub fn isr_bit_set(v: u8) -> bool {
+    let off = 0x100 + u64::from(v / 32) * 0x10 + u64::from((v % 32) / 8) * 4;
+    (read32(off) >> u32::from(v % 8)) & 1 == 1
+}
+
+/// P1-1: is vector `v` pending in the IRR (raised, not yet
+/// delivered)? — the tick guard's halt line.
+#[cfg(not(test))]
+pub fn irr_bit_set(v: u8) -> bool {
+    let off = 0x200 + u64::from(v / 32) * 0x10 + u64::from((v % 32) / 8) * 4;
+    (read32(off) >> u32::from(v % 8)) & 1 == 1
+}
+
 #[cfg(not(test))]
 fn write32(offset: u64, v: u32) {
     if x2apic_active() {
@@ -305,6 +322,13 @@ pub fn mask_timer() {
 #[cfg(not(test))]
 pub fn timer_masked() -> bool {
     read32(REG_LVT_TIMER) & LVT_MASKED != 0
+}
+
+/// P1-1: the timer LVT's raw value — the tick guard's halt line
+/// (which mode, which vector, whose mask).
+#[cfg(not(test))]
+pub fn lvt_timer_raw() -> u32 {
+    read32(REG_LVT_TIMER)
 }
 
 /// Unmask the timer's LVT entry (resume ticks after the window).

@@ -1008,6 +1008,58 @@ fn relay_udp_round_trip_and_the_stack_errnos_pass_through() {
     assert_eq!(relay.stats.stream_recvd, 0);
 }
 
+/// P1-1 (found LIVE on the q35 lane): a datagram connect WITHOUT a
+/// prior bind must still leave the socket with a SOURCE port — POSIX
+/// semantics, and the exact flow of the gcc netcat client (socket →
+/// connect → send, no bind call anywhere). The stack used to answer
+/// NotBound for that send: every other test in this suite bound port
+/// 4000 explicitly first, so the gap was invisible until the lane.
+#[test]
+fn an_unbound_dgram_connect_auto_binds_a_source_port() {
+    let (mut relay, mut sink) = client_relay();
+    let (mut peer, mut psink) = peer();
+    let mut now = 0u64;
+    seed_arp(&mut relay.stack, &B_IP, 2, now);
+    seed_arp(&mut peer, &A_IP, 1, now);
+    // The peer's echo socket: bound, as a real server would be.
+    let pfd = peer.socket(7, SOCK_DGRAM).unwrap();
+    peer.bind(7, pfd, 5353).unwrap();
+
+    // The client: NO bind — the connect must mint the source port.
+    let fd = dgram_socket(&mut relay, &mut sink, 0, now);
+    let mut c = Req::new(OP_CONNECT);
+    c.fd = fd;
+    c.ip = B_IP;
+    c.port = 5353;
+    assert_eq!(
+        relay.submit(now, &mut sink, 0, &c, &[]),
+        Step::Now(Rep::result(OP_CONNECT, 0))
+    );
+    // The send that used to answer NotBound → EINVAL: now it is the
+    // datagram count, because the socket has a source port.
+    let mut s = Req::new(OP_SEND);
+    s.fd = fd;
+    assert_eq!(
+        relay.submit(now, &mut sink, 0, &s, b"udp-live"),
+        Step::Now(Rep::result(OP_SEND, 8))
+    );
+    // The datagram reaches the peer with the client's ephemeral
+    // source port recorded (a real one, in the dynamic range).
+    pump(&mut relay, &mut sink, &mut peer, &mut psink, &mut now, 1);
+    let mut buf = [0u8; 64];
+    assert_eq!(peer.recv(7, pfd, &mut buf).unwrap(), 8);
+    assert_eq!(&buf[..8], b"udp-live");
+    // An explicit bind after the auto-bind still holds: rebinding is
+    // the caller's call, and the bound port stays what it was.
+    let mut b = Req::new(OP_BIND);
+    b.fd = fd;
+    b.port = 4000;
+    assert_eq!(
+        relay.submit(now, &mut sink, 0, &b, &[]),
+        Step::Now(Rep::result(OP_BIND, 0))
+    );
+}
+
 #[test]
 fn relay_listen_accept_hands_the_client_an_inbound_connection() {
     let (mut relay, mut sink) = client_relay();

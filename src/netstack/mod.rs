@@ -738,12 +738,25 @@ impl<E: Entropy> NetStack<E> {
     ) -> Result<()> {
         // Datagram sockets: connect sets the DEFAULT remote (the
         // POSIX connected-UDP shape — send() needs no per-call peer
-        // and recv() filters... we accept from anyone, the queue
-        // records the sender). Idempotent re-connect allowed.
+        // and recv() accepts from anyone, the queue records the
+        // sender) AND, when no local port is bound yet, binds an
+        // ephemeral one — POSIX semantics: an unbound UDP socket that
+        // connects gets a source port, so send() has a sender (found
+        // LIVE: the gcc netcat client connects without binding and
+        // the stack answered NotBound for a send the host suite only
+        // ever tried after an explicit bind — the gap stayed
+        // invisible for exactly that reason).
         {
+            let local_port = self.ephemeral_port(fd, now);
             let e = self.sockets.get_mut(domain, fd)?;
-            if let socket::SocketKind::Dgram { remote, .. } = &mut e.kind {
+            if let socket::SocketKind::Dgram {
+                remote, bound_port, ..
+            } = &mut e.kind
+            {
                 *remote = Some((*ip, port));
+                if bound_port.is_none() {
+                    *bound_port = Some(local_port);
+                }
                 return Ok(());
             }
         }

@@ -1082,6 +1082,21 @@ mod exec {
         let Some(k) = context::kernel_mut() else {
             return (-EPERM) as u64;
         };
+        // P1-1: stamp the kernel clock from the TSC — the net token
+        // bucket's refill windows read `Kernel::clock`, which until
+        // now had no caller (a bucket that never refilled past its
+        // opening burst). A POLLING service (the tcpip domain) is the
+        // one workload that yields constantly while its egress rides
+        // the bucket, so THIS arm is where a monotonic, calibrated
+        // tick count enters the policy core — never at the NET_SEND
+        // arm (the sender must not mint its own refill: the netd
+        // "no clock advance" marker stays true).
+        let iv = crate::sched::preempt::tick_interval();
+        if let Some(ticks) = crate::hw::read_tsc().checked_div(iv) {
+            if ticks > k.clock() {
+                k.set_clock(ticks);
+            }
+        }
         match crate::sched::preempt::yield_decision(&mut k.sched, run.domain) {
             Some(_) => crate::sched::park::park_current_from_syscall(0),
             None => 0,

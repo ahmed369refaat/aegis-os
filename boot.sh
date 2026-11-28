@@ -112,6 +112,40 @@ echo "==> [0e/4] building the signed local repo fixture (pkg-mkrepo)"
 cargo build -p aegis-pkg --bin pkg-mkrepo --features signer
 target/debug/pkg-mkrepo kernel-x86_64/blob/pkg-fixture
 
+# P1-1: the ring-3 TCP/IP service image — the netstack + the socket
+# relay as a REAL no_alloc ELF under the NETSVC memory contract
+# (text RX / rodata R / data RW with the shared config page at
+# 0x420000). Checked against the contract at EVERY build
+# (scripts/check-tcpip-image.py), then stripped: the kernel's
+# spawn_user_elf reads only the ELF + program headers.
+echo "==> [0f/4] linking the tcpip service (aegis-tcpip — the NETSVC contract, opt-level=z)"
+cargo build -p aegis-tcpip --bin tcpipd --profile pkg-image --target x86_64-unknown-none
+python3 scripts/check-tcpip-image.py target/x86_64-unknown-none/pkg-image/tcpipd
+strip --strip-all target/x86_64-unknown-none/pkg-image/tcpipd -o kernel-x86_64/blob/tcpipd.bin
+[ "$(readelf -lW kernel-x86_64/blob/tcpipd.bin | grep -c '^  LOAD')" = 3 ] \
+    || { echo "FATAL: the stripped tcpipd image lost a PT_LOAD"; exit 1; }
+
+# P1-1: the gcc userland net client — a freestanding static binary
+# (the same toolchain as /bin/hello) that speaks the P1-1 sockets
+# surface over the byte channels: socket/connect/send/recv/close,
+# TCP + UDP, and the live -EPERM probes that prove a client cannot
+# bypass the broker. Linked at the canonical cage's vaddrs.
+echo "==> [0g/4] building the gcc net client (userland-netcat — the CANONICAL contract)"
+# -mgeneral-regs-only: this kernel's ring 3 has NO FPU/SSE state —
+# gcc -O2 zeroes structs with pxor/movaps and the image dies on #UD at
+# the first one (found live, rip=0x4001b0). No vector, no x87, ever.
+gcc -ffreestanding -nostdlib -nostartfiles -static -O2 -mgeneral-regs-only \
+    -T "examples/userland-netcat/netcat.ld" \
+    -o "kernel-x86_64/blob/netcatd.bin" \
+    "examples/userland-netcat/netcat.c" 2>&1 | grep -v "build-id" || true
+[ -s "kernel-x86_64/blob/netcatd.bin" ] || { echo "FATAL: gcc net client build failed"; exit 1; }
+[ "$(readelf -lW kernel-x86_64/blob/netcatd.bin | grep -c '^  LOAD')" = 2 ] \
+    || { echo "FATAL: the net client image lost a PT_LOAD"; exit 1; }
+if objdump -d kernel-x86_64/blob/netcatd.bin | grep -q '%xmm\|%ymm\|%zmm\|%st('; then
+    echo "FATAL: the net client image contains FPU/SSE instructions (ring 3 has no FPU state)"
+    exit 1
+fi
+
 echo "==> [1/4] building the 64-bit kernel (x86_64-unknown-none, release)"
 cargo build -p aegis-kernel --release --target x86_64-unknown-none
 
@@ -229,6 +263,10 @@ case "${1:-}" in
       "[VNET] ring-3 NET_RECV:"  # the OFFER returned to ring-3 through SYS_NET_RECV
       "[VNET] ring-3 round trip:"  # ring-3 → policy gate → broker ring → slirp → rx → ring-3
       "[VNET] ring-3 throttle:"  # the bucket: 1+20 sends fit, the next EAGAIN; 1515B → EMSGSIZE
+      # P1-1: the TCP/IP stack live at ring 3 — the service + its gcc
+      # client over the brokered NIC, verified two-sided.
+      "[NET] stack=live tcp=1 udp=1 broker=1"  # the netstack service ran to a clean exit with both round trips
+      "[NET] client_roundtrip=ok"  # the gcc static ELF: socket → connect → send → echo → recv → close, TCP and UDP
       "[E1K] alive:"  # registers live: MAC + link
       "[E1K] TX: DHCP DISCOVER sent"  # the NIC egress works
       "[E1K] RX: "  # the OFFER parsed: full round trip through the IOMMU
@@ -613,6 +651,7 @@ if [ "$MODE" = "verify" ]; then
   TLS_ECHO_PID=""
   TLS_HOSTILE_PID=""
   TLS_WRONGNAME_PID=""
+  NET_ECHO_PID=""
   if command -v python3 >/dev/null 2>&1 && [ -f scripts/tls_echo_server.py ]; then
     rm -f /tmp/echo-accepts.log
     python3 scripts/tls_echo_server.py 44333 tls/tests/server-key.pem \
@@ -629,6 +668,14 @@ if [ "$MODE" = "verify" ]; then
       tls/tests/wrongname-cert.pem >/dev/null 2>&1 &
     TLS_WRONGNAME_PID=$!
     sleep 1.2
+  fi
+  # P1-1: the PLAIN TCP+UDP echo peers for the ring-3 stack's live
+  # round trip (10.0.2.2 under slirp IS this host's loopback).
+  if command -v python3 >/dev/null 2>&1 && [ -f scripts/net_echo_server.py ]; then
+    rm -f /tmp/net-echo.log
+    python3 scripts/net_echo_server.py 18080 18081 /tmp/net-echo.log >/dev/null 2>&1 &
+    NET_ECHO_PID=$!
+    sleep 0.3
   fi
   QEMU_RC=0
   if [ "${1:-}" = "--verify-q35" ]; then
@@ -651,6 +698,9 @@ if [ "$MODE" = "verify" ]; then
   fi
   if [ -n "$TLS_WRONGNAME_PID" ]; then
     kill "$TLS_WRONGNAME_PID" 2>/dev/null || true
+  fi
+  if [ -n "$NET_ECHO_PID" ]; then
+    kill "$NET_ECHO_PID" 2>/dev/null || true
   fi
   if [ "$QEMU_RC" = 124 ]; then
     echo "QEMU hit its ${QEMU_TIMEOUT}s budget (the kernel halted without exiting) — the verify greps still run"

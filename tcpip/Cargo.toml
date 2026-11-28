@@ -1,0 +1,19 @@
+[package]
+name = "aegis-tcpip"
+version = "0.1.0"
+edition = "2021"
+description = "AegisOS ring-3 TCP/IP service (P1-1): the no_alloc image that runs the policy core's netstack + socket relay at CPL=3 — egress only through SYS_NET_SEND, ingress only through SYS_NET_RECV, clients over byte channels. Built by boot.sh under the NETSVC memory contract."
+license = "MIT"
+
+# Core-only (the service is no_std, no_alloc): the policy core is the
+# one dependency, exactly as the kernel itself consumes it.
+[dependencies]
+aegis-os = { path = ".." }
+
+[lib]
+name = "aegis_tcpip"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tcpipd"
+path = "src/main.rs"

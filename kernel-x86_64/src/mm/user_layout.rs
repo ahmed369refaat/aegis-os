@@ -137,6 +137,26 @@ pub const SERVICE: ExecLayout = ExecLayout {
     trampoline_base: 0x00E0_4000,
 };
 
+/// P1-1: the tcpip service's contract — the ring-3 home of `netstack`
+/// (spawned by the kernel's `drvstack::tcpip` step through
+/// `mm::user::spawn_user_elf`, never execve'd by a parent). The cage
+/// mirrors `SERVICE`'s 128 pages (the image is a linked `no_alloc`
+/// build — netstack + the socket relay + their state — 12 pages today
+/// with headroom to grow); the stack is 96 pages (384 KiB): the
+/// service holds the stack, the broker queue and the relay as ONE
+/// frame of plain locals (~160 KiB by rustc's probe loop) and the
+/// netstack's frame processing nests INSIDE it (~60 KiB more) — the
+/// first cut's 64 pages faulted on exactly that seam (found live: a
+/// wild-RSP #PF one closure away from green). 128 + 96 + 1 = 225 of
+/// the `tcpip` profile's 256 pages, page-table slack included.
+pub const NETSVC: ExecLayout = ExecLayout {
+    code_base: CODE_BASE,
+    cage_end: 0x0048_0000,
+    stack_base: 0x0050_0000,
+    stack_pages: 96,
+    trampoline_base: 0x00E0_4000,
+};
+
 /// K22: the image cage in pages for a layout (what
 /// `exec_quota_check` compares the plan's `map_bytes` against).
 #[must_use]
@@ -218,7 +238,7 @@ mod tests {
     #[test]
     fn every_exec_layout_passes_the_policy_gate_as_a_whole_image() {
         use crate::mm::pte::USER_LIMIT;
-        for layout in [CANONICAL, SERVICE] {
+        for layout in [CANONICAL, SERVICE, NETSVC] {
             // 4096: the service contract alone is 128 + 2048 + 1 = 2177
             // pages — the space must cover the whole grant.
             let mut sp = AddressSpace::new(4096);
@@ -303,5 +323,15 @@ mod tests {
         // a profile that budgeted for it may declare it.
         assert!(7 + CANONICAL.overhead_pages() <= aegis_os::profile::service_profile().quota_pages);
         assert!(128 + SERVICE.overhead_pages() > aegis_os::profile::app_profile().quota_pages);
+        // P1-1: the NETSVC contract fits the tcpip profile's quota
+        // (a full 128-page cage + the 96-page stack + the trampoline,
+        // with page-table slack) and does NOT fit a client-sized one —
+        // only the service profile budgeted for it.
+        assert_eq!(cage_pages(&NETSVC), 128);
+        assert_eq!(NETSVC.stack_pages, 96);
+        assert_eq!(NETSVC.stack_top(), 0x0056_0000);
+        assert_eq!(NETSVC.overhead_pages(), 97);
+        assert!(128 + NETSVC.overhead_pages() <= aegis_os::profile::tcpip_profile().quota_pages);
+        assert!(128 + NETSVC.overhead_pages() > aegis_os::profile::app_profile().quota_pages);
     }
 }

@@ -35,6 +35,7 @@ mod netutil;
 mod nvme;
 mod pci;
 mod persist;
+mod tcpip;
 mod tls;
 mod vballoon;
 mod vblk;
@@ -150,6 +151,12 @@ pub fn driver_stack_step<const N: usize>(
                 // domain RESETS the device and brings it up on its
                 // OWN rings at CPL=3.
                 vnetdom::vnetdom_step(k, pool, out, &mut broker, &inv);
+                // P1-1: the TCP/IP stack LIVE at ring 3 — the netstack
+                // service + its gcc client over the brokered NIC. Runs
+                // AFTER vnetdom (the device is free again; this step
+                // re-claims it, re-arms the syscall session, and tears
+                // it all back down before the e1k steps).
+                tcpip::tcpip_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_step(k, pool, out, &mut broker, &inv);
                 e1k::e1k_cross_device_probe_step(k, pool, out, &mut broker, &inv);
                 // K26: the THIRD migrated driver — the e1000. Runs

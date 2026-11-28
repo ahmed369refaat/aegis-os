@@ -143,7 +143,33 @@ pub fn on_timer_tick(frame: &mut ExceptionFrame) {
             }
             return;
         }
-        serial::write_str("[IRQ ] KERNEL BUG: timer tick from CPL0 — halting\n");
+        // P1-1: name the frame's full vector, the LAPIC's live state,
+        // and the landing RIP before the halt — the seam evidence for
+        // the syscall-entry swapgs→cli window (a CPL0 tick there was
+        // found live at rip=syscall_entry+2; the driver stack's long
+        // syscall-heavy steps now pause ticks around their runs, and
+        // a stub-level stack switch is the P2 answer).
+        let mut bv = [0u8; 20];
+        serial::write_str("[IRQ ] KERNEL BUG: timer tick from CPL0 (vector=");
+        serial::write_str(strutil::dec(frame.vector, &mut bv));
+        serial::write_str(" isr48=");
+        serial::write_str(strutil::hex(
+            u64::from(lapic::isr_bit_set(48)),
+            &mut [0u8; 18],
+        ));
+        serial::write_str(" irr48=");
+        serial::write_str(strutil::hex(
+            u64::from(lapic::irr_bit_set(48)),
+            &mut [0u8; 18],
+        ));
+        serial::write_str(" lvt=");
+        serial::write_str(strutil::hex(
+            u64::from(lapic::lvt_timer_raw()),
+            &mut [0u8; 18],
+        ));
+        serial::write_str(" rip=");
+        serial::write_str(strutil::hex(frame.rip, &mut [0u8; 18]));
+        serial::write_str(") — halting\n");
         hw::halt_forever();
     }
 

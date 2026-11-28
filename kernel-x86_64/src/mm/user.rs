@@ -206,6 +206,80 @@ pub fn spawn_user_blob_as<const N: usize>(
     }
 }
 
+/// Why an ELF spawn failed. Like [`SpawnError`], every failure happens
+/// *before* any launch — and the three whole-image gates (plan, cage,
+/// quota) run BEFORE the domain identity is even created, so a refused
+/// image spends no identity, no frame, and needs no rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElfSpawnError {
+    /// The lib refused the domain (duplicate id, table full, ...).
+    Domain,
+    /// The image did not plan — the ELF validator's refusal (bad
+    /// header, W+X, out-of-order offsets, ...).
+    Plan,
+    /// A PT_LOAD sits outside the contract's cage.
+    Cage(ExecMapError),
+    /// The image's pages + the contract's stack + trampoline exceed
+    /// the profile's quota (the `exec_quota_check` arithmetic).
+    Quota { need: usize, quota: usize },
+    /// The mapper refused a region mid-build (rolled back).
+    Map(ExecMapError),
+}
+
+/// P1-1: spawn a ring-3 domain from a full ELF64 image — the spawn
+/// twin of the execve loader. `spawn_user_blob` maps the canonical
+/// flat layout; this runs the REAL plan path (`build_exec_plan`, the
+/// cage check, the quota check, `exec_tables`) so a linked no_alloc
+/// image (the tcpip service) runs under its OWN contract without a
+/// parent domain having to execve it. Identity is DECLARED
+/// (`uid`/`gid`), like `spawn_user_blob_as`.
+#[allow(clippy::too_many_arguments)] // the blob twin's shape: kernel, pool, identity, image, contract
+pub fn spawn_user_elf<const N: usize>(
+    k: &mut Kernel<N>,
+    pool: &mut FramePool<N>,
+    id: u32,
+    profile: DomainProfile,
+    uid: u16,
+    gid: u16,
+    image: &[u8],
+    contract: &layout::ExecLayout,
+) -> Result<UserSpawn, ElfSpawnError> {
+    // The whole-image gates first — a refused image never registers.
+    let plan = aegis_os::elf::build_exec_plan(image).map_err(|_| ElfSpawnError::Plan)?;
+    exec_cage_check(&plan, contract).map_err(ElfSpawnError::Cage)?;
+    crate::exec_registry::exec_quota_check(
+        plan.map_bytes,
+        contract.stack_pages,
+        layout::TRAMPOLINE_PAGES,
+        profile.quota_pages,
+    )
+    .map_err(|e| match e {
+        crate::exec_registry::ExecQuotaError::OverQuota { need, quota } => {
+            ElfSpawnError::Quota { need, quota }
+        }
+    })?;
+    // Lib identity + stdio, then the transactional build (the blob
+    // path's discipline, N3 rollback included).
+    k.create_domain_with(id, profile, uid, gid, 0)
+        .map_err(|_| ElfSpawnError::Domain)?;
+    if k.reserve_stdio(id).is_err() {
+        let _ = k.destroy_domain(id);
+        return Err(ElfSpawnError::Domain);
+    }
+    match exec_tables(k, pool, id, &plan, image, contract, profile.quota_pages) {
+        Ok((tables, space)) => Ok(UserSpawn {
+            domain: id,
+            ctx: UserContext::new(plan.entry, contract.stack_top()),
+            run: UserRun::new(tables, space, id, profile.syscalls, false),
+        }),
+        Err(e) => {
+            pool.free_all_owned(&mut k.frames, id);
+            let _ = k.destroy_domain(id);
+            Err(ElfSpawnError::Map(e))
+        }
+    }
+}
+
 /// The hardware half of a spawn: fresh tables, kernel half shared in,
 /// layout mapped through the policy gate, blob/data copied in via the
 /// direct map. Every frame it takes is pool-owned by `id`, so a single
@@ -762,5 +836,61 @@ mod transaction_tests {
         assert!(tables.translate(SERVICE.stack_top() - 4096).is_some());
         assert!(tables.translate(layout::STACK_BASE).is_none());
         assert_eq!(space.used_pages(), 2 + SERVICE.overhead_pages());
+    }
+
+    /// P1-1: the ELF spawn path against the REAL package-manager
+    /// bytes — the image builds under its own contract through
+    /// `spawn_user_elf` (identity registered, tables built, entry and
+    /// stack taken from the contract), and the very same image under
+    /// the canonical contract is refused by the CAGE gate BEFORE any
+    /// identity or frame exists (the pre-check's promise, made good).
+    #[test]
+    fn spawn_user_elf_runs_the_pkg_image_under_its_own_contract() {
+        use crate::exec_registry::EXEC_PKG_ELF;
+        use crate::mm::user_layout::SERVICE;
+        let (mut k, mut pool, _p) = setup();
+        let base = (k.frames.frames_in_use(), pool.owned_count());
+        // The cage refusal: no identity, no frames, nothing to roll back.
+        assert!(matches!(
+            spawn_user_elf(
+                &mut k,
+                &mut pool,
+                7,
+                aegis_os::profile::package_manager_profile(),
+                150,
+                150,
+                EXEC_PKG_ELF,
+                &layout::CANONICAL
+            ),
+            Err(ElfSpawnError::Cage(_))
+        ));
+        assert_eq!(k.domain_state(7), None);
+        assert_eq!((k.frames.frames_in_use(), pool.owned_count()), base);
+
+        // The real spawn under the real contract.
+        let sp = spawn_user_elf(
+            &mut k,
+            &mut pool,
+            7,
+            aegis_os::profile::package_manager_profile(),
+            150,
+            150,
+            EXEC_PKG_ELF,
+            &SERVICE,
+        )
+        .expect("the pkg image spawns under its own contract");
+        assert_eq!(sp.domain, 7);
+        assert!(k.domain_state(7).is_some());
+        assert!(sp.run.tables.translate(SERVICE.code_base).is_some());
+        assert!(sp
+            .run
+            .tables
+            .translate(SERVICE.stack_top() - 4096)
+            .is_some());
+        assert!(sp.run.tables.translate(SERVICE.trampoline_base).is_some());
+        // The full teardown reclaims every frame and the identity.
+        pool.free_all_owned(&mut k.frames, 7);
+        let _ = k.destroy_domain(7);
+        assert_eq!(k.frames.frames_in_use(), base.0);
     }
 }
