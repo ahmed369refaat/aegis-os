@@ -12,10 +12,14 @@
 ## Current status — honestly stated
 
 - **(P1-2) real binaries through the signed package path + the documented toolchain:**
-  the repo fixture's packages now carry REAL programs — `r1/hello` 1.1.0's payload is the
-  stripped gcc userland ELF (the same bytes the ext2 disk serves as `/bin/hello`), and a
-  third package `r1/netcat` delivers the P1-1 socket client itself. The in-VM lane runs
-  FOUR rounds (install → upgrade-to-a-real-ELF → remove → install-the-netcat) with each
+  the repo fixture's packages now carry REAL programs across THREE compiler paths —
+  `r1/hello` 1.1.0's payload is the stripped gcc userland ELF (the same bytes the ext2
+  disk serves as `/bin/hello`), `r1/netcat` delivers the P1-1 socket client itself, and
+  `r1/rust-hello` delivers a REAL rustc-built ELF (512 B, `ld -n`-packed with congruent
+  vaddrs — small enough to ride the ramfs's inline window, so it costs no large-file
+  spill slot; `scripts/check-citizen.py` pins the congruence at build time). The in-VM
+  lane runs FIVE rounds (install → upgrade-to-a-real-ELF → remove → install-the-netcat →
+  install-the-rustc-citizen) with each
   round's installed tree verified byte-exact AND parsed by the exec loader's own plan
   gate — a package that delivered bytes that are not a genuine image cannot pass. The
   netcat image fits the repo's bounds because its pinned blocks and bss ride the data
