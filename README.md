@@ -4,13 +4,49 @@
 
 [![CI](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml/badge.svg)](https://github.com/ahmed369refaat/aegis-os/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests: 790](https://img.shields.io/badge/tests-760%20passing-brightgreen.svg)](tests/)
+[![Tests: 983](https://img.shields.io/badge/tests-983%20passing-brightgreen.svg)](tests/)
 [![Boot](https://img.shields.io/badge/boots%20in%20QEMU-ring--3%20isolation%20live%20%F0%9F%9F%A2-brightgreen.svg)](#quick-start)
 
 > The name: **Aegis** (the shield). One rule shapes the whole design: everything runs inside an isolated `Domain`, and every privilege is granted once and can only ever shrink.
 
 ## Current status — honestly stated
 
+- **(P1-2) real binaries through the signed package path + the documented toolchain:**
+  the repo fixture's packages now carry REAL programs — `r1/hello` 1.1.0's payload is the
+  stripped gcc userland ELF (the same bytes the ext2 disk serves as `/bin/hello`), and a
+  third package `r1/netcat` delivers the P1-1 socket client itself. The in-VM lane runs
+  FOUR rounds (install → upgrade-to-a-real-ELF → remove → install-the-netcat) with each
+  round's installed tree verified byte-exact AND parsed by the exec loader's own plan
+  gate — a package that delivered bytes that are not a genuine image cannot pass. The
+  netcat image fits the repo's bounds because its pinned blocks and bss ride the data
+  segment's NOLOAD memsz tail (13,192 → 8,576 B). `BUILD.md` is now the toolchain map:
+  the three citizen types (gcc freestanding / rustc ELF + custom ld / Rust lib+bin
+  composition), the memory contracts, the check scripts, and the package path. Found
+  live on the way: a 9 KiB kmain verification buffer blew the 16 KiB kernel stack and
+  the corruption surfaced far away as a dead CoW entry in the fork lane — the verifier
+  now streams 4-KiB chunks; and the first VFS sizing crossed `Kernel<4096>`'s 512-KiB
+  boot-stack budget, which the capacity test caught loudly (the spills are now 5×10 KiB,
+  measured for the netcat transaction's commit peak).
+- **(P1-1) the TCP/IP stack LIVE at ring 3 — the userspace sockets surface:** the policy
+  core's own netstack (`src/netstack/`) runs as a REAL CPL=3 ELF service domain
+  (`tcpip/`, the NETSVC memory contract, spawned by the kernel's new `spawn_user_elf` —
+  the spawn twin of the execve loader), with its clients over capability-mediated byte
+  channels. Egress has exactly one exit (`SYS_NET_SEND` through the broker's token
+  bucket and broker-mapped rings), ingress exactly one entrance (`SYS_NET_RECV`); the
+  service NEVER parks (a poll loop cannot deadlock). The q35 lane proves it live, with
+  a **gcc freestanding static client** (`userland-netcat`): `[NET] stack=live tcp=1
+  udp=1 broker=1` and `[NET] client_roundtrip=ok` — socket → connect → send → the
+  host echo servers → recv → close, TCP and UDP, the bucket's EAGAIN observed and
+  REFILLED (the kernel clock's stamp at `sched_yield` works), and the client's own
+  probes answered `-EPERM` (denied by policy — a client cannot bypass the broker).
+  Ten live-found bugs on the way, all fixed and documented in the commit: LTO
+  const-folding the patched config page, the SSE `#UD` (ring 3 has no FPU state),
+  non-page-aligned `translate()` offsets, the drain scrubbing report pages before the
+  reads, the dgram `connect` auto-bind gap in the core, and the **syscall-entry tick
+  seam** — SYSCALL enters CPL0 with IF=1 on this QEMU, a preempt tick between `swapgs`
+  and `cli` is a CPL0 timer frame, and this step is the first syscall-heavy long run
+  under the live timer (the step now pauses ticks around its run; the P2 answer is a
+  stub-level stack switch for CPL0-origin interrupt frames).
 - **K20 (the P0 hardening round, three items lane-proven):**
   **(P0-1) production limits, measured** — the fixed tables now speak their real workloads: `MAX_SYSCALL_MSG` 32→2 KiB, `MAX_WAKE_FRAMES` 8→256, `MAX_CHILDREN` 4→32, IPC channels 16→64, pipe buffer 2→16 KiB, domain stack 1→2 MiB — every raise carries a measured cost and a host accounting test, plus a `[CAP]` boot selftest that EXERCISES the new ceilings on every lane (fills them, verifies, frees, count=0). What was NOT raised and why is in `docs/capacity.md` (inline inode payloads, ABI width, VT-d contexts, the frame pool).
   **(P0-2) the network data path** — `SYS_NET_SEND(9)`/`SYS_NET_RECV(10)` are live at the ring-3 entry, ordered fail-closed (frame bound EMSGSIZE → live-session ENODEV → range EFAULT → the core policy gate EACCES/EAGAIN → copy → the wire), driving the CPL0 proof's broker-mapped virtio-net rings through a live-session static. A ring-3 netd domain proves the round trip on the q35 lanes: a 290-byte DHCP DISCOVER out at CPL=3, slirp's 590-byte OFFER back (`op=BOOTREPLY`, yiaddr 10.0.2.15), the bucket exhausting after 1+20 sends (EAGAIN, no clock advance), a 1515-byte send refusing -EMSGSIZE. The core's burst grew 64→1514 bytes — the old default could never pass the boot's own 290-byte frame; a frame that can never fit any window is now `TooLong`→EMSGSIZE, never a throttle.
@@ -40,7 +76,36 @@
 - **Exception machinery (Stage 1 / PR-1.1)**: a kernel-owned GDT/TSS/IDT with a uniform exception frame, IST stacks for `#DF/#NMI/#MC/#SS`, and a live negative test — the boot forces a hardware `#DE` and the dispatch prints the diagnosis and the selftest marker before powering off. Every fault from here on is diagnosed, not a silent hang. **11 new host tests pin the descriptor/frame encodings, including the boot-stub GDT literals as an ABI contract.**
 - Unsafe policy enforced by machine, not convention: the policy core is `forbid(unsafe_code)`; the kernel is `deny(unsafe_code)` with a five-entry allowlist (`arch/`, `boot/`, `hw.rs`, `memops.rs`, `sched/`), every item carrying a `SAFETY` note, and a **ratchet** (`scripts/unsafe-count.txt`, baseline 78) that fails CI if the count grows without an ADR.
 
-**Not yet (see [`docs/GAP-ANALYSIS-v2.md`](docs/GAP-ANALYSIS-v2.md), the master plan):** the REST of the ring-3 syscall surface (SPAWN answers -ENOSYS at the ring-3 entry; the file family — including K21's STAT/RENAME — MMAP/MUNMAP, KILL, CHROOT, MKDIR/UNLINK, LISTDIR, fork/exec, the wait family, and the brokered-socket NET_SEND/NET_RECV pair are live), TCP/IP and anything above raw frames (the net data path speaks Ethernet+DHCP through QEMU slirp; there is no TCP/IP stack), musl or any hosted libc (the gcc userland is freestanding -nostdlib), SMP (both migrated driver domains — virtio-blk and virtio-net — are lane-green; the e1000/NVMe/AHCI paths are still ring-0), and the second architecture (aarch64 — the HAL seam is designed in ADR-0011, enforced in CI by cross-arch builds of the core). Timer-preemption machinery, the ELF loader, fork+CoW and ext2 persistence are LIVE (see the bullets above); storage (AHCI/NVMe/virtio-blk + ext2 read/write, FAT32 read-only) is live on the driver-stack lanes. The package manager's in-VM domain is the remaining K21 item: the exec cage is 16 KiB ([0x400000, 0x404000)) while the manager's fixed no-alloc buffers need a larger cage contract — the design is in `pkg/BUILD.md`'s boot-integration section. Fuzz harnesses for the syscall storm / lifecycle / ELF loader are the next item in flight. KVM and real hardware: not run in this sandbox (TCG only).
+**Not yet — the explicit P2 list (no aspiration, only named work):**
+
+1. **The syscall-entry tick seam, at the stub level**: SYSCALL enters CPL0 with IF=1
+   (this QEMU ignores FMASK.IF), so a preempt tick landing between `swapgs` and `cli`
+   is a CPL0-origin interrupt frame pushed on the USER stack. The long syscall-heavy
+   steps pause ticks around their runs today (the ADR-0019 window discipline, scaled);
+   the real fix is the IDT stubs switching to the kernel stack for CPL0-origin
+   external vectors (named by the tick guard's halt telemetry: `rip=syscall_entry+2`).
+2. **The ext2 indirect-block read**: files above 12 KiB cannot ride the repo path
+   (direct blocks only) — a bigger userland program than the netcat client needs it.
+3. **A hosted libc (musl)**: the gcc userland is freestanding `-nostdlib`, and the
+   syscall surface it needs (the v1 Linux ABI lane) is live but far from complete.
+4. **SMP**: single CPU only; all driver domains are lane-green but the scheduler,
+   the frame pool and the broker tables are single-CPU shapes.
+5. **NVMe and AHCI at ring 3**: the three NIC/disk driver migrations are done
+   (virtio-blk, virtio-net, e1000 — each a CPL=3 domain on its OWN rings); NVMe and
+   AHCI still run ring-0 proofs.
+6. **aarch64**: the HAL seam is designed (ADR-0011) and CI cross-arch builds the
+   policy core, but no second boot exists.
+7. **KVM and real hardware**: never run — this sandbox is TCG-only.
+
+Live and lane-proven (the gaps the list above is NOT about): the ring-3 syscall
+surface (the file family, mmap/munmap, fork/exec/CoW, the wait family, signals,
+chroot, and the brokered NET pair), the full TCP/IP story twice over (the kernel's
+own stack driving TLS 1.3 to a real OpenSSL server, and the P1-1 ring-3 netstack
+service with its gcc client against the host's echo servers), timer preemption, the
+ELF loader with image-identity policy, ext2 write persistence and the TTY + shell
+lanes, the package manager in-VM (four lifecycle rounds with real binaries), and the
+driver stack (rng, wdt, console, balloon, virtio-net, e1000, NVMe, AHCI + ext2/FAT32,
+xHCI + the USB keyboard, the GFX console, the RTC).
 
 ## The architecture in one line
 
