@@ -79,6 +79,12 @@ SECRET_SCAN_EXCLUDE=(
     # round 5 added the history scanner to this class
     'scripts/check-no-binaries.sh'
     'scripts/check-history-clean.sh'
+    # K27: a TEST-ONLY identity — a throwaway Ed25519 key with zero
+    # authority, published as the pinned-trust FIXTURE (the kernel
+    # verifies the server against this key BY NAME, SSH's
+    # known-hosts model). Its secrecy has no value; every OTHER key
+    # file in the tree stays loud.
+    'tls/tests/server-key.pem'
 )
 
 # Prints the paths among "$@" that are text files matching a pattern.
