@@ -1677,16 +1677,25 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         // ext2 walk reads /pkgsrc into the crate::pkgsrc store (the
         // [PKGSRC] markers) BEFORE this lane runs; the TEST-ONLY seeds
         // themselves — see pkg/src/bin/pkg-mkrepo.rs, which built the
-        // files boot.sh step [0e] put on the disk. The store carries
-        // FIVE files (both package versions — the repo is
-        // version-qualified, so the upgrade round's transaction reads
-        // the 1.1.0 one).
+        // files boot.sh step [0g] put on the disk. The store carries
+        // SIX files (both package versions, the netcat client — the
+        // repo is version-qualified, so the upgrade round's
+        // transaction reads the 1.1.0 one).
         /// What each version installs, byte-exact — different bytes
         /// AND a different size, so the upgrade proves the payload
         /// moved (the old no-op `pkg upgrade` kept 12 B and still
         /// printed "done").
         const PAYLOAD_V10: &[u8] = b"hello world\n";
-        const PAYLOAD_V11: &[u8] = b"hello world v1.1\n";
+        /// P1-2: the 1.1.0 payload is the REAL stripped gcc userland
+        /// ELF — the same bytes the ext2 disk serves as /bin/hello and
+        /// the same file pkg-mkrepo embedded, so the upgrade round now
+        /// installs a GENUINE loadable image (the exec plan check
+        /// below proves it parses) instead of a 17-B string.
+        const PAYLOAD_V11: &[u8] = include_bytes!("../blob/userland-hello.elf");
+        /// P1-2: the netcat client (the P1-1 socket citizen) as a
+        /// THIRD package — a REAL third-party static binary delivered
+        /// through the signed path and installed byte-exact.
+        static NETCAT_ELF: &[u8] = include_bytes!("../blob/netcatd.bin");
 
         // (a) the exec policy for the PM image's identity.
         let declared = k
@@ -1738,6 +1747,74 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                     Ok(SysValue::Count(_))
                 );
                 off += want;
+            }
+            let _ = k.syscall(dom, SysRequest::Close { fd });
+            ok
+        }
+
+        // P1-2: the big-payload verifier — opens the file and compares
+        // it against the expected bytes ONE 4-KiB CHUNK AT A TIME. The
+        // first cut read the whole 8.5-KiB ELF into a [u8; 9216] kmain
+        // local — a ~17-KiB frame that blew the 16-KiB kernel stack and
+        // corrupted the state below it (the damage surfaced far away,
+        // as a dead CoW entry in the fork lane — found live). The
+        // streaming shape keeps the kmain frame at the size every other
+        // round already holds.
+        fn probe_verify_file<const N: usize>(
+            k: &mut aegis_os::Kernel<N>,
+            dom: u32,
+            path: &'static str,
+            expected: &[u8],
+        ) -> bool {
+            use aegis_os::sys::{SysRequest, SysValue};
+            let Ok(SysValue::Fd(fd)) = k.syscall(
+                dom,
+                SysRequest::Open {
+                    path,
+                    mode: aegis_os::vfs::Mode(0),
+                    create: false,
+                    read: true,
+                    write: false,
+                    truncate: false,
+                    excl: false,
+                },
+            ) else {
+                return false;
+            };
+            let mut chunk = [0u8; 4096];
+            let mut off = 0usize;
+            let mut ok = true;
+            while ok && off < expected.len() {
+                let want = (expected.len() - off).min(4096);
+                match k.syscall(
+                    dom,
+                    SysRequest::Read {
+                        fd,
+                        buf: &mut chunk[..want],
+                    },
+                ) {
+                    Ok(SysValue::Count(n)) if n == want => {
+                        if chunk[..want] != expected[off..off + want] {
+                            ok = false;
+                        }
+                        off += want;
+                    }
+                    _ => ok = false,
+                }
+            }
+            // EOF must land exactly at the expected end: a longer file
+            // is a wrong tree too.
+            if ok
+                && k.syscall(
+                    dom,
+                    SysRequest::Read {
+                        fd,
+                        buf: &mut chunk[..1],
+                    },
+                )
+                .is_ok_and(|v| matches!(v, SysValue::Count(n) if n > 0))
+            {
+                ok = false;
             }
             let _ = k.syscall(dom, SysRequest::Close { fd });
             ok
@@ -1870,6 +1947,13 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 "/r1/r1.hello-1.1.0.akp",
                 0o644,
                 crate::pkgsrc::file(crate::pkgsrc::IDX_PKG_V11).unwrap_or(&[]),
+            )
+            && probe_put(
+                &mut k,
+                PKG_PROBE,
+                "/r1/r1.netcat-1.0.0.akp",
+                0o644,
+                crate::pkgsrc::file(crate::pkgsrc::IDX_NETCAT).unwrap_or(&[]),
             )
             && probe_put(
                 &mut k,
@@ -2228,29 +2312,26 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
         match run_exit {
             crate::sched::context::ExitKind::Exited(0) => {
                 let probed = verify_probe(&mut k).is_some();
-                let mut payload = [0u8; 64];
                 let mut rec = [0u8; 4096];
                 let mut state = [0u8; 4096];
-                let (got, rec_n, state_n) = if probed {
+                let (payload_ok, rec_n, state_n) = if probed {
                     (
-                        probe_read(&mut k, PKG_VERIFY, "/usr/bin/pkg-hello", &mut payload),
+                        // P1-2: the upgraded payload is the REAL stripped
+                        // gcc ELF (8,496 B) — compared STREAMING (the
+                        // 4-KiB-chunk verifier above), and a genuine
+                        // loadable image by the exec loader's own gate.
+                        probe_verify_file(&mut k, PKG_VERIFY, "/usr/bin/pkg-hello", PAYLOAD_V11)
+                            && aegis_os::elf::build_exec_plan(PAYLOAD_V11).is_ok(),
                         // the upgraded record replaces the old one at
                         // the same committed name.
                         probe_read(&mut k, PKG_VERIFY, "/pkg/db/r1.hello", &mut rec),
                         probe_read(&mut k, PKG_VERIFY, "/pkg/db/state", &mut state),
                     )
                 } else {
-                    (None, None, None)
+                    (false, None, None)
                 };
                 let _ = k.destroy_domain(PKG_VERIFY);
-                // 17 B, byte-exact: a DIFFERENT payload at a DIFFERENT
-                // size is what separates a real upgrade from the old
-                // structural no-op (which printed "done" and left the
-                // 12-B 1.0.0 bytes in place).
-                let tree_ok = got == Some(PAYLOAD_V11.len())
-                    && &payload[..PAYLOAD_V11.len()] == PAYLOAD_V11
-                    && rec_n.unwrap_or(0) > 0
-                    && state_n.unwrap_or(0) > 0;
+                let tree_ok = payload_ok && rec_n.unwrap_or(0) > 0 && state_n.unwrap_or(0) > 0;
                 if tree_ok {
                     line(
                         &mut out,
@@ -2258,10 +2339,14 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                             "[PKG] upgrade r1/hello: 1.1.0 resolved ABOVE the installed 1.0.0, Ed25519-verified, committed (exit 0)",
                         ],
                     );
+                    let mut binsz = [0u8; 20];
                     line(
                         &mut out,
                         &[
-                            "[PKG] the upgraded tree: /usr/bin/pkg-hello == 17-B \"hello world v1.1\" payload, byte-exact — the payload moved",
+                            "[PKG] the upgraded tree: /usr/bin/pkg-hello == the REAL ",
+                            "stripped gcc ELF (",
+                            strutil::dec(PAYLOAD_V11.len() as u64, &mut binsz),
+                            " B, byte-exact, exec-plan parses) — the payload moved",
                         ],
                     );
                     round_common_markers(&mut out, mask_verified, high_water, live_mask);
@@ -2392,6 +2477,96 @@ pub extern "C" fn kmain(magic: u32, info: u32) -> ! {
                 line(
                     &mut out,
                     &["[PKG] ERROR: the manager faulted (remove) — LOUD"],
+                );
+            }
+        }
+        pool.free_all_owned(&mut k.frames, PKG_DOM);
+        let _ = k.destroy_domain(PKG_DOM);
+
+        // ── round 4 (P1-2): install r1/netcat@1.0.0 (selector 3) —
+        //      the REAL third-party static binary delivered through
+        //      the signed path. The remove round left a clean, warm
+        //      tree (the repo is still provisioned, the state is a
+        //      valid count-0 ASTT — the same "fresh install after the
+        //      remove" shape the host mirror proves), so this round
+        //      exercises the lifecycle's fourth command on a live
+        //      system: the solver resolves the netcat entry, the
+        //      transaction reads the 8,748-B version-qualified .akp,
+        //      the commit writes /usr/bin/netcat, and the verification
+        //      below is THREE-sided: byte-exact against the same
+        //      stripped ELF the tcpip step spawns (P1-1's citizen),
+        //      parsed as a GENUINE exec image by the loader's own
+        //      plan gate, and the record written. ──
+        let (run_exit, mask_verified, high_water, live_mask) =
+            match pkg_round(&mut k, &mut pool, &mut out, PKG_DOM, pm_mask, 3) {
+                Some(r) => r,
+                None => {
+                    pool.free_all_owned(&mut k.frames, PKG_DOM);
+                    let _ = k.destroy_domain(PKG_DOM);
+                    hw::halt_forever();
+                }
+            };
+        match run_exit {
+            crate::sched::context::ExitKind::Exited(0) => {
+                let probed = verify_probe(&mut k).is_some();
+                let mut rec = [0u8; 4096];
+                let mut state = [0u8; 4096];
+                let (payload_ok, rec_n, state_n) = if probed {
+                    (
+                        // Byte-exact against the ELF the tcpip step
+                        // spawns (streamed, 4-KiB chunks), and a
+                        // genuine image by the loader's own gate.
+                        probe_verify_file(&mut k, PKG_VERIFY, "/usr/bin/netcat", NETCAT_ELF)
+                            && aegis_os::elf::build_exec_plan(NETCAT_ELF).is_ok(),
+                        probe_read(&mut k, PKG_VERIFY, "/pkg/db/r1.netcat", &mut rec),
+                        probe_read(&mut k, PKG_VERIFY, "/pkg/db/state", &mut state),
+                    )
+                } else {
+                    (false, None, None)
+                };
+                let _ = k.destroy_domain(PKG_VERIFY);
+                let tree_ok = payload_ok && rec_n.unwrap_or(0) > 0 && state_n.unwrap_or(0) > 0;
+                if tree_ok {
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] install r1/netcat@1.0.0: the REAL third-party binary resolved, Ed25519-verified, committed (exit 0)",
+                        ],
+                    );
+                    let mut binsz = [0u8; 20];
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] the installed citizen: /usr/bin/netcat == the stripped gcc socket client (",
+                            strutil::dec(NETCAT_ELF.len() as u64, &mut binsz),
+                            " B, byte-exact, exec-plan parses) — a signed package delivered a genuine program",
+                        ],
+                    );
+                    round_common_markers(&mut out, mask_verified, high_water, live_mask);
+                } else {
+                    line(
+                        &mut out,
+                        &[
+                            "[PKG] ERROR: exit 0 but the installed netcat is wrong (payload/record/state) — LOUD",
+                        ],
+                    );
+                }
+            }
+            crate::sched::context::ExitKind::Exited(code) => {
+                let mut cn = [0u8; 20];
+                line(
+                    &mut out,
+                    &[
+                        "[PKG] ERROR: netcat install exit=",
+                        strutil::dec(code, &mut cn),
+                        " — LOUD",
+                    ],
+                );
+            }
+            _ => {
+                line(
+                    &mut out,
+                    &["[PKG] ERROR: the manager faulted (netcat install) — LOUD"],
                 );
             }
         }

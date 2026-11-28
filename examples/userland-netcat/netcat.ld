@@ -7,9 +7,17 @@
  * the one-page stack (0x408000) and the trampoline (0x40C000) are
  * kernel-provisioned and untouched here.
  *
+ * P1-2: the pinned blocks and the bss buffers ride the data segment's
+ * MEMSZ tail (NOLOAD — the loader's zero-fill contract, the same one
+ * the exec target's bss tail proves). The file shrinks ~4.5 KiB
+ * (2 KiB of pinned-block zeros + the buffers): a REAL binary small
+ * enough to ride the signed-package path — the ext2 reader's
+ * direct-block ceiling (12 KiB) bounds the repo fixture's files, and
+ * a 13 KiB image could not be a package at all.
+ *
  * NOTE: assignments INSIDE an output section are offsets from the
  * section's start (the ld rule) — the pinned blocks are written as
- * 0x800/0xC00 offsets of the .data section that starts at 0x403000.
+ * 0x800/0xC00 offsets of the sections that start at 0x403000.
  */
 OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(_start)
@@ -21,13 +29,15 @@ SECTIONS
   .data : {
       *(.rodata .rodata.*)
       *(.data .data.*)
-      . = 0x800;   /* 0x403800: the kernel-patched config block */
+  } :data
+  .bss (NOLOAD) : {
+      . = 0x800;   /* 0x403800: the kernel-patched config block (zero at load) */
       *(.netcfg)
-      . = 0xC00;   /* 0x403C00: the report block */
+      . = 0xC00;   /* 0x403C00: the report block (zero at load) */
       *(.netrep)
-      . = 0x1000;  /* 0x404000: the bss buffers land here (one RW
-                      region with the data — no adjacent-region
-                      refusal, they are the same mapping) */
+      . = 0x1000;  /* 0x404000: the bss buffers (one RW region with the
+                      data — no adjacent-region refusal, same mapping;
+                      memsz tail, zero-filled by the loader) */
       *(.bss .bss.*)
       *(COMMON)
   } :data

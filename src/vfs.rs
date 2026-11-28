@@ -35,11 +35,22 @@ pub const FILE_DATA_MAX: usize = 1024;
 /// one of these side-table slots instead of answering ENOSPC
 /// mid-transaction: `LARGE_FILE_SLOTS` files of up to `LARGE_FILE_MAX`
 /// bytes may be live at once, the rest stay inline exactly as before.
-/// The table is a flat 32 KiB of `Kernel` state (never per-inode);
+/// The table is a flat 50 KiB of `Kernel` state (never per-inode);
 /// a file that needs a slot when all are taken still answers the
 /// honest `NoSpace`.
-pub const LARGE_FILE_MAX: usize = 8192;
-pub const LARGE_FILE_SLOTS: usize = 4;
+///
+/// P1-2: the window is 10 KiB (the largest file the signed repo
+/// carries — the 8,748-B netcat package — plus margin; the ext2
+/// reader's 12-KiB direct-block ceiling bounds the REPO files, this
+/// window bounds what the ramfs holds) and the slot count is 5: the
+/// repo's two REAL-binary .akp files, the netcat transaction's
+/// staged payload and the manager's journal are all live at once at
+/// the commit peak (4 slots), with one spare. This sizing is also
+/// what keeps `Kernel<4096>` inside its 512-KiB boot-stack budget
+/// (the capacity accounting test pins that line — the first cut's
+/// 6×12 KiB crossed it and the test said so, loudly).
+pub const LARGE_FILE_MAX: usize = 10 * 1024;
+pub const LARGE_FILE_SLOTS: usize = 5;
 /// `Inode.spill` value for "data is inline".
 const NO_SPILL: u8 = 0xFF;
 /// K20 (P0-1): 28 -> 64 bytes per path component — real file names

@@ -71,6 +71,12 @@ gcc -ffreestanding -nostdlib -nostartfiles -static -O2 \
     -o "kernel-x86_64/blob/userland-hello.elf" \
     "examples/userland-hello/hello.c" 2>&1 | grep -v "build-id" || true
 [ -s "kernel-x86_64/blob/userland-hello.elf" ] || { echo "FATAL: gcc userland image build failed"; exit 1; }
+# P1-2: strip at build — the canonical blob is the STRIPPED ELF (the
+# kernel's loader reads only the ELF + program headers; the ext2 disk
+# carries it as /bin/hello; and the signed package's 1.1.0 payload is
+# THE SAME BYTES, so the upgrade round installs a genuine image and
+# the byte-identical proof is by construction).
+strip --strip-all kernel-x86_64/blob/userland-hello.elf
 
 echo "==> [0c/4] linking the shell (a REAL ELF64 — /bin/sh, opt-level=z + gc-sections)"
 rustc --edition 2021 --crate-type=bin -C panic=abort -C opt-level=z -C codegen-units=1 \
@@ -96,21 +102,30 @@ strip --strip-all target/x86_64-unknown-none/pkg-image/pkg -o kernel-x86_64/blob
 [ "$(readelf -lW kernel-x86_64/blob/pkg.bin | grep -c '^  LOAD')" = 3 ] \
     || { echo "FATAL: the stripped /bin/pkg image lost a PT_LOAD"; exit 1; }
 
-# K22: the signed local repo fixture — the host-side repo builder
-# (pkg-mkrepo, signer feature; TEST-ONLY fixed seeds — see
-# pkg/src/bin/pkg-mkrepo.rs). Five files, each ≤ 8 KiB (the ramfs
-# spill-window bound — the tool fails the build if one crosses it):
-# the trust anchors, the repo config, the signed index, and BOTH
-# version-qualified packages (the repo layout is version-qualified
-# now — the upgrade round has something to move TO). K23: the
-# fixture feeds ONLY THE DISK — scripts/mkext2.py
-# writes these bytes into the ext2 image's /pkgsrc and the boot's
-# ext2 walk reads them back (the kernel image no longer embeds
-# package data); scripts/check-pkgsrc-image.py proves them
-# byte-exact on the image at every build.
-echo "==> [0e/4] building the signed local repo fixture (pkg-mkrepo)"
-cargo build -p aegis-pkg --bin pkg-mkrepo --features signer
-target/debug/pkg-mkrepo kernel-x86_64/blob/pkg-fixture
+# P1-1: the gcc userland net client — a freestanding static binary
+# (the same toolchain as /bin/hello) that speaks the P1-1 sockets
+# surface over the byte channels: socket/connect/send/recv/close,
+# TCP + UDP, and the live -EPERM probes that prove a client cannot
+# bypass the broker. Linked at the canonical cage's vaddrs.
+echo "==> [0e/4] building the gcc net client (userland-netcat — the CANONICAL contract)"
+# -mgeneral-regs-only: this kernel's ring 3 has NO FPU/SSE state —
+# gcc -O2 zeroes structs with pxor/movaps and the image dies on #UD at
+# the first one (found live, rip=0x4001b0). No vector, no x87, ever.
+gcc -ffreestanding -nostdlib -nostartfiles -static -O2 -mgeneral-regs-only \
+    -T "examples/userland-netcat/netcat.ld" \
+    -o "kernel-x86_64/blob/netcatd.bin" \
+    "examples/userland-netcat/netcat.c" 2>&1 | grep -v "build-id" || true
+[ -s "kernel-x86_64/blob/netcatd.bin" ] || { echo "FATAL: gcc net client build failed"; exit 1; }
+# P1-2: strip — the signed package's payload is the SAME stripped
+# bytes (and the loader reads headers only; the NOLOAD tail keeps the
+# file small enough to ride the 12-KiB repo ceiling).
+strip --strip-all kernel-x86_64/blob/netcatd.bin
+[ "$(readelf -lW kernel-x86_64/blob/netcatd.bin | grep -c '^  LOAD')" = 2 ] \
+    || { echo "FATAL: the net client image lost a PT_LOAD"; exit 1; }
+if objdump -d kernel-x86_64/blob/netcatd.bin | grep -q '%xmm\|%ymm\|%zmm\|%st('; then
+    echo "FATAL: the net client image contains FPU/SSE instructions (ring 3 has no FPU state)"
+    exit 1
+fi
 
 # P1-1: the ring-3 TCP/IP service image — the netstack + the socket
 # relay as a REAL no_alloc ELF under the NETSVC memory contract
@@ -125,26 +140,24 @@ strip --strip-all target/x86_64-unknown-none/pkg-image/tcpipd -o kernel-x86_64/b
 [ "$(readelf -lW kernel-x86_64/blob/tcpipd.bin | grep -c '^  LOAD')" = 3 ] \
     || { echo "FATAL: the stripped tcpipd image lost a PT_LOAD"; exit 1; }
 
-# P1-1: the gcc userland net client — a freestanding static binary
-# (the same toolchain as /bin/hello) that speaks the P1-1 sockets
-# surface over the byte channels: socket/connect/send/recv/close,
-# TCP + UDP, and the live -EPERM probes that prove a client cannot
-# bypass the broker. Linked at the canonical cage's vaddrs.
-echo "==> [0g/4] building the gcc net client (userland-netcat — the CANONICAL contract)"
-# -mgeneral-regs-only: this kernel's ring 3 has NO FPU/SSE state —
-# gcc -O2 zeroes structs with pxor/movaps and the image dies on #UD at
-# the first one (found live, rip=0x4001b0). No vector, no x87, ever.
-gcc -ffreestanding -nostdlib -nostartfiles -static -O2 -mgeneral-regs-only \
-    -T "examples/userland-netcat/netcat.ld" \
-    -o "kernel-x86_64/blob/netcatd.bin" \
-    "examples/userland-netcat/netcat.c" 2>&1 | grep -v "build-id" || true
-[ -s "kernel-x86_64/blob/netcatd.bin" ] || { echo "FATAL: gcc net client build failed"; exit 1; }
-[ "$(readelf -lW kernel-x86_64/blob/netcatd.bin | grep -c '^  LOAD')" = 2 ] \
-    || { echo "FATAL: the net client image lost a PT_LOAD"; exit 1; }
-if objdump -d kernel-x86_64/blob/netcatd.bin | grep -q '%xmm\|%ymm\|%zmm\|%st('; then
-    echo "FATAL: the net client image contains FPU/SSE instructions (ring 3 has no FPU state)"
-    exit 1
-fi
+# K22: the signed local repo fixture — the host-side repo builder
+# (pkg-mkrepo, signer feature; TEST-ONLY fixed seeds — see
+# pkg/src/bin/pkg-mkrepo.rs). Five files, each ≤ 8 KiB (the ramfs
+# spill-window bound — the tool fails the build if one crosses it):
+# the trust anchors, the repo config, the signed index, and BOTH
+# version-qualified packages (the repo layout is version-qualified
+# now — the upgrade round has something to move TO). K23: the
+# fixture feeds ONLY THE DISK — scripts/mkext2.py
+# writes these bytes into the ext2 image's /pkgsrc and the boot's
+# ext2 walk reads them back (the kernel image no longer embeds
+# package data); scripts/check-pkgsrc-image.py proves them
+# byte-exact on the image at every build.
+echo "==> [0g/4] building the signed local repo fixture (pkg-mkrepo — REAL binaries)"
+# P1-2: runs LAST of the image builds — the fixture embeds the STRIPPED
+# hello ELF and the STRIPPED netcat client as real package payloads
+# (steps [0c]/[0e] above built them), so it must see them first.
+cargo build -p aegis-pkg --bin pkg-mkrepo --features signer
+target/debug/pkg-mkrepo kernel-x86_64/blob/pkg-fixture
 
 echo "==> [1/4] building the 64-bit kernel (x86_64-unknown-none, release)"
 cargo build -p aegis-kernel --release --target x86_64-unknown-none
@@ -831,18 +844,24 @@ if [ "$MODE" = "verify" ]; then
   grep -qF "[PKG] /bin/pkg: execve'd at CPL=3 under the SERVICE contract" "$LOG" || { echo "VERIFY FAIL: K22 pkg exec marker missing"; ok=0; }
   grep -qF "[PKG] install r1/hello@1.0.0: resolved from the signed local repo" "$LOG" || { echo "VERIFY FAIL: K22 pkg install marker missing"; ok=0; }
   grep -qF "[PKG] the installed tree: /usr/bin/pkg-hello byte-exact" "$LOG" || { echo "VERIFY FAIL: K22 pkg tree marker missing"; ok=0; }
+  # P1-2: the REAL third-party binary round — the signed package
+  # delivered a genuine program, byte-exact, in every lane.
+  grep -qF "[PKG] install r1/netcat@1.0.0: the REAL third-party binary resolved" "$LOG" || { echo "VERIFY FAIL: P1-2 netcat install marker missing"; ok=0; }
+  grep -qF "[PKG] the installed citizen: /usr/bin/netcat == the stripped gcc socket client" "$LOG" || { echo "VERIFY FAIL: P1-2 netcat citizen marker missing"; ok=0; }
   grep -qF "[PKG] live mask after exec == package_manager_profile" "$LOG" || { echo "VERIFY FAIL: K22 pkg live-mask marker missing"; ok=0; }
   grep -qF "[PKG] stack high-water: " "$LOG" || { echo "VERIFY FAIL: K22 pkg stack high-water marker missing"; ok=0; }
   grep -qF "[PKG] ERROR" "$LOG" && { echo "VERIFY FAIL: K22 pkg lane reported an ERROR"; ok=0; }
-  # K23: the lifecycle rounds. The upgrade must be a real MOVE — the
-  # solver resolves 1.1.0 ABOVE the installed 1.0.0 and the 17-B v1.1
-  # payload replaces the 12-B 1.0.0 one (the old structural no-op
-  # printed "done" and kept the bytes); the remove must take the
-  # payload (ENOENT), the db record and the state entry away. The
-  # rounds share ONE caller blob (a kernel-written selector byte in
-  # its data page picks install/upgrade/remove).
+  # K23/P1-2: the lifecycle rounds. The upgrade must be a real MOVE —
+  # the solver resolves 1.1.0 ABOVE the installed 1.0.0 and the REAL
+  # stripped gcc ELF (the same bytes the disk serves as /bin/hello)
+  # replaces the 12-B 1.0.0 string (the old structural no-op printed
+  # "done" and kept the bytes); the remove must take the payload
+  # (ENOENT), the db record and the state entry away; P1-2's fourth
+  # round installs the REAL netcat client through the signed path.
+  # The rounds share ONE caller blob (a kernel-written selector byte
+  # in its data page picks install/upgrade/remove/install-netcat).
   grep -qF "[PKG] upgrade r1/hello: 1.1.0 resolved ABOVE the installed 1.0.0, Ed25519-verified, committed (exit 0)" "$LOG" || { echo "VERIFY FAIL: K23 pkg upgrade marker missing"; ok=0; }
-  grep -qF "[PKG] the upgraded tree: /usr/bin/pkg-hello == 17-B \"hello world v1.1\" payload, byte-exact — the payload moved" "$LOG" || { echo "VERIFY FAIL: K23 pkg upgraded-tree marker missing"; ok=0; }
+  grep -qF "[PKG] the upgraded tree: /usr/bin/pkg-hello == the REAL stripped gcc ELF" "$LOG" || { echo "VERIFY FAIL: K23 pkg upgraded-tree marker missing"; ok=0; }
   grep -qF "[PKG] remove r1/hello: the payload, the db record and the state entry uninstalled (exit 0)" "$LOG" || { echo "VERIFY FAIL: K23 pkg remove marker missing"; ok=0; }
   grep -qF "[PKG] the removed tree: stat /usr/bin/pkg-hello = ENOENT, /pkg/db/r1.hello gone, no r1/hello in /pkg/db/state" "$LOG" || { echo "VERIFY FAIL: K23 pkg removed-tree marker missing"; ok=0; }
   # K23: both markers must carry REAL values — a regression to the

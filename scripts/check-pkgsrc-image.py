@@ -5,7 +5,8 @@ Run right after scripts/mkext2.py in boot.sh. Self-contained: it
 re-parses target/sdisk0.img with the SAME ext2 logic the kernel's
 reader runs (GPT partition 1 -> superblock -> group descriptor ->
 root dir -> /pkgsrc -> each file's direct blocks) and asserts the
-five pkg-mkrepo fixture files (both version-qualified packages
+six pkg-mkrepo fixture files (both version-qualified hello packages
+and P1-2's REAL-binary netcat package
 included) are on the image BYTE-EXACT against
 kernel-x86_64/blob/pkg-fixture/*. The kernel image stopped carrying
 package data, so this check is the build-time guarantee that the
@@ -17,7 +18,7 @@ import sys
 
 IMG = 'target/sdisk0.img'
 BLOB = 'kernel-x86_64/blob/pkg-fixture'
-FILES = ['trust', 'r1.repo', 'index.aki', 'r1.hello-1.0.0.akp', 'r1.hello-1.1.0.akp']
+FILES = ['trust', 'r1.repo', 'index.aki', 'r1.hello-1.0.0.akp', 'r1.hello-1.1.0.akp', 'r1.netcat-1.0.0.akp']
 BS = 1024
 
 img = open(IMG, 'rb').read()
@@ -46,7 +47,7 @@ check(struct.unpack_from('<H', sb, 56)[0] == 0xEF53, 'ext2 magic missing')
 inodes_count = struct.unpack_from('<I', sb, 0)[0]
 blocks_count = struct.unpack_from('<I', sb, 4)[0]
 inode_size = struct.unpack_from('<H', sb, 88)[0]
-check(inodes_count == 24, f'inodes_count is {inodes_count}, not 24')
+check(inodes_count == 25, f'inodes_count is {inodes_count}, not 25')
 check(blocks_count == 128, f'blocks_count is {blocks_count}, not 128')
 check(inode_size == 128, f'inode_size is {inode_size}, not 128')
 gdt = img[FS + 2 * BS:FS + 2 * BS + 32]
@@ -95,7 +96,7 @@ mode, size, direct = inode(pkg_ino)
 check(mode & 0xF000 == 0x4000, 'pkgsrc inode is not a directory')
 pkg_blk = img[FS + direct[0] * BS:FS + direct[0] * BS + BS]
 
-# ── the five files, byte-exact against the blob copies ──
+# ── the six files, byte-exact against the blob copies ──
 sizes = []
 for i, name in enumerate(FILES):
     want = open(f'{BLOB}/{name}', 'rb').read()

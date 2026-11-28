@@ -39,10 +39,19 @@ static REPO_CFG: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1.re
 static INDEX: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/index.aki");
 static PACKAGE_V10: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1.hello-1.0.0.akp");
 static PACKAGE_V11: &[u8] = include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1.hello-1.1.0.akp");
+/// P1-2: the netcat client's package — a REAL third-party static
+/// binary through the signed path (the in-VM lane's fourth round).
+static PACKAGE_NETCAT: &[u8] =
+    include_bytes!("../kernel-x86_64/blob/pkg-fixture/r1.netcat-1.0.0.akp");
 /// The payload each version installs — different bytes AND sizes, so
 /// an upgrade that "succeeded" without moving the payload cannot pass.
+/// P1-2: the 1.1.0 payload is the REAL stripped gcc ELF (the same
+/// file the ext2 disk serves as /bin/hello — the upgrade installs a
+/// genuine loadable image), and the netcat payload is the P1-1 socket
+/// citizen itself.
 const PAYLOAD_V10: &[u8] = b"hello world\n";
-const PAYLOAD_V11: &[u8] = b"hello world v1.1\n";
+static PAYLOAD_V11: &[u8] = include_bytes!("../kernel-x86_64/blob/userland-hello.elf");
+static NETCAT_ELF: &[u8] = include_bytes!("../kernel-x86_64/blob/netcatd.bin");
 
 fn kernel_with_fixture() -> Kernel {
     let mut k = Kernel::new();
@@ -79,9 +88,11 @@ fn kernel_with_fixture() -> Kernel {
     for &(path, bytes) in &[
         ("/r1/index.aki", INDEX),
         // K23: BOTH versions — the upgrade round's solver picks 1.1.0
-        // and its transaction reads the 1.1.0 file.
+        // and its transaction reads the 1.1.0 file. P1-2: the netcat
+        // package rides the same repo.
         ("/r1/r1.hello-1.0.0.akp", PACKAGE_V10),
         ("/r1/r1.hello-1.1.0.akp", PACKAGE_V11),
+        ("/r1/r1.netcat-1.0.0.akp", PACKAGE_NETCAT),
         ("/pkg/trust", TRUST),
         ("/pkg/repos/r1.repo", REPO_CFG),
     ] {
@@ -457,5 +468,27 @@ fn the_real_cli_runs_the_whole_lifecycle() {
     assert_eq!(
         probe_read_all(&mut k, "/usr/bin/pkg-hello").as_deref(),
         Some(PAYLOAD_V10)
+    );
+
+    // ── P1-2: the REAL third-party binary round — install the netcat
+    // client's package and prove the installed file is the genuine
+    // ELF (byte-exact AND a valid exec plan, the loader's own gate) —
+    // the host mirror of the in-VM lane's fourth round. ──
+    let (code, out) = pm_cli(&mut k, &[b"install", b"r1/netcat@1.0.0"], &paths);
+    assert_eq!(code, 0, "install netcat: {out}");
+    assert_eq!(
+        probe_read_all(&mut k, "/usr/bin/netcat").as_deref(),
+        Some(NETCAT_ELF),
+        "the installed netcat must be the stripped socket client, byte-exact"
+    );
+    assert!(
+        aegis_os::elf::build_exec_plan(NETCAT_ELF).is_ok(),
+        "the installed citizen must parse as a genuine exec image"
+    );
+    let (code, out) = pm_cli(&mut k, &[b"list"], &paths);
+    assert_eq!(code, 0, "list after netcat: {out}");
+    assert!(
+        out.contains("r1/netcat 1.0.0"),
+        "the record must say r1/netcat 1.0.0: {out}"
     );
 }

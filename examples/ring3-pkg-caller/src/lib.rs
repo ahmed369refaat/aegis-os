@@ -2,14 +2,16 @@
 //! to execve("/bin/pkg", …) — the package manager image the kernel
 //! carries in its second 2 MiB leaf.
 //!
-//! K23: ONE blob now drives the whole lifecycle. The kernel writes a
-//! COMMAND SELECTOR into byte 0 of this blob's data page before
-//! launch (0 = install, 1 = upgrade, 2 = remove); the blob reads it
-//! first thing, builds the strings and the matching argv table in the
-//! same page, and execve's with that table. The K22 shape (a separate
-//! blob per command) would have needed three more embedded binaries
-//! for two extra commands — the selector keeps the registry and the
-//! boot image size flat while the lane grows.
+//! K23/P1-2: ONE blob now drives the whole lifecycle. The kernel
+//! writes a COMMAND SELECTOR into byte 0 of this blob's data page
+//! before launch (0 = install hello, 1 = upgrade, 2 = remove,
+//! 3 = install netcat — P1-2's REAL third-party binary round); the
+//! blob reads it first thing, builds the strings and the matching
+//! argv table in the same page, and execve's with that table. The
+//! K22 shape (a separate blob per command) would have needed four
+//! more embedded binaries for three extra commands — the selector
+//! keeps the registry and the boot image size flat while the lane
+//! grows.
 //!
 //! On success the syscall never returns: the image replaces this blob
 //! under the `SERVICE` memory contract (its own profile's policy —
@@ -42,7 +44,9 @@
 //!   +0x10  "/bin/pkg\0"
 //!   +0x20  "install\0"   +0x28 "upgrade\0"   +0x30 "remove\0"
 //!   +0x38  "r1/hello@1.0.0\0"   +0x48 "r1/hello\0" (remove's name)
-//!   +0x60 + sel*0x20  the three argv tables (4 qwords, NULL-
+//!   +0x52  "r1/netcat@1.0.0\0" (P1-2's fourth round, pinned — clear
+//!          of r1/hello's NUL at +0x51)
+//!   +0x80 + sel*0x20  the FOUR argv tables (4 qwords, NULL-
 //!          terminated — the exec arm reads them BEFORE the point of
 //!          no return, from this blob's pages)
 //!
@@ -85,24 +89,36 @@ _ring3_start:
     movabs rax, 0x6f6c6c65682f3172    /* "r1/hello" */
     mov qword ptr [0x00403048], rax
     mov dword ptr [0x00403050], 0     /* the NUL */
-    /* argv tables at +0x60 + sel*0x20 — ["/bin/pkg", cmd, target?,
+    /* P1-2's fourth round: the netcat install's pinned target — at
+     * +0x52, clear of "r1/hello\0" at +0x48..+0x51 (a first cut at
+     * +0x50 clobbered that string's NUL: every later reader of the
+     * bare name would have walked straight into this one). */
+    movabs rax, 0x616374656e2f3172    /* "r1/netca" */
+    mov qword ptr [0x00403052], rax
+    movabs rax, 0x00302e302e314074    /* "t@1.0.0\0\0" */
+    mov qword ptr [0x0040305a], rax
+    /* argv tables at +0x80 + sel*0x20 — ["/bin/pkg", cmd, target?,
      * NULL]. upgrade takes no argument (cmd_upgrade walks the
      * installed set), so its table ends at the NULL after the
      * command. */
-    mov qword ptr [0x00403060], 0x00403010
-    mov qword ptr [0x00403068], 0x00403020
-    mov qword ptr [0x00403070], 0x00403038
-    mov qword ptr [0x00403078], 0
     mov qword ptr [0x00403080], 0x00403010
-    mov qword ptr [0x00403088], 0x00403028
-    mov qword ptr [0x00403090], 0
+    mov qword ptr [0x00403088], 0x00403020
+    mov qword ptr [0x00403090], 0x00403038
     mov qword ptr [0x00403098], 0
     mov qword ptr [0x004030a0], 0x00403010
-    mov qword ptr [0x004030a8], 0x00403030
-    mov qword ptr [0x004030b0], 0x00403048
+    mov qword ptr [0x004030a8], 0x00403028
+    mov qword ptr [0x004030b0], 0
     mov qword ptr [0x004030b8], 0
+    mov qword ptr [0x004030c0], 0x00403010
+    mov qword ptr [0x004030c8], 0x00403030
+    mov qword ptr [0x004030d0], 0x00403048
+    mov qword ptr [0x004030d8], 0
+    mov qword ptr [0x004030e0], 0x00403010
+    mov qword ptr [0x004030e8], 0x00403020
+    mov qword ptr [0x004030f0], 0x00403052
+    mov qword ptr [0x004030f8], 0
     /* rcx = the selected table (base + sel*0x20, computed above). */
-    add rcx, 0x00403060
+    add rcx, 0x00403080
     /* execve(path, argv, envp=NULL) — INTERNAL nr 19. */
     mov eax, 19
     mov rdi, 0x00403010

@@ -144,42 +144,57 @@ walks candidates newest-first, and `package_path_for(&Candidate)`
 picks the file matching the PLAN'S chosen version — not the repo's
 only one.
 
-## K23 — the lifecycle fixture and the three-round boot lane
+## K23/P1-2 — the lifecycle fixture and the four-round boot lane
 
 The boot fixture (`pkg/src/bin/pkg-mkrepo.rs`, `./boot.sh` step
-`[0e]`) serves FIVE files, each ≤ 8 KiB (the ramfs spill window):
+`[0g]`) serves SIX files, each ≤ 12 KiB (the ext2 direct-block
+ceiling — the one bound that rules the whole repo path: the disk
+walk, the store slot, the ramfs spill window):
 
 ```text
 trust               root anchors (ATST)
 r1.repo             pinned local repo config (ARPS, url /r1)
-index.aki           root-countersigned index (AKI1, epoch 7, TWO entries)
+index.aki           root-countersigned index (AKI1, epoch 7, THREE entries)
 r1.hello-1.0.0.akp  r1/hello 1.0.0 → /usr/bin/pkg-hello = "hello world\n" (12 B)
-r1.hello-1.1.0.akp  r1/hello 1.1.0 → /usr/bin/pkg-hello = "hello world v1.1\n" (17 B)
+r1.hello-1.1.0.akp  r1/hello 1.1.0 → /usr/bin/pkg-hello = the REAL stripped
+                    gcc userland ELF (8,496 B — the same bytes the ext2 disk
+                    serves as /bin/hello)
+r1.netcat-1.0.0.akp r1/netcat 1.0.0 → /usr/bin/netcat = the REAL stripped
+                    gcc socket client (the P1-1 citizen, 8,576 B)
 ```
 
-Different payload bytes AND sizes, so an upgrade that "succeeded"
-without moving the file cannot pass its byte-exact check.
+P1-2 made the payloads REAL programs: the upgrade round now installs a
+genuine loadable image (byte-exact AND parsed by the loader's own
+`build_exec_plan` gate), and a fourth round installs the netcat client
+— a third-party static binary delivered through the signed path. The
+1.0.0 payload stays a 12-B string: different bytes AND sizes is what
+separates a real upgrade from the old structural no-op.
 
 ONE caller blob (`examples/ring3-pkg-caller/`) drives the whole
 lifecycle: the kernel writes a command selector into byte 0 of the
 blob's data page before each launch (0 = install, 1 = upgrade,
-2 = remove); the blob reads it, builds the strings and the argv
-table at `0x403060 + sel*0x20`, and execve's (internal nr 19). The
-install round's argv PINS the version (`r1/hello@1.0.0`): a bare
-name resolves newest-first, which would install 1.1.0 directly and
-leave the upgrade round nothing to move.
+2 = remove, 3 = install the netcat package); the blob reads it, builds
+the strings and the argv table at `0x40403080 + sel*0x20`, and
+execve's (internal nr 19). The install round's argv PINS the version
+(`r1/hello@1.0.0`): a bare name resolves newest-first, which would
+install 1.1.0 directly and leave the upgrade round nothing to move.
 
-The kmain lane (kernel-x86_64/src/kmain.rs, the K22/K23 section)
-runs three rounds — spawn → execve → dual drain → verify → destroy —
+The kmain lane (kernel-x86_64/src/kmain.rs, the K22/K23/P1-2 section)
+runs FOUR rounds — spawn → execve → dual drain → verify → destroy —
 each verified through a fresh root probe (id 72, never across a
 drain):
 
 - **install**: exit 0, `/usr/bin/pkg-hello` == the 12-B 1.0.0
   payload, `/pkg/db/r1.hello` + `/pkg/db/state` written;
-- **upgrade**: exit 0, the payload == the 17-B v1.1 bytes (the
-  record moved too — a real MOVE, not the old no-op);
+- **upgrade**: exit 0, the payload == the REAL stripped gcc ELF,
+  byte-exact AND parsed by `build_exec_plan` (the record moved too —
+  a real MOVE, not the old no-op);
 - **remove**: exit 0, stat `/usr/bin/pkg-hello` = ENOENT, the db
-  record gone, no `r1/hello` in a still-valid count-0 ASTT state.
+  record gone, no `r1/hello` in a still-valid count-0 ASTT state;
+- **install netcat (P1-2)**: exit 0 on the warm, clean tree,
+  `/usr/bin/netcat` == the stripped socket client byte-exact, the
+  plan gate parses it, `/pkg/db/r1.netcat` written — a signed
+  package delivered a genuine third-party program.
 
 The host mirror of the lane is `tests/pkg_lane_cli.rs`
 (`cargo test -p aegis-os --test pkg_lane_cli`): the REAL `run_cli`

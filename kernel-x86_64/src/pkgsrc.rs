@@ -38,16 +38,19 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The number of fixture files the store holds — the named half of
 /// the const pair with [`FILE_ORDER`]. `mkext2.py` writes the same
-/// five files to `/pkgsrc` and `drvstack/ext2.rs` walks them in
-/// order; a sixth file extends BOTH consts and nothing else changes.
-pub const SLOT_COUNT: usize = 5;
+/// six files to `/pkgsrc` and `drvstack/ext2.rs` walks them in
+/// order; a seventh file extends BOTH consts and nothing else changes
+/// (P1-2 added the sixth — the netcat client's package — as exactly
+/// that two-line change, the way the doc promised).
+pub const SLOT_COUNT: usize = 6;
 
 /// One slot's capacity. The ext2 reader's direct-block ceiling is
 /// 12 KiB; the repo fixture's builder bound (pkg-mkrepo's spill
-/// window) is 8 KiB — the tighter of the two, so a fixture file that
-/// outgrows its slot is a BUILD failure long before it is a boot
-/// one.
-pub const SLOT_MAX: usize = 8 * 1024;
+/// window) mirrors it — P1-2's REAL-binary packages (the 8,670-B
+/// hello 1.1.0 and the 8,748-B netcat) ride the same ceiling, so a
+/// fixture file that outgrows its slot is a BUILD failure long
+/// before it is a boot one.
+pub const SLOT_MAX: usize = 12 * 1024;
 
 /// The fixture file names in slot order — exactly the set
 /// `scripts/mkext2.py` writes into `/pkgsrc` (trust, the repo
@@ -61,6 +64,7 @@ pub const FILE_ORDER: [&str; SLOT_COUNT] = [
     "index.aki",
     "r1.hello-1.0.0.akp",
     "r1.hello-1.1.0.akp",
+    "r1.netcat-1.0.0.akp",
 ];
 
 /// Slot 0: the trust anchors (`/pkg/trust` at provisioning).
@@ -73,8 +77,12 @@ pub const IDX_INDEX: usize = 2;
 /// install round pins 1.0.0, so the upgrade has something to move).
 pub const IDX_PKG_V10: usize = 3;
 /// Slot 4: the 1.1.0 signed package (`/r1/r1.hello-1.1.0.akp` — the
-/// upgrade round's transaction reads this one).
+/// upgrade round's transaction reads this one; P1-2: its payload is
+/// the REAL stripped gcc userland ELF).
 pub const IDX_PKG_V11: usize = 4;
+/// Slot 5: the netcat client's signed package (`/r1/r1.netcat-1.0.0.akp`
+/// — P1-2's third package, a REAL third-party static binary).
+pub const IDX_NETCAT: usize = 5;
 
 static mut SLOTS: [[u8; SLOT_MAX]; SLOT_COUNT] = [[0; SLOT_MAX]; SLOT_COUNT];
 static INSTALLED: [AtomicBool; SLOT_COUNT] = [const { AtomicBool::new(false) }; SLOT_COUNT];

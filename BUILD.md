@@ -1,174 +1,169 @@
-# Building and wiring the netstack into AegisOS (K24)
+# BUILD — the AegisOS toolchain and the userland build path (P1-2)
 
-The stack is a pure library (`src/netstack/`, `no_std`, `no_alloc`,
-zero dependencies, zero `unsafe`). It compiles for the host (tests) and
-for the kernel's `x86_64-unknown-none` target without modification —
-there is no cfg ladder beyond `cfg(test)`.
+One `./boot.sh` builds everything: the kernel, every ring-3 image, and
+the signed repo fixture. This document is the map — what each image
+type is, which compiler builds it, which memory contract it links
+under, and where the build refuses loudly instead of failing at boot.
 
-## 1. Quick verification (host)
+## 1. The toolchain
+
+| Tool | Version | Builds |
+|---|---|---|
+| `rustc` / `cargo` | 1.100.0, target `x86_64-unknown-none` | the kernel, the policy core (`aegis_os`), the Rust images (`pkg`, `tcpipd`, `/bin/sh`), the flat ring-3 blobs |
+| `gcc` | 14.2 (`-ffreestanding -nostdlib`) | the C userland images (`/bin/hello`, the netcat client) |
+| `ld` / `objcopy` / `strip` | binutils | the boot stub, the blob flattening, the image strips |
+
+`source /home/z/my-project/tools/env.sh` puts the toolchain on PATH.
+No C library, no startup files, no allocator anywhere in a target
+build: every image is `no_std`/freestanding and owns its whole program.
+
+## 2. The memory contracts (one gate, three shapes)
+
+Every ring-3 image links under a *contract* the kernel's loader checks
+before a frame is spent (`mm/user_layout.rs`; `check-pkg-image.py` /
+`check-tcpip-image.py` pin them at build time):
+
+| Contract | Cage | Stack | Who |
+|---|---|---|---|
+| `CANONICAL` | 7 pages [0x400000,0x407000) | 1 page | flat blobs, the exec target, `/bin/hello`, the netcat client |
+| `SERVICE` | 128 pages | 2048 pages | the package manager (`pkg/`) — the no_alloc recursion budget |
+| `NETSVC` | 128 pages | 96 pages | the tcpip service (`tcpip/`) — one ~160 KiB frame + nested stack processing |
+
+The rules every link must honor (the ten-check policy enforces them at
+load; the checker scripts fail the BUILD first):
+
+- PT_LOADs separated by one ABSENT page (`GuardGap`) — no adjacent
+  regions, ever;
+- `W^X`: text R+X, data R+W, rodata R — never both on one page range;
+- an ELF header + program headers the loader parses (unknown segment
+  types are refused);
+- **memsz may exceed filesz** (the bss tail): the loader zero-fills it
+  — this is also how an image keeps its FILE small (the netcat client
+  rides a 12 KiB repo ceiling by putting its pinned blocks and buffers
+  in the tail).
+
+## 3. The three citizen types
+
+### (a) A C freestanding ELF — `examples/userland-hello`, `examples/userland-netcat`
 
 ```sh
-# the module + integration suites (57 tests, deterministic, ~0.1 s)
-cargo test -p aegis-os --lib netstack
-
-# the lint lanes the CI gates run
-cargo clippy -p aegis-os --all-targets -- -D warnings
-cargo clippy -p aegis-kernel --release --target x86_64-unknown-none -- -D warnings
-cargo fmt --all --check
+gcc -ffreestanding -nostdlib -nostartfiles -static -O2 -mgeneral-regs-only \
+    -T examples/userland-netcat/netcat.ld \
+    -o kernel-x86_64/blob/netcatd.bin examples/userland-netcat/netcat.c
+strip --strip-all kernel-x86_64/blob/netcatd.bin
 ```
 
-The tests are deterministic: the clock is a hand-driven `u64`, the
-entropy source is a seeded xorshift, and the "wire" is two stacks whose
-`FrameSink`s feed each other. No sleeps, no real time, no network.
+- `-mgeneral-regs-only` is NOT optional: this kernel's ring 3 has no
+  FPU/SSE state, and `-O2` zeroes structs with `pxor/movaps` — the
+  image dies on `#UD` at its first vector instruction (found live,
+  `rip=0x4001b0`). `boot.sh` greps the disassembly for `%xmm/%st(` and
+  fails the build on a hit.
+- The linker script pins the data page's blocks (the kernel patches a
+  config block before launch, the program writes a report block). Two
+  lessons live in `netcat.ld`'s comments: section-internal `.`
+  assignments are offsets from the section start, and the pinned
+  blocks + bss belong in the NOLOAD tail.
+- The stripped ELF is the CANONICAL-cage citizen: spawnable by the
+  kernel (`spawn_user_elf`), execve-able from the registry, and — since
+  P1-2 — installable from a signed package (below).
 
-## 2. Where the stack runs
+### (b) A Rust ELF with a custom linker script — `examples/ring3-sh`, the exec target
 
-**Inside the `netd` domain (or a dedicated `tcpip` domain), never the
-kernel.** The stack owns frame parsing and connection state; the domain
-owns the event loop; the BROKER owns the wire (THREAT_MODEL.md §6):
-
-```
-ring-3 user domains
-    │  sockets API → syscalls (capability-checked per domain)
-    ▼
-NetStack (in netd)  ──FrameSink──▶  Broker (SYS_NET_SEND: token bucket,
-    ▲  on_frame / poll              per-domain accounting, 1514 B cap)
-    │                                        │
-    └──────────── driver domain ◀────────────┘
-                  (virtio-net rings: vnetdom)
-```
-
-## 3. The syscall surface the domain needs
-
-`netd_profile` (src/profile.rs) already carries the arms:
-
-| Syscall | nr | Role for the stack |
-|---|---|---|
-| `SYS_NET_SEND` | 9 | Egress: every frame the stack emits, through the broker's token bucket |
-| `SYS_NET_RECV` | 10 | Ingress: frames the driver domain deposited |
-| `SYS_READ`/`SYS_WRITE`/`SYS_OPEN` | — | Config (interface, address) from the ramfs |
-| `SYS_IOCTL`/`SYS_PARK`/`SYS_EXIT` | — | The domain's existing runtime arms |
-
-No new syscalls are REQUIRED for the stack itself: the five-argument
-sockets surface (below) can ride the existing `SYS_NET_SEND`/`RECV`
-mailbox convention the domain already speaks (fd + op word + args in the
-data page), which is how `vnetd` already multiplexes DHCP.
-
-### The user-facing sockets surface (mapping)
-
-The stack's API is the semantic definition (`src/netstack/socket.rs` +
-`NetStack::` methods); the syscall boundary is a thin marshaller:
-
-| POSIX call | NetStack method | errno surface |
-|---|---|---|
-| `socket(AF_INET, SOCK_STREAM\|SOCK_DGRAM, 0)` | `socket(domain, kind)` | EMFILE on quota/table |
-| `bind(fd, port)` | `bind(domain, fd, port)` | EADDRINUSE, EOPNOTSUPP |
-| `listen(fd, backlog)` | `listen(domain, fd, port)` | EADDRINUSE (backlog clamped to the fixed 4) |
-| `connect(fd, ip, port)` | `connect(now, sink, domain, fd, ip, port)` | EINPROGRESS; ECONNREFUSED on the RST; ETIMEDOUT on retransmission exhaustion |
-| `accept(fd)` | `accept(domain, fd)` | EAGAIN when nothing is established |
-| `send(fd, buf)` | `send(now, sink, domain, fd, buf)` | partial writes; EAGAIN when window+ring stall; EMSGSIZE over the datagram cap |
-| `recv(fd, buf)` | `recv(domain, fd, buf)` | EAGAIN when empty; 0 = EOF (FIN) |
-| `close(fd)` | `close(now, sink, domain, fd)` | FIN (or RST half-open), fd freed immediately |
-
-Every error maps through the ONE errno table
-(`netstack::error::errno`) — the boundary translates, it never invents
-codes. All operations are non-blocking by construction (the stack has no
-sleep primitive).
-
-## 4. Wiring the stack into the domain
-
-```rust
-// (inside the netd domain's main loop — sketch of the whole glue)
-use aegis_os::netstack::{FrameSink, Entropy, IfCfg, NetStack, MacAddr};
-
-/// The ONLY egress door: the broker syscall. Every frame the stack
-/// emits goes through here — the token bucket and per-domain
-/// accounting sit under every byte (THREAT_MODEL.md §6).
-struct BrokerSink { domain_socket: u32 }
-impl FrameSink for BrokerSink {
-    fn send_frame(&mut self, frame: &[u8]) -> netstack::Result<()> {
-        sys_net_send(self.domain_socket, frame)   // SYS_NET_SEND (nr 9)
-            .map_err(|e| map_net_error(e))         // RateLimited → EAGAIN shape
-    }
-}
-
-/// The clock: ms ticks from the domain's time source (the same
-/// tick counter the driver stack already maintains).
-fn now_ms() -> u64 { /* the domain's monotonic tick / TIMER tick */ }
-
-/// The entropy: fold the same per-boot entropy the domain already
-/// draws (RDRAND-backed, or the seed the kernel passed at spawn).
-struct DomainEntropy { state: u32 }
-impl Entropy for DomainEntropy { fn next_u32(&mut self) -> u32 { /* ... */ } }
-
-let cfg = IfCfg {
-    mac: MacAddr(driver_mac()),          // from the DHCP/config stage
-    ip: leased_ip(), netmask: [255,255,255,0], gateway: leased_gw(),
-};
-let mut stack = NetStack::new(cfg, DomainEntropy::seeded());
-let mut sink = BrokerSink { domain_socket: broker_fd };
-
-loop {
-    // 1. Ingress: every frame the driver delivered (SYS_NET_RECV).
-    while let Some(frame) = sys_net_recv() {
-        let _ = stack.on_frame(now_ms(), &mut sink, &frame);
-    }
-    // 2. Timers: retransmissions, delayed ACKs, window updates,
-    //    persist probes, ARP retries, reassembly and TIME_WAIT expiry.
-    let _ = stack.poll(now_ms(), &mut sink);
-    // 3. User work: drain the sockets mailbox (the marshaller calls
-    //    stack.socket/bind/listen/connect/accept/send/recv/close).
-    drain_sockets_mailbox(&mut stack, &mut sink, now_ms());
-    park_until_event();   // the domain's existing wait primitive
-}
+```sh
+rustc --edition 2021 --crate-type=bin -C panic=abort -C opt-level=z \
+      -C codegen-units=1 -C linker=ld -C link-arg=-T<...>/image.ld \
+      -C link-arg=--gc-sections -C relocation-model=static \
+      --target x86_64-unknown-none src/lib.rs -o blob/image.bin
 ```
 
-**Rules the glue must keep (they are what the threat model promises):**
+One rustc invocation, no cargo: the shell (`/bin/sh`) is the exemplar.
+`--gc-sections` keeps the image flat; the `.ld` carries the contract.
 
-1. The `FrameSink` impl MUST call the broker — never the virtio rings
-   directly. The broker is the rate limit and the accounting; bypassing
-   it is the one architectural sin the stack cannot defend against from
-   inside.
-2. `on_frame` and `poll` need the SAME clock value style (monotonic
-   ms). Late ticks are late, not lost — every deadline is absolute.
-3. `poll` must run at least a few times per second (the delayed-ACK is
-   40 ms; the RTO floor is 1 s). One park-wakeup per driver receive
-   plus a 250 ms idle timer is plenty.
-4. `Entropy` must be per-boot unpredictable (fold a real source). A
-   constant seed turns the ISN mixer into a known function.
+### (c) A Rust lib + bin composition — `pkg/`, `tcpip/`
 
-## 5. Integration steps (the K25 candidate list)
+The shape for real programs: a workspace crate whose **lib** holds all
+logic (host-compiled, host-tested, clippy-gated by the workspace lanes)
+and whose **bin** is only a `_start`/`panic_handler` shim; the build
+script emits the link recipe for the target only:
 
-This round ships the stack as a fully tested library inside the
-`aegis-os` crate (compiled by both clippy lanes, 57/57 tests). The
-remaining VM work, in dependency order:
+```toml
+# Cargo.toml — a workspace member
+[dependencies]
+aegis-os = { path = ".." }        # the policy core rlib
+[[bin]]
+name = "tcpipd"
+```
 
-1. **The `BrokerSink` + `DomainEntropy` glue** in `kernel-x86_64/`
-   `drvstack/vnetdom.rs`'s user side (the netd blob grows the stack via
-   the registry's exec image discipline — the SERVICE contract's
-   2 MiB leaf has room for ~60 KiB of stack state; the TCB pool is the
-   big block and is `.bss`-friendly).
-2. **The sockets mailbox**: extend the existing `SYS_NET_SEND`/
-   `SYS_NET_RECV` data-page convention with a sockets op word (fd,
-   op, args) so user domains reach the stack's API — the kernel side
-   routes by domain and the stack enforces the per-domain quota.
-3. **A boot lane marker** (`[NET] tcp/ip stack: N connections, M
-   sockets`) asserted by `boot.sh --verify` the way the `[PKG]` lanes
-   are — the VM-side proof that the stack runs at CPL=3 through the
-   broker.
-4. **DHCP feeding `IfCfg`** (the DHCP state machine the driver domain
-   already runs becomes the config source for `NetStack::new`).
+```sh
+cargo build -p aegis-tcpip --bin tcpipd --profile pkg-image \
+      --target x86_64-unknown-none
+python3 scripts/check-tcpip-image.py target/.../tcpipd   # the contract gate
+strip --strip-all target/.../tcpipd -o kernel-x86_64/blob/tcpipd.bin
+```
 
-## 6. Capacity constants (the memory bill)
+`build.rs` emits `-Ttcpipd.ld -no-pie -nostdlib --gc-sections
+-z max-page-size=4096` for the target and NOTHING for host builds —
+tests and clippy link normally. The `pkg-image` profile (opt-level z,
+one codegen unit) is the size recipe every image measures under.
 
-| Structure | Size | Count | Total |
-|---|---|---|---|
-| TCB (2 KiB rings + state) | ~2.1 KiB | 8 | ~17 KiB |
-| Socket entries (UDP queue inline) | ~2.2 KiB | 16 | ~35 KiB (only as opened) |
-| Reassembly slots | 1.5 KiB | 4 | 6 KiB |
-| ARP cache | 32 B | 16 | 512 B |
-| TCP tx scratch | 1514 B | 1 | 1.5 KiB |
+**The LTO lesson (found live):** a kernel-patched config page read
+through its static symbol gets constant-folded into the code — the
+whole service collapsed to `exit(2)`. Read such bytes through
+`read_volatile` at the pinned VA, never through the symbol.
 
-Total worst case ≈ 60 KiB of fixed `.bss`-style state — comfortably
-inside the SERVICE contract's 8 MiB no_alloc stack and 128-page cage
-(the K22 lesson: the image fits the cage or the exec refuses, loudly).
+## 4. The flat ring-3 blobs (the demo lane)
+
+`examples/ring3-*` build as `--emit=obj` and `objcopy -O binary
+-j .text.ring3` into `blob/*.bin` — position-dependent code the kernel
+maps at the CANONICAL code base. `scripts/check-blob-deltas.py` pins
+the two hand-pinned handler landings so a layout shift fails the
+build, and `scripts/check-no-binaries.sh` keeps the blob set the only
+tracked binaries in the tree.
+
+## 5. The signed package path (P1-2: real binaries)
+
+`pkg/src/bin/pkg-mkrepo.rs` builds the signed local repo the in-VM
+manager installs from — and since P1-2 the packages carry REAL
+programs, not fixture strings:
+
+```text
+r1.hello-1.0.0.akp   /usr/bin/pkg-hello = "hello world\n" (12 B)
+r1.hello-1.1.0.akp   /usr/bin/pkg-hello = the REAL stripped gcc hello ELF
+                     (the SAME bytes the ext2 disk serves as /bin/hello)
+r1.netcat-1.0.0.akp  /usr/bin/netcat    = the REAL stripped socket client
+```
+
+Two bounds rule the path, both measured, not round: **12 KiB, the
+ext2 reader's direct-block ceiling** (the fixture files, `SLOT_MAX`),
+and **10 KiB, the ramfs spill window** (`LARGE_FILE_MAX`, sized for
+the largest file the repo carries plus margin — and what keeps
+`Kernel<4096>` inside its 512-KiB boot-stack budget). The netcat
+image fits BECAUSE its pinned blocks and buffers ride the NOLOAD tail
+(§3a); a bigger program needs the ext2 indirect-block read, which is
+deliberately not built yet.
+
+The in-VM lane (kmain's `[PKG]` section, four rounds now) proves the
+whole path per boot: install → upgrade-to-a-real-ELF → remove →
+install-the-real-netcat, each round verified byte-exact through a
+fresh root probe, the installed files additionally parsed by the
+loader's own plan gate (`build_exec_plan`) — a package that delivered
+bytes that are not a genuine image cannot pass. The host mirror is
+`tests/pkg_lane_cli.rs`.
+
+## 6. The build order (why boot.sh's steps are numbered)
+
+```text
+[0/4]  the flat blobs + the delta gate
+[0b/4] the exec target (rustc + ld)
+[0c/4] /bin/hello (gcc, STRIPPED — the disk and the package carry the same bytes)
+[0c/4] /bin/sh (rustc)
+[0d/4] /bin/pkg (cargo, pkg-image profile + the contract check)
+[0e/4] the netcat client (gcc, STRIPPED — the package payload)
+[0f/4] the tcpip service (cargo, the NETSVC contract check)
+[0g/4] the signed repo fixture (pkg-mkrepo — LAST: it embeds [0c]/[0e])
+[1..3] the kernel (release), objcopy, the multiboot stub
+[4/4]  QEMU + the verify greps
+```
+
+Every gate in `scripts/gates.sh` runs the same builds first, so a
+fresh checkout is green without ceremony.
