@@ -85,6 +85,7 @@ SECRET_SCAN_EXCLUDE=(
     # known-hosts model). Its secrecy has no value; every OTHER key
     # file in the tree stays loud.
     'tls/tests/server-key.pem'
+    'tls/tests/hostile-key.pem'
 )
 
 # Prints the paths among "$@" that are text files matching a pattern.

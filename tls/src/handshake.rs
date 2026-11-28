@@ -7,9 +7,10 @@
 //! ```text
 //! build_client_hello  →  send
 //! on_record(ServerHello)        → keys derive (WaitFlight)
-//! on_record(flight records)     → EE, Certificate (PIN CHECK),
-//!                                 CertificateVerify (Ed25519
-//!                                 signature over the transcript),
+//! on_record(flight records)     → EE (ALPN checked), Certificate
+//!                                 (the VERIFY MODE: pin, pin+name,
+//!                                 or TOFU), CertificateVerify
+//!                                 (Ed25519 over the transcript),
 //!                                 Finished (HMAC check)
 //!                               → Event::ServerVerified
 //! build_finished      →  send (then Established)
@@ -29,15 +30,76 @@ use crate::x25519;
 use aegis_pkg::crypto::ct_eq;
 use aegis_pkg::crypto::ed25519;
 
+/// The verification policy — THE security flag of the connection.
+///
+/// - `Pinned` (the default, the known-hosts model): the presented
+///   key must equal `pinned_ed25519` byte-for-byte, in constant
+///   time.
+/// - `PinnedRequireName`: the pin AND the certificate's CommonName
+///   must equal the SNI host — the closest shape to a browser's
+///   identity check this trust model gets.
+/// - `AcceptAnyKey` (TEST/TOFU shape, off by default): the pin is
+///   skipped, but the CertificateVerify signature is STILL verified
+///   against the PRESENTED key — an active impostor without the
+///   private key still fails; only a pre-known-key check is waived.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum VerifyMode {
+    Pinned,
+    PinnedRequireName,
+    AcceptAnyKey,
+}
+
+/// The connection FLAGS (`tls::handshake::TlsOptions`) — every knob
+/// this client honors, each implemented for real:
+///
+/// - `sni` — the Server Name Indication host, sent in the
+///   ClientHello (and the name `PinnedRequireName` checks against
+///   the certificate's CN).
+/// - `alpn` — the offered ALPN protocol list, sent in the
+///   ClientHello; the server's selection (in EncryptedExtensions)
+///   must be one of ours or the connection refuses with
+///   `BadAlpn`; the answer is readable via `negotiated_alpn()`.
+/// - `verify` — the trust policy (see `VerifyMode`).
+/// - `max_record_len` — records (ciphertext included) above this
+///   are refused before any decryption (`BadRecord`): the hostile
+///   record budget. 64..=RECORD_CAP.
+///
+/// Not flags, by design: the protocol floor (TLS 1.3 only — a
+/// ServerHello without supported_versions 0x0304 refuses with
+/// `BadVersion`; there IS no TLS 1.2 path to enable), the cipher
+/// (TLS_CHACHA20_POLY1305_SHA256 — the only suite compiled in, so
+/// downgrade-to-weak is structurally impossible), and the handshake
+/// deadline (the PUMP owns the clock — the kernel step and the host
+/// tests bound it themselves; the state machine is clockless and
+/// total).
+#[derive(Debug, Clone, Copy)]
+pub struct TlsOptions<'a> {
+    pub sni: Option<&'a str>,
+    pub alpn: &'a [&'a str],
+    pub verify: VerifyMode,
+    pub max_record_len: usize,
+}
+
+impl Default for TlsOptions<'_> {
+    fn default() -> Self {
+        TlsOptions {
+            sni: None,
+            alpn: &[],
+            verify: VerifyMode::Pinned,
+            max_record_len: crate::record::RECORD_CAP,
+        }
+    }
+}
+
 /// The client's inputs: the ECDHE private scalar, the two
-/// ClientHello randoms, and the PINNED server key (the trust anchor
-/// — the SSH known-hosts model; X.509 chain validation is out of
-/// scope by name, see THREAT_MODEL.md).
-pub struct ClientConfig {
+/// ClientHello randoms, the PINNED server key (the trust anchor for
+/// the Pinned modes), and the connection flags.
+pub struct ClientConfig<'a> {
     pub client_private: [u8; 32],
     pub client_random: [u8; 32],
     pub session_id: [u8; 32],
     pub pinned_ed25519: [u8; 32],
+    pub options: TlsOptions<'a>,
 }
 
 /// The machine's phase.
@@ -58,6 +120,8 @@ pub enum Error {
     BadVersion,
     BadCipher,
     BadKeyShare,
+    BadAlpn,
+    NameMismatch,
     CertMalformed,
     PinMismatch,
     CertVerifyFailed,
@@ -77,6 +141,8 @@ impl Error {
             Error::BadVersion => "not TLS 1.3",
             Error::BadCipher => "cipher not negotiated",
             Error::BadKeyShare => "no x25519 key share",
+            Error::BadAlpn => "the ALPN answer is not one we offered",
+            Error::NameMismatch => "the certificate name is not the host we asked",
             Error::CertMalformed => "certificate walk failed",
             Error::PinMismatch => "the server key is NOT the pinned anchor",
             Error::CertVerifyFailed => "CertificateVerify signature failed",
@@ -120,9 +186,12 @@ const CIPHER_CHACHA20: [u8; 2] = [0x13, 0x03];
 /// Ed25519 in the signature schemes registry.
 const SIG_ED25519: [u8; 2] = [0x08, 0x07];
 
+/// The ALPN answer buffer (protocol names this client serves).
+const ALPN_STORE: usize = 32;
+
 /// The client.
-pub struct Client {
-    cfg: ClientConfig,
+pub struct Client<'a> {
+    cfg: ClientConfig<'a>,
     phase: Phase,
     transcript: Transcript,
     schedule: KeySchedule,
@@ -133,11 +202,18 @@ pub struct Client {
     flight_seen: u8,
     client_public: [u8; 32],
     server_random: [u8; 32],
+    /// The key the server PRESENTED (extracted at the Certificate
+    /// step — the CV signature verifies against THIS, whatever the
+    /// verify mode).
+    presented_key: Option<[u8; 32]>,
+    /// The ALPN protocol the server selected.
+    alpn_selected: Option<[u8; ALPN_STORE]>,
+    alpn_len: usize,
 }
 
-impl Client {
+impl<'a> Client<'a> {
     /// A fresh client at `SendHello`.
-    pub fn new(cfg: ClientConfig) -> Client {
+    pub fn new(cfg: ClientConfig<'a>) -> Client<'a> {
         // The early state is zeroed; the schedule is only valid after
         // ServerHello, but Rust wants every field initialized — the
         // phase gate makes the zeroed cryptos unreachable before
@@ -154,6 +230,9 @@ impl Client {
             client_ap: RecordCrypto::from_secret(&[0u8; 32]),
             flight_seen: 0,
             server_random: [0u8; 32],
+            presented_key: None,
+            alpn_selected: None,
+            alpn_len: 0,
         }
     }
 
@@ -162,32 +241,55 @@ impl Client {
         self.phase
     }
 
+    /// The ALPN protocol the server selected (None if none was
+    /// negotiated). Valid after `ServerVerified`. The name lands in
+    /// the caller's buffer (bounded to 32 bytes) — the protocol list
+    /// this client serves fits by construction.
+    pub fn negotiated_alpn(&self, out: &mut [u8]) -> Option<usize> {
+        let s = self.alpn_selected?;
+        let n = self.alpn_len;
+        if out.len() < n {
+            return None;
+        }
+        out[..n].copy_from_slice(&s[..n]);
+        Some(n)
+    }
+
     /// Build the ClientHello as a full record into `out`; appends the
     /// handshake message to the transcript. Returns the length.
+    ///
+    /// The extension set: supported_versions, supported_groups,
+    /// signature_algorithms, key_share — plus the FLAGS' own:
+    /// server_name (SNI) and ALPN when set.
     pub fn build_client_hello(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         if self.phase != Phase::SendHello {
             return Err(Error::TooLate);
         }
-        // The handshake message: type(1) len24 body.
-        // body: version(2) random(32) session_id(1+32) ciphers(2+2)
-        //       compression(1+1) extensions(2+…)
-        // extensions:
-        //   supported_versions  002b len 3: 02 0304
-        //   supported_groups    000a len 4: 02 001d
-        //   signature_algs      000d len 4: 02 0807
-        //   key_share           0033: the entry is group(2)+klen(2)+key(32)
-        //       = 36 bytes; the list is that entry; the EXTENSION is
-        //       the list length field + entry = 38.
-        let body_len = 2 + 32 + 1 + 32 + 2 + 2 + 1 + 1 + 2
-            + 7   // supported_versions: type+len(4) + 3
-            + 8   // supported_groups: 4 + 4
-            + 8   // signature_algorithms: 4 + 4
-            + 42; // key_share: 4 + 2+2+2+32
-        let msg_len = 4 + body_len;
-        if out.len() < 5 + msg_len {
+        let host = self.cfg.options.sni;
+        let alpn = self.cfg.options.alpn;
+        // guards: the SNI host ≤ 200 bytes, ≤ 8 protocols of ≤ 200
+        if host.map(|h| h.len() > 200).unwrap_or(false) {
             return Err(Error::Buffer);
         }
-        let mut m = [0u8; 256];
+        if alpn.len() > 8 || alpn.iter().any(|p| p.len() > 200) {
+            return Err(Error::Buffer);
+        }
+        let sni_ext = host.map(|h| 4 + 5 + h.len()).unwrap_or(0);
+        let alpn_list: usize = alpn.iter().map(|p| 1 + p.len()).sum();
+        let alpn_ext = if alpn.is_empty() {
+            0
+        } else {
+            4 + 2 + alpn_list
+        };
+        let ext_total = 7 + 8 + 8 + 42 + sni_ext + alpn_ext;
+        // body: version(2) random(32) session_id(1+32) ciphers(2+2)
+        //       compression(1+1) extensions(2+…)
+        let body_len = 2 + 32 + 1 + 32 + 2 + 2 + 1 + 1 + 2 + ext_total;
+        let msg_len = 4 + body_len;
+        if out.len() < 5 + msg_len || msg_len > 300 {
+            return Err(Error::Buffer);
+        }
+        let mut m = [0u8; 300];
         m[0] = 1; // ClientHello
         m[1] = (body_len >> 16) as u8;
         m[2] = (body_len >> 8) as u8;
@@ -210,7 +312,6 @@ impl Client {
         m[p] = 0x01; // compression methods len
         m[p + 1] = 0x00; // null
         p += 2;
-        let ext_total = 7 + 8 + 8 + 42;
         m[p] = (ext_total >> 8) as u8;
         m[p + 1] = ext_total as u8;
         p += 2;
@@ -256,20 +357,70 @@ impl Client {
         m[p + 9] = 0x20; // 32
         m[p + 10..p + 42].copy_from_slice(&self.client_public);
         p += 42;
+        // the FLAGS' extensions
+        if let Some(h) = host {
+            // server_name: list_len(2) type(1)=host_name namelen(2) name
+            m[p] = 0x00;
+            m[p + 1] = 0x00;
+            m[p + 2] = ((5 + h.len()) >> 8) as u8;
+            m[p + 3] = (5 + h.len()) as u8;
+            m[p + 4] = ((3 + h.len()) >> 8) as u8;
+            m[p + 5] = (3 + h.len()) as u8;
+            m[p + 6] = 0x00; // host_name
+            m[p + 7] = (h.len() >> 8) as u8;
+            m[p + 8] = h.len() as u8;
+            m[p + 9..p + 9 + h.len()].copy_from_slice(h.as_bytes());
+            p += 4 + 5 + h.len();
+        }
+        if !alpn.is_empty() {
+            // ALPN: list_len(2) then (len(1) proto)*
+            m[p] = 0x00;
+            m[p + 1] = 0x10;
+            m[p + 2] = ((2 + alpn_list) >> 8) as u8;
+            m[p + 3] = (2 + alpn_list) as u8;
+            m[p + 4] = (alpn_list >> 8) as u8;
+            m[p + 5] = alpn_list as u8;
+            p += 6;
+            for proto in alpn {
+                m[p] = proto.len() as u8;
+                m[p + 1..p + 1 + proto.len()].copy_from_slice(proto.as_bytes());
+                p += 1 + proto.len();
+            }
+        }
         debug_assert_eq!(p, msg_len);
         self.transcript.message(&m[..msg_len]);
-        crate::record::plain_record(TYPE_HANDSHAKE, &m[..msg_len], out).map_err(|_| Error::Buffer)
+        let n = crate::record::plain_record(TYPE_HANDSHAKE, &m[..msg_len], out)
+            .map_err(|_| Error::Buffer)?;
+        // The CH is on the wire: the next thing this client accepts
+        // is the ServerHello (a second build call refuses with
+        // TooLate — the phase is protocol state, not a convenience).
+        self.phase = Phase::WaitServerHello;
+        Ok(n)
     }
 
     /// Feed one complete outer record. The phase gates everything.
+    /// The `max_record_len` flag is enforced HERE: a record whose
+    /// ciphertext exceeds the budget is refused before any
+    /// decryption work.
     pub fn on_record(&mut self, rec: &[u8], app_out: &mut [u8]) -> Result<Event, Error> {
         if rec.len() < 5 {
             return Err(Error::BadRecord);
         }
+        let ct_len = u16::from_be_bytes([rec[3], rec[4]]) as usize;
+        if 5 + ct_len != rec.len() || ct_len > self.cfg.options.max_record_len {
+            return Err(Error::BadRecord);
+        }
         // The compat ChangeCipherSpec may appear anywhere pre-key:
-        // skip it (never part of the transcript).
+        // skip it (never part of the transcript). The SKIP is
+        // VALIDATED (RFC 8446 D.4: payload length exactly 1, value
+        // exactly 0x01) — an arbitrary type-20 record is not a
+        // middlebox artifact, it is hostile framing and refuses
+        // (the hostile battery caught the unconditional skip).
         if rec[0] == TYPE_CHANGE_CIPHER_SPEC {
-            return Ok(Event::Continue);
+            if ct_len == 1 && rec.len() == 6 && rec[5] == 0x01 {
+                return Ok(Event::Continue);
+            }
+            return Err(Error::BadHandshake);
         }
         match self.phase {
             Phase::SendHello | Phase::WaitServerHello => {
@@ -433,6 +584,7 @@ impl Client {
             let msg = &content[p..p + 4 + mlen];
             match mtype {
                 M_ENCRYPTED_EXTENSIONS => {
+                    self.on_encrypted_extensions(&msg[4..])?;
                     self.transcript.message(msg);
                     self.flight_seen |= F_EE;
                 }
@@ -444,9 +596,32 @@ impl Client {
                     let Some(pk) = cert::ed25519_public_key(der) else {
                         return Err(Error::CertMalformed);
                     };
-                    if !ct_eq(&pk, &self.cfg.pinned_ed25519) {
-                        return Err(Error::PinMismatch);
+                    // THE VERIFY MODE — the trust policy flag
+                    match self.cfg.options.verify {
+                        VerifyMode::Pinned => {
+                            if !ct_eq(&pk, &self.cfg.pinned_ed25519) {
+                                return Err(Error::PinMismatch);
+                            }
+                        }
+                        VerifyMode::PinnedRequireName => {
+                            if !ct_eq(&pk, &self.cfg.pinned_ed25519) {
+                                return Err(Error::PinMismatch);
+                            }
+                            let Some(host) = self.cfg.options.sni else {
+                                return Err(Error::NameMismatch);
+                            };
+                            let Some(cn) = cert::subject_cn(der) else {
+                                return Err(Error::NameMismatch);
+                            };
+                            if cn != host.as_bytes() {
+                                return Err(Error::NameMismatch);
+                            }
+                        }
+                        // TOFU: no pin check — the signature below
+                        // still binds the presented key
+                        VerifyMode::AcceptAnyKey => {}
                     }
+                    self.presented_key = Some(pk);
                     self.flight_seen |= F_CERT;
                 }
                 M_CERTIFICATE_VERIFY => {
@@ -473,7 +648,11 @@ impl Client {
                     signed[98..130].copy_from_slice(&th);
                     let mut sig = [0u8; 64];
                     sig.copy_from_slice(&body[4..68]);
-                    let pk = self.cfg.pinned_ed25519;
+                    // the key the server PRESENTED — not the pin: the
+                    // signature must bind the flight's own key
+                    let Some(pk) = self.presented_key else {
+                        return Err(Error::UnexpectedMessage);
+                    };
                     if !ed25519::verify(&pk, &signed, &sig) {
                         return Err(Error::CertVerifyFailed);
                     }
@@ -508,6 +687,66 @@ impl Client {
             p += 4 + mlen;
         }
         Ok(Event::Continue)
+    }
+
+    /// EncryptedExtensions: the flags' answer surface — the ALPN
+    /// selection. Total and length-checked: an unsolicited ALPN, an
+    /// answer we did not offer, or a malformed list all refuse with
+    /// `BadAlpn`.
+    fn on_encrypted_extensions(&mut self, body: &[u8]) -> Result<(), Error> {
+        let offered = self.cfg.options.alpn;
+        if body.len() < 2 {
+            return Err(Error::BadHandshake);
+        }
+        let ext_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+        if 2 + ext_len > body.len() {
+            return Err(Error::BadHandshake);
+        }
+        let exts = &body[2..2 + ext_len];
+        let mut q = 0;
+        while q + 4 <= exts.len() {
+            let et = u16::from_be_bytes([exts[q], exts[q + 1]]);
+            let el = u16::from_be_bytes([exts[q + 2], exts[q + 3]]) as usize;
+            if q + 4 + el > exts.len() {
+                return Err(Error::BadHandshake);
+            }
+            if et == 0x0010 {
+                // ALPN: list_len(2) (len(1) proto)+
+                let ev = &exts[q + 4..q + 4 + el];
+                if ev.len() < 2 {
+                    return Err(Error::BadAlpn);
+                }
+                let list_len = u16::from_be_bytes([ev[0], ev[1]]) as usize;
+                if 2 + list_len != el || list_len == 0 {
+                    return Err(Error::BadAlpn);
+                }
+                let mut r = 2;
+                let mut matched = false;
+                while r < ev.len() {
+                    let pl = ev[r] as usize;
+                    r += 1;
+                    if r + pl > ev.len() {
+                        return Err(Error::BadAlpn);
+                    }
+                    let proto = &ev[r..r + pl];
+                    if offered.iter().any(|o| o.as_bytes() == proto) {
+                        matched = true;
+                        // store the answer (bounded)
+                        let take = core::cmp::min(pl, ALPN_STORE);
+                        let mut store = [0u8; ALPN_STORE];
+                        store[..take].copy_from_slice(&proto[..take]);
+                        self.alpn_selected = Some(store);
+                        self.alpn_len = take;
+                    }
+                    r += pl;
+                }
+                if !matched {
+                    return Err(Error::BadAlpn);
+                }
+            }
+            q += 4 + el;
+        }
+        Ok(())
     }
 
     /// Build the client Finished record (under the CLIENT handshake

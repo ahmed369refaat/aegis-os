@@ -6,6 +6,8 @@
 //! never a transcription of this crate's own output.
 
 use crate::x25519;
+
+mod hostile;
 #[allow(unused_imports)]
 use std::string::String;
 #[allow(unused_imports)]
@@ -297,12 +299,21 @@ const CLIENT_RANDOM: [u8; 32] =
 const SESSION_ID: [u8; 32] =
     hex("2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40");
 
-fn the_config() -> ClientConfig {
+fn the_config() -> ClientConfig<'static> {
     ClientConfig {
         client_private: CLIENT_PRIVATE,
         client_random: CLIENT_RANDOM,
         session_id: SESSION_ID,
         pinned_ed25519: PIN,
+        // K28: the full flag surface, live: the SNI host (the cert's
+        // CN is "aegis-tls"), ALPN ("echo/1"), and the STRICTEST
+        // verify mode — the pin AND the name both check.
+        options: crate::handshake::TlsOptions {
+            sni: Some("aegis-tls"),
+            alpn: &["echo/1"],
+            verify: crate::handshake::VerifyMode::PinnedRequireName,
+            max_record_len: crate::record::RECORD_CAP,
+        },
     }
 }
 

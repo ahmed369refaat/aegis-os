@@ -286,6 +286,12 @@ case "${1:-}" in
       # K27: TLS 1.3 live over the kernel's own stack
       "[TLS] TLS 1.3 handshake VERIFIED over the kernel's own TCP/IP stack: X25519 + HKDF key schedule + ChaCha20-Poly1305, the server's Ed25519 CertificateVerify against the PINNED key, both Finished MACs — a real OpenSSL peer ("  # the full client handshake, lane-live
       "[TLS] encrypted round trip: GET out, PONG echo back — "  # one encrypted request + the decrypted echo, in the kernel
+      # K28: the flags, live
+      "[TLS] flags live: SNI aegis-tls sent, ALPN echo/1 negotiated, the certificate name verified against the host"  # the full connection-flag surface on the real lane
+      # K28: the hostile peers — the zero-vulnerability proofs
+      "[TLS] hostile peer refused: the server key is NOT the pinned anchor"  # the impostor with a different key
+      "[TLS] hostile peer refused: the certificate name is not the host we asked"  # the impostor with the right key, the wrong name
+      "[TLS] hostile containment: 2 of 2 impostors refused, teardown clean"  # both named refusals + the clean teardown
       "[FAT32] HELLO.ESP (cluster 3, 1200 bytes, 3 clusters): \"HEAD:AEGIS-FAT32:\"…\":TAIL-OK\" ← read-only FAT32 over AHCI"  # the ESP mount LIVE on the same port (GPT partition 2, the chain walk proven)
       "[E1K] teardown dom"  # ADR-0018
       "[GFX] VBE 640x480x32 linear"  # the mode engaged
@@ -605,11 +611,23 @@ if [ "$MODE" = "verify" ]; then
   # the host (slirp's 10.0.2.2 IS this host). Started before qemu,
   # killed after; a failed start is loud (the [TLS] markers say so).
   TLS_ECHO_PID=""
+  TLS_HOSTILE_PID=""
+  TLS_WRONGNAME_PID=""
   if command -v python3 >/dev/null 2>&1 && [ -f scripts/tls_echo_server.py ]; then
     rm -f /tmp/echo-accepts.log
     python3 scripts/tls_echo_server.py 44333 tls/tests/server-key.pem \
       tls/tests/server-cert.pem /tmp/echo-accepts.log >/dev/null 2>&1 &
     TLS_ECHO_PID=$!
+    # K28: the HOSTILE peers — (a) a different key under any name:
+    # the PIN must refuse; (b) the SAME key under the WRONG name:
+    # PinnedRequireName must refuse. Two impostors, two named
+    # refusals, on every lane.
+    python3 scripts/tls_echo_server.py 44334 tls/tests/hostile-key.pem \
+      tls/tests/hostile-cert.pem >/dev/null 2>&1 &
+    TLS_HOSTILE_PID=$!
+    python3 scripts/tls_echo_server.py 44335 tls/tests/server-key.pem \
+      tls/tests/wrongname-cert.pem >/dev/null 2>&1 &
+    TLS_WRONGNAME_PID=$!
     sleep 1.2
   fi
   QEMU_RC=0
@@ -627,6 +645,12 @@ if [ "$MODE" = "verify" ]; then
   set -e
   if [ -n "$TLS_ECHO_PID" ]; then
     kill "$TLS_ECHO_PID" 2>/dev/null || true
+  fi
+  if [ -n "$TLS_HOSTILE_PID" ]; then
+    kill "$TLS_HOSTILE_PID" 2>/dev/null || true
+  fi
+  if [ -n "$TLS_WRONGNAME_PID" ]; then
+    kill "$TLS_WRONGNAME_PID" 2>/dev/null || true
   fi
   if [ "$QEMU_RC" = 124 ]; then
     echo "QEMU hit its ${QEMU_TIMEOUT}s budget (the kernel halted without exiting) — the verify greps still run"

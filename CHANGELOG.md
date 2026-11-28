@@ -1,5 +1,101 @@
 # Changelog
 
+## [Unreleased] — the K28 round: the connection FLAGS, the hostile battery, and the zero-vulnerability live proof
+
+**The gap (the user's words):** "complete what's missing, I want ALL
+the connection flags, and make VIOLENT network tests to find the
+errors and fix them, and zero security holes."
+
+**What landed:**
+
+- **`TlsOptions` — the connection flags, each real:** `sni` (sent in
+  the ClientHello; the name `PinnedRequireName` checks against the
+  certificate's CN — `cert::subject_cn` walks the DER's RDNSequence
+  to the CN attribute, positionally safe: the SPKI is identified
+  structurally and the Subject is the Name before it), `alpn` (the
+  offer in the CH; the server's selection in EncryptedExtensions
+  must be one we offered or the connection refuses `BadAlpn`; the
+  answer readable via `negotiated_alpn`), `verify` (`Pinned` /
+  `PinnedRequireName` / `AcceptAnyKey` — the TOFU mode still
+  verifies the CertificateVerify signature against the PRESENTED
+  key, only the pre-known-key check is waived), and
+  `max_record_len` (the hostile-record budget, enforced BEFORE any
+  decryption). Not flags, by design: the protocol floor (TLS 1.3
+  only — no 0x0304 in the ServerHello, no 1.2 path exists in the
+  binary) and the cipher (ChaCha20-Poly1305 is the only suite
+  compiled in — downgrade-to-weak is structurally impossible).
+- **The hostile battery (`tls/src/tests/hostile.rs`, 13 tests):**
+  the EVERY-BYTE mutation sweep over the recorded OpenSSL flight
+  (~3.8k cases: no mutation of any security-relevant byte verifies
+  the handshake or releases plaintext — the outer record version
+  bytes are the RFC's own ignored framing, and the post-handshake
+  session tickets carry no state); every truncation; header lies
+  (the 0xFFFF bomb, zero-length claims, off-by-ones); 500-record
+  garbage storms followed by the REAL flight (the machine is never
+  wedged); the downgrade surgery (0x0303 → `BadVersion`, AES-GCM →
+  `BadCipher`); the trust flags (wrong pin, wrong name, forged
+  Finished — each refusal NAMED); the flight REPLAY (refused by the
+  AEAD's own nonce sequence — the second pass fails every tag);
+  the AEAD every-byte tamper sweep; X25519 degenerate peers; the
+  flag guards at BUILD time.
+- **Two real holes the battery found and closed:** (1) the compat
+  ChangeCipherSpec was skipped UNVALIDATED — any type-20 record
+  sailed through; it now enforces the RFC 8446 D.4 shape (payload
+  length exactly 1, value exactly 0x01) and everything else
+  refuses `BadHandshake`. (2) `build_client_hello` did not move the
+  phase — a caller that rebuilt after sending would double-hash the
+  transcript and silently desync the keys; the phase is now
+  protocol state (`SendHello → WaitServerHello`, a second build is
+  `TooLate`).
+- **The live hostile lane:** two impostor servers on every boot —
+  (a) a different key under any name (the pin refuses), (b) the
+  SAME key under the WRONG name (`PinnedRequireName` refuses) — the
+  kernel connects, reads the flight, prints the NAMED refusal, and
+  tears the socket down clean:
+  `[TLS] hostile peer refused: the server key is NOT the pinned
+  anchor` + `[TLS] hostile peer refused: the certificate name is
+  not the host we asked` + `[TLS] hostile containment: 2 of 2
+  impostors refused, teardown clean` — plus the flags' own live
+  line (SNI sent, ALPN negotiated, the name verified).
+- Tests 950 → **963** (the battery's 13), gates 10/10, lane-green.
+
+## [Unreleased] — the K27 round: TLS 1.3 LIVE over the kernel's own TCP/IP stack
+
+**The gap (the user's words):** "no transport-security layer
+(TLS/SSL): the stack provides raw TCP/IP — any application wanting
+a secure connection (HTTPS, SSH) needs TLS on top of these sockets;
+the project mentions no TLS and no cryptographic methods."
+
+**What landed:** the `tls/` crate (no_std, no-alloc, zero external
+crates, zero unsafe, the pkg crate's audited primitives by path):
+X25519 (RFC 7748, 5×51-bit limbs, the fixed-sequence Montgomery
+ladder), ChaCha20-Poly1305 (RFC 8439, ARX constant-time),
+HKDF-SHA-256 (RFC 5869), the full TLS 1.3 key schedule (§7.1), the
+record layer (nonce = IV⊕seq, the inner content type), and the
+CLIENT state machine (ClientHello, the ServerHello's real server
+shapes, the encrypted flight decrypt, the PINNED Ed25519
+CertificateVerify — the X.509 SPKI walked, the raw key must equal
+the trust anchor, the signature verified through pkg — and both
+Finished MACs). Pinned by: every primitive's RFC vectors, a
+300-case randomized AEAD sweep against the cryptography library, a
+keylog comparison (the derived traffic secrets match OpenSSL's
+byte-for-byte), and a RECORDED real-OpenSSL flight replayed
+offline. The live lane: the e1000 claimed and broker-mapped, the
+K24 netstack driven over the NIC through slirp to a real OpenSSL
+server on the host — the full handshake, one encrypted GET, the
+encrypted PONG echo decrypted in the kernel.
+
+**The live-lane finds, both fixed loudly:** the RX ring discipline
+(poll EVERY descriptor's DD — QEMU writes at RDH; RDT only ever
+advances) and the REAL time clock (QEMU parks the first RX behind
+the RCTL write's 1000ms virtual window — a virtual 1ms-per-cycle
+clock burns the ARP retry budget before any reply lands). And the
+round's biggest catch, a K24 bug the wire exposed: `tcp.connect`
+propagated `ArpPending` past the TCB allocation — the SYN left, the
+handshake even completed on the wire, but the fd never learned its
+TCB and `send()` answered `NotBound` forever; connect now returns
+the index and the ARP queue + RTO drive the SYN.
+
 ## [Unreleased] — the K26 round: the e1000, the THIRD ring-3 driver domain — the real-NIC-class migration
 
 **The gap (the user's words):** "the network runs on virtio-net (a

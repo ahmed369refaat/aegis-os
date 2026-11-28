@@ -26,6 +26,9 @@ def main() -> None:
     logfile = sys.argv[4] if len(sys.argv) > 4 else None
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
+    # K28: answer the client's ALPN offer ("echo/1") — the negotiated
+    # protocol rides EncryptedExtensions back
+    ctx.set_alpn_protocols(["echo/1"])
     # the CLIENT's list decides: our Rust client offers only
     # TLS_CHACHA20_POLY1305_SHA256, so that is what negotiates
     with socket.socket() as srv:

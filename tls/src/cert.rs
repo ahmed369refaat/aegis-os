@@ -183,3 +183,73 @@ fn tlv_total(b: &[u8]) -> Option<usize> {
     };
     Some(pos + len)
 }
+
+/// The Subject's CommonName (OID 2.5.4.3) — the name the
+/// `PinnedRequireName` verification mode checks against the SNI. The
+/// walk is positional-safe: the SPKI is IDENTIFIED structurally (the
+/// SEQUENCE whose second child is a BIT STRING), and the Subject is
+/// the Name SEQUENCE immediately before it (the TBS order: serial,
+/// sigAlg, issuer, validity, subject, SPKI, extensions). `None` on
+/// any malformed shape or a missing CN.
+pub fn subject_cn(cert_der: &[u8]) -> Option<&[u8]> {
+    let (tag, cert) = Der::new(cert_der).tlv()?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (tag, tbs) = Der::new(cert).tlv()?;
+    if tag != 0x30 {
+        return None;
+    }
+    // walk the TBS children; the child immediately before the SPKI
+    // is the Subject Name
+    let mut prev: Option<&[u8]> = None;
+    let mut cur = Der::new(tbs);
+    while !cur.done() {
+        let (tag, child) = cur.tlv()?;
+        if tag != 0x30 {
+            prev = None;
+            continue;
+        }
+        // the SPKI test: first child a SEQUENCE, second a BIT STRING
+        let mut inner = Der::new(child);
+        let is_spki = matches!(
+            (inner.tlv(), inner.tlv()),
+            (Some((0x30, _)), Some((0x03, _)))
+        );
+        if is_spki {
+            let subject = prev?;
+            return cn_of_rdn(subject);
+        }
+        prev = Some(child);
+    }
+    None
+}
+
+/// The RDNSequence contents (a SEQUENCE of SETs of
+/// AttributeTypeAndValue SEQUENCEs) → the CN attribute's value.
+fn cn_of_rdn(rdn_contents: &[u8]) -> Option<&[u8]> {
+    let mut cur = Der::new(rdn_contents);
+    while !cur.done() {
+        let (stag, set) = cur.tlv()?;
+        if stag != 0x31 {
+            continue; // not a RelativeDistinguishedName SET
+        }
+        let mut scur = Der::new(set);
+        while !scur.done() {
+            let (atag, atv) = scur.tlv()?;
+            if atag != 0x30 {
+                continue;
+            }
+            let mut acur = Der::new(atv);
+            if let Some((0x06, oid)) = acur.tlv() {
+                if oid == [0x55, 0x04, 0x03] {
+                    // CommonName — the value is the next TLV
+                    if let Some((_, val)) = acur.tlv() {
+                        return Some(val);
+                    }
+                }
+            }
+        }
+    }
+    None
+}

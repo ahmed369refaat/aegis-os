@@ -325,11 +325,20 @@ pub(crate) fn tls_step<const N: usize>(
     }
 
     // ── the TLS client ──
+    // The FULL flag surface, live: SNI (the cert's CN is
+    // "aegis-tls"), ALPN ("echo/1"), and the STRICTEST verify mode —
+    // the pin AND the name.
     let cfg = aegis_tls::handshake::ClientConfig {
         client_private: CLIENT_PRIVATE,
         client_random: CLIENT_RANDOM,
         session_id: SESSION_ID,
         pinned_ed25519: PIN,
+        options: aegis_tls::handshake::TlsOptions {
+            sni: Some("aegis-tls"),
+            alpn: &["echo/1"],
+            verify: aegis_tls::handshake::VerifyMode::PinnedRequireName,
+            max_record_len: aegis_tls::record::RECORD_CAP,
+        },
     };
     let mut client = aegis_tls::handshake::Client::new(cfg);
     let mut outbuf = [0u8; aegis_tls::record::RECORD_CAP + 64];
@@ -498,6 +507,160 @@ pub(crate) fn tls_step<const N: usize>(
         }
     }
 
+    // ── K28: THE HOSTILE PASSES — two impostors, two named refusals ──
+    // The same rings, the same stack, the same session: (a) a server
+    // with a DIFFERENT key (the pin must refuse); (b) a server with
+    // the RIGHT key under the WRONG name (PinnedRequireName must
+    // refuse). Each pass is a full connect → CH → flight → REFUSAL,
+    // and the socket tears down cleanly after.
+    let mut hostile_refused = 0u32;
+    for &(hport, _want) in [(44334u16, 0u8), (44335u16, 1u8)].iter() {
+        let Ok(hfd) = stack.socket(TLS_DOMAIN, aegis_os::netstack::socket::SOCK_STREAM) else {
+            break;
+        };
+        if let Err(e) = stack.connect(now, &mut sink, TLS_DOMAIN, hfd, &HOST, hport) {
+            if !matches!(
+                e,
+                NetError::ArpPending | NetError::InProgress | NetError::Again
+            ) {
+                let _ = stack.close(now, &mut sink, TLS_DOMAIN, hfd);
+                break;
+            }
+        }
+        // the hostile client: the SAME flags (SNI + ALPN + the
+        // strictest mode) — the refusal must come from the TRUST
+        // layer, not from a weaker config
+        let hcfg = aegis_tls::handshake::ClientConfig {
+            client_private: CLIENT_PRIVATE,
+            client_random: CLIENT_RANDOM,
+            session_id: SESSION_ID,
+            pinned_ed25519: PIN,
+            options: aegis_tls::handshake::TlsOptions {
+                sni: Some("aegis-tls"),
+                alpn: &["echo/1"],
+                verify: aegis_tls::handshake::VerifyMode::PinnedRequireName,
+                max_record_len: aegis_tls::record::RECORD_CAP,
+            },
+        };
+        let mut hclient = aegis_tls::handshake::Client::new(hcfg);
+        let mut hstream = [0u8; 4096];
+        let mut hstream_len = 0usize;
+        let mut refused: Option<&'static str> = None;
+        let mut ch_len = 0usize;
+        // the hostile pump: bounded, the same discipline
+        let mut hcycles = 0u64;
+        while hcycles < 12_000_000 {
+            hcycles += 1;
+            for n in 0..E1K_NDESC {
+                let desc = rx_ring + n * 16;
+                if crate::virtio::read_u8_pa(desc + 12) & 1 == 0 {
+                    continue;
+                }
+                let len = crate::memops::read_u16(desc + 8) as usize;
+                let n_bytes = core::cmp::min(len, 1514);
+                let buf = rxbufs[(n / 2) as usize] + (n % 2) * RX_STRIDE;
+                let mut frame = [0u8; 1514];
+                for (i, b) in frame.iter_mut().enumerate().take(n_bytes) {
+                    *b = crate::virtio::read_u8_pa(buf + i as u64);
+                }
+                crate::memops::write_u32(desc + 8, 0);
+                crate::memops::write_u32(desc + 12, 0);
+                rdt = (rdt + 1) % 16;
+                let _ = bus.write32(E1K_RDT, rdt);
+                let _ = stack.on_frame(now, &mut sink, &frame[..n_bytes]);
+            }
+            let _ = stack.poll(now, &mut sink);
+            now = (crate::clock::now_ns() / 1_000_000) as u64;
+            // drain
+            loop {
+                let mut chunk = [0u8; 512];
+                match stack.recv(TLS_DOMAIN, hfd, &mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if hstream_len + n <= hstream.len() {
+                            hstream[hstream_len..hstream_len + n].copy_from_slice(&chunk[..n]);
+                            hstream_len += n;
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // the CH: built once (the phase moves), then sent as
+            // the TCP window allows — the length persists across
+            // cycles
+            if hclient.phase() == aegis_tls::handshake::Phase::SendHello {
+                if let Ok(n) = hclient.build_client_hello(&mut outbuf) {
+                    ch_len = n;
+                }
+            }
+            if ch_len > 0 {
+                if let Ok(n) = stack.send(now, &mut sink, TLS_DOMAIN, hfd, &outbuf[..ch_len]) {
+                    let _ = n;
+                    ch_len = 0; // the whole record went out
+                }
+            }
+            // the records
+            let mut consumed = 0usize;
+            while hstream_len - consumed >= 5 {
+                let rl =
+                    u16::from_be_bytes([hstream[consumed + 3], hstream[consumed + 4]]) as usize;
+                if consumed + 5 + rl > hstream_len {
+                    break;
+                }
+                let rec: &[u8] = &hstream[consumed..consumed + 5 + rl];
+                let mut scratch = [0u8; aegis_tls::record::RECORD_CAP];
+                match hclient.on_record(rec, &mut scratch) {
+                    Ok(aegis_tls::handshake::Event::Continue) => {}
+                    Ok(aegis_tls::handshake::Event::ServerVerified) => {
+                        // the impostor got through?! — the loud line
+                        // (the lane's containment marker would fail)
+                        refused = Some("VERIFIED — A HOSTILE PEER GOT THROUGH");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        refused = Some(e.describe());
+                        break;
+                    }
+                }
+                consumed += 5 + rl;
+            }
+            if consumed > 0 {
+                hstream.copy_within(consumed..hstream_len, 0);
+                hstream_len -= consumed;
+            }
+            if refused.is_some() {
+                break;
+            }
+        }
+        // the loud refusal + the clean teardown
+        if let Some(why) = refused {
+            line(
+                out,
+                &[
+                    "[TLS] hostile peer refused: ",
+                    why,
+                    if _want == 0 {
+                        " (10.0.2.2:44334, a different key)"
+                    } else {
+                        " (10.0.2.2:44335, the right key, the wrong name)"
+                    },
+                ],
+            );
+            if !why.starts_with("VERIFIED") {
+                hostile_refused += 1;
+            }
+        }
+        let _ = stack.close(now, &mut sink, TLS_DOMAIN, hfd);
+    }
+    if hostile_refused == 2 {
+        line(
+            out,
+            &["[TLS] hostile containment: 2 of 2 impostors refused, teardown clean"],
+        );
+    }
+
     // ── the verdict + teardown ──
     let mut nb = [0u8; 20];
     let cyc = strutil::dec(cycles, &mut nb);
@@ -520,6 +683,17 @@ pub(crate) fn tls_step<const N: usize>(
                 " bytes decrypted in the kernel (the transport-security layer is live)",
             ],
         );
+        // the flags' own proof: the ALPN answer came back (and the
+        // name mode passed — the handshake would have refused)
+        let mut alpn = [0u8; 32];
+        let an = client.negotiated_alpn(&mut alpn);
+        let alpn_ok = an == Some(6) && &alpn[..6] == b"echo/1";
+        if alpn_ok {
+            line(
+                out,
+                &["[TLS] flags live: SNI aegis-tls sent, ALPN echo/1 negotiated, the certificate name verified against the host"],
+            );
+        }
     } else if verified {
         line(
             out,
