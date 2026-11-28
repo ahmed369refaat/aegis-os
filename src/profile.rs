@@ -5,8 +5,10 @@
 //! Policy choices (deliberately narrow defaults — least privilege):
 //! - Parsers get no network, no spawn, no ioctl, no write.
 //! - Plugins get read + IPC only.
-//! - Network egress is brokered: `netd_profile` is the ONLY profile that
-//!   carries NET_* rights, and its sends are kernel rate-limited per client.
+//! - Network egress is brokered: `netd_profile` and `tcpip_profile` are the
+//!   ONLY profiles that carry NET_* rights, and their sends are kernel
+//!   rate-limited per client (P1-1). Every socket client
+//!   (`net_client_profile`) is NET-free by construction.
 //! - The Linux-like process-management syscalls (PIPE/DUP/KILL/CHROOT)
 //!   belong to the service profile exclusively; the file-family
 //!   mutators (MKDIR/UNLINK/LISTDIR/STAT/RENAME) are shared with the
@@ -307,6 +309,91 @@ pub const fn netd_profile() -> DomainProfile {
     }
 }
 
+/// P1-1: the TCP/IP service domain (`tcpip`) — the ring-3 home of
+/// `netstack`. Together with `netd` it is one of the ONLY two profiles
+/// that may speak to the brokered NIC, and only through the two broker
+/// syscalls: NET_SEND is the BrokerSink's one exit (the stack's frames
+/// leave through the kernel's token bucket and its broker-mapped rings),
+/// NET_RECV is ingress. It never touches a virtio ring, a device
+/// register or a DMA buffer: no DEVREG, no mmap, no file I/O.
+///
+/// Its clients reach it over byte channels (PIPE_READ drains the request
+/// pipe, PIPE_WRITE answers the reply pipe). CLOCK_GETTIME and
+/// SCHED_YIELD are not conveniences — `netstack` is non-blocking and
+/// re-driven by its caller (`poll(now)` runs the RTO, delayed-ACK, ARP
+/// and TIME_WAIT timers), so a clock and a yield are the two things a
+/// polling stack service cannot exist without. A Tightened tcpip keeps
+/// its NIC path and loses its clients (the netd rule, mirrored).
+///
+/// The quota is right-sized to the `NETSVC` exec layout (see the kernel's
+/// `mm::user_layout`): a 128-page image cage, a 64-page stack and the
+/// trampoline — 193 pages of ceiling plus page-table slack.
+pub const fn tcpip_profile() -> DomainProfile {
+    DomainProfile {
+        name: "tcpip",
+        syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_WRITE)
+                | (1u64 << SYS_PIPE_READ)
+                | (1u64 << SYS_PIPE_WRITE)
+                | (1u64 << SYS_NET_SEND)
+                | (1u64 << SYS_NET_RECV)
+                | (1u64 << SYS_SCHED_YIELD)
+                | (1u64 << SYS_CLOCK_GETTIME)
+                | (1u64 << SYS_EXIT),
+        ),
+        // Degraded tcpip: NET_* is the whole point — it stays; the
+        // client channels and the pacing drop (the netd rule).
+        degraded_syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_WRITE)
+                | (1u64 << SYS_NET_SEND)
+                | (1u64 << SYS_NET_RECV)
+                | (1u64 << SYS_EXIT),
+        ),
+        quota_pages: 256,
+        // READ|WRITE mint Device(0) READ+WRITE — the two halves of the
+        // brokered socket (NET_RECV reads, NET_SEND writes). No GRANT:
+        // the service confers nothing.
+        base_rights: Rights::READ.union(Rights::WRITE),
+        sensitivity: 30,
+        max_children: 0,
+    }
+}
+
+/// P1-1: a network CLIENT — any ring-3 domain that opens sockets through
+/// the tcpip service. The socket surface is a thin marshaller over two
+/// byte channels: the request pipe to the service (PIPE_WRITE) and the
+/// reply pipe back (PIPE_READ + the blocking IPC_RECV_WAIT rendezvous).
+/// That is the whole networking surface of a client — NO NET_*: the
+/// kernel's mask answers a direct NET_SEND with -ENOSYS before any
+/// capability is read, so a client cannot bypass the broker even by
+/// asking. No IPC_SEND/IPC_RECV/IPC_CALL: message endpoints are not its
+/// transport. SCHED_YIELD keeps a non-blocking poll loop fair.
+pub const fn net_client_profile() -> DomainProfile {
+    DomainProfile {
+        name: "net-client",
+        syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ)
+                | (1u64 << SYS_WRITE)
+                | (1u64 << SYS_PIPE_READ)
+                | (1u64 << SYS_PIPE_WRITE)
+                | (1u64 << SYS_IPC_RECV_WAIT)
+                | (1u64 << SYS_SCHED_YIELD)
+                | (1u64 << SYS_EXIT),
+        ),
+        // Degraded client: no new requests (the pipes drop); a parked
+        // reply is still answered into the pipes it no longer touches.
+        degraded_syscalls: SyscallMask::from_bits(
+            (1u64 << SYS_READ) | (1u64 << SYS_WRITE) | (1u64 << SYS_EXIT),
+        ),
+        quota_pages: 64,
+        // READ only: base rights mint Device(0) too, and a client must
+        // not even hold the WRITE half of the brokered NIC.
+        base_rights: Rights::READ,
+        sensitivity: 60,
+        max_children: 0,
+    }
+}
+
 /// K22: the package manager domain (`/bin/pkg`). The file family's
 /// whole working set — read, write, open (with O_EXCL), close, mkdir,
 /// unlink, listdir, stat, rename — and NOTHING from the process
@@ -475,6 +562,8 @@ mod degraded_tests {
             driver_profile(),
             plugin_profile(),
             netd_profile(),
+            tcpip_profile(),
+            net_client_profile(),
             package_manager_profile(),
         ];
         for p in all {
@@ -543,6 +632,29 @@ mod degraded_tests {
                 .unwrap(),
             "netd: ingress"
         );
+        // P1-1: the stack service keeps BOTH halves of its NIC path when
+        // tightened, and loses its clients (the netd rule, mirrored).
+        assert!(
+            tcpip_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_NET_SEND)
+                .unwrap(),
+            "tcpip: egress"
+        );
+        assert!(
+            tcpip_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_NET_RECV)
+                .unwrap(),
+            "tcpip: ingress"
+        );
+        assert!(
+            !tcpip_profile()
+                .degraded_syscalls
+                .is_allowed(SYS_PIPE_WRITE)
+                .unwrap(),
+            "tcpip: Tighten silences the client channels"
+        );
         assert!(
             plugin_profile()
                 .degraded_syscalls
@@ -598,6 +710,8 @@ mod degraded_tests {
             driver_profile(),
             plugin_profile(),
             netd_profile(),
+            tcpip_profile(),
+            net_client_profile(),
             package_manager_profile(),
         ] {
             let mut d = crate::domain::Domain::new(7, p);
@@ -702,6 +816,73 @@ mod tests {
         }
     }
 
+    /// P1-1: the two new profiles, pinned mask-for-mask. Every bit is
+    /// an explicit `1 <<` — nothing rides `SyscallMask::ALL` — so the
+    /// two surfaces below are the WHOLE authority each class ever gets,
+    /// and any later bit lands default-OFF for both.
+    #[test]
+    fn tcpip_and_net_client_masks_are_pinned_exactly() {
+        let tcpip = tcpip_profile();
+        assert_eq!(
+            tcpip.syscalls,
+            SyscallMask::from_bits(
+                (1u64 << SYS_WRITE)
+                    | (1u64 << SYS_PIPE_READ)
+                    | (1u64 << SYS_PIPE_WRITE)
+                    | (1u64 << SYS_NET_SEND)
+                    | (1u64 << SYS_NET_RECV)
+                    | (1u64 << SYS_SCHED_YIELD)
+                    | (1u64 << SYS_CLOCK_GETTIME)
+                    | (1u64 << SYS_EXIT)
+            )
+        );
+        assert_eq!(
+            tcpip.degraded_syscalls,
+            SyscallMask::from_bits(
+                (1u64 << SYS_WRITE)
+                    | (1u64 << SYS_NET_SEND)
+                    | (1u64 << SYS_NET_RECV)
+                    | (1u64 << SYS_EXIT)
+            )
+        );
+        assert_eq!(tcpip.base_rights, Rights::READ.union(Rights::WRITE));
+        // The quota is a real ceiling for the NETSVC exec layout: the
+        // 128-page cage + the 64-page stack + the trampoline fit with
+        // page-table slack; a second cage's worth on top does not.
+        assert!(tcpip.quota_pages > 128 + 64);
+        assert!(tcpip.quota_pages < 128 + 64 + 1 + 128);
+
+        let client = net_client_profile();
+        assert_eq!(
+            client.syscalls,
+            SyscallMask::from_bits(
+                (1u64 << SYS_READ)
+                    | (1u64 << SYS_WRITE)
+                    | (1u64 << SYS_PIPE_READ)
+                    | (1u64 << SYS_PIPE_WRITE)
+                    | (1u64 << SYS_IPC_RECV_WAIT)
+                    | (1u64 << SYS_SCHED_YIELD)
+                    | (1u64 << SYS_EXIT)
+            )
+        );
+        assert_eq!(
+            client.degraded_syscalls,
+            SyscallMask::from_bits((1u64 << SYS_READ) | (1u64 << SYS_WRITE) | (1u64 << SYS_EXIT))
+        );
+        assert_eq!(client.base_rights, Rights::READ);
+        // Neither new class may spawn, fork, exec, map, or open a file.
+        for p in [tcpip, client] {
+            for denied in [SYS_SPAWN, SYS_FORK, SYS_EXEC, SYS_MMAP, SYS_OPEN, SYS_KILL] {
+                assert!(
+                    !p.syscalls.is_allowed(denied).unwrap(),
+                    "{} must not use {}",
+                    p.name,
+                    denied
+                );
+            }
+        }
+    }
+
     #[test]
     fn only_the_broker_profile_has_network_egress() {
         // Every non-broker profile must be NET-free...
@@ -711,11 +892,75 @@ mod tests {
             driver_profile(),
             plugin_profile(),
             package_manager_profile(),
+            net_client_profile(),
         ] {
             assert!(!p.syscalls.is_allowed(SYS_NET_SEND).unwrap(), "{}", p.name);
             assert!(!p.syscalls.is_allowed(SYS_NET_RECV).unwrap(), "{}", p.name);
         }
-        // ...and netd (the broker) is the only one that holds NET_*.
+        // P1-1: the socket CLIENT — the profile whose whole purpose is
+        // networking — holds no NET_* at all. Its traffic leaves through
+        // the tcpip service's budget, never its own.
+        let client = net_client_profile();
+        assert_eq!(client.name, "net-client");
+        assert!(client.syscalls.is_allowed(SYS_PIPE_WRITE).unwrap());
+        assert!(client.syscalls.is_allowed(SYS_PIPE_READ).unwrap());
+        assert!(client.syscalls.is_allowed(SYS_IPC_RECV_WAIT).unwrap());
+        for denied in [
+            SYS_NET_SEND,
+            SYS_NET_RECV,
+            SYS_DEVREG,
+            SYS_IPC_SEND,
+            SYS_IPC_RECV,
+            SYS_IPC_CALL,
+            SYS_IPC_GRANT,
+            SYS_MMAP,
+            SYS_OPEN,
+            SYS_SPAWN,
+        ] {
+            assert!(
+                !client.syscalls.is_allowed(denied).unwrap(),
+                "net-client must not use {}",
+                denied
+            );
+        }
+        // ...and the NET-holding set is EXACTLY {netd, tcpip}. The
+        // stack service adds no authority the broker lacks: its mask
+        // is netd's NET_* core plus only what a polling stack needs
+        // (the two byte-channel ops, a clock and a yield) — and it
+        // drops netd's message-endpoint family and its GRANT.
+        let tcpip = tcpip_profile();
+        assert_eq!(tcpip.name, "tcpip");
+        assert!(tcpip.syscalls.is_allowed(SYS_NET_SEND).unwrap());
+        assert!(tcpip.syscalls.is_allowed(SYS_NET_RECV).unwrap());
+        for denied in [
+            SYS_DEVREG,
+            SYS_MMAP,
+            SYS_OPEN,
+            SYS_SPAWN,
+            SYS_KILL,
+            SYS_PIPE,
+            SYS_DUP,
+            SYS_IPC_SEND,
+            SYS_IPC_RECV,
+            SYS_IPC_CALL,
+            SYS_IPC_REPLY,
+            SYS_IPC_GRANT,
+            SYS_IPC_RECV_WAIT,
+        ] {
+            assert!(
+                !tcpip.syscalls.is_allowed(denied).unwrap(),
+                "tcpip must not use {}",
+                denied
+            );
+        }
+        assert!(
+            !tcpip.base_rights.contains(Rights::GRANT),
+            "the stack service confers nothing"
+        );
+        assert!(tcpip.base_rights.contains(Rights::WRITE));
+        assert_eq!(tcpip.max_children, 0, "the stack service never forks");
+        assert_eq!(client.max_children, 0);
+        // ...and netd (the broker) is the other NET holder.
         let netd = netd_profile();
         assert!(netd.syscalls.is_allowed(SYS_NET_SEND).unwrap());
         assert!(netd.syscalls.is_allowed(SYS_NET_RECV).unwrap());
@@ -745,6 +990,8 @@ mod tests {
             driver_profile(),
             plugin_profile(),
             netd_profile(),
+            tcpip_profile(),
+            net_client_profile(),
             package_manager_profile(),
         ] {
             for denied in [SYS_PIPE, SYS_DUP, SYS_KILL, SYS_CHROOT] {

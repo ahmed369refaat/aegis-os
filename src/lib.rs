@@ -54,6 +54,7 @@ pub mod ivrs;
 pub mod memory;
 pub mod monitor;
 pub mod net;
+pub mod netsock;
 pub mod netstack;
 pub mod part;
 pub mod pipe;
