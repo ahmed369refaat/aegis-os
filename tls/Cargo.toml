@@ -1,0 +1,15 @@
+[package]
+name = "aegis-tls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Internal, path-only: the TLS layer builds on the package manager's
+# audited primitives (SHA-256 streaming + digest, Ed25519 verify,
+# constant-time compare). No external crates — the supply chain this
+# layer defends is not extended by its own build.
+aegis-pkg = { path = "../pkg" }
+
+[lib]
+name = "aegis_tls"
+path = "src/lib.rs"

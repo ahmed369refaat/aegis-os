@@ -18,6 +18,9 @@ path = "src/main.rs"
 # Path dependency on the policy core (package `aegis-os`, crate name
 # `aegis_os`): still zero external crates.
 [dependencies]
+# K27: the TLS 1.3 layer (no_std, no-alloc, path-only — pulls the
+# audited `pkg` crypto primitives with it).
+aegis-tls = { path = "../tls" }
 aegis-os = { path = ".." }
 
 # Host tests only: pulls the shared DmaProt contract harness

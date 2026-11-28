@@ -283,6 +283,9 @@ case "${1:-}" in
       "[E1KD] driver-domains=3: the ring-3 domain brought the e1000 up on its OWN rings through the devreg channel ("  # the legacy-descriptor edition of the vnetdom proof
       "[E1KD] DHCP at CPL=3 through the domain's OWN legacy rings: 290-byte DISCOVER out, "  # device ownership proven by the exchange itself
       "[E1KD] rogue driver domain contained: "  # the quarantine, e1000 edition
+      # K27: TLS 1.3 live over the kernel's own stack
+      "[TLS] TLS 1.3 handshake VERIFIED over the kernel's own TCP/IP stack: X25519 + HKDF key schedule + ChaCha20-Poly1305, the server's Ed25519 CertificateVerify against the PINNED key, both Finished MACs — a real OpenSSL peer ("  # the full client handshake, lane-live
+      "[TLS] encrypted round trip: GET out, PONG echo back — "  # one encrypted request + the decrypted echo, in the kernel
       "[FAT32] HELLO.ESP (cluster 3, 1200 bytes, 3 clusters): \"HEAD:AEGIS-FAT32:\"…\":TAIL-OK\" ← read-only FAT32 over AHCI"  # the ESP mount LIVE on the same port (GPT partition 2, the chain walk proven)
       "[E1K] teardown dom"  # ADR-0018
       "[GFX] VBE 640x480x32 linear"  # the mode engaged
@@ -598,6 +601,17 @@ if [ "$MODE" = "verify" ]; then
   # at exactly QEMU_TIMEOUT+8s). A budget-kill is not a verify
   # failure: the session markers are already in the log. Capture the
   # rc, restore -e, keep going.
+  # K27: the TLS step's peer — a real OpenSSL handshake server on
+  # the host (slirp's 10.0.2.2 IS this host). Started before qemu,
+  # killed after; a failed start is loud (the [TLS] markers say so).
+  TLS_ECHO_PID=""
+  if command -v python3 >/dev/null 2>&1 && [ -f scripts/tls_echo_server.py ]; then
+    rm -f /tmp/echo-accepts.log
+    python3 scripts/tls_echo_server.py 44333 tls/tests/server-key.pem \
+      tls/tests/server-cert.pem /tmp/echo-accepts.log >/dev/null 2>&1 &
+    TLS_ECHO_PID=$!
+    sleep 1.2
+  fi
   QEMU_RC=0
   if [ "${1:-}" = "--verify-q35" ]; then
     TRACE_LOG=$(mktemp)
@@ -611,6 +625,9 @@ if [ "$MODE" = "verify" ]; then
     QEMU_RC=$?
   fi
   set -e
+  if [ -n "$TLS_ECHO_PID" ]; then
+    kill "$TLS_ECHO_PID" 2>/dev/null || true
+  fi
   if [ "$QEMU_RC" = 124 ]; then
     echo "QEMU hit its ${QEMU_TIMEOUT}s budget (the kernel halted without exiting) — the verify greps still run"
   fi

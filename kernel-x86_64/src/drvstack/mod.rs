@@ -35,6 +35,7 @@ mod netutil;
 mod nvme;
 mod pci;
 mod persist;
+mod tls;
 mod vballoon;
 mod vblk;
 mod vblkdom;
@@ -156,6 +157,11 @@ pub fn driver_stack_step<const N: usize>(
                 // this domain repoints the NIC onto its OWN legacy
                 // rings at CPL=3 through the devreg channel.
                 e1kdom::e1kdom_step(k, pool, out, &mut broker, &inv);
+                // K27: TLS 1.3 LIVE over the kernel's own TCP/IP
+                // stack — the e1000, ARP, TCP through slirp to a real
+                // OpenSSL server on the host, the full handshake, and
+                // the encrypted echo.
+                tls::tls_step(k, pool, out, &mut broker, &inv);
                 nvme::nvme_step(k, pool, out, &mut broker, &inv);
                 ahci::ahci_step(k, pool, out, &mut broker, &inv);
                 // Phase 6 S5: the M3 exit criterion — files that survive

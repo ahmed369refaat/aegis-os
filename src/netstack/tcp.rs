@@ -921,7 +921,16 @@ impl TcpLayer {
             tcb.cwnd = 2 * DEFAULT_MSS as u32;
             tcb.ssthresh = 8 * DEFAULT_MSS as u32;
         }
-        self.send_control(now, cfg, arp, sink, idx, SYN_BIT, None)?;
+        // The SYN's FIRST emission may pend on ARP resolution (or be
+        // refused by the broker's bucket) — either way the TCB is
+        // live, the frame rides the ARP queue, and the RTO machinery
+        // re-drives it from poll(). connect() must return the idx so
+        // the SOCKET layer can bind its fd; propagating ArpPending
+        // here orphaned the TCB: the SYN left, the handshake even
+        // completed on the wire, but the fd never learned its tcb —
+        // send() answered NotBound forever. Caught live by the K27
+        // TLS lane (SYN+SYN-ACK+ACK on the pcap, zero data).
+        let _ = self.send_control(now, cfg, arp, sink, idx, SYN_BIT, None);
         Ok(idx)
     }
 
